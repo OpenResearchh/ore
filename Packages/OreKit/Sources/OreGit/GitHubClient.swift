@@ -1,0 +1,452 @@
+import Foundation
+import OreProtocol
+import OreSupport
+
+/// GitHub, through the user's own `gh` CLI.
+///
+/// Same principle as the agent harnesses: drive the tool the user already has
+/// and is already authenticated with, rather than asking for a token and
+/// reimplementing auth, SSO, enterprise hosts and rate limiting.
+public actor GitHubClient {
+    private let executablePath: String?
+    private let repositoryURL: URL
+
+    public init(repositoryURL: URL, executablePath: String? = nil) {
+        self.repositoryURL = repositoryURL
+        self.executablePath = executablePath ?? ShellEnvironment.locate("gh")
+    }
+
+    public var isAvailable: Bool { executablePath != nil }
+
+    public struct Status: Sendable, Hashable {
+        public var isInstalled: Bool
+        public var isAuthenticated: Bool
+        public var version: String?
+        public var diagnostic: String?
+
+        public init(
+            isInstalled: Bool,
+            isAuthenticated: Bool,
+            version: String? = nil,
+            diagnostic: String? = nil
+        ) {
+            self.isInstalled = isInstalled
+            self.isAuthenticated = isAuthenticated
+            self.version = version
+            self.diagnostic = diagnostic
+        }
+    }
+
+    public func status() async -> Status {
+        guard executablePath != nil else {
+            return Status(
+                isInstalled: false,
+                isAuthenticated: false,
+                diagnostic: "The GitHub CLI (`gh`) is not installed."
+            )
+        }
+        let version = try? await run(["--version"]).lines.first
+        let authenticated = (try? await run(["auth", "status"])) != nil
+        return Status(
+            isInstalled: true,
+            isAuthenticated: authenticated,
+            version: version,
+            diagnostic: authenticated ? nil : "Run `gh auth login` to connect GitHub."
+        )
+    }
+
+    // MARK: - Account and repositories
+
+    public struct Repository: Sendable, Hashable, Codable, Identifiable {
+        public var id: String { nameWithOwner }
+        public var nameWithOwner: String
+        public var description: String?
+        public var isPrivate: Bool
+        public var htmlURL: String
+        public var defaultBranch: String
+        public var pushedAt: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case nameWithOwner = "full_name"
+            case description
+            case isPrivate = "private"
+            case htmlURL = "html_url"
+            case defaultBranch = "default_branch"
+            case pushedAt = "pushed_at"
+        }
+    }
+
+    /// Browser-based `gh` authentication. Flags remove every question the CLI
+    /// would otherwise ask in a GUI process; the account decision remains in
+    /// GitHub's own browser page and credential store.
+    public func authenticate() async throws {
+        guard let executablePath else { throw GitHubError.ghNotInstalled }
+        _ = try await GitProcess.run(
+            executablePath: executablePath,
+            arguments: [
+                "auth", "login", "--hostname", "github.com",
+                "--git-protocol", "https", "--web", "--clipboard",
+            ],
+            workingDirectory: repositoryURL,
+            stdin: nil,
+            environmentOverrides: ["GH_PAGER": "cat"]
+        )
+    }
+
+    /// Repositories the signed-in account can access: owned, organization, and
+    /// collaborator repositories. Pagination matters for established accounts.
+    public func repositories() async throws -> [Repository] {
+        let output = try await run([
+            "api", "--method", "GET", "user/repos",
+            "-f", "per_page=100", "-f", "sort=pushed", "-f", "direction=desc",
+            "--paginate", "--slurp",
+        ])
+        let data = Data(output.standardOutput.utf8)
+        if let pages = try? JSONDecoder().decode([[Repository]].self, from: data) {
+            return pages.flatMap { $0 }
+        }
+        return try JSONDecoder().decode([Repository].self, from: data)
+    }
+
+    public func clone(repository reference: String, to destination: URL) async throws {
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw GitHubError.destinationExists(destination.path)
+        }
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try await run(["repo", "clone", reference, destination.path])
+    }
+
+    // MARK: - Pull requests
+
+    public struct PullRequest: Sendable, Hashable, Codable {
+        public var number: Int
+        public var title: String
+        public var url: String
+        public var state: String
+        public var isDraft: Bool
+        public var baseRefName: String
+        public var headRefName: String
+        public var mergeable: String?
+        public var reviewDecision: String?
+        public var checks: [CheckRun]
+
+        public init(
+            number: Int,
+            title: String = "",
+            url: String = "",
+            state: String = "OPEN",
+            isDraft: Bool = false,
+            baseRefName: String = "main",
+            headRefName: String = "",
+            mergeable: String? = nil,
+            reviewDecision: String? = nil,
+            checks: [CheckRun] = []
+        ) {
+            self.number = number
+            self.title = title
+            self.url = url
+            self.state = state
+            self.isDraft = isDraft
+            self.baseRefName = baseRefName
+            self.headRefName = headRefName
+            self.mergeable = mergeable
+            self.reviewDecision = reviewDecision
+            self.checks = checks
+        }
+
+        /// GitHub reports `MERGEABLE`, `CONFLICTING` or `UNKNOWN` (still
+        /// computing). Unknown is treated as not-yet-ready rather than blocked.
+        public var hasConflicts: Bool { mergeable == "CONFLICTING" }
+        public var isOpen: Bool { state.uppercased() == "OPEN" }
+        public var isMerged: Bool { state.uppercased() == "MERGED" }
+
+        public var failingChecks: [CheckRun] {
+            checks.filter { $0.isComplete && !$0.isSuccess }
+        }
+
+        public var hasRunningChecks: Bool { checks.contains { !$0.isComplete } }
+
+        public var allChecksPassed: Bool {
+            !checks.isEmpty && checks.allSatisfy { $0.isComplete && $0.isSuccess }
+        }
+    }
+
+    public struct CheckRun: Sendable, Hashable, Codable {
+        public var name: String
+        public var state: String
+        public var link: String?
+        public var workflow: String?
+
+        public init(name: String, state: String, link: String? = nil, workflow: String? = nil) {
+            self.name = name
+            self.state = state
+            self.link = link
+            self.workflow = workflow
+        }
+
+        public var isComplete: Bool {
+            !["PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"]
+                .contains(state.uppercased())
+        }
+
+        public var isSuccess: Bool {
+            ["SUCCESS", "NEUTRAL", "SKIPPED"].contains(state.uppercased())
+        }
+    }
+
+    /// The open PR for a branch, if there is one.
+    public func pullRequest(forBranch branch: String) async -> PullRequest? {
+        let fields = [
+            "number", "title", "url", "state", "isDraft",
+            "baseRefName", "headRefName", "mergeable", "reviewDecision", "statusCheckRollup",
+        ].joined(separator: ",")
+
+        guard let output = try? await run(
+            ["pr", "view", branch, "--json", fields]
+        ) else { return nil }
+
+        return decodePullRequest(output.standardOutput)
+    }
+
+    public func createPullRequest(
+        branch: String,
+        base: String,
+        title: String,
+        body: String,
+        draft: Bool = false
+    ) async throws -> String {
+        var arguments = [
+            "pr", "create",
+            "--head", branch,
+            "--base", base,
+            "--title", title,
+            "--body", body,
+        ]
+        if draft { arguments.append("--draft") }
+        let output = try await run(arguments)
+        // `gh pr create` prints the PR URL on success.
+        return output.lines.last(where: { $0.hasPrefix("http") }) ?? output.trimmedStandardOutput
+    }
+
+    /// Retargets an open PR. Used after a lower PR in a stack merges: its
+    /// children were branched from it, so they must point at the base branch
+    /// instead of a branch that no longer exists.
+    public func retargetPullRequest(number: Int, to base: String) async throws {
+        try await run(["pr", "edit", String(number), "--base", base])
+    }
+
+    public func merge(number: Int, method: MergeMethod = .squash, deleteBranch: Bool = true) async throws {
+        var arguments = ["pr", "merge", String(number), method.flag]
+        if deleteBranch { arguments.append("--delete-branch") }
+        try await run(arguments)
+    }
+
+    public enum MergeMethod: String, Sendable, Codable, CaseIterable {
+        case squash, merge, rebase
+
+        var flag: String { "--\(rawValue)" }
+    }
+
+    // MARK: - CI logs
+
+    /// The failing part of a CI run, ready to hand to the agent.
+    ///
+    /// One click from "CI is red" to the agent working on it is the whole
+    /// point: the alternative is the user tabbing to a browser, finding the
+    /// failing job, scrolling to the error and pasting it back.
+    public func failedCheckLogs(forBranch branch: String, limit: Int = 4) async -> String? {
+        guard let runs = try? await run([
+            "run", "list", "--branch", branch, "--limit", "5",
+            "--json", "databaseId,conclusion,name,status",
+        ]) else { return nil }
+
+        struct Run: Decodable {
+            var databaseId: Int
+            var conclusion: String?
+            var name: String
+            var status: String
+        }
+        guard let decoded = try? JSONDecoder().decode(
+            [Run].self, from: Data(runs.standardOutput.utf8)
+        ) else { return nil }
+
+        let failed = decoded.filter { $0.conclusion == "failure" }.prefix(limit)
+        guard !failed.isEmpty else { return nil }
+
+        var sections: [String] = []
+        for failure in failed {
+            guard let log = try? await run(
+                ["run", "view", String(failure.databaseId), "--log-failed"]
+            ) else { continue }
+            // A full CI log can be tens of megabytes; the failing tail is what
+            // diagnoses the problem, and the rest just burns the agent's context.
+            let tail = log.lines.suffix(200).joined(separator: "\n")
+            sections.append("### \(failure.name)\n\n```\n\(tail)\n```")
+        }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+    }
+
+    // MARK: - Issues and PRs as workspace seeds
+
+    public struct IssueSeed: Sendable, Hashable {
+        public var number: Int
+        public var title: String
+        public var body: String
+        public var url: String
+        /// For a PR seed: the branch to check out instead of creating one.
+        public var headRefName: String?
+
+        public init(
+            number: Int,
+            title: String,
+            body: String,
+            url: String,
+            headRefName: String? = nil
+        ) {
+            self.number = number
+            self.title = title
+            self.body = body
+            self.url = url
+            self.headRefName = headRefName
+        }
+    }
+
+    public func issue(number: Int) async throws -> IssueSeed {
+        let output = try await run([
+            "issue", "view", String(number), "--json", "number,title,body,url",
+        ])
+        struct Payload: Decodable {
+            var number: Int
+            var title: String
+            var body: String?
+            var url: String
+        }
+        let payload = try JSONDecoder().decode(Payload.self, from: Data(output.standardOutput.utf8))
+        return IssueSeed(
+            number: payload.number,
+            title: payload.title,
+            body: payload.body ?? "",
+            url: payload.url
+        )
+    }
+
+    public func pullRequestSeed(number: Int) async throws -> IssueSeed {
+        let output = try await run([
+            "pr", "view", String(number), "--json", "number,title,body,url,headRefName",
+        ])
+        struct Payload: Decodable {
+            var number: Int
+            var title: String
+            var body: String?
+            var url: String
+            var headRefName: String
+        }
+        let payload = try JSONDecoder().decode(Payload.self, from: Data(output.standardOutput.utf8))
+        return IssueSeed(
+            number: payload.number,
+            title: payload.title,
+            body: payload.body ?? "",
+            url: payload.url,
+            headRefName: payload.headRefName
+        )
+    }
+
+    // MARK: - Plumbing
+
+    private func decodePullRequest(_ json: String) -> PullRequest? {
+        struct Payload: Decodable {
+            var number: Int
+            var title: String
+            var url: String
+            var state: String
+            var isDraft: Bool
+            var baseRefName: String
+            var headRefName: String
+            var mergeable: String?
+            var reviewDecision: String?
+            var statusCheckRollup: [Rollup]?
+
+            struct Rollup: Decodable {
+                var name: String?
+                var context: String?
+                var status: String?
+                var state: String?
+                var conclusion: String?
+                var detailsUrl: String?
+                var targetUrl: String?
+                var workflowName: String?
+            }
+        }
+
+        guard let payload = try? JSONDecoder().decode(Payload.self, from: Data(json.utf8)) else {
+            return nil
+        }
+
+        // The rollup mixes two shapes: check runs (status + conclusion) and
+        // legacy commit statuses (state). Normalizing here keeps that out of
+        // the state machine.
+        let checks = (payload.statusCheckRollup ?? []).map { entry -> CheckRun in
+            let state: String
+            if let status = entry.status, status.uppercased() != "COMPLETED" {
+                state = status
+            } else {
+                state = entry.conclusion ?? entry.state ?? "PENDING"
+            }
+            return CheckRun(
+                name: entry.name ?? entry.context ?? "check",
+                state: state,
+                link: entry.detailsUrl ?? entry.targetUrl,
+                workflow: entry.workflowName
+            )
+        }
+
+        return PullRequest(
+            number: payload.number,
+            title: payload.title,
+            url: payload.url,
+            state: payload.state,
+            isDraft: payload.isDraft,
+            baseRefName: payload.baseRefName,
+            headRefName: payload.headRefName,
+            mergeable: payload.mergeable,
+            reviewDecision: payload.reviewDecision,
+            checks: checks
+        )
+    }
+
+    @discardableResult
+    private func run(_ arguments: [String]) async throws -> GitOutput {
+        guard let executablePath else { throw GitHubError.ghNotInstalled }
+        return try await GitProcess.run(
+            executablePath: executablePath,
+            arguments: arguments,
+            workingDirectory: repositoryURL,
+            stdin: nil,
+            environmentOverrides: ["GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat"]
+        )
+    }
+}
+
+public enum GitHubError: Error, Sendable, CustomStringConvertible {
+    case ghNotInstalled
+    case notAuthenticated
+    case destinationExists(String)
+
+    public var description: String {
+        switch self {
+        case .ghNotInstalled:
+            return "The GitHub CLI (`gh`) is not installed."
+        case .notAuthenticated:
+            return "`gh` is not signed in. Run `gh auth login`."
+        case .destinationExists(let path):
+            return "A repository already exists at \(path)."
+        }
+    }
+}
+
+extension GitHubError: LocalizedError {
+    public var errorDescription: String? { description }
+}

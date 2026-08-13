@@ -1,0 +1,244 @@
+import Foundation
+import OreProtocol
+
+/// The one thing to do next to get this work merged.
+///
+/// This is the idea the changelog is clearest about: a developer shipping an
+/// agent's work runs the same loop every time — commit, push, open a PR, fix
+/// CI, merge — and at any moment exactly one of those is the next step. Making
+/// the app compute which one turns a five-tool workflow into a button.
+public enum SuggestedGitAction: Sendable, Hashable, Codable {
+    /// Nothing changed yet.
+    case none
+    /// Committed work in a repo with no remote to push it to. This is a real
+    /// state — there is a diff to see — not "no changes", which is the lie the
+    /// `.none` label told when it stood in for this case.
+    case committedNoRemote
+    case commit(fileCount: Int, insertions: Int, deletions: Int)
+    case push(commitCount: Int, isFirstPush: Bool)
+    case createPullRequest(base: String, isStacked: Bool)
+    /// CI is running; nothing to do but wait.
+    case waitForChecks(running: Int, total: Int)
+    /// CI failed. The action is not "go look at CI" — it's "hand the failure
+    /// to the agent that wrote the code".
+    case fixFailingChecks(prNumber: Int, failing: [String])
+    case resolveConflicts(prNumber: Int, base: String)
+    case waitForReview(prNumber: Int)
+    case merge(prNumber: Int, isStacked: Bool)
+    /// Lower PRs in the stack must land first; merging out of order would
+    /// bring their commits along with this one.
+    case waitForParentToMerge(parentBranch: String, parentPRNumber: Int?)
+    /// A parent merged, so this branch is now stacked on something that's gone.
+    case retargetAfterParentMerged(prNumber: Int?, newBase: String)
+    case merged(prNumber: Int)
+    /// `gh` missing or signed out — say so instead of silently offering nothing.
+    case setUpGitHub(reason: String)
+
+    /// Button label.
+    public var title: String {
+        switch self {
+        case .none: return "No changes"
+        case .committedNoRemote: return "Committed locally"
+        case .commit(let count, _, _): return "Commit \(count) file\(count == 1 ? "" : "s")"
+        case .push(let count, let isFirst):
+            return isFirst ? "Publish branch" : "Push \(count) commit\(count == 1 ? "" : "s")"
+        case .createPullRequest(let base, let isStacked):
+            return isStacked ? "Create PR onto \(base)" : "Create pull request"
+        case .waitForChecks(let running, let total): return "Checks running (\(running)/\(total))"
+        case .fixFailingChecks: return "Send failing checks to agent"
+        case .resolveConflicts: return "Resolve conflicts with agent"
+        case .waitForReview: return "Waiting for review"
+        case .merge(_, let isStacked): return isStacked ? "Merge (bottom of stack)" : "Merge"
+        case .waitForParentToMerge(let branch, _): return "Waiting on \(branch)"
+        case .retargetAfterParentMerged(_, let base): return "Retarget onto \(base)"
+        case .merged: return "Merged"
+        case .setUpGitHub: return "Set up GitHub"
+        }
+    }
+
+    /// Whether the action does something, or is just reporting a state.
+    public var isActionable: Bool {
+        switch self {
+        case .none, .committedNoRemote, .waitForChecks, .waitForReview,
+             .waitForParentToMerge, .merged:
+            return false
+        default:
+            return true
+        }
+    }
+
+    /// True when the action needs the agent rather than the user — those get
+    /// routed into the chat instead of run directly.
+    public var delegatesToAgent: Bool {
+        switch self {
+        case .fixFailingChecks, .resolveConflicts: return true
+        default: return false
+        }
+    }
+}
+
+/// Everything the state machine needs to decide. Gathering it is I/O; deciding
+/// is not, which is why they're separate — the decision is a pure function and
+/// is tested as one.
+public struct GitActionContext: Sendable {
+    public var hasUncommittedChanges: Bool
+    public var changedFileCount: Int
+    public var insertions: Int
+    public var deletions: Int
+    /// Commits on this branch that aren't on its upstream.
+    public var unpushedCommitCount: Int
+    /// Commits this branch has that its base doesn't. Zero means there is
+    /// nothing to open a pull request *from* — a workspace that was created
+    /// and never worked in looks identical to a fully pushed one otherwise.
+    public var commitsAheadOfBase: Int
+    public var hasUpstream: Bool
+    public var hasRemote: Bool
+    public var baseBranch: String
+    public var pullRequest: GitHubClient.PullRequest?
+    public var gitHubStatus: GitHubClient.Status
+    /// Set when this workspace is stacked on another.
+    public var parentBranch: String?
+    public var parentPullRequest: GitHubClient.PullRequest?
+
+    public init(
+        hasUncommittedChanges: Bool = false,
+        changedFileCount: Int = 0,
+        insertions: Int = 0,
+        deletions: Int = 0,
+        unpushedCommitCount: Int = 0,
+        commitsAheadOfBase: Int = 0,
+        hasUpstream: Bool = false,
+        hasRemote: Bool = true,
+        baseBranch: String = "main",
+        pullRequest: GitHubClient.PullRequest? = nil,
+        gitHubStatus: GitHubClient.Status = GitHubClient.Status(
+            isInstalled: true, isAuthenticated: true
+        ),
+        parentBranch: String? = nil,
+        parentPullRequest: GitHubClient.PullRequest? = nil
+    ) {
+        self.hasUncommittedChanges = hasUncommittedChanges
+        self.changedFileCount = changedFileCount
+        self.insertions = insertions
+        self.deletions = deletions
+        self.unpushedCommitCount = unpushedCommitCount
+        self.commitsAheadOfBase = commitsAheadOfBase
+        self.hasUpstream = hasUpstream
+        self.hasRemote = hasRemote
+        self.baseBranch = baseBranch
+        self.pullRequest = pullRequest
+        self.gitHubStatus = gitHubStatus
+        self.parentBranch = parentBranch
+        self.parentPullRequest = parentPullRequest
+    }
+}
+
+public enum SuggestedGitActionResolver {
+    /// Picks the next step.
+    ///
+    /// Order matters and encodes the workflow: local work before remote work,
+    /// blockers before conveniences, and — for a stack — the parent's state
+    /// before this branch's own, because merging a child first quietly drags
+    /// the parent's commits in with it.
+    public static func resolve(_ context: GitActionContext) -> SuggestedGitAction {
+        if let pullRequest = context.pullRequest, pullRequest.isMerged {
+            return .merged(prNumber: pullRequest.number)
+        }
+
+        // A stack whose parent already merged leaves this PR pointing at a
+        // deleted branch; retargeting is the only thing that unblocks it.
+        if let parent = context.parentPullRequest, parent.isMerged,
+           context.parentBranch != nil,
+           let pullRequest = context.pullRequest, pullRequest.baseRefName != context.baseBranch {
+            return .retargetAfterParentMerged(
+                prNumber: pullRequest.number,
+                newBase: context.baseBranch
+            )
+        }
+
+        if context.hasUncommittedChanges {
+            return .commit(
+                fileCount: context.changedFileCount,
+                insertions: context.insertions,
+                deletions: context.deletions
+            )
+        }
+
+        if !context.hasRemote {
+            return context.commitsAheadOfBase > 0 ? .committedNoRemote : .none
+        }
+
+        if !context.gitHubStatus.isInstalled || !context.gitHubStatus.isAuthenticated {
+            // Push still works without `gh`; only the PR half needs it. Don't
+            // offer to publish a branch that has nothing on it yet — an unpushed
+            // branch with zero commits ahead of base is nothing to publish.
+            if context.unpushedCommitCount > 0
+                || (!context.hasUpstream && context.commitsAheadOfBase > 0) {
+                return .push(
+                    commitCount: context.unpushedCommitCount,
+                    isFirstPush: !context.hasUpstream
+                )
+            }
+            return .setUpGitHub(
+                reason: context.gitHubStatus.diagnostic ?? "GitHub is not set up."
+            )
+        }
+
+        if context.unpushedCommitCount > 0
+            || (!context.hasUpstream && context.commitsAheadOfBase > 0) {
+            return .push(
+                commitCount: context.unpushedCommitCount,
+                isFirstPush: !context.hasUpstream
+            )
+        }
+
+        guard let pullRequest = context.pullRequest, pullRequest.isOpen else {
+            guard context.hasUpstream, context.commitsAheadOfBase > 0 else { return .none }
+            return .createPullRequest(
+                base: context.parentBranch ?? context.baseBranch,
+                isStacked: context.parentBranch != nil
+            )
+        }
+
+        if pullRequest.hasConflicts {
+            return .resolveConflicts(
+                prNumber: pullRequest.number,
+                base: pullRequest.baseRefName
+            )
+        }
+
+        let failing = pullRequest.failingChecks
+        if !failing.isEmpty {
+            return .fixFailingChecks(
+                prNumber: pullRequest.number,
+                failing: failing.map(\.name)
+            )
+        }
+
+        if pullRequest.hasRunningChecks {
+            let running = pullRequest.checks.filter { !$0.isComplete }.count
+            return .waitForChecks(running: running, total: pullRequest.checks.count)
+        }
+
+        if pullRequest.reviewDecision == "CHANGES_REQUESTED" {
+            return .waitForReview(prNumber: pullRequest.number)
+        }
+
+        // Green and ready — but only if nothing below it in the stack is
+        // still open.
+        if let parentBranch = context.parentBranch {
+            let parentIsMerged = context.parentPullRequest?.isMerged ?? false
+            if !parentIsMerged {
+                return .waitForParentToMerge(
+                    parentBranch: parentBranch,
+                    parentPRNumber: context.parentPullRequest?.number
+                )
+            }
+        }
+
+        return .merge(
+            prNumber: pullRequest.number,
+            isStacked: context.parentBranch != nil
+        )
+    }
+}

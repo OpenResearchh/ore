@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Swift / SwiftPM
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local agent workspace scratch
+.context/
+
+# Local changelog archive (not part of the project)
+changelog/
+
+# Python bytecode
+__pycache__/

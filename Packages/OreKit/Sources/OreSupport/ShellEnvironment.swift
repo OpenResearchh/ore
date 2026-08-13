@@ -1,0 +1,209 @@
+import Foundation
+
+/// Resolves the environment a GUI app must hand to child processes.
+///
+/// An app launched from Finder inherits a minimal `PATH` that contains none of
+/// the version managers (nvm, mise, asdf, homebrew) developers install their
+/// CLIs with. Every "works in Terminal, not in the app" bug traces back to
+/// this, so we probe the user's login shell once and cache the result.
+public enum ShellEnvironment {
+    /// Environment variables that would silently redirect a subscription
+    /// session onto metered API billing. Scrubbed unless the user explicitly
+    /// opts into API-key auth.
+    public static let providerCredentialKeys: Set<String> = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "XAI_API_KEY",
+        "CURSOR_API_KEY",
+    ]
+
+    private static let cache = Cache()
+
+    private final class Cache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: [String: String]?
+
+        func resolve(_ compute: () -> [String: String]) -> [String: String] {
+            lock.lock()
+            defer { lock.unlock() }
+            if let value { return value }
+            let computed = compute()
+            value = computed
+            return computed
+        }
+
+        func invalidate() {
+            lock.lock()
+            defer { lock.unlock() }
+            value = nil
+        }
+    }
+
+    /// The user's login-shell environment, probed once per app run.
+    ///
+    /// Falls back to the process environment if the probe fails or times out;
+    /// a degraded `PATH` beats a hung launch.
+    public static func loginShellEnvironment() -> [String: String] {
+        cache.resolve { probeLoginShell() ?? ProcessInfo.processInfo.environment }
+    }
+
+    public static func invalidateCache() {
+        cache.invalidate()
+    }
+
+    /// The environment to hand a harness child process: login-shell values,
+    /// provider credentials removed, overrides applied last.
+    public static func childEnvironment(
+        overrides: [String: String] = [:],
+        allowProviderCredentials: Bool = false
+    ) -> [String: String] {
+        var environment = loginShellEnvironment()
+        for (key, value) in overrides {
+            environment[key] = value
+        }
+        // Scrubbed last, so the flag is the single answer to "can this session
+        // reach a metered API?" — an override can't route around it.
+        if !allowProviderCredentials {
+            for key in providerCredentialKeys {
+                environment.removeValue(forKey: key)
+            }
+        }
+        return environment
+    }
+
+    /// Finds an executable on the resolved `PATH`.
+    public static func locate(
+        _ executable: String,
+        in environment: [String: String]? = nil
+    ) -> String? {
+        let environment = environment ?? loginShellEnvironment()
+
+        // An absolute or relative path is used as given.
+        if executable.contains("/") {
+            return isExecutable(executable) ? executable : nil
+        }
+
+        let searchPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        for directory in searchPath.split(separator: ":", omittingEmptySubsequences: true) {
+            let candidate = URL(fileURLWithPath: String(directory))
+                .appendingPathComponent(executable)
+                .path
+            if isExecutable(candidate) { return candidate }
+        }
+        return nil
+    }
+
+    public static var searchPathDescription: String {
+        loginShellEnvironment()["PATH"] ?? "(no PATH)"
+    }
+
+    private static func isExecutable(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else { return false }
+        return FileManager.default.isExecutableFile(atPath: path)
+    }
+
+    /// Runs the login shell with a marker-delimited `env` dump.
+    ///
+    /// The markers matter: shell profiles print banners, version-manager
+    /// notices and update nags, and parsing that noise as environment
+    /// variables produces a corrupt environment rather than an obvious failure.
+    private static func probeLoginShell() -> [String: String]? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        guard isExecutable(shell) else { return nil }
+
+        let begin = "__ORE_ENV_BEGIN__"
+        let end = "__ORE_ENV_END__"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shell)
+        // Interactive as well as login: nvm and mise are commonly initialized
+        // in .zshrc / .bashrc rather than the profile.
+        process.arguments = ["-ilc", "printf '%s\\n' \(begin); env -0; printf '%s\\n' \(end)"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        // Announce ourselves so a profile can opt out of expensive work.
+        var probeEnvironment = ProcessInfo.processInfo.environment
+        probeEnvironment["ORE_ENV_PROBE"] = "1"
+        process.environment = probeEnvironment
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        // Read to EOF on a background thread so a shell that never exits
+        // (a profile waiting on input) can be killed without deadlocking here.
+        let output = Lockbox<Data>(Data())
+        let finished = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            output.set(data)
+            finished.signal()
+        }
+
+        if finished.wait(timeout: .now() + 5) == .timedOut {
+            process.terminate()
+            _ = finished.wait(timeout: .now() + 1)
+            return nil
+        }
+        process.waitUntilExit()
+
+        guard let text = String(data: output.get(), encoding: .utf8),
+              let beginRange = text.range(of: begin + "\n"),
+              let endRange = text.range(of: end, range: beginRange.upperBound..<text.endIndex)
+        else { return nil }
+
+        let body = String(text[beginRange.upperBound..<endRange.lowerBound])
+        var environment: [String: String] = [:]
+        // `env -0` separates entries with NUL, so values containing newlines
+        // survive intact.
+        for entry in body.split(separator: "\0", omittingEmptySubsequences: true) {
+            guard let separator = entry.firstIndex(of: "=") else { continue }
+            let key = String(entry[entry.startIndex..<separator])
+            let value = String(entry[entry.index(after: separator)...])
+            guard !key.isEmpty else { continue }
+            environment[key] = value
+        }
+        return environment.isEmpty ? nil : environment
+    }
+}
+
+/// Minimal lock-guarded box, used where a value crosses a thread boundary
+/// without an actor being available.
+public final class Lockbox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    public init(_ value: Value) { self.value = value }
+
+    public func get() -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    public func set(_ newValue: Value) {
+        lock.lock()
+        defer { lock.unlock() }
+        value = newValue
+    }
+
+    @discardableResult
+    public func withLock<Result>(_ body: (inout Value) -> Result) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+}

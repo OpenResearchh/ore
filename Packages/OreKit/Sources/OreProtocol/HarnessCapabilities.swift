@@ -1,0 +1,169 @@
+import Foundation
+
+/// The agent CLIs ORE can drive. Each is spawned as the user's own local
+/// process so it carries the user's subscription credentials itself.
+public enum HarnessKind: String, Sendable, Codable, CaseIterable {
+    case claudeCode
+    case codex
+    case cursorAgent
+
+    public var displayName: String {
+        switch self {
+        case .claudeCode: return "Claude Code"
+        case .codex: return "Codex"
+        case .cursorAgent: return "Cursor Agent"
+        }
+    }
+
+    /// Default executable name looked up on the user's login-shell `PATH`.
+    public var defaultExecutableName: String {
+        switch self {
+        case .claudeCode: return "claude"
+        case .codex: return "codex"
+        case .cursorAgent: return "cursor-agent"
+        }
+    }
+
+    /// Harnesses that ship behind an experimental flag declare reduced
+    /// capabilities rather than pretending to be at parity.
+    public var isExperimental: Bool { self == .cursorAgent }
+}
+
+/// How a harness asks for permission before running a tool.
+public enum PermissionModel: String, Sendable, Codable {
+    /// The harness calls back over its control channel and blocks until we
+    /// answer (Claude Code `can_use_tool`, Codex approval requests, ACP
+    /// `session/request_permission`).
+    case interactiveCallback
+    /// The harness only accepts an up-front allow/deny policy; ORE can shape
+    /// the rules but cannot answer a live prompt.
+    case staticPolicy
+    /// No permission surface at all — the agent proposes and ORE applies.
+    case none
+}
+
+public enum UsageGranularity: String, Sendable, Codable {
+    /// Token counts stream during the turn.
+    case live
+    /// Token counts arrive once, at turn end.
+    case perTurn
+    case unavailable
+}
+
+/// One model advertised by an installed agent CLI.
+///
+/// Model catalogs move independently of ORE releases. Keeping the provider's
+/// identifier separate from its human name lets the UI show a useful picker
+/// without turning display copy into a command-line argument.
+public struct AgentModel: Sendable, Codable, Hashable, Identifiable {
+    public var id: String
+    public var displayName: String
+    public var description: String
+    public var isDefault: Bool
+    public var supportedReasoningEfforts: [String]
+    /// Catalog-provided processing tiers such as Codex `fast`. This is
+    /// independent of the model and its reasoning effort.
+    public var supportedServiceTiers: [String]
+
+    public init(
+        id: String,
+        displayName: String,
+        description: String = "",
+        isDefault: Bool = false,
+        supportedReasoningEfforts: [String] = [],
+        supportedServiceTiers: [String] = []
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.description = description
+        self.isDefault = isDefault
+        self.supportedReasoningEfforts = supportedReasoningEfforts
+        self.supportedServiceTiers = supportedServiceTiers
+    }
+}
+
+/// What a given harness can actually do.
+///
+/// The UI reads this to degrade gracefully — a missing capability greys out a
+/// control, it never breaks a screen. This is also the record we assert against
+/// in golden-transcript CI when a CLI version bumps.
+public struct HarnessCapabilities: Sendable, Codable, Hashable {
+    public var supportsPlanMode: Bool
+    /// Can accept a new user message while a turn is in flight (steering).
+    public var supportsSteering: Bool
+    public var supportsInterrupt: Bool
+    /// Can resume a prior session by id.
+    public var supportsResume: Bool
+    /// Can resume *into a new session id*, leaving the original intact — the
+    /// chat-side half of checkpoints.
+    public var supportsSessionFork: Bool
+    public var supportsThinkingStream: Bool
+    public var supportsPartialMessages: Bool
+    /// Can switch permission mode mid-session without a restart.
+    public var supportsRuntimePermissionModeChange: Bool
+    /// ORE can expose its own MCP tools (diff comments, ask-user) to the agent.
+    public var supportsCustomTools: Bool
+    public var permissionModel: PermissionModel
+    public var usageGranularity: UsageGranularity
+
+    public init(
+        supportsPlanMode: Bool = false,
+        supportsSteering: Bool = false,
+        supportsInterrupt: Bool = false,
+        supportsResume: Bool = false,
+        supportsSessionFork: Bool = false,
+        supportsThinkingStream: Bool = false,
+        supportsPartialMessages: Bool = false,
+        supportsRuntimePermissionModeChange: Bool = false,
+        supportsCustomTools: Bool = false,
+        permissionModel: PermissionModel = .none,
+        usageGranularity: UsageGranularity = .unavailable
+    ) {
+        self.supportsPlanMode = supportsPlanMode
+        self.supportsSteering = supportsSteering
+        self.supportsInterrupt = supportsInterrupt
+        self.supportsResume = supportsResume
+        self.supportsSessionFork = supportsSessionFork
+        self.supportsThinkingStream = supportsThinkingStream
+        self.supportsPartialMessages = supportsPartialMessages
+        self.supportsRuntimePermissionModeChange = supportsRuntimePermissionModeChange
+        self.supportsCustomTools = supportsCustomTools
+        self.permissionModel = permissionModel
+        self.usageGranularity = usageGranularity
+    }
+}
+
+/// Result of the onboarding doctor's check for one harness.
+public struct HarnessProbeResult: Sendable, Codable, Hashable {
+    public enum AuthState: String, Sendable, Codable {
+        case authenticated
+        case notAuthenticated
+        /// The CLI exists but doesn't let us determine login state without
+        /// spending a request — don't block onboarding on it.
+        case unknown
+    }
+
+    public var kind: HarnessKind
+    public var executablePath: String?
+    public var version: String?
+    public var authState: AuthState
+    /// Set when the CLI is present but something is wrong we can explain.
+    public var diagnostic: String?
+
+    public var isInstalled: Bool { executablePath != nil }
+    public var isReady: Bool { isInstalled && authState != .notAuthenticated }
+
+    public init(
+        kind: HarnessKind,
+        executablePath: String? = nil,
+        version: String? = nil,
+        authState: AuthState = .unknown,
+        diagnostic: String? = nil
+    ) {
+        self.kind = kind
+        self.executablePath = executablePath
+        self.version = version
+        self.authState = authState
+        self.diagnostic = diagnostic
+    }
+}

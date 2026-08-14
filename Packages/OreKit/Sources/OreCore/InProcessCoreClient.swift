@@ -79,8 +79,8 @@ public actor InProcessCoreClient: CoreClient {
         case .deleteWorkspace(let id, let deleteBranch):
             try await deleteWorkspace(id, deleteBranch: deleteBranch)
 
-        case .renameWorkspace(let id, let name):
-            try await engine(for: id).rename(name)
+        case .renameWorkspace(let id, let name, let userInitiated):
+            try await engine(for: id).rename(name, userInitiated: userInitiated)
 
         case .setWorkspacePinned(let id, let pinned):
             try await engine(for: id).setPinned(pinned)
@@ -100,6 +100,9 @@ public actor InProcessCoreClient: CoreClient {
         case .commit(let id, let message):
             try await commit(id, message: message)
 
+        case .createGitHubRepo(let id):
+            try await createGitHubRepo(id)
+
         case .push(let id):
             try await push(id)
 
@@ -116,8 +119,10 @@ public actor InProcessCoreClient: CoreClient {
             let chat = try await engine(for: request.workspaceID).createChat(request)
             continuation.yield(.chatAdded(chat))
 
-        case .renameChat(let id, let chatID, let title):
-            _ = try await engine(for: id).renameChat(chatID, title: title)
+        case .renameChat(let id, let chatID, let title, let userInitiated):
+            _ = try await engine(for: id).renameChat(
+                chatID, title: title, userInitiated: userInitiated
+            )
 
         case .closeChat(let workspaceID, let chatID):
             let chat = try await engine(for: workspaceID).closeChat(chatID)
@@ -533,11 +538,29 @@ public actor InProcessCoreClient: CoreClient {
         try await resync(id)
     }
 
+    /// Creates a GitHub repo from the canonical checkout and publishes its base
+    /// branch. Sourcing from `repositoryPath` (which sits on the base branch)
+    /// means GitHub's default branch is the base — the branch PRs target — and
+    /// leaves the workspace's own branch to the normal "Publish branch" step
+    /// that follows once a remote exists.
+    private func createGitHubRepo(_ id: WorkspaceID) async throws {
+        let (record, _, _) = try await workspaceAndGit(id)
+        let name = (record.repositoryPath as NSString).lastPathComponent
+        let github = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
+        try await github.createRepository(name: name, sourcePath: record.repositoryPath)
+        try await resync(id)
+    }
+
     @discardableResult
     private func createPullRequest(
         _ id: WorkspaceID, title: String, body: String, base: String, draft: Bool
     ) async throws -> String {
-        let (record, _, _) = try await workspaceAndGit(id)
+        let (record, git, worktree) = try await workspaceAndGit(id)
+        // Publishing is part of opening a PR now, not a step before it: `gh pr
+        // create --head` needs the branch on the remote, so push (and set
+        // upstream) first. This is a no-op — "Everything up-to-date" — when the
+        // branch is already published, so it stays safe to re-run.
+        try await git.runSerialized(["push", "-u", "origin", record.branch], in: worktree)
         let github = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
         let url = try await github.createPullRequest(
             branch: record.branch,
@@ -817,9 +840,10 @@ private extension CoreCommand {
         case .deleteWorkspace(let id, _), .setPermissionMode(let id, _),
              .startSession(let id, _):
             return id
-        case .renameWorkspace(let id, _), .setWorkspacePinned(let id, _),
+        case .renameWorkspace(let id, _, _), .setWorkspacePinned(let id, _),
              .addDiffComment(let id, _), .markFileViewed(let id, _, _),
-             .commit(let id, _), .push(let id), .createPullRequest(let id, _, _, _, _),
+             .commit(let id, _), .createGitHubRepo(let id), .push(let id),
+             .createPullRequest(let id, _, _, _, _),
              .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _):
             return id
         case .resolvePermission(let id, _, _), .answerQuestion(let id, _, _),
@@ -829,7 +853,7 @@ private extension CoreCommand {
             return request.workspaceID
         case .createChat(let request):
             return request.workspaceID
-        case .renameChat(let id, _, _):
+        case .renameChat(let id, _, _, _):
             return id
         case .closeChat(let id, _), .reopenChat(let id, _),
              .switchChatHarness(let id, _, _, _), .setChatModel(let id, _, _),

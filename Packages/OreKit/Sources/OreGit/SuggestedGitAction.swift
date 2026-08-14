@@ -14,6 +14,10 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
     /// state — there is a diff to see — not "no changes", which is the lie the
     /// `.none` label told when it stood in for this case.
     case committedNoRemote
+    /// Committed work with no remote, but `gh` is ready — so the dead end
+    /// becomes a button: create the GitHub repo and publish it, which hands the
+    /// rest of the flow (push → PR → merge) back to the usual states.
+    case createGitHubRepo
     case commit(fileCount: Int, insertions: Int, deletions: Int)
     case push(commitCount: Int, isFirstPush: Bool)
     case createPullRequest(base: String, isStacked: Bool)
@@ -39,6 +43,7 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
         switch self {
         case .none: return "No changes"
         case .committedNoRemote: return "Committed locally"
+        case .createGitHubRepo: return "Create GitHub repo"
         case .commit(let count, _, _): return "Commit \(count) file\(count == 1 ? "" : "s")"
         case .push(let count, let isFirst):
             return isFirst ? "Publish branch" : "Push \(count) commit\(count == 1 ? "" : "s")"
@@ -165,7 +170,14 @@ public enum SuggestedGitActionResolver {
         }
 
         if !context.hasRemote {
-            return context.commitsAheadOfBase > 0 ? .committedNoRemote : .none
+            guard context.commitsAheadOfBase > 0 else { return .none }
+            // With `gh` ready, "committed but nowhere to push" is no longer a
+            // dead end — offer to create the repo. Without it, there's nothing
+            // to click, so report the state honestly.
+            if context.gitHubStatus.isInstalled, context.gitHubStatus.isAuthenticated {
+                return .createGitHubRepo
+            }
+            return .committedNoRemote
         }
 
         if !context.gitHubStatus.isInstalled || !context.gitHubStatus.isAuthenticated {
@@ -184,20 +196,22 @@ public enum SuggestedGitActionResolver {
             )
         }
 
-        if context.unpushedCommitCount > 0
-            || (!context.hasUpstream && context.commitsAheadOfBase > 0) {
-            return .push(
-                commitCount: context.unpushedCommitCount,
-                isFirstPush: !context.hasUpstream
-            )
-        }
-
+        // No PR yet: opening one publishes the branch in the same step (the core
+        // pushes `-u` before `gh pr create`), so the flow never stops at a
+        // separate "Publish branch" button first — that was the extra click. A
+        // branch with no commits ahead of base has nothing to open a PR from.
         guard let pullRequest = context.pullRequest, pullRequest.isOpen else {
-            guard context.hasUpstream, context.commitsAheadOfBase > 0 else { return .none }
+            guard context.commitsAheadOfBase > 0 else { return .none }
             return .createPullRequest(
                 base: context.parentBranch ?? context.baseBranch,
                 isStacked: context.parentBranch != nil
             )
+        }
+
+        // A PR is already open: new local commits update it, so push them before
+        // reading the PR's checks and review state.
+        if context.unpushedCommitCount > 0 {
+            return .push(commitCount: context.unpushedCommitCount, isFirstPush: false)
         }
 
         if pullRequest.hasConflicts {

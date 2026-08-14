@@ -108,6 +108,16 @@ struct TranscriptView: NSViewRepresentable {
         /// once per (row, width) rather than on every scroll tick.
         private var heightCache: [String: CGFloat] = [:]
         private var cachedWidth: CGFloat = 0
+        /// The turn-rail inputs last pushed, so a streaming delta (which changes
+        /// neither) doesn't force the rail to redraw and rebuild tracking areas.
+        private var railTurnRows: [Int] = []
+        private var railTotalRows = 0
+        /// A saved scroll offset waiting to be applied. Restoring before the
+        /// table has a real width (and therefore measured, correct row heights)
+        /// lands the offset in the empty band above still-unmeasured rows — the
+        /// blank that only fills in once a scroll forces a re-measure. So the
+        /// restore is deferred until the first real layout can honour it.
+        private var pendingScrollRestore: CGFloat?
 
         init(
             persistenceKey: String,
@@ -169,17 +179,22 @@ struct TranscriptView: NSViewRepresentable {
                 tableView.reloadData()
             }
 
-            container?.turnRail.update(
-                turnRows: newRows.indices.filter { newRows[$0].kind == .userMessage },
-                totalRows: newRows.count
-            )
+            // The rail only depends on where the user messages sit and the total
+            // row count — neither changes while text streams into the last row.
+            // Skipping the redraw + tracking-area rebuild on every delta is what
+            // keeps streaming cheap.
+            let turnRows = newRows.indices.filter { newRows[$0].kind == .userMessage }
+            if turnRows != railTurnRows || newRows.count != railTotalRows {
+                railTurnRows = turnRows
+                railTotalRows = newRows.count
+                container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
+            }
 
-            if previous.isEmpty, !newRows.isEmpty,
-               let scrollView = tableView.enclosingScrollView {
+            if previous.isEmpty, !newRows.isEmpty {
                 let saved = UserDefaults.standard.double(forKey: persistenceKey)
                 if saved > 0 {
-                    scrollView.contentView.scroll(to: NSPoint(x: 0, y: saved))
-                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                    pendingScrollRestore = saved
+                    restorePendingScrollIfReady()
                     return
                 }
             }
@@ -190,6 +205,23 @@ struct TranscriptView: NSViewRepresentable {
             if wasAtBottom { scrollToBottom(tableView) }
         }
 
+        /// Applies a deferred scroll restore once the table can honour it — i.e.
+        /// it has a real width, so every row height is measured and the document
+        /// is its true height. Called again from `viewDidResize` for the case
+        /// where the first `update` ran before the view had been sized.
+        private func restorePendingScrollIfReady() {
+            guard let target = pendingScrollRestore,
+                  let tableView,
+                  let scrollView = tableView.enclosingScrollView,
+                  tableView.bounds.width > 1 else { return }
+            // Force the measure now so the offset lands on real content, not the
+            // blank band above rows the table hasn't laid out yet.
+            tableView.layoutSubtreeIfNeeded()
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            pendingScrollRestore = nil
+        }
+
         @objc func viewDidResize(_ notification: Notification) {
             guard let tableView else { return }
             let width = tableView.bounds.width
@@ -197,6 +229,9 @@ struct TranscriptView: NSViewRepresentable {
             cachedWidth = width
             heightCache.removeAll()
             tableView.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+            // A width was just established; a restore that couldn't run on load
+            // (view not yet sized) can finally land correctly.
+            restorePendingScrollIfReady()
         }
 
         @objc func scrollDidChange(_ notification: Notification) {
@@ -214,10 +249,16 @@ struct TranscriptView: NSViewRepresentable {
             let item = rows[row]
             if let cached = heightCache[item.id] { return cached }
 
-            let width = min(
-                max(tableView.bounds.width - TranscriptCell.horizontalInset * 2, 100),
-                TranscriptCell.contentMaxWidth
-            )
+            let available = tableView.bounds.width - TranscriptCell.horizontalInset * 2
+            // Before the table has a real width (the first layout pass reports 0),
+            // measuring would wrap every row's text at a bogus 100pt and cache a
+            // wildly-too-tall height. That inflated the document, so restoring the
+            // scroll position landed in empty space above the content — the blank
+            // band that only filled in once a scroll forced a re-measure. Hand back
+            // a provisional height *without* caching until the width is real.
+            guard available > 1 else { return 44 }
+
+            let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
             let height = TranscriptCell.height(for: item, width: width)
             heightCache[item.id] = height
             return height
@@ -277,9 +318,25 @@ struct TranscriptView: NSViewRepresentable {
             guard let tableView, let rail = container?.turnRail else { return }
             let visible = tableView.rows(in: tableView.visibleRect)
             let middle = visible.location + max(visible.length / 2, 0)
-            rail.activeRow = rail.turnRows.min {
-                abs($0 - middle) < abs($1 - middle)
+            rail.activeRow = Self.nearest(to: middle, in: rail.turnRows)
+        }
+
+        /// Closest value in an ascending array, in O(log n). The rail resolves
+        /// this on every scroll tick; a linear scan over every user message was
+        /// work a fast scroll could feel in a long conversation.
+        private static func nearest(to target: Int, in sorted: [Int]) -> Int? {
+            guard !sorted.isEmpty else { return nil }
+            var low = 0
+            var high = sorted.count - 1
+            while low < high {
+                let mid = (low + high) / 2
+                if sorted[mid] < target { low = mid + 1 } else { high = mid }
             }
+            // `low` is the first element >= target; its predecessor may be nearer.
+            if low > 0, abs(sorted[low - 1] - target) <= abs(sorted[low] - target) {
+                return sorted[low - 1]
+            }
+            return sorted[low]
         }
     }
 }
@@ -317,7 +374,9 @@ final class TranscriptContainerView: NSView {
 final class TurnRailView: NSView {
     var turnRows: [Int] = []
     var totalRows = 0
-    var activeRow: Int? { didSet { needsDisplay = true } }
+    // Only a genuine change is worth a redraw; the scroll observer sets this on
+    // every tick, and most ticks leave the active turn exactly where it was.
+    var activeRow: Int? { didSet { if oldValue != activeRow { needsDisplay = true } } }
     var onSelectRow: ((Int) -> Void)?
     private var isHovering = false
 
@@ -399,6 +458,8 @@ final class TranscriptCell: NSTableCellView {
     private var badgeHeightZero: NSLayoutConstraint!
     private var leadingConstraint: NSLayoutConstraint!
     private var trailingConstraint: NSLayoutConstraint!
+    private var bubbleTopConstraint: NSLayoutConstraint!
+    private var bubbleBottomConstraint: NSLayoutConstraint!
     private var preferredWidthConstraint: NSLayoutConstraint!
     private var userWidthConstraint: NSLayoutConstraint!
     private var revertAction: (() -> Void)?
@@ -480,6 +541,11 @@ final class TranscriptCell: NSTableCellView {
         userWidthConstraint = bubble.widthAnchor.constraint(equalToConstant: 620)
         userWidthConstraint.priority = .defaultHigh
 
+        // Held as properties so the vertical inset can tighten per row — process
+        // rows (tool calls, thinking, activity) sit closer together than prose.
+        bubbleTopConstraint = bubble.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset)
+        bubbleBottomConstraint = bubble.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.verticalInset)
+
         NSLayoutConstraint.activate([
             contentGuide.centerXAnchor.constraint(equalTo: centerXAnchor),
             contentGuide.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: Self.horizontalInset),
@@ -499,8 +565,8 @@ final class TranscriptCell: NSTableCellView {
             ),
             bubble.widthAnchor.constraint(lessThanOrEqualToConstant: Self.contentMaxWidth),
             preferredWidthConstraint,
-            bubble.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset),
-            bubble.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.verticalInset),
+            bubbleTopConstraint,
+            bubbleBottomConstraint,
 
             badge.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
             badge.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 6),
@@ -542,6 +608,10 @@ final class TranscriptCell: NSTableCellView {
         // The copy button belongs to user messages; it stays hidden until the
         // row is hovered (see mouseEntered/Exited).
         if !isUser { copyButton.isHidden = true }
+        let inset = Self.verticalInset(for: row)
+        bubbleTopConstraint.constant = inset
+        bubbleBottomConstraint.constant = -inset
+
         let indent = row.parentToolCallID != nil ? Self.subagentIndent : 0
         leadingConstraint.constant = indent
         indentGuide.isHidden = indent == 0
@@ -661,7 +731,17 @@ final class TranscriptCell: NSTableCellView {
         // Text, plus the bubble's own padding (16), plus the cell's vertical
         // inset — and the badge line only when there is a badge to show.
         let badgeLine: CGFloat = badgeText(for: row).isEmpty ? 0 : 14
-        return ceil(bounding.height) + 16 + verticalInset * 2 + badgeLine
+        return ceil(bounding.height) + 16 + verticalInset(for: row) * 2 + badgeLine
+    }
+
+    /// Process rows — tool calls, thinking, the collapsed activity group — sit
+    /// closer together than prose so a run of them reads as one quiet block
+    /// rather than a widely-spaced list competing with the answer.
+    private static func verticalInset(for row: TranscriptRow) -> CGFloat {
+        switch row.kind {
+        case .toolCall, .thinking, .activityGroup, .error: return 5
+        default: return verticalInset
+        }
     }
 
     /// The row's rendered content.
@@ -720,6 +800,7 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
             hasher.combine(row.activitySignature)
+            hasher.combine(row.subagentChildCount)
             return hasher.finalize()
         }
 
@@ -815,51 +896,107 @@ final class TranscriptCell: NSTableCellView {
         var isDiff = false
     }
 
-    /// A small rounded, outlined pill for a file reference or command argument,
+    /// A small rounded, tinted pill for a file reference or command argument,
     /// drawn as an image so it can sit inline in the attributed transcript text.
-    /// This is the quiet "chip" look — subtle fill, hairline border, an optional
-    /// language icon, then the label — instead of a flat highlight or a
-    /// full-width band.
+    /// File chips pick up the language colour; tool chips use the tool tint.
+    /// Edit/Write chips also carry +/− line counts so the size of the change
+    /// is visible without expanding the row.
     private static func subjectPillImage(
         identity: FileVisualIdentity?,
         text: String,
-        monospace: Bool
+        monospace: Bool,
+        tint: NSColor,
+        insertions: Int = 0,
+        deletions: Int = 0
     ) -> NSImage {
         let font = monospace
-            ? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-            : NSFont.systemFont(ofSize: 11.5, weight: .medium)
+            ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            : NSFont.systemFont(ofSize: 12, weight: .medium)
         let textAttrs: [NSAttributedString.Key: Any] = [
             .font: font, .foregroundColor: NSColor.labelColor,
         ]
+        let statFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        let plusAttrs: [NSAttributedString.Key: Any] = [
+            .font: statFont, .foregroundColor: NSColor.systemGreen,
+        ]
+        let minusAttrs: [NSAttributedString.Key: Any] = [
+            .font: statFont, .foregroundColor: NSColor.systemRed,
+        ]
+        let plusText = insertions > 0 ? "+\(insertions)" : ""
+        let minusText = deletions > 0 ? "−\(deletions)" : ""
         let textSize = (text as NSString).size(withAttributes: textAttrs)
-        let iconSize: CGFloat = identity != nil ? 13 : 0
-        let iconGap: CGFloat = identity != nil ? 5 : 0
-        let hPad: CGFloat = 7
-        let vPad: CGFloat = 3
-        let width = ceil(hPad + iconSize + iconGap + textSize.width + hPad)
+        let plusSize = (plusText as NSString).size(withAttributes: plusAttrs)
+        let minusSize = (minusText as NSString).size(withAttributes: minusAttrs)
+        let iconSize: CGFloat = identity != nil ? 14 : 0
+        let iconGap: CGFloat = identity != nil ? 6 : 0
+        let statGap: CGFloat = plusText.isEmpty && minusText.isEmpty ? 0 : 8
+        let betweenStats: CGFloat = plusText.isEmpty || minusText.isEmpty ? 0 : 6
+        // Roomier than the old candy-pill: a rounded rectangle (not a full
+        // capsule) with generous horizontal padding and a neutral fill, so the
+        // file's own icon colour carries the identity instead of tinting the
+        // whole chip. Modelled on the file chips in editor review UIs.
+        let hPad: CGFloat = 10
+        let vPad: CGFloat = 5
+        let width = ceil(
+            hPad + iconSize + iconGap + textSize.width
+                + statGap + plusSize.width + betweenStats + minusSize.width
+                + hPad
+        )
         let height = ceil(textSize.height + vPad * 2)
         let image = NSImage(size: NSSize(width: max(1, width), height: max(1, height)))
         image.lockFocus()
         let rect = NSRect(x: 0.5, y: 0.5, width: width - 1, height: height - 1)
-        let radius = height / 2
-        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-        NSColor.secondaryLabelColor.withAlphaComponent(0.09).setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        NSColor.secondaryLabelColor.withAlphaComponent(0.10).setFill()
         path.fill()
         path.lineWidth = 1
-        NSColor.separatorColor.withAlphaComponent(0.7).setStroke()
+        NSColor.separatorColor.setStroke()
         path.stroke()
         var x = hPad
         if let identity {
-            let icon = identity.appKitImage(size: iconSize)
-            icon.draw(in: NSRect(x: x, y: (height - iconSize) / 2, width: iconSize, height: iconSize))
+            let iconRect = NSRect(x: x, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
+            drawFileIcon(identity, in: iconRect)
             x += iconSize + iconGap
         }
         (text as NSString).draw(
             at: NSPoint(x: x, y: (height - textSize.height) / 2),
             withAttributes: textAttrs
         )
+        x += textSize.width
+        if !plusText.isEmpty {
+            x += statGap
+            (plusText as NSString).draw(
+                at: NSPoint(x: x, y: (height - plusSize.height) / 2),
+                withAttributes: plusAttrs
+            )
+            x += plusSize.width
+        }
+        if !minusText.isEmpty {
+            x += plusText.isEmpty ? statGap : betweenStats
+            (minusText as NSString).draw(
+                at: NSPoint(x: x, y: (height - minusSize.height) / 2),
+                withAttributes: minusAttrs
+            )
+        }
         image.unlockFocus()
         return image
+    }
+
+    /// Language glyphs already carry colour; SF Symbol templates need a tint
+    /// pass so a Swift file doesn't render as a grey blob inside a coloured chip.
+    private static func drawFileIcon(_ identity: FileVisualIdentity, in rect: NSRect) {
+        let icon = identity.appKitImage(size: rect.width)
+        if icon.isTemplate {
+            let tinted = NSImage(size: rect.size, flipped: false) { bounds in
+                icon.draw(in: bounds)
+                identity.tone.nsColor.set()
+                bounds.fill(using: .sourceIn)
+                return true
+            }
+            tinted.draw(in: rect)
+        } else {
+            icon.draw(in: rect)
+        }
     }
 
     private static func processText(for row: TranscriptRow) -> NSAttributedString {
@@ -889,7 +1026,10 @@ final class TranscriptCell: NSTableCellView {
             let pill = subjectPillImage(
                 identity: item.fileIdentity,
                 text: compact(subject, limit: 64),
-                monospace: item.fileIdentity == nil
+                monospace: item.fileIdentity == nil,
+                tint: item.tint,
+                insertions: item.insertions,
+                deletions: item.deletions
             )
             let attachment = NSTextAttachment()
             attachment.image = pill
@@ -909,18 +1049,42 @@ final class TranscriptCell: NSTableCellView {
                     range: NSRange(location: subjectStart, length: result.length - subjectStart)
                 )
             }
+        } else if item.insertions > 0 || item.deletions > 0 {
+            if item.insertions > 0 {
+                result.append(NSAttributedString(
+                    string: "  +\(item.insertions)",
+                    attributes: [
+                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+                        .foregroundColor: NSColor.systemGreen,
+                    ]
+                ))
+            }
+            if item.deletions > 0 {
+                result.append(NSAttributedString(
+                    string: "  −\(item.deletions)",
+                    attributes: [
+                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+                        .foregroundColor: NSColor.systemRed,
+                    ]
+                ))
+            }
         }
-        if item.insertions > 0 {
+        // A subagent (Task) row is a collapsible group: show how many steps ran
+        // inside it and a disclosure chevron, and stop here — its children are
+        // separate rows below, so the noisy launch blob isn't worth showing.
+        if let steps = row.subagentChildCount {
             result.append(NSAttributedString(
-                string: "   +\(item.insertions)",
-                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.systemGreen]
+                string: "  · \(steps) step\(steps == 1 ? "" : "s")",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
             ))
-        }
-        if item.deletions > 0 {
             result.append(NSAttributedString(
-                string: "  −\(item.deletions)",
-                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.systemRed]
+                string: row.isExpanded ? "   ⌄" : "   ›",
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor]
             ))
+            return result
         }
         if !item.detail.isEmpty {
             result.append(NSAttributedString(
@@ -935,7 +1099,7 @@ final class TranscriptCell: NSTableCellView {
             let value = String(line)
             let color: NSColor
             if item.isDiff && value.hasPrefix("+") && !value.hasPrefix("+++") { color = .systemGreen }
-            else if item.isDiff && value.hasPrefix("-") && !value.hasPrefix("---") { color = .systemRed }
+            else if item.isDiff && (value.hasPrefix("-") || value.hasPrefix("−")) && !value.hasPrefix("---") { color = .systemRed }
             else { color = .secondaryLabelColor }
             result.append(NSAttributedString(
                 string: value + (index == lines.count - 1 ? "" : "\n"),
@@ -967,6 +1131,12 @@ final class TranscriptCell: NSTableCellView {
             ))
         }
 
+        // The icon and file-pill summaries stand in for the work while it's
+        // folded away; once expanded, every tool row shows its own icon and
+        // chip in the right place, so repeating them on the header is just
+        // noise. Collapsed only.
+        guard !row.isExpanded else { return result }
+
         var seenIcons: Set<String> = []
         for child in row.groupedRows {
             let icon = processPresentation(for: child).icon
@@ -990,33 +1160,51 @@ final class TranscriptCell: NSTableCellView {
         // once the agent has finished.
         let changed = changedFiles(in: row.groupedRows)
         if !changed.isEmpty {
-            result.append(NSAttributedString(string: "\n", attributes: secondary))
-            for file in changed.prefix(8) {
-                result.append(NSAttributedString(string: "  "))
+            // The pills sit on their own line with real leading and even gaps,
+            // rather than being wedged onto the end of the count line.
+            let pillLine = NSMutableParagraphStyle()
+            pillLine.paragraphSpacingBefore = 6
+            pillLine.lineSpacing = 4
+            result.append(NSAttributedString(
+                string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 5), .paragraphStyle: pillLine]
+            ))
+            for (index, file) in changed.prefix(8).enumerated() {
+                if index > 0 {
+                    result.append(NSAttributedString(string: "   ", attributes: [.paragraphStyle: pillLine]))
+                }
                 let pill = subjectPillImage(
                     identity: FileVisualIdentity(path: file.path),
                     text: (file.path as NSString).lastPathComponent,
-                    monospace: false
+                    monospace: false,
+                    tint: .systemOrange,
+                    insertions: file.insertions,
+                    deletions: file.deletions
                 )
                 let attachment = NSTextAttachment()
                 attachment.image = pill
-                attachment.bounds = NSRect(x: 0, y: -5, width: pill.size.width, height: pill.size.height)
-                result.append(NSAttributedString(attachment: attachment))
-                if file.insertions > 0 {
-                    result.append(NSAttributedString(string: " +\(file.insertions)", attributes: [
-                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-                        .foregroundColor: NSColor.systemGreen,
-                    ]))
-                }
-                if file.deletions > 0 {
-                    result.append(NSAttributedString(string: " −\(file.deletions)", attributes: [
-                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-                        .foregroundColor: NSColor.systemRed,
-                    ]))
-                }
+                let rowFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+                attachment.bounds = NSRect(
+                    x: 0,
+                    y: (rowFont.capHeight - pill.size.height) / 2,
+                    width: pill.size.width,
+                    height: pill.size.height
+                )
+                let pillString = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
+                pillString.addAttribute(
+                    .paragraphStyle, value: pillLine,
+                    range: NSRange(location: 0, length: pillString.length)
+                )
+                result.append(pillString)
             }
             if changed.count > 8 {
-                result.append(NSAttributedString(string: "  +\(changed.count - 8) more", attributes: secondary))
+                result.append(NSAttributedString(
+                    string: "   +\(changed.count - 8) more",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+                        .foregroundColor: NSColor.secondaryLabelColor,
+                        .paragraphStyle: pillLine,
+                    ]
+                ))
             }
         }
         return result
@@ -1100,7 +1288,7 @@ final class TranscriptCell: NSTableCellView {
                 icon: "checklist",
                 title: "Updated plan",
                 detail: row.resultText ?? row.text,
-                tint: .controlAccentColor
+                tint: .systemPurple
             )
         }
 
@@ -1117,28 +1305,35 @@ final class TranscriptCell: NSTableCellView {
 
         if key.contains("edit") || key.contains("write") || key.contains("patch") {
             let suppliedDiff = patchText ?? input?[0]?["diff"]?.stringValue
-            let old = input?["old_string"]?.stringValue
-            let new = input?["new_string"]?.stringValue
-            let diff = suppliedDiff ?? [old.map { "− " + $0 }, new.map { "+ " + $0 }]
-                .compactMap { $0 }.joined(separator: "\n")
+            let old = input?["old_string"]?.stringValue ?? input?["oldString"]?.stringValue
+            let new = input?["new_string"]?.stringValue ?? input?["newString"]?.stringValue
+            let content = input?["content"]?.stringValue ?? input?["contents"]?.stringValue
+            let diff = suppliedDiff ?? {
+                var parts: [String] = []
+                if let old { parts.append(Self.prefixedLines(old, prefix: "- ")) }
+                if let new { parts.append(Self.prefixedLines(new, prefix: "+ ")) }
+                return parts.joined(separator: "\n")
+            }()
             let changeKind = input?[0]?["kind"]?["type"]?.stringValue
                 ?? input?["kind"]?["type"]?.stringValue
-            var plus = diff.split(separator: "\n").filter { $0.hasPrefix("+") && !$0.hasPrefix("+++") }.count
-            var minus = diff.split(separator: "\n").filter { $0.hasPrefix("-") && !$0.hasPrefix("---") }.count
-            if plus == 0, minus == 0, changeKind == "add" {
-                plus = diff.split(separator: "\n", omittingEmptySubsequences: true).count
-            } else if plus == 0, minus == 0, changeKind == "delete" {
-                minus = diff.split(separator: "\n", omittingEmptySubsequences: true).count
-            }
             let isWrite = key.contains("write") || changeKind == "add"
+            let counts = ToolChangeStats.lineCounts(
+                diff: suppliedDiff ?? "",
+                old: old,
+                new: new,
+                content: content,
+                changeKind: changeKind,
+                isWrite: isWrite
+            )
             return ProcessPresentation(
                 icon: isWrite ? "doc.badge.plus" : "pencil.line",
                 title: isWrite ? "Write" : "Edit",
-                detail: diff.isEmpty ? resultText : diff, tint: row.isError ? .systemRed : .labelColor,
+                detail: diff.isEmpty ? (content ?? resultText) : diff,
+                tint: row.isError ? .systemRed : (isWrite ? .systemGreen : .systemOrange),
                 fileIdentity: path.map { FileVisualIdentity(path: $0) },
                 subject: patchPaths.count > 1 ? "\(patchPaths.count) files" : fileName ?? compact(row.text),
                 filePath: patchPaths.count <= 1 ? path : nil,
-                insertions: plus, deletions: minus, isDiff: true
+                insertions: counts.insertions, deletions: counts.deletions, isDiff: true
             )
         }
         if key.contains("bash") || key.contains("shell") || key.contains("command") || key.contains("exec") {
@@ -1159,7 +1354,7 @@ final class TranscriptCell: NSTableCellView {
                 return ProcessPresentation(
                     icon: "photo", title: "Read image",
                     detail: resultText.isEmpty ? command : resultText,
-                    tint: .secondaryLabelColor,
+                    tint: .systemPurple,
                     fileIdentity: FileVisualIdentity(path: commandPath),
                     subject: commandFileName,
                     filePath: commandPath
@@ -1171,7 +1366,7 @@ final class TranscriptCell: NSTableCellView {
                     icon: "doc.text",
                     title: lineCount.map { "Read \($0) lines" } ?? "Read",
                     detail: resultText.isEmpty ? command : resultText,
-                    tint: .secondaryLabelColor,
+                    tint: .systemBlue,
                     fileIdentity: FileVisualIdentity(path: commandPath),
                     subject: commandFileName,
                     filePath: commandPath
@@ -1181,28 +1376,47 @@ final class TranscriptCell: NSTableCellView {
                 return ProcessPresentation(
                     icon: "magnifyingglass", title: "Search",
                     detail: resultText.isEmpty ? command : resultText,
-                    tint: .secondaryLabelColor,
+                    tint: .systemPurple,
                     subject: compact(command.split(separator: "\n").first.map(String.init) ?? command)
                 )
             }
             let summary = compact(command.split(separator: "\n").first.map(String.init) ?? command)
-            return ProcessPresentation(icon: "terminal", title: "Bash", detail: resultText.isEmpty ? command : resultText, tint: row.isError ? .systemRed : .labelColor, subject: summary)
+            return ProcessPresentation(
+                icon: "terminal",
+                title: "Bash",
+                detail: resultText.isEmpty ? command : resultText,
+                tint: row.isError ? .systemRed : .systemTeal,
+                subject: summary
+            )
         }
         if key.contains("image") || ["png", "jpg", "jpeg", "gif", "webp"].contains((path as NSString?)?.pathExtension.lowercased() ?? "") {
-            return ProcessPresentation(icon: "photo", title: "Read image", detail: path ?? resultText, tint: .secondaryLabelColor, fileIdentity: path.map { FileVisualIdentity(path: $0) }, subject: fileName, filePath: path)
+            return ProcessPresentation(
+                icon: "photo", title: "Read image",
+                detail: path ?? resultText, tint: .systemPurple,
+                fileIdentity: path.map { FileVisualIdentity(path: $0) },
+                subject: fileName, filePath: path
+            )
         }
         if key.contains("read") || key.contains("file") {
             let lineCount = resultText.isEmpty ? input?["limit"]?.intValue : resultText.split(separator: "\n").count
             let count = lineCount.map { "\($0) lines " } ?? ""
-            return ProcessPresentation(icon: "doc.text", title: "Read \(count)".trimmingCharacters(in: .whitespaces), detail: resultText.isEmpty ? (path ?? row.text) : resultText, tint: .secondaryLabelColor, fileIdentity: path.map { FileVisualIdentity(path: $0) }, subject: fileName ?? compact(row.text), filePath: path)
+            return ProcessPresentation(
+                icon: "doc.text",
+                title: "Read \(count)".trimmingCharacters(in: .whitespaces),
+                detail: resultText.isEmpty ? (path ?? row.text) : resultText,
+                tint: .systemBlue,
+                fileIdentity: path.map { FileVisualIdentity(path: $0) },
+                subject: fileName ?? compact(row.text),
+                filePath: path
+            )
         }
         if key.contains("web") || key.contains("fetch") || input?["url"]?.stringValue != nil {
             let url = input?["url"]?.stringValue ?? input?["query"]?.stringValue ?? row.text
-            return ProcessPresentation(icon: "globe", title: "Fetch", detail: resultText, tint: .secondaryLabelColor, subject: compact(url))
+            return ProcessPresentation(icon: "globe", title: "Fetch", detail: resultText, tint: .systemCyan, subject: compact(url))
         }
         if key.contains("search") || key.contains("grep") || key.contains("glob") {
             let query = input?["query"]?.stringValue ?? input?["q"]?.stringValue ?? input?["pattern"]?.stringValue ?? row.text
-            return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .secondaryLabelColor, subject: compact(query))
+            return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .systemPurple, subject: compact(query))
         }
         return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
     }
@@ -1215,6 +1429,12 @@ final class TranscriptCell: NSTableCellView {
     private static func compact(_ text: String, limit: Int = 110) -> String {
         guard text.count > limit else { return text }
         return String(text.prefix(limit - 1)) + "…"
+    }
+
+    private static func prefixedLines(_ text: String, prefix: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { prefix + $0 }
+            .joined(separator: "\n")
     }
 
     private static func patchFilePaths(in patch: String) -> [String] {
@@ -1251,6 +1471,64 @@ final class TranscriptCell: NSTableCellView {
             let path = source.substring(with: match.range)
             return seen.insert(path).inserted ? path : nil
         }
+    }
+}
+
+/// Line-change counts for Edit/Write tool chips.
+///
+/// Claude Code's Edit tool sends `old_string`/`new_string`, not a unified
+/// diff. Counting only lines that start with `+`/`-` therefore reported
+/// nothing. Write sends `content`. Codex file-change items send a raw snippet
+/// plus `kind: add|delete`. This collapses those shapes into one pair of
+/// numbers the chip can show.
+enum ToolChangeStats {
+    static func lineCounts(
+        diff: String,
+        old: String?,
+        new: String?,
+        content: String?,
+        changeKind: String?,
+        isWrite: Bool
+    ) -> (insertions: Int, deletions: Int) {
+        if let old, let new {
+            return (lineCount(new), lineCount(old))
+        }
+
+        let plus = unifiedCount(diff, added: true)
+        let minus = unifiedCount(diff, added: false)
+        if plus > 0 || minus > 0 {
+            return (plus, minus)
+        }
+
+        if isWrite || changeKind == "add" {
+            let text = content ?? diff
+            return (max(lineCount(text), text.isEmpty ? 0 : 1), 0)
+        }
+        if changeKind == "delete" {
+            let text = content ?? diff
+            return (0, max(lineCount(text), text.isEmpty ? 0 : 1))
+        }
+        if let content, !content.isEmpty {
+            return (lineCount(content), 0)
+        }
+        return (0, 0)
+    }
+
+    static func lineCount(_ text: String) -> Int {
+        if text.isEmpty { return 0 }
+        let trimmed = text.hasSuffix("\n") ? String(text.dropLast()) : text
+        if trimmed.isEmpty { return 1 }
+        return trimmed.split(separator: "\n", omittingEmptySubsequences: false).count
+    }
+
+    private static func unifiedCount(_ diff: String, added: Bool) -> Int {
+        diff.split(separator: "\n", omittingEmptySubsequences: false).filter { line in
+            let value = String(line)
+            if added {
+                return value.hasPrefix("+") && !value.hasPrefix("+++")
+            }
+            return (value.hasPrefix("-") || value.hasPrefix("−")) && !value.hasPrefix("---")
+        }.count
     }
 }
 

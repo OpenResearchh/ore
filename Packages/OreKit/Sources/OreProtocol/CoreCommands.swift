@@ -14,13 +14,19 @@ public enum CoreCommand: Sendable, Codable {
     case archiveWorkspace(WorkspaceID)
     case unarchiveWorkspace(WorkspaceID)
     case deleteWorkspace(WorkspaceID, deleteBranch: Bool)
-    case renameWorkspace(WorkspaceID, name: String)
+    /// `userInitiated` marks a name the user typed, so the engine won't later
+    /// replace it with a prompt-derived or generated title. Automatic
+    /// research-identity assignment passes `false`.
+    case renameWorkspace(WorkspaceID, name: String, userInitiated: Bool)
     case setWorkspacePinned(WorkspaceID, pinned: Bool)
 
     // Review and shipping
     case addDiffComment(WorkspaceID, DiffCommentReference)
     case markFileViewed(WorkspaceID, path: String, contentHash: String?)
     case commit(WorkspaceID, message: String)
+    /// Create a GitHub repository for a local-only repo and publish it, so a
+    /// workspace with committed work but no remote can enter the push/PR flow.
+    case createGitHubRepo(WorkspaceID)
     case push(WorkspaceID)
     case createPullRequest(WorkspaceID, title: String, body: String, base: String, draft: Bool)
     case retargetPullRequest(WorkspaceID, number: Int, base: String)
@@ -28,7 +34,10 @@ public enum CoreCommand: Sendable, Codable {
 
     // Chat
     case createChat(CreateChatRequest)
-    case renameChat(WorkspaceID, ChatID, title: String)
+    /// `userInitiated` marks a title the user typed, so the first message's
+    /// auto-titling leaves it alone. Automatic research-title assignment passes
+    /// `false`.
+    case renameChat(WorkspaceID, ChatID, title: String, userInitiated: Bool)
     case closeChat(WorkspaceID, ChatID)
     case reopenChat(WorkspaceID, ChatID)
     case switchChatHarness(WorkspaceID, ChatID, harness: HarnessKind, model: String?)

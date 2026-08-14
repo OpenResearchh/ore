@@ -221,6 +221,18 @@ public actor TranscriptWriter {
         case .sessionEnded:
             currentTurn = nil
 
+        case .contextCompacted(let compaction):
+            // Persist as a notice block so the marker survives a relaunch, hung
+            // off whichever turn was active when the harness compacted.
+            guard let turn = currentTurn else { break }
+            try await append(BlockRecord(
+                id: "compaction-\(turn.id.rawValue)-\(nextOrdinalPreview())",
+                turnID: compaction.turnID ?? turn.id,
+                ordinal: nextOrdinal(),
+                kind: .notice,
+                text: compaction.summary
+            ))
+
         case .textDelta, .thinkingDelta, .statusChanged, .rateLimit,
              .permissionResolved, .sessionError:
             // Deltas are for the live view only; the rest is either transient

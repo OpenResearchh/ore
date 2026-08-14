@@ -108,6 +108,30 @@ public actor GitHubClient {
         return try JSONDecoder().decode([Repository].self, from: data)
     }
 
+    /// Creates a GitHub repository from a local checkout and publishes it.
+    ///
+    /// `--source` adds `origin` and `--push` publishes the source directory's
+    /// current branch, so a local-only repo becomes one the normal push → PR →
+    /// merge flow can act on. Private by default: freshly written code is the
+    /// last thing to make public by accident, and it's one click to flip on
+    /// GitHub afterwards. Returns the new repository's URL.
+    @discardableResult
+    public func createRepository(
+        name: String,
+        sourcePath: String,
+        isPrivate: Bool = true,
+        push: Bool = true
+    ) async throws -> String {
+        var arguments = [
+            "repo", "create", name,
+            isPrivate ? "--private" : "--public",
+            "--source", sourcePath,
+        ]
+        if push { arguments.append("--push") }
+        let output = try await run(arguments)
+        return output.lines.last(where: { $0.hasPrefix("http") }) ?? output.trimmedStandardOutput
+    }
+
     public func clone(repository reference: String, to destination: URL) async throws {
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw GitHubError.destinationExists(destination.path)

@@ -147,6 +147,52 @@ struct MarkdownRendererTests {
         #expect(url?.absoluteString == "https://example.com/docs")
     }
 
+    private func firstWebLink(in result: NSAttributedString) -> URL? {
+        var found: URL?
+        result.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: result.length)
+        ) { value, _, stop in
+            if let url = value as? URL, url.scheme == "http" || url.scheme == "https" {
+                found = url
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
+    @Test func bareURLsBecomeClickableChips() {
+        // A bare link the agent drops in prose should be clickable, not raw text.
+        let result = render("Opened https://github.com/OpenResearchh/ore/pull/1 for review.")
+        #expect(firstWebLink(in: result)?.absoluteString
+            == "https://github.com/OpenResearchh/ore/pull/1")
+        // The long path is shortened into a chip label rather than shown whole.
+        #expect(!result.string.contains("OpenResearchh/ore/pull/1"))
+        #expect(result.string.contains("github.com"))
+    }
+
+    @Test func urlsAreNotFracturedByTheFileReferencePass() {
+        // The bug this guards: `.c` in `github.com` matched the C-file extension
+        // and turned a slice of the URL into an `ore-file` chip.
+        let result = render("See https://github.com/a/b for details.")
+        #expect(firstWebLink(in: result)?.scheme == "https")
+        // No slice of the URL was mis-tagged as an internal file reference.
+        var sawFileLink = false
+        result.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: result.length)
+        ) { value, _, _ in
+            if (value as? URL)?.scheme == "ore-file" { sawFileLink = true }
+        }
+        #expect(!sawFileLink)
+    }
+
+    @Test func descriptiveMarkdownLinksKeepTheirWords() {
+        // `linksCarryTheirDestination` covers the URL; this covers that a chip
+        // doesn't replace human text with a bare host.
+        let result = render("Read [the changelog](https://example.com/log).")
+        #expect(result.string.contains("the changelog"))
+        #expect(firstWebLink(in: result)?.absoluteString == "https://example.com/log")
+    }
+
     @Test func bareWorkspaceFileReferencesBecomeInternalLinks() {
         let result = render("Open server/index.ts:42 and continue.")
         guard let range = result.string.range(of: "server/index.ts:42") else {
@@ -353,5 +399,197 @@ struct SourceFileIconTests {
         #expect(FileVisualIdentity(path: "Dockerfile").label == "Docker")
         #expect(FileVisualIdentity(path: ".env.local").label == "Environment file")
         #expect(FileVisualIdentity(path: "src", isDirectory: true).symbol == "folder.fill")
+    }
+}
+
+@MainActor
+struct GitHubUpdaterVersionTests {
+    @Test func newerVersionsAreDetectedAcrossComponentsAndPrefixes() {
+        #expect(GitHubUpdater.isNewer("0.2.0", than: "0.1.0"))
+        #expect(GitHubUpdater.isNewer("v0.1.1", than: "0.1.0"))
+        #expect(GitHubUpdater.isNewer("1.0.0", than: "0.9.9"))
+        // A leading `v` and missing components must not fake a difference.
+        #expect(!GitHubUpdater.isNewer("v0.1.0", than: "0.1.0"))
+        #expect(!GitHubUpdater.isNewer("0.1", than: "0.1.0"))
+        #expect(!GitHubUpdater.isNewer("0.1.0", than: "0.2.0"))
+        // A malformed tag sorts as zeros rather than pretending to be newer.
+        #expect(!GitHubUpdater.isNewer("garbage", than: "0.1.0"))
+    }
+
+    @Test func displayVersionAddsALeadingVOnce() {
+        #expect(GitHubUpdater.displayVersion("0.2.0") == "v0.2.0")
+        #expect(GitHubUpdater.displayVersion("v0.2.0") == "v0.2.0")
+        #expect(GitHubUpdater.displayVersion("V1.0") == "V1.0")
+    }
+
+    @Test func prefersDmgOverZip() {
+        let assets: [[String: Any]] = [
+            [
+                "name": "ORE-0.2.0.zip",
+                "browser_download_url": "https://example.com/ORE-0.2.0.zip",
+                "id": 1,
+            ],
+            [
+                "name": "ORE-0.2.0.dmg",
+                "browser_download_url": "https://example.com/ORE-0.2.0.dmg",
+                "id": 2,
+            ],
+        ]
+        let chosen = GitHubUpdater.preferredAsset(from: assets)
+        #expect(chosen?.name == "ORE-0.2.0.dmg")
+        #expect(chosen?.id == 2)
+    }
+
+    @Test func prefersOREAppInADiskImageLayout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-upd-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("ORE.app"), withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("Applications"),
+            withDestinationURL: URL(fileURLWithPath: "/Applications")
+        )
+        #expect(GitHubUpdater.appBundle(in: root)?.lastPathComponent == "ORE.app")
+        try FileManager.default.removeItem(at: root)
+    }
+
+    @Test func findsNestedAppInAZipLayout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-upd-\(UUID().uuidString)")
+        let nested = root.appendingPathComponent("ORE").appendingPathComponent("ORE.app")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        #expect(GitHubUpdater.appBundle(in: root)?.lastPathComponent == "ORE.app")
+        try FileManager.default.removeItem(at: root)
+    }
+
+    @Test func installDestinationMovesOffADiskImage() {
+        let fromVolume = URL(fileURLWithPath: "/Volumes/ORE/ORE.app")
+        #expect(GitHubUpdater.installDestination(currentBundle: fromVolume).path == "/Applications/ORE.app")
+        let fromApps = URL(fileURLWithPath: "/Applications/ORE.app")
+        #expect(GitHubUpdater.installDestination(currentBundle: fromApps).path == "/Applications/ORE.app")
+        let fromDownloads = URL(fileURLWithPath: "/Users/me/Downloads/ORE.app")
+        #expect(
+            GitHubUpdater.installDestination(currentBundle: fromDownloads).path
+                == "/Users/me/Downloads/ORE.app"
+        )
+    }
+
+    @Test func shellQuoteEscapesEmbeddedQuotes() {
+        #expect(GitHubUpdater.shellQuote("/tmp/ORE.app") == "'/tmp/ORE.app'")
+        #expect(GitHubUpdater.shellQuote("/tmp/O'Reilly.app") == "'/tmp/O'\\''Reilly.app'")
+    }
+
+    @Test func mountPointReadsHdiutilPlist() {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0">
+        <dict>
+            <key>system-entities</key>
+            <array>
+                <dict>
+                    <key>dev-entry</key>
+                    <string>/dev/disk4</string>
+                </dict>
+                <dict>
+                    <key>mount-point</key>
+                    <string>/Volumes/ORE</string>
+                </dict>
+            </array>
+        </dict>
+        </plist>
+        """
+        let mount = GitHubUpdater.mountPoint(fromPlist: Data(xml.utf8))
+        #expect(mount?.path == "/Volumes/ORE")
+    }
+
+    @Test func parsePicksTheDmgAsset() {
+        let object: [String: Any] = [
+            "tag_name": "v0.2.0",
+            "name": "ORE v0.2.0",
+            "html_url": "https://github.com/OpenResearchh/ore/releases/tag/v0.2.0",
+            "assets": [
+                [
+                    "name": "ORE-0.2.0.zip",
+                    "browser_download_url": "https://example.com/ORE-0.2.0.zip",
+                    "id": 11,
+                ],
+                [
+                    "name": "ORE-0.2.0.dmg",
+                    "browser_download_url": "https://example.com/ORE-0.2.0.dmg",
+                    "id": 12,
+                ],
+            ],
+        ]
+        let release = GitHubUpdater.parse(object)
+        #expect(release?.version == "v0.2.0")
+        #expect(release?.assetName == "ORE-0.2.0.dmg")
+        #expect(release?.assetID == 12)
+        #expect(release?.downloadURL?.lastPathComponent == "ORE-0.2.0.dmg")
+    }
+}
+
+struct ToolChangeStatsTests {
+    @Test func editUsesOldAndNewStringLineCounts() {
+        let old = "func a() {\n    return 1\n}\n"
+        let new = "func a() {\n    return 2\n}\nfunc b() {}\n"
+        let counts = ToolChangeStats.lineCounts(
+            diff: "",
+            old: old,
+            new: new,
+            content: nil,
+            changeKind: nil,
+            isWrite: false
+        )
+        #expect(counts.insertions == 4)
+        #expect(counts.deletions == 3)
+    }
+
+    @Test func writeCountsContentLines() {
+        let counts = ToolChangeStats.lineCounts(
+            diff: "",
+            old: nil,
+            new: nil,
+            content: "one\ntwo\nthree\n",
+            changeKind: nil,
+            isWrite: true
+        )
+        #expect(counts.insertions == 3)
+        #expect(counts.deletions == 0)
+    }
+
+    @Test func unifiedDiffCountsAddedAndRemovedLines() {
+        let diff = """
+        --- a/App.swift
+        +++ b/App.swift
+        @@ -1,3 +1,4 @@
+         keep
+        -old
+        +new
+        +extra
+        """
+        let counts = ToolChangeStats.lineCounts(
+            diff: diff,
+            old: nil,
+            new: nil,
+            content: nil,
+            changeKind: nil,
+            isWrite: false
+        )
+        #expect(counts.insertions == 2)
+        #expect(counts.deletions == 1)
+    }
+
+    @Test func addedFileWithoutDiffMarkersCountsSnippetLines() {
+        let counts = ToolChangeStats.lineCounts(
+            diff: "ore\n",
+            old: nil,
+            new: nil,
+            content: nil,
+            changeKind: "add",
+            isWrite: false
+        )
+        #expect(counts.insertions == 1)
+        #expect(counts.deletions == 0)
     }
 }

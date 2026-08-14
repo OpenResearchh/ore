@@ -125,7 +125,15 @@ final class ChatState {
             status = .awaitingInput
 
         case .usage(let report):
-            usage = report
+            // Mid-turn usage reports (one per assistant message) don't carry the
+            // context window — only the end-of-turn `result` does. Overwriting
+            // wholesale therefore blanked the context meter for the rest of the
+            // turn (it hides when the window is nil), which read as "the meter
+            // stopped updating". Carry the last known window forward instead, so
+            // it keeps tracking as the harness streams and after it auto-compacts.
+            var merged = report
+            if merged.contextWindow == nil { merged.contextWindow = usage?.contextWindow }
+            usage = merged
 
         case .rateLimit(let report):
             rateLimit = report
@@ -163,6 +171,18 @@ final class ChatState {
 
         case .sessionEnded:
             status = .idle
+
+        case .contextCompacted(let compaction):
+            // The harness summarised its own history to stay under the window.
+            // A divider makes that visible instead of the conversation just
+            // carrying on as if nothing changed.
+            rows.append(TranscriptRow(
+                id: "compaction-\(rows.count)",
+                turnID: compaction.turnID ?? currentTurnID ?? TurnID(rawValue: "compaction"),
+                kind: .divider,
+                text: compaction.summary,
+                isComplete: true
+            ))
         }
     }
 
@@ -316,6 +336,10 @@ struct TranscriptRow: Identifiable, Sendable {
     var attachedComments: [DiffCommentReference] = []
     var groupedRows: [TranscriptRow] = []
     var isExpanded = false
+    /// When this row launched a subagent (a Task tool call), how many tool uses
+    /// ran inside it. Set while assembling the display list; it turns the row
+    /// into a collapsible group whose children fold away beneath it.
+    var subagentChildCount: Int?
     var createdAt: Date = Date()
 
     var activitySignature: Int {

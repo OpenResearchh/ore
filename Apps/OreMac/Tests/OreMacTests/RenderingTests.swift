@@ -147,6 +147,52 @@ struct MarkdownRendererTests {
         #expect(url?.absoluteString == "https://example.com/docs")
     }
 
+    private func firstWebLink(in result: NSAttributedString) -> URL? {
+        var found: URL?
+        result.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: result.length)
+        ) { value, _, stop in
+            if let url = value as? URL, url.scheme == "http" || url.scheme == "https" {
+                found = url
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
+    @Test func bareURLsBecomeClickableChips() {
+        // A bare link the agent drops in prose should be clickable, not raw text.
+        let result = render("Opened https://github.com/OpenResearchh/ore/pull/1 for review.")
+        #expect(firstWebLink(in: result)?.absoluteString
+            == "https://github.com/OpenResearchh/ore/pull/1")
+        // The long path is shortened into a chip label rather than shown whole.
+        #expect(!result.string.contains("OpenResearchh/ore/pull/1"))
+        #expect(result.string.contains("github.com"))
+    }
+
+    @Test func urlsAreNotFracturedByTheFileReferencePass() {
+        // The bug this guards: `.c` in `github.com` matched the C-file extension
+        // and turned a slice of the URL into an `ore-file` chip.
+        let result = render("See https://github.com/a/b for details.")
+        #expect(firstWebLink(in: result)?.scheme == "https")
+        // No slice of the URL was mis-tagged as an internal file reference.
+        var sawFileLink = false
+        result.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: result.length)
+        ) { value, _, _ in
+            if (value as? URL)?.scheme == "ore-file" { sawFileLink = true }
+        }
+        #expect(!sawFileLink)
+    }
+
+    @Test func descriptiveMarkdownLinksKeepTheirWords() {
+        // `linksCarryTheirDestination` covers the URL; this covers that a chip
+        // doesn't replace human text with a bare host.
+        let result = render("Read [the changelog](https://example.com/log).")
+        #expect(result.string.contains("the changelog"))
+        #expect(firstWebLink(in: result)?.absoluteString == "https://example.com/log")
+    }
+
     @Test func bareWorkspaceFileReferencesBecomeInternalLinks() {
         let result = render("Open server/index.ts:42 and continue.")
         guard let range = result.string.range(of: "server/index.ts:42") else {

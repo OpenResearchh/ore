@@ -36,6 +36,10 @@ struct MarkdownRenderer {
         let result = NSMutableAttributedString(
             attributedString: trimmingTrailingNewlines(visitor.visit(document))
         )
+        // Claim bare URLs first so the file-reference pass can't chew into a
+        // domain (its single-letter extensions like `.c`/`.m` used to turn
+        // `github.com` into a `github.c` file chip mid-URL).
+        linkifyBareURLs(in: result)
         linkFileReferences(in: result)
         // Trailing block spacing is padding inside the bubble's own padding.
         return result
@@ -70,9 +74,11 @@ struct MarkdownRenderer {
             "xml", "md", "mdx", "txt", "plist", "gradle", "properties", "env",
         ].joined(separator: "|")
         // A trailing `:line`, `:line:col`, or `:line,col` locator is captured so a
-        // click can jump straight to it.
+        // click can jump straight to it. The trailing `(?![A-Za-z0-9])` boundary
+        // stops a one-letter extension from matching the head of a longer run —
+        // e.g. the `.c` in `github.com` — which used to fracture URLs.
         let pattern = #"(?<![A-Za-z0-9_])(?:/?(?:[A-Za-z0-9_.@+\-]+/)+)?[A-Za-z0-9_.@+\-]+\.(?:"#
-            + extensions + #")(?::\d+(?:[:,]\d+)?)?"#
+            + extensions + #")(?::\d+(?:[:,]\d+)?)?(?![A-Za-z0-9])"#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
         let whole = NSRange(location: 0, length: result.length)
         for match in expression.matches(in: result.string, range: whole).reversed() {
@@ -88,6 +94,103 @@ struct MarkdownRenderer {
                 .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
                 .underlineStyle: 0,
             ], range: match.range)
+        }
+    }
+
+    /// Turns bare `http(s)://` and `mailto:` URLs into clickable chips: a site
+    /// icon plus a shortened label, so a long link reads as one tappable token
+    /// instead of a wall of path segments the reader has to scan.
+    private func linkifyBareURLs(in result: NSMutableAttributedString) {
+        let pattern = #"(?:https?://|mailto:)[^\s<>]+"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
+        let whole = NSRange(location: 0, length: result.length)
+        let trailing: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "\"", "'", "]", ">"]
+        for match in expression.matches(in: result.string, range: whole).reversed() {
+            // Leave anything already linked (a markdown link's own text) alone.
+            guard result.attribute(.link, at: match.range.location, effectiveRange: nil) == nil
+            else { continue }
+            var text = (result.string as NSString).substring(with: match.range)
+            var range = match.range
+            // Sentence punctuation that trails a URL isn't part of it.
+            while let last = text.last, trailing.contains(last) {
+                text.removeLast()
+                range.length -= 1
+            }
+            guard range.length > 0, let url = URL(string: text) else { continue }
+            result.replaceCharacters(
+                in: range,
+                with: Self.urlChip(url: url, label: Self.linkLabel(for: url), baseFont: baseFont)
+            )
+        }
+    }
+
+    /// A compact, clickable chip for a web link: a site-aware icon and a short
+    /// label, tinted and filled like ORE's other inline tokens.
+    static func urlChip(url: URL, label: String, baseFont: NSFont) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        if let icon = NSImage(systemSymbolName: linkSymbolName(for: url), accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: baseFont.pointSize * 0.92, weight: .medium))?
+            .withSymbolConfiguration(.init(paletteColors: [.controlAccentColor])) {
+            icon.isTemplate = false
+            let attachment = NSTextAttachment()
+            attachment.image = icon
+            let side = baseFont.pointSize
+            attachment.bounds = NSRect(x: 0, y: -2, width: side, height: side)
+            result.append(NSAttributedString(attachment: attachment))
+            result.append(NSAttributedString(string: "\u{2009}"))
+        }
+        result.append(NSAttributedString(
+            string: label,
+            attributes: [.font: NSFont.systemFont(ofSize: baseFont.pointSize * 0.95, weight: .medium)]
+        ))
+        result.addAttributes([
+            .link: url,
+            .foregroundColor: NSColor.controlAccentColor,
+            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
+            .underlineStyle: 0,
+        ], range: NSRange(location: 0, length: result.length))
+        return result
+    }
+
+    /// A short, human label for a link chip: the host, plus the tail of the path
+    /// when there is one, so `…/OpenResearchh/ore/pull/1` reads as `…/pull/1`.
+    static func linkLabel(for url: URL) -> String {
+        if url.scheme == "mailto" {
+            return url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
+        }
+        let host = (url.host ?? url.absoluteString)
+            .replacingOccurrences(of: "www.", with: "")
+        let segments = url.path.split(separator: "/").map(String.init)
+        if segments.isEmpty { return host }
+        if segments.count <= 2 { return host + "/" + segments.joined(separator: "/") }
+        return host + "/…/" + segments.suffix(2).joined(separator: "/")
+    }
+
+    /// A site-appropriate SF Symbol for a link chip, so common destinations are
+    /// recognisable at a glance; everything else gets a neutral globe.
+    static func linkSymbolName(for url: URL) -> String {
+        if url.scheme == "mailto" { return "envelope.fill" }
+        let host = (url.host ?? "").lowercased()
+        switch true {
+        case host.contains("github"), host.contains("gitlab"), host.contains("bitbucket"):
+            return "chevron.left.forwardslash.chevron.right"
+        case host.contains("youtube"), host.contains("youtu.be"), host.contains("vimeo"):
+            return "play.rectangle.fill"
+        case host.contains("stackoverflow"), host.contains("stackexchange"):
+            return "bubble.left.and.bubble.right.fill"
+        case host.contains("npmjs"), host.contains("pypi"), host.contains("crates.io"):
+            return "shippingbox.fill"
+        case host.contains("developer."), host.contains("docs."),
+             host.contains("readthedocs"), host.hasSuffix("apple.com"):
+            return "book.fill"
+        case host.contains("figma"):
+            return "pencil.and.outline"
+        case host.contains("notion"):
+            return "note.text"
+        case host.contains("google"):
+            return "magnifyingglass"
+        default:
+            return "globe"
         }
     }
 
@@ -140,7 +243,7 @@ struct MarkdownRenderer {
                 [
                     .font: font,
                     .foregroundColor: textColor,
-                    .paragraphStyle: readableParagraph(spacingBefore: 14, spacingAfter: 8),
+                    .paragraphStyle: readableParagraph(spacingBefore: 10, spacingAfter: 7),
                 ],
                 range: NSRange(location: 0, length: result.length)
             )
@@ -202,7 +305,7 @@ struct MarkdownRenderer {
                 result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont]))
             }
             let paragraph = readableParagraph(spacingAfter: 7)
-            paragraph.lineSpacing = 4.5
+            paragraph.lineSpacing = 4
             paragraph.firstLineHeadIndent = CGFloat(max(listDepth - 1, 0) * 22)
             paragraph.headIndent = CGFloat(listDepth * 22)
             result.addAttribute(
@@ -402,25 +505,31 @@ struct MarkdownRenderer {
         }
 
         mutating func visitLink(_ link: Markdown.Link) -> NSAttributedString {
-            let result = NSMutableAttributedString(attributedString: children(of: link))
-            guard let destination = link.destination else { return result }
-            let url: URL?
-            if destination.hasPrefix("http://") || destination.hasPrefix("https://")
-                || destination.hasPrefix("mailto:") || destination.hasPrefix("#") {
-                url = URL(string: destination)
-            } else {
-                url = MarkdownRenderer.fileReferenceURL(destination)
-            }
-            guard let url else { return result }
+            let inner = NSMutableAttributedString(attributedString: children(of: link))
+            guard let destination = link.destination else { return inner }
+            let isWeb = destination.hasPrefix("http://")
+                || destination.hasPrefix("https://")
+                || destination.hasPrefix("mailto:")
+            let url = isWeb || destination.hasPrefix("#")
+                ? URL(string: destination)
+                : MarkdownRenderer.fileReferenceURL(destination)
+            guard let url else { return inner }
 
-            result.addAttributes(
-                [
-                    .link: url,
-                    .foregroundColor: NSColor.linkColor,
-                ],
-                range: NSRange(location: 0, length: result.length)
+            if isWeb {
+                // A descriptive link keeps its words; a bare-URL link is shortened.
+                // Either way it reads as a clickable chip with a site icon.
+                let visible = inner.string.trimmingCharacters(in: .whitespaces)
+                let label = visible.isEmpty || visible.hasPrefix("http") || visible == destination
+                    ? MarkdownRenderer.linkLabel(for: url)
+                    : visible
+                return MarkdownRenderer.urlChip(url: url, label: label, baseFont: baseFont)
+            }
+
+            inner.addAttributes(
+                [.link: url, .foregroundColor: NSColor.linkColor],
+                range: NSRange(location: 0, length: inner.length)
             )
-            return result
+            return inner
         }
 
         mutating func visitSoftBreak(_ softBreak: SoftBreak) -> NSAttributedString {

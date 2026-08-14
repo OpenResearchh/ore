@@ -1,0 +1,2116 @@
+import OrePersistence
+import OreProtocol
+import AppKit
+import SwiftUI
+import UniformTypeIdentifiers
+
+/// The conversation with one agent, plus everything the user needs to answer it.
+struct ChatPane: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let workspace: WorkspaceSummary
+
+    @State private var draft = ""
+    /// Prevents a tab switch from briefly writing the previous tab's text into
+    /// the newly selected chat before its persisted draft has loaded.
+    @State private var draftOwnerID: ChatID?
+    @State private var composerTextHeight: CGFloat = 22
+    @State private var queuedMessages: [QueuedMessageRecord] = []
+    @State private var revertTarget: TurnID?
+    @State private var expandedActivityGroups: Set<String> = []
+    @State private var attachments: [Attachment] = []
+    @State private var showModelChooser = false
+    @State private var showEffortChooser = false
+    @State private var reasoningEffort: ReasoningEffort = .high
+    @State private var fastModeEnabled = false
+    @State private var effortScrollProgress: CGFloat = 0
+    @State private var effortStepPulse = 0
+    @State private var modelScrollProgress: CGFloat = 0
+    @State private var modelStepPulse = 0
+    @State private var hoveredTabKey: String?
+    @State private var renameChatTarget: ChatSummary?
+    @State private var renameChatText = ""
+    @State private var workspaceFileIndex: [WorkspaceFileNode] = []
+    @FocusState private var composerFocused: Bool
+
+    private var chat: ChatState { model.chat(for: workspace.id) }
+    private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
+
+    var body: some View {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                tabBar(availableWidth: geometry.size.width)
+
+                // The centre column shows either a chat transcript or — when a file
+                // tab is active — that file's diff, opened from the review list.
+                if let filePath = model.activeFilePath[workspace.id] {
+                    DiffDocumentView(workspace: workspace, path: filePath)
+                } else {
+                    chatBody
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        // Workspace identity lives in the window's title bar now, not a 58pt
+        // header that repeated the tab title. The toolbar band was empty anyway.
+        .navigationTitle(workspace.name)
+        .navigationSubtitle("\(workspace.branch) → \(workspace.baseBranch)")
+    }
+
+    @ViewBuilder
+    private var chatBody: some View {
+        VStack(spacing: 0) {
+            ZStack(alignment: .bottomLeading) {
+                if chat.rows.isEmpty && !chat.isBusy {
+                    ResearchEmptyState(
+                        identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
+                            ?? model.researchIdentity(for: workspace),
+                        title: chatSummary?.title,
+                        seed: chatSummary?.id.rawValue ?? workspace.id.rawValue,
+                        onSuggestion: { suggestion in
+                            draft = suggestion
+                            composerFocused = true
+                        }
+                    )
+                } else {
+                    TranscriptView(
+                        rows: displayRows,
+                        persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
+                        onRevert: { revertTarget = $0 },
+                        onToggleActivity: { toggleActivity($0) },
+                        onOpenFile: { openAgentFile($0) }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                if chat.isBusy {
+                    HStack {
+                        AgentWorkingPill(
+                            harness: chatSummary?.harness ?? workspace.harness,
+                            status: chat.status,
+                            startedAt: chat.turnStartedAt,
+                            onStop: { model.interrupt(workspace.id) }
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, OreTheme.Space.lg)
+                    .padding(.bottom, OreTheme.Space.sm)
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                }
+            }
+            // Transition snapshots of an infinitely-sized empty view could
+            // paint over sibling split-view columns while changing tabs. The
+            // transcript viewport owns and clips all of its content now.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
+            .clipped()
+
+            // Anything blocking the agent sits directly above the composer,
+            // where the user is already looking. AskUserQuestion is both a
+            // permission gate and a question; showing the generic Allow/Deny
+            // card alongside the question card is the confusing "two prompts at
+            // once" — the QuestionCard below owns it, and answering there also
+            // allows this permission.
+            if let permission = chat.pendingPermission,
+               permission.toolName != "AskUserQuestion" {
+                PermissionCard(request: permission) { decision in
+                    model.resolvePermission(permission.id, decision: decision, for: workspace.id)
+                }
+                .frame(maxWidth: OreTheme.contentMaxWidth)
+                .padding(.horizontal, OreTheme.Space.md)
+                .padding(.top, OreTheme.Space.sm)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if case .proposal(let markdown, let requestID) = chat.plan {
+                PlanApprovalCard(markdown: markdown) { feedback in
+                    if let requestID {
+                        model.resolvePermission(requestID, decision: .allow, for: workspace.id)
+                    }
+                    model.setPermissionMode(.default, for: workspace.id)
+                    if !feedback.isEmpty { model.send(feedback, to: workspace.id) }
+                } onReject: { feedback in
+                    if let requestID {
+                        model.resolvePermission(
+                            requestID,
+                            decision: .deny(reason: feedback.isEmpty ? "Revise the plan." : feedback),
+                            for: workspace.id
+                        )
+                    }
+                }
+                .frame(maxWidth: OreTheme.contentMaxWidth)
+                .padding(.horizontal, OreTheme.Space.md)
+                .padding(.top, OreTheme.Space.sm)
+            }
+
+            if !queuedMessages.isEmpty {
+                MessageQueueCard(messages: $queuedMessages) { id, text in
+                    await model.updateQueuedMessage(id, text: text)
+                } onDelete: { id in
+                    await model.deleteQueuedMessage(id)
+                    queuedMessages.removeAll { $0.id == id }
+                }
+                .frame(maxWidth: OreTheme.contentMaxWidth)
+                .padding(.horizontal, OreTheme.Space.md)
+            }
+
+            if !chat.draftComments.isEmpty {
+                DraftCommentsBar(comments: chat.draftComments) { index in
+                    chat.removeDraftComment(at: index)
+                }
+            }
+
+            // Hard failures — usage limits especially — belong where the user
+            // is about to act, not buried as a red row up in the transcript.
+            if let error = chat.prominentError {
+                ProminentErrorBanner(error: error) { chat.dismissProminentError() }
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, OreTheme.Space.md)
+                    .padding(.top, OreTheme.Space.sm)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if let question = chat.pendingQuestion {
+                QuestionCard(
+                    question: question,
+                    harness: chatSummary?.harness ?? workspace.harness
+                ) { answer in
+                    // AskUserQuestion is a permission-gated tool: its result is
+                    // whatever we return through the can_use_tool reply. Allowing
+                    // it echoed the untouched input, so the agent saw an empty
+                    // "answered:" and the real answer (sent separately as a user
+                    // message) raced the still-open control request and was lost.
+                    // Deliver the answer *as* the tool result instead.
+                    if let permission = chat.pendingPermission,
+                       permission.toolCallID == question.toolCallID {
+                        model.answerQuestion(
+                            question.id,
+                            viaPermission: permission.id,
+                            answer: answer,
+                            for: workspace.id
+                        )
+                    } else {
+                        model.answerQuestion(question.id, answer: answer, for: workspace.id)
+                    }
+                }
+                .frame(maxWidth: OreTheme.contentMaxWidth)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, OreTheme.Space.md)
+                .padding(.vertical, 10)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else {
+                composer
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .layoutPriority(1)
+        .task(id: chatSummary?.id) {
+            draftOwnerID = chatSummary?.id
+            draft = chatSummary?.draftText ?? ""
+        }
+        .task(id: "\(chatSummary?.id.rawValue ?? "")-\(chatSummary?.queuedMessageCount ?? 0)") {
+            guard let id = chatSummary?.id else { queuedMessages = []; return }
+            queuedMessages = await model.queuedMessages(for: id)
+        }
+        .onChange(of: draft) { _, value in
+            attachments.removeAll { attachment in
+                !attachment.relativePath.hasPrefix(".context/attachments/")
+                    && !value.contains("@\(attachment.displayName)")
+            }
+            guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            model.setDraft(value, for: chatSummary)
+        }
+        .task(id: chatSummary?.id) {
+            let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+            if let raw = UserDefaults.standard.string(forKey: key),
+               let effort = ReasoningEffort(rawValue: raw) { reasoningEffort = effort }
+            let fastKey = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+            fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
+        }
+        .onChange(of: reasoningEffort) { _, effort in
+            let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+            UserDefaults.standard.set(effort.rawValue, forKey: key)
+        }
+        .onChange(of: fastModeEnabled) { _, enabled in
+            let key = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+            UserDefaults.standard.set(enabled, forKey: key)
+        }
+        .task(id: workspace.id) {
+            workspaceFileIndex = Self.flattenFiles(await model.workspaceFiles(for: workspace))
+        }
+        .confirmationDialog(
+            "Revert chat and workspace?",
+            isPresented: Binding(
+                get: { revertTarget != nil },
+                set: { if !$0 { revertTarget = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Revert", role: .destructive) {
+                if let revertTarget { model.revert(to: revertTarget, in: workspace.id) }
+                revertTarget = nil
+            }
+            Button("Cancel", role: .cancel) { revertTarget = nil }
+        } message: {
+            Text("This restores both the transcript and working tree to the selected checkpoint.")
+        }
+        .confirmationDialog(
+            "Close this tab while the agent is working?",
+            isPresented: Binding(
+                get: { model.pendingChatClose != nil },
+                set: { if !$0 { model.pendingChatClose = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Close Tab", role: .destructive) {
+                if let pending = model.pendingChatClose {
+                    model.closeChat(pending.chatID, in: pending.workspaceID)
+                }
+                model.pendingChatClose = nil
+            }
+            Button("Keep Working", role: .cancel) { model.pendingChatClose = nil }
+        } message: {
+            if let pending = model.pendingChatClose {
+                Text("“\(pending.title)” still has a running turn. Closing the tab will stop the agent.")
+            }
+        }
+        .alert("Rename Chat", isPresented: Binding(
+            get: { renameChatTarget != nil },
+            set: { if !$0 { renameChatTarget = nil } }
+        )) {
+            TextField("Name", text: $renameChatText)
+            Button("Rename") {
+                guard let target = renameChatTarget else { return }
+                let title = renameChatText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty { model.renameChat(target.id, in: workspace.id, to: title) }
+                renameChatTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameChatTarget = nil }
+        }
+    }
+
+    private var displayRows: [TranscriptRow] {
+        let visible = chat.rows.compactMap { source -> TranscriptRow? in
+            if source.kind == .error, !Self.isMeaningfulError(source.text, result: source.resultText) {
+                return nil
+            }
+            var row = source
+            // Some harnesses report a successful empty result as an error
+            // carrying `null`. That should not paint a successful tool red or
+            // inflate the issue count for the turn.
+            if row.kind == .toolCall, row.isError,
+               !Self.isMeaningfulError(row.text, result: row.resultText) {
+                row.isError = false
+            }
+            if row.kind == .toolCall || row.kind == .thinking || row.kind == .error
+                || row.kind == .activityGroup {
+                row.isExpanded = expandedActivityGroups.contains(row.id)
+            }
+            return row
+        }
+
+        // A turn's activity folds into one collapsed "N tool calls" group only
+        // once that turn is fully finished. While the agent is still working the
+        // live turn stays expanded, so its tool calls (and any preamble text)
+        // read inline until the final response has actually landed. Gating on a
+        // completed assistant block instead collapsed the group the moment an
+        // early preamble line finished — hiding the work mid-turn.
+        let activeTurn: TurnID? = chat.isBusy ? visible.last?.turnID : nil
+        let completedTurns = Set(visible.compactMap { row in
+            row.turnID == activeTurn ? nil : row.turnID
+        })
+        let groupedByTurn = Dictionary(grouping: visible.filter {
+            Self.isActivity($0) && completedTurns.contains($0.turnID)
+        }, by: \.turnID)
+        let lastActivityIndex = Dictionary(uniqueKeysWithValues: groupedByTurn.compactMap { turn, rows in
+            visible.lastIndex(where: { $0.turnID == turn && Self.isActivity($0) })
+                .map { (turn, $0) }
+        })
+
+        var result: [TranscriptRow] = []
+        for (index, row) in visible.enumerated() {
+            if Self.isActivity(row), completedTurns.contains(row.turnID) {
+                guard lastActivityIndex[row.turnID] == index,
+                      let activities = groupedByTurn[row.turnID]
+                else { continue }
+                let tools = activities.filter { $0.kind == .toolCall }.count
+                let messages = activities.filter { $0.kind == .thinking }.count
+                let errors = activities.filter { $0.kind == .error || $0.isError }.count
+                var parts: [String] = []
+                if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
+                if messages > 0 { parts.append("\(messages) message\(messages == 1 ? "" : "s")") }
+                if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
+                let id = "activity-\(row.turnID.rawValue)"
+                let expanded = expandedActivityGroups.contains(id)
+                result.append(TranscriptRow(
+                    id: id,
+                    turnID: row.turnID,
+                    kind: .activityGroup,
+                    text: parts.isEmpty ? "Activity" : parts.joined(separator: ", "),
+                    groupedRows: activities,
+                    isExpanded: expanded
+                ))
+                // Insert virtualized child rows when requested, but leave every
+                // tool result collapsed. This keeps a 100-call turn quick to
+                // open and lets Bash/Edit/Read details expand independently.
+                if expanded {
+                    result.append(contentsOf: activities.map { child in
+                        var item = child
+                        item.isExpanded = expandedActivityGroups.contains(child.id)
+                        return item
+                    })
+                }
+            } else {
+                result.append(row)
+            }
+        }
+        return result
+    }
+
+    private static func isActivity(_ row: TranscriptRow) -> Bool {
+        row.kind == .toolCall || row.kind == .thinking || row.kind == .error
+    }
+
+    private static func isMeaningfulError(_ text: String, result: String?) -> Bool {
+        let value = (result?.isEmpty == false ? result! : text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return !value.isEmpty && !["null", "nil", "<null>", "(null)", "\"null\""].contains(value)
+    }
+
+    private func toggleActivity(_ id: String) {
+        if expandedActivityGroups.contains(id) { expandedActivityGroups.remove(id) }
+        else { expandedActivityGroups.insert(id) }
+    }
+
+    private func tabBar(availableWidth: CGFloat) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: OreTheme.Space.xs) {
+                    ForEach(model.chats(for: workspace.id)) { tab in
+                        Button {
+                            model.selectChat(tab.id, in: workspace.id)
+                            model.showChatInCenter(workspace.id)
+                        } label: {
+                            tabLabel(tab)
+                        }
+                        .buttonStyle(.plain)
+                        .id("chat:\(tab.id.rawValue)")
+                        .contextMenu {
+                            Button("Rename…") { beginRenaming(tab) }
+                            if model.chats(for: workspace.id).count > 1 {
+                                Button("Close") { requestCloseChat(tab) }
+                            }
+                        }
+                    }
+
+                    // File diffs opened from the review list show up here as
+                    // tabs, so a diff reads as an open document, not a side pane.
+                    ForEach(model.openFilePaths[workspace.id] ?? [], id: \.self) { path in
+                        Button { model.selectDiffFile(path, in: workspace.id) } label: {
+                            fileTabLabel(path)
+                        }
+                        .buttonStyle(.plain)
+                        .id("file:\(path)")
+                    }
+
+                }
+                // Symmetric clearance on both edges keeps a single tab centred on
+                // the window's true midline; the trailing controls sit inside the
+                // right reservation via the overlay below. When the tabs outgrow
+                // the strip, the HStack simply scrolls.
+                .padding(.horizontal, tabControlAllowance)
+                .frame(minWidth: availableWidth, alignment: .center)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onChange(of: activeTabKey) { _, key in
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(key, anchor: .center)
+                }
+            }
+        }
+        // The header's controls fold into the strip's trailing edge rather than
+        // occupying a row of their own. Overlaying (instead of an HStack sibling)
+        // means they don't skew the tabs off-centre.
+        .overlay(alignment: .trailing) {
+            trailingControls
+                .padding(.horizontal, OreTheme.Space.xs)
+                .background(.bar)
+        }
+        .frame(height: OreTheme.RowHeight.bar)
+        .background(.bar)
+    }
+
+    /// The trailing edge reserved for the fixed controls (new-tab, history, and
+    /// the stop button while busy). Mirrored as leading padding so the tabs stay
+    /// optically centred rather than shifted by the controls' width.
+    private var tabControlAllowance: CGFloat {
+        chat.isBusy ? 142 : 112
+    }
+
+    private var activeTabKey: String {
+        if let path = model.activeFilePath[workspace.id] { return "file:\(path)" }
+        if let id = chatSummary?.id { return "chat:\(id.rawValue)" }
+        return ""
+    }
+
+    private func fileTabLabel(_ path: String) -> some View {
+        let isSelected = model.activeFilePath[workspace.id] == path
+        return HStack(spacing: 6) {
+            SourceFileIcon(path: path, size: 16)
+            HStack(spacing: 6) {
+                Text((path as NSString).lastPathComponent)
+                    .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
+                    .lineLimit(1)
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .semibold))
+                    .opacity(hoveredTabKey == "file:\(path)" || isSelected ? 1 : 0)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.closeDiffFile(path, in: workspace.id) }
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: 190, minHeight: 28)
+        .foregroundStyle(isSelected ? .primary : .secondary)
+        .oreNavigationSelection(
+            isSelected: isSelected,
+            isHovered: hoveredTabKey == "file:\(path)"
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onHover { hovering in
+            let key = "file:\(path)"
+            if hovering { hoveredTabKey = key }
+            else if hoveredTabKey == key { hoveredTabKey = nil }
+        }
+    }
+
+    private func tabLabel(_ tab: ChatSummary) -> some View {
+        let isSelected = tab.id == chatSummary?.id && model.activeFilePath[workspace.id] == nil
+        let tabState = model.chat(for: tab.id)
+        let isWorking = tabState.isBusy
+        return HStack(spacing: 6) {
+            HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected)
+            HStack(spacing: 6) {
+                if tab.hasUnread {
+                    Circle().fill(.blue).frame(width: 6, height: 6)
+                }
+                Text(tab.title)
+                    .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
+                    .lineLimit(1)
+                if !tab.draftText.isEmpty {
+                    Image(systemName: "pencil").font(.system(size: 8))
+                }
+                if tab.queuedMessageCount > 0 {
+                    Text("\(tab.queuedMessageCount)")
+                        .font(.caption2.monospacedDigit())
+                }
+                if model.chats(for: workspace.id).count > 1 {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .semibold))
+                        .opacity(hoveredTabKey == "chat:\(tab.id.rawValue)" || isSelected ? 1 : 0)
+                        .contentShape(Rectangle())
+                        .onTapGesture { requestCloseChat(tab) }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: 190, minHeight: 28)
+        .foregroundStyle(isSelected ? .primary : .secondary)
+        .oreNavigationSelection(
+            isSelected: isSelected,
+            isHovered: hoveredTabKey == "chat:\(tab.id.rawValue)"
+        )
+        .overlay {
+            if isWorking {
+                BusyTabSheen(reduceMotion: reduceMotion)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .allowsHitTesting(false)
+            }
+        }
+        .overlay {
+            if isWorking {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor.opacity(0.30), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onHover { hovering in
+            let key = "chat:\(tab.id.rawValue)"
+            if hovering { hoveredTabKey = key }
+            else if hoveredTabKey == key { hoveredTabKey = nil }
+        }
+    }
+
+    private func beginRenaming(_ tab: ChatSummary) {
+        renameChatText = tab.title
+        renameChatTarget = tab
+    }
+
+    /// Route every tab-close through the model so a working tab gets a
+    /// confirmation prompt instead of stopping the agent silently.
+    private func requestCloseChat(_ tab: ChatSummary) {
+        model.requestCloseChat(tab.id, in: workspace.id, title: tab.title)
+    }
+
+    @ViewBuilder
+    private var trailingControls: some View {
+        HStack(spacing: OreTheme.Space.xs) {
+            Button { model.createChat(in: workspace.id) } label: {
+                HStack(spacing: 5) {
+                    if model.chatCreationsInFlight.contains(workspace.id) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "plus")
+                    }
+                    Text("⌘T")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 6)
+                .frame(height: 26)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .disabled(model.chatCreationsInFlight.contains(workspace.id))
+            .help("New tab (⌘T)")
+
+            Menu {
+                if !chat.revertableTurns.isEmpty {
+                    Section("Checkpoints") {
+                        ForEach(Array(chat.revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
+                            Button("Before turn \(index + 1)") { revertTarget = turn }
+                        }
+                    }
+                }
+                let closed = model.chats(for: workspace.id, includeClosed: true).filter(\.isClosed)
+                if !closed.isEmpty {
+                    Section("Closed chats") {
+                        ForEach(closed) { tab in
+                            Button(tab.title) { model.reopenChat(tab.id, in: workspace.id) }
+                        }
+                    }
+                }
+                if chat.revertableTurns.isEmpty && closed.isEmpty {
+                    Text("No history yet")
+                }
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .frame(width: 26, height: 26)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Chat and checkpoint history")
+
+            if chat.isBusy {
+                Button { model.interrupt(workspace.id) } label: {
+                    Image(systemName: "stop.fill")
+                        .foregroundStyle(.red)
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(".", modifiers: .command)
+                .help("Stop the running turn (⌘.)")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func modelChoices(for tab: ChatSummary) -> some View {
+        Text("Default model").tag("")
+        ForEach(model.knownModels(for: tab.harness)) { choice in
+            Text(choice.displayName).tag(choice.id)
+        }
+        if let selected = tab.model,
+           !model.knownModels(for: tab.harness).contains(where: { $0.id == selected }) {
+            Text(selected).tag(selected)
+        }
+    }
+
+    // MARK: - Composer
+
+    private var composer: some View {
+        VStack(spacing: OreTheme.Space.sm) {
+            if !externalAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(externalAttachments, id: \.offset) { index, attachment in
+                            HStack(spacing: 5) {
+                                SourceFileIcon(path: attachment.displayName, size: 16)
+                                Text("@\(attachment.displayName)").lineLimit(1)
+                                Button { attachments.remove(at: index) } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                }.buttonStyle(.plain)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(OreTheme.subduedFill, in: Capsule())
+                        }
+                    }
+                }
+            }
+
+            if !slashCommands.isEmpty {
+                VStack(spacing: 2) {
+                    ForEach(slashCommands) { command in
+                        Button { run(command) } label: {
+                            HStack {
+                                Image(systemName: command.icon).frame(width: 22)
+                                Text(command.name).fontWeight(.medium)
+                                Text(command.detail).foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 8).frame(minHeight: 36)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(4)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            }
+
+            if !mentionSuggestions.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("REFERENCE A FILE")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Text("Tab to insert")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+
+                    ForEach(mentionSuggestions.prefix(6)) { node in
+                        Button { tagFile(node) } label: {
+                            HStack(spacing: 8) {
+                                SourceFileIcon(path: node.path, size: 17)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(node.name)
+                                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                                    Text(node.path)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .frame(height: 40)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(OrePressableButtonStyle())
+                    }
+                }
+                .padding(4)
+                .fixedSize(horizontal: false, vertical: true)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(OreTheme.hairline))
+                .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
+            }
+
+            InlineMentionTextEditor(
+                text: $draft,
+                mentionNames: attachments
+                    .filter { !$0.relativePath.hasPrefix(".context/attachments/") }
+                    .map(\.displayName),
+                onTab: acceptFirstMentionSuggestion,
+                onPaste: handlePasteboard
+            )
+                .frame(height: min(max(composerTextHeight + 16, 38), 200))
+                .focused($composerFocused)
+                .overlay(alignment: .topLeading) {
+                    if draft.isEmpty {
+                        Text(placeholder)
+                            .font(.system(size: OreTheme.Font.title))
+                            .foregroundStyle(.tertiary)
+                            // Match the editor's textContainerInset (5×6) so the
+                            // placeholder sits exactly where the caret and typed
+                            // text do, instead of 6pt above them.
+                            .padding(.leading, 5)
+                            .padding(.top, 6)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .background(
+                    // A hidden copy of the text, measured at the editor's width,
+                    // grows the composer with its content — one line by default,
+                    // up to a scroll cap — instead of a fixed 72pt box.
+                    Text(draft.isEmpty ? " " : draft)
+                        .font(.system(size: OreTheme.Font.title))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(GeometryReader { geo in
+                            Color.clear
+                                .onAppear { composerTextHeight = geo.size.height }
+                                .onChange(of: draft) { _, _ in composerTextHeight = geo.size.height }
+                        })
+                        .hidden()
+                )
+
+            if let tab = chatSummary {
+                composerToolbar(for: tab)
+            }
+        }
+        .oreComposerSurface(padding: 10)
+        // Left-aligned to sit in the same column as the transcript, rather than
+        // centring while the prose above it starts at the leading edge.
+        .frame(maxWidth: OreTheme.contentMaxWidth)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.vertical, 10)
+        .dropDestination(for: URL.self) { urls, _ in
+            addFiles(urls)
+            return true
+        }
+    }
+
+    private func composerToolbar(for tab: ChatSummary) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: OreTheme.Space.xs) {
+                attachmentMenu
+                modelChooserButton(for: tab)
+                if supportsEffort(for: tab) {
+                    effortButton(for: tab)
+                }
+                permissionChip
+                modeControls(for: tab)
+
+                if let usage = chat.usage ?? tab.contextUsage,
+                   let window = usage.contextWindow, window > 0 {
+                    ContextMeter(used: usage.totalContextTokens, window: window)
+                }
+
+                Spacer(minLength: OreTheme.Space.xs)
+                sendButton
+            }
+
+            HStack(spacing: OreTheme.Space.xs) {
+                attachmentMenu
+                modelChooserButton(for: tab)
+                permissionChip
+                modeControls(for: tab)
+                Spacer(minLength: OreTheme.Space.xs)
+                sendButton
+            }
+        }
+        .frame(minHeight: 34)
+    }
+
+    private var permissionChip: some View {
+        Menu {
+            ForEach(PermissionMode.allCases, id: \.self) { mode in
+                Button(mode.displayName) { model.setPermissionMode(mode, for: workspace.id) }
+            }
+        } label: {
+            chipLabel(
+                chatSummary?.permissionMode.displayName ?? workspace.permissionMode.displayName,
+                systemImage: "shield.lefthalf.filled"
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Permission mode")
+    }
+
+    @ViewBuilder
+    private func modeControls(for tab: ChatSummary) -> some View {
+        if (chatSummary?.permissionMode ?? workspace.permissionMode) == .plan {
+            ComposerModeTag(title: "Plan", systemImage: "list.bullet.clipboard", tint: .purple)
+        }
+        if supportsFastMode(tab) {
+            Menu {
+                Button {
+                    fastModeEnabled = false
+                } label: {
+                    Label("Standard", systemImage: fastModeEnabled ? "circle" : "checkmark")
+                }
+                Button {
+                    fastModeEnabled = true
+                } label: {
+                    Label("Fast · higher credit use", systemImage: fastModeEnabled ? "checkmark" : "bolt.fill")
+                }
+            } label: {
+                ComposerModeTag(
+                    title: fastModeEnabled ? "Fast" : "Standard",
+                    systemImage: fastModeEnabled ? "bolt.fill" : "speedometer",
+                    tint: fastModeEnabled ? .orange : .secondary
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Codex processing tier. Fast increases speed and credit use.")
+        }
+    }
+
+    private func supportsFastMode(_ tab: ChatSummary) -> Bool {
+        guard tab.harness == .codex else { return false }
+        let choices = model.knownModels(for: tab.harness)
+        let selected = tab.model.flatMap { id in choices.first { $0.id == id } }
+            ?? choices.first(where: \.isDefault)
+        return selected?.supportedServiceTiers.contains("fast") == true
+    }
+
+    /// The composer's controls all read as one kind of object: a bordered
+    /// capsule with an icon and a word. A shared height and padding is exactly
+    /// what the old mix of plain labels, a fixed-width Picker, and bare icons
+    /// was missing.
+    private func chipLabel(_ text: String, systemImage: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage).font(.system(size: 11))
+            Text(text).font(.system(size: OreTheme.Font.body)).lineLimit(1)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 26)
+        .background(OreTheme.subduedFill, in: Capsule())
+        .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+        .contentShape(Capsule())
+    }
+
+    private func iconChip(_ systemImage: String) -> some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 12))
+            .frame(width: 26, height: 26)
+            .background(OreTheme.subduedFill, in: Capsule())
+            .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+            .contentShape(Capsule())
+    }
+
+    private var attachmentMenu: some View {
+        Menu {
+            Button("Attach Files…", systemImage: "paperclip") { chooseFiles() }
+            Button("Reference Workspace File…", systemImage: "at") { referenceFiles() }
+            Divider()
+            Text("Drop files here, or type / for commands")
+        } label: {
+            iconChip("paperclip")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Add files or references")
+    }
+
+    private func modelChooserButton(for tab: ChatSummary) -> some View {
+        Button { showModelChooser.toggle() } label: {
+            modelChipLabel(for: tab)
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .fixedSize()
+        .overlay {
+            // Scroll over the chip to switch harness (to each one's default
+            // model) — the same gesture, animation, and haptics as the effort
+            // chip beside it.
+            ScrollWheelAdjuster(
+                onProgress: { progress in
+                    withAnimation(reduceMotion ? nil : .interactiveSpring(response: 0.2, dampingFraction: 0.8)) {
+                        modelScrollProgress = progress
+                    }
+                },
+                onStep: { direction in adjustHarnessDefault(direction, for: tab) }
+            )
+        }
+        .popover(isPresented: $showModelChooser, arrowEdge: .bottom) {
+            ModelChooser(
+                currentHarness: tab.harness,
+                currentModel: tab.model,
+                harnesses: model.readyHarnesses,
+                models: { model.knownModels(for: $0) }
+            ) { harness, selectedModel in
+                if harness == tab.harness { model.setModel(selectedModel, for: tab) }
+                else { model.switchHarness(harness, model: selectedModel, for: tab) }
+                showModelChooser = false
+            }
+        }
+        .help("Model: \(modelDisplayName(for: tab)). Scroll to switch agent.")
+    }
+
+    private func modelChipLabel(for tab: ChatSummary) -> some View {
+        HStack(spacing: 6) {
+            HarnessMark(harness: tab.harness, size: 17)
+            Text(modelDisplayName(for: tab))
+                .font(.system(size: OreTheme.Font.body))
+                .lineLimit(1)
+                .contentTransition(.numericText())
+            Color.clear.frame(width: 7, height: 1)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .background(OreTheme.subduedFill, in: Capsule())
+        .overlay {
+            Capsule().stroke(
+                modelScrollProgress == 0
+                    ? OreTheme.hairline
+                    : Color.accentColor.opacity(0.25 + 0.45 * abs(modelScrollProgress)),
+                lineWidth: 1
+            )
+        }
+        .overlay(alignment: .trailing) {
+            Image(systemName: modelScrollProgress >= 0 ? "chevron.up" : "chevron.down")
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(Color.accentColor)
+                .padding(.trailing, 7)
+                .opacity(min(1, abs(modelScrollProgress) * 1.6))
+                .offset(y: reduceMotion ? 0 : -modelScrollProgress * 1.5)
+        }
+        .overlay(alignment: .bottomLeading) {
+            GeometryReader { geometry in
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.75))
+                    .frame(width: max(0, geometry.size.width * abs(modelScrollProgress)), height: 2)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+            }
+            .clipShape(Capsule())
+        }
+        .scaleEffect(reduceMotion ? 1 : 1 + abs(modelScrollProgress) * 0.018)
+        .contentShape(Capsule())
+        .symbolEffect(.bounce, value: modelStepPulse)
+    }
+
+    /// Scrolling the model chip steps between ready harnesses, selecting each
+    /// one's default model — "between the default models of different harnesses".
+    private func adjustHarnessDefault(_ direction: Int, for tab: ChatSummary) -> Bool {
+        let harnesses = model.readyHarnesses
+        guard harnesses.count > 1 else { return false }
+        let index = harnesses.firstIndex(of: tab.harness) ?? 0
+        let next = harnesses[(index + direction).clamped(to: 0...(harnesses.count - 1))]
+        guard next != tab.harness else { return false }
+        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.68)) {
+            modelStepPulse += 1
+        }
+        model.switchHarness(next, model: model.defaultModelID(for: next), for: tab)
+        return true
+    }
+
+    private func modelDisplayName(for tab: ChatSummary) -> String {
+        let models = model.knownModels(for: tab.harness)
+        guard let selected = tab.model else {
+            return models.first(where: \.isDefault)?.displayName
+                ?? models.first?.displayName
+                ?? tab.harness.displayName
+        }
+        return models.first { $0.id == selected }?.displayName ?? selected
+    }
+
+    private func effortButton(for tab: ChatSummary) -> some View {
+        Button { showEffortChooser.toggle() } label: {
+            effortChipLabel
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .fixedSize()
+        .overlay {
+            ScrollWheelAdjuster(
+                onProgress: { progress in
+                    withAnimation(reduceMotion ? nil : .interactiveSpring(response: 0.2, dampingFraction: 0.8)) {
+                        effortScrollProgress = progress
+                    }
+                },
+                onStep: { direction in adjustEffort(direction, for: tab) }
+            )
+        }
+        .popover(isPresented: $showEffortChooser, arrowEdge: .bottom) {
+            EffortChooser(
+                selection: $reasoningEffort,
+                efforts: availableEfforts(for: tab),
+                harness: tab.harness
+            )
+        }
+        .help("Reasoning effort: \(reasoningEffort.displayName). Scroll to adjust.")
+    }
+
+    private var effortChipLabel: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "chart.bar.fill")
+                .font(.system(size: 11))
+                .symbolEffect(.bounce, value: effortStepPulse)
+            Text(reasoningEffort.displayName)
+                .font(.system(size: OreTheme.Font.body))
+                .lineLimit(1)
+                .contentTransition(.numericText())
+            Color.clear.frame(width: 7, height: 1)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 26)
+        .background(OreTheme.subduedFill, in: Capsule())
+        .overlay {
+            Capsule().stroke(
+                effortScrollProgress == 0
+                    ? OreTheme.hairline
+                    : Color.accentColor.opacity(0.25 + 0.45 * abs(effortScrollProgress)),
+                lineWidth: 1
+            )
+        }
+        .overlay(alignment: .trailing) {
+            Image(systemName: effortScrollProgress >= 0 ? "chevron.up" : "chevron.down")
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(Color.accentColor)
+                .padding(.trailing, 9)
+                .opacity(min(1, abs(effortScrollProgress) * 1.6))
+                .offset(y: reduceMotion ? 0 : -effortScrollProgress * 1.5)
+        }
+        .overlay(alignment: .bottomLeading) {
+            GeometryReader { geometry in
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.75))
+                    .frame(
+                        width: max(0, geometry.size.width * abs(effortScrollProgress)),
+                        height: 2
+                    )
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+            }
+            .clipShape(Capsule())
+        }
+        .scaleEffect(reduceMotion ? 1 : 1 + abs(effortScrollProgress) * 0.018)
+        .contentShape(Capsule())
+    }
+
+    private func supportsEffort(for tab: ChatSummary) -> Bool {
+        !availableEfforts(for: tab).isEmpty
+    }
+
+    private func availableEfforts(for tab: ChatSummary) -> [ReasoningEffort] {
+        let choices = model.knownModels(for: tab.harness)
+        let selected = tab.model.flatMap { id in choices.first { $0.id == id } }
+            ?? choices.first(where: \.isDefault)
+        let advertised = Set(selected?.supportedReasoningEfforts ?? [])
+        guard !advertised.isEmpty else { return [] }
+        return ReasoningEffort.allCases.filter { advertised.contains($0.rawValue) }
+    }
+
+    private func adjustEffort(_ direction: Int, for tab: ChatSummary) -> Bool {
+        let efforts = availableEfforts(for: tab)
+        guard !efforts.isEmpty else { return false }
+        let index = efforts.firstIndex(of: reasoningEffort)
+            ?? efforts.lastIndex(where: { $0.rawValue == ReasoningEffort.high.rawValue })
+            ?? 0
+        let next = efforts[(index + direction).clamped(to: 0...(efforts.count - 1))]
+        guard next != reasoningEffort else { return false }
+        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.68)) {
+            reasoningEffort = next
+            effortStepPulse += 1
+        }
+        return true
+    }
+
+    private func harnessIcon(_ harness: HarnessKind) -> String {
+        switch harness {
+        case .claudeCode: "sparkles"
+        case .codex: "bolt.fill"
+        case .cursorAgent: "cursorarrow.rays"
+        }
+    }
+
+    @ViewBuilder
+    private var sendButton: some View {
+        if #available(macOS 26.0, *) {
+            Button(action: send) {
+                Image(systemName: chat.isBusy ? "text.append" : "arrow.up")
+                    .font(.system(size: 13, weight: .bold))
+                    .frame(width: 30, height: 30)
+            }
+            .buttonStyle(.glassProminent)
+            .buttonBorderShape(.circle)
+            .tint(.accentColor)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .keyboardShortcut(.return, modifiers: .command)
+            .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
+        } else {
+            Button(action: send) {
+                Image(systemName: chat.isBusy ? "text.append" : "arrow.up")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(Color.accentColor, in: Circle())
+                    .shadow(color: Color.accentColor.opacity(0.16), radius: 3, y: 1)
+            }
+            .buttonStyle(.plain)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .keyboardShortcut(.return, modifiers: .command)
+            .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
+        }
+    }
+
+    private var placeholder: String {
+        chat.draftComments.isEmpty
+            ? "Ask the agent to do something…"
+            : "\(chat.draftComments.count) review comment"
+                + (chat.draftComments.count == 1 ? "" : "s")
+                + " will be sent with this message"
+    }
+
+    private func send() {
+        var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty || !attachments.isEmpty else { return }
+        if text.isEmpty { text = "Review the attached files." }
+        model.send(
+            text,
+            attachments: attachments,
+            effort: chatSummary.map { supportsEffort(for: $0) } == true ? reasoningEffort : nil,
+            serviceTier: chatSummary.map { supportsFastMode($0) } == true && fastModeEnabled ? "fast" : nil,
+            to: workspace.id
+        )
+        draft = ""
+        attachments = []
+    }
+
+    private func chooseFiles() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        addFiles(panel.urls)
+    }
+
+    private func referenceFiles() {
+        let panel = NSOpenPanel()
+        panel.directoryURL = URL(fileURLWithPath: workspace.worktreePath)
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        let root = URL(fileURLWithPath: workspace.worktreePath).standardizedFileURL.path + "/"
+        for url in panel.urls where url.standardizedFileURL.path.hasPrefix(root) {
+            let relative = String(url.standardizedFileURL.path.dropFirst(root.count))
+            insertWorkspaceReference(path: relative, displayName: url.lastPathComponent)
+        }
+    }
+
+    private var externalAttachments: [(offset: Int, element: Attachment)] {
+        Array(attachments.enumerated()).filter {
+            $0.element.relativePath.hasPrefix(".context/attachments/")
+        }
+    }
+
+    private func addFiles(_ urls: [URL]) {
+        let folder = URL(fileURLWithPath: workspace.worktreePath)
+            .appendingPathComponent(".context/attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for source in urls where source.isFileURL {
+            let name = "\(UUID().uuidString.prefix(8))-\(source.lastPathComponent)"
+            let destination = folder.appendingPathComponent(name)
+            do {
+                try FileManager.default.copyItem(at: source, to: destination)
+                attachments.append(Attachment(
+                    relativePath: ".context/attachments/\(name)",
+                    displayName: source.lastPathComponent,
+                    mimeType: UTType(filenameExtension: source.pathExtension)?.preferredMIMEType
+                ))
+            } catch { continue }
+        }
+    }
+
+    /// Attaches whatever was pasted: a copied file lands as a file attachment, a
+    /// copied/screenshot image is written out as a PNG and attached. Returns true
+    /// when it consumed the paste so the editor doesn't also insert text.
+    private func handlePasteboard(_ pasteboard: NSPasteboard) -> Bool {
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL], !urls.isEmpty {
+            addFiles(urls)
+            return true
+        }
+        if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
+            as? [NSImage], !images.isEmpty {
+            return addPastedImages(images)
+        }
+        // Some sources (screenshots, certain apps) only put raw image data on the
+        // board rather than an NSImage object; pick it up directly.
+        for type: NSPasteboard.PasteboardType in [.png, .tiff] {
+            if let data = pasteboard.data(forType: type), let image = NSImage(data: data) {
+                return addPastedImages([image])
+            }
+        }
+        return false
+    }
+
+    private func addPastedImages(_ images: [NSImage]) -> Bool {
+        let folder = URL(fileURLWithPath: workspace.worktreePath)
+            .appendingPathComponent(".context/attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var added = false
+        for image in images {
+            guard let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else { continue }
+            let display = "pasted-image.png"
+            let name = "\(UUID().uuidString.prefix(8))-\(display)"
+            let destination = folder.appendingPathComponent(name)
+            do {
+                try png.write(to: destination)
+                attachments.append(Attachment(
+                    relativePath: ".context/attachments/\(name)",
+                    displayName: display,
+                    mimeType: "image/png"
+                ))
+                added = true
+            } catch { continue }
+        }
+        return added
+    }
+
+    private var slashCommands: [ComposerCommand] {
+        guard draft.hasPrefix("/"), !draft.contains("\n") else { return [] }
+        let query = String(draft.dropFirst()).lowercased()
+        return ComposerCommand.all.filter { query.isEmpty || $0.name.dropFirst().hasPrefix(query) }
+    }
+
+    private var mentionSuggestions: [WorkspaceFileNode] {
+        guard let mention = activeMention else { return [] }
+        let query = mention.query.lowercased()
+        return workspaceFileIndex
+            .filter { node in
+                !node.isDirectory
+                    && !attachments.contains(where: { $0.relativePath == node.path })
+                    && (query.isEmpty
+                        || node.name.lowercased().contains(query)
+                        || node.path.lowercased().contains(query))
+            }
+            .sorted { first, second in
+                let firstName = first.name.lowercased().hasPrefix(query)
+                let secondName = second.name.lowercased().hasPrefix(query)
+                if firstName != secondName { return firstName }
+                // A bare `@` should lead with useful project files instead of
+                // dotfiles such as .git and .replit. Explicit queries can still
+                // find those files normally.
+                if query.isEmpty {
+                    let firstHidden = first.path.split(separator: "/").contains { $0.hasPrefix(".") }
+                    let secondHidden = second.path.split(separator: "/").contains { $0.hasPrefix(".") }
+                    if firstHidden != secondHidden { return !firstHidden }
+                }
+                if first.path.count != second.path.count { return first.path.count < second.path.count }
+                return first.path.localizedCaseInsensitiveCompare(second.path) == .orderedAscending
+            }
+    }
+
+    private var activeMention: (range: Range<String.Index>, query: String)? {
+        guard let at = draft.lastIndex(of: "@") else { return nil }
+        if at != draft.startIndex {
+            let previous = draft[draft.index(before: at)]
+            guard previous.isWhitespace else { return nil }
+        }
+        let start = draft.index(after: at)
+        let suffix = draft[start...]
+        guard !suffix.contains(where: \.isWhitespace) else { return nil }
+        return (at..<draft.endIndex, String(suffix))
+    }
+
+    private func tagFile(_ node: WorkspaceFileNode) {
+        guard let mention = activeMention else { return }
+        draft.replaceSubrange(mention.range, with: "@\(node.name) ")
+        insertWorkspaceReference(path: node.path, displayName: node.name, appendToken: false)
+        composerFocused = true
+    }
+
+    private func insertWorkspaceReference(
+        path: String,
+        displayName: String,
+        appendToken: Bool = true
+    ) {
+        if !attachments.contains(where: { $0.relativePath == path }) {
+            attachments.append(Attachment(relativePath: path, displayName: displayName))
+        }
+        if appendToken {
+            if !draft.isEmpty, !draft.last!.isWhitespace { draft.append(" ") }
+            draft.append("@\(displayName) ")
+        }
+    }
+
+    private func acceptFirstMentionSuggestion() -> Bool {
+        guard let first = mentionSuggestions.first else { return false }
+        tagFile(first)
+        return true
+    }
+
+    private static func flattenFiles(_ nodes: [WorkspaceFileNode]) -> [WorkspaceFileNode] {
+        nodes.flatMap { node in
+            node.isDirectory ? flattenFiles(node.children ?? []) : [node]
+        }
+    }
+
+    /// Agent output may use a repository-relative path, an absolute worktree
+    /// path, or a short basename. Resolve all three into the workspace index so
+    /// clicking a reference opens ORE's source tab rather than asking Finder to
+    /// interpret a relative URL.
+    private func openAgentFile(_ reference: String) {
+        var candidate = reference.removingPercentEncoding ?? reference
+        if candidate.hasPrefix("file://"), let url = URL(string: candidate) {
+            candidate = url.path
+        }
+        // Capture a trailing `:line`, `:line:col`, or `:line,col` locator, then
+        // strip it so the path resolves against the file index.
+        var focusLine: Int?
+        if let match = candidate.range(of: #":\d+(?:[:,]\d+)?$"#, options: .regularExpression) {
+            let locator = candidate[match].dropFirst()  // drop the leading ':'
+            focusLine = Int(locator.prefix { $0.isNumber })
+            candidate.removeSubrange(match)
+        }
+        let root = workspace.worktreePath.hasSuffix("/")
+            ? workspace.worktreePath
+            : workspace.worktreePath + "/"
+        if candidate.hasPrefix(root) { candidate.removeFirst(root.count) }
+        while candidate.hasPrefix("./") { candidate.removeFirst(2) }
+        candidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "`'\"()[]{}<>.,"))
+
+        let resolved = workspaceFileIndex.first(where: { $0.path == candidate })?.path
+            ?? workspaceFileIndex.first(where: { $0.path.hasSuffix("/" + candidate) })?.path
+            ?? workspaceFileIndex.first(where: { $0.name == candidate })?.path
+        guard let path = resolved, !path.split(separator: "/").contains("..") else { return }
+        model.openSourceFile(path, in: workspace.id, line: focusLine)
+    }
+
+    private func run(_ command: ComposerCommand) {
+        switch command.name {
+        case "/plan":
+            model.setPermissionMode(.plan, for: workspace.id)
+            draft = "Create a detailed implementation plan for "
+        case "/review": draft = "Review the current workspace diff. Focus on correctness, regressions, and missing tests."
+        case "/test": draft = "Run the relevant test suite, diagnose any failures, and fix them."
+        case "/fix": draft = "Diagnose and fix the issue: "
+        case "/explain": draft = "Explain this code clearly: "
+        case "/model": draft = ""; showModelChooser = true
+        case "/clear": draft = ""; attachments = []
+        default: break
+        }
+        composerFocused = true
+    }
+}
+
+private struct ComposerCommand: Identifiable {
+    var id: String { name }
+    let name: String
+    let detail: String
+    let icon: String
+
+    static let all = [
+        ComposerCommand(name: "/plan", detail: "Plan before editing", icon: "list.bullet.clipboard"),
+        ComposerCommand(name: "/review", detail: "Review the workspace diff", icon: "eye"),
+        ComposerCommand(name: "/test", detail: "Run and fix tests", icon: "checkmark.circle"),
+        ComposerCommand(name: "/fix", detail: "Diagnose an issue", icon: "wrench.and.screwdriver"),
+        ComposerCommand(name: "/explain", detail: "Explain code", icon: "text.bubble"),
+        ComposerCommand(name: "/model", detail: "Choose harness and model", icon: "sparkles"),
+        ComposerCommand(name: "/clear", detail: "Clear prompt and files", icon: "xmark.circle"),
+    ]
+}
+
+/// A stable overlay rather than another transcript row. It makes work obvious
+/// at a glance while keeping streamed text from repeatedly inserting/removing
+/// loading content and shifting the scroll position.
+private struct AgentWorkingPill: View {
+    let harness: HarnessKind
+    let status: AgentStatus
+    var startedAt: Date?
+    let onStop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ProgressView()
+                .controlSize(.small)
+            Text(label)
+                .font(.system(size: OreTheme.Font.body, weight: .medium))
+            if let startedAt {
+                // A live counter that ticks each second while the turn runs.
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(Self.elapsed(from: startedAt, to: context.date))
+                        .font(.system(size: OreTheme.Font.body, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Button(action: onStop) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 20, height: 20)
+                    .background(.red.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .help("Stop the running turn (⌘.)")
+        }
+        .padding(.leading, 11)
+        .padding(.trailing, 6)
+        .frame(height: 30)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+        .shadow(color: .black.opacity(0.06), radius: 4, y: 1)
+    }
+
+    private var label: String {
+        switch status {
+        case .runningTool: return "\(harness.displayName) is running a tool"
+        case .thinking: return "\(harness.displayName) is thinking"
+        default: return "\(harness.displayName) is working"
+        }
+    }
+
+    static func elapsed(from start: Date, to now: Date) -> String {
+        let total = max(0, Int(now.timeIntervalSince(start)))
+        let hours = total / 3600, minutes = (total % 3600) / 60, seconds = total % 60
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        if minutes > 0 { return "\(minutes)m \(seconds)s" }
+        return "\(seconds)s"
+    }
+}
+
+private struct ResearchEmptyState: View {
+    let identity: ResearchIdentity?
+    let title: String?
+    let seed: String
+    let onSuggestion: (String) -> Void
+
+    private struct Starter: Identifiable {
+        let title: String
+        let detail: String
+        let icon: String
+        let prompt: String
+        var id: String { title }
+    }
+
+    private let starters = [
+        Starter(
+            title: "Understand the project",
+            detail: "Get a quick map before changing anything",
+            icon: "map",
+            prompt: "Give me a concise tour of this project: its architecture, important entry points, and how to run it."
+        ),
+        Starter(
+            title: "Plan the next change",
+            detail: "Turn an idea into a small, testable path",
+            icon: "list.bullet.clipboard",
+            prompt: "Help me turn this idea into a small, testable implementation plan: "
+        ),
+        Starter(
+            title: "Review what changed",
+            detail: "Look for regressions and missing tests",
+            icon: "eye",
+            prompt: "Review the current workspace changes for correctness, regressions, and missing tests."
+        ),
+        Starter(
+            title: "Run the right tests",
+            detail: "Find the relevant checks and fix failures",
+            icon: "checkmark.circle",
+            prompt: "Find and run the tests relevant to this workspace, then diagnose and fix any failures."
+        ),
+    ]
+
+    var body: some View {
+        GeometryReader { geometry in
+            let availableWidth = max(0, geometry.size.width - OreTheme.Space.lg * 2)
+            content(
+                compact: geometry.size.height < 460,
+                singleColumn: availableWidth < 410
+            )
+                .frame(width: min(700, availableWidth))
+                .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func content(compact: Bool, singleColumn: Bool) -> some View {
+        VStack(spacing: compact ? 8 : 24) {
+            VStack(spacing: compact ? 4 : 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(Color.accentColor)
+                        .symbolEffect(.pulse, options: .nonRepeating)
+                    Text(title ?? "New conversation")
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+                Text("What are we working on?")
+                    .font(.system(size: compact ? 22 : 27, weight: .semibold, design: .rounded))
+                Text("Pick a starting point, or describe the outcome in your own words.")
+                    .font(.system(size: compact ? 13 : 14))
+                    .foregroundStyle(.secondary)
+            }
+
+            LazyVGrid(
+                columns: singleColumn
+                    ? [GridItem(.flexible())]
+                    : [GridItem(.flexible()), GridItem(.flexible())],
+                spacing: compact ? 7 : 10
+            ) {
+                ForEach(starters) { starter in
+                    Button { onSuggestion(starter.prompt) } label: {
+                        HStack(alignment: .top, spacing: 11) {
+                            Image(systemName: starter.icon)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                                .frame(width: 28, height: 28)
+                                .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(starter.title)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Text(starter.detail)
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(compact ? 8 : 11)
+                        .frame(maxWidth: .infinity, minHeight: compact ? 50 : 66, alignment: .leading)
+                        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
+                        }
+                        .contentShape(RoundedRectangle(cornerRadius: 13))
+                    }
+                    .buttonStyle(OrePressableButtonStyle())
+                }
+            }
+
+            if !compact {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 16) {
+                        ForEach(shortcutHints, id: \.label) { hint in
+                            ShortcutHint(keys: hint.keys, label: hint.label)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(shortcutHints, id: \.label) { hint in
+                            ShortcutHint(keys: hint.keys, label: hint.label)
+                        }
+                    }
+                }
+            }
+
+            if let identity {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "lightbulb.min")
+                        .foregroundStyle(.secondary)
+                    Text("\(identity.name): \(identity.fact)")
+                        .font(.system(size: compact ? 10.5 : 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(compact ? 1 : nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.vertical, compact ? 6 : 44)
+    }
+
+    private struct Hint {
+        let keys: String
+        let label: String
+    }
+
+    private var shortcutHints: [Hint] {
+        let groups: [[Hint]] = [
+            [Hint(keys: "⌘P", label: "Open file"), Hint(keys: "@", label: "Reference file"), Hint(keys: "⌘↩", label: "Send")],
+            [Hint(keys: "⌘K", label: "Command palette"), Hint(keys: "/", label: "Prompt commands"), Hint(keys: "⌘.", label: "Stop agent")],
+            [Hint(keys: "⌘T", label: "New chat"), Hint(keys: "⌘W", label: "Close chat"), Hint(keys: "⇧⌘[ / ]", label: "Switch chats")],
+            [Hint(keys: "⌥⌘T", label: "Terminal"), Hint(keys: "⌘1–9", label: "Jump workspace"), Hint(keys: "⌘/", label: "All shortcuts")],
+        ]
+        let value = seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+        return groups[abs(value) % groups.count]
+    }
+}
+
+private struct ShortcutHint: View {
+    let keys: String
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(keys)
+                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 6)
+                .frame(height: 20)
+                .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 5))
+                .overlay { RoundedRectangle(cornerRadius: 5).stroke(OreTheme.hairline) }
+            Text(label).font(.system(size: 11.5)).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct ModelChooser: View {
+    let currentHarness: HarnessKind
+    let currentModel: String?
+    let harnesses: [HarnessKind]
+    let models: (HarnessKind) -> [AgentModel]
+    let onSelect: (HarnessKind, String?) -> Void
+    @State private var search = ""
+    @State private var hoveredModelKey: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Choose model").font(.headline)
+            TextField("Search models", text: $search)
+                .textFieldStyle(.roundedBorder)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(harnesses, id: \.self) { harness in
+                        Text(harness.displayName.uppercased())
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                        if search.isEmpty {
+                            modelRow(harness, nil)
+                        }
+                        ForEach(filteredModels(for: harness)) { choice in
+                            modelRow(harness, choice)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 410, height: 520)
+    }
+
+    private func filteredModels(for harness: HarnessKind) -> [AgentModel] {
+        models(harness).filter {
+            search.isEmpty
+                || $0.displayName.localizedCaseInsensitiveContains(search)
+                || $0.id.localizedCaseInsensitiveContains(search)
+                || $0.description.localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    private func modelRow(_ harness: HarnessKind, _ model: AgentModel?) -> some View {
+        let key = harness.rawValue + ":" + (model?.id ?? "default")
+        return Button { onSelect(harness, model?.id) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: currentHarness == harness && currentModel == model?.id
+                    ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(currentHarness == harness && currentModel == model?.id
+                        ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model?.displayName ?? "Default model").fontWeight(.medium)
+                    Text(model?.description.isEmpty == false
+                        ? model?.description ?? ""
+                        : modelDetail(model?.id, harness: harness))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model?.isDefault == true {
+                    Text("DEFAULT")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8).frame(minHeight: 48)
+            .background(
+                hoveredModelKey == key ? OreTheme.subduedFill : .clear,
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .onHover { hovering in
+            if hovering { hoveredModelKey = key }
+            else if hoveredModelKey == key { hoveredModelKey = nil }
+        }
+    }
+
+    private func modelDetail(_ name: String?, harness: HarnessKind) -> String {
+        guard let name else { return "Use the harness default" }
+        if name.contains("opus") { return "Deepest Claude reasoning" }
+        if name.contains("sonnet") { return "Balanced speed and capability" }
+        if name.contains("haiku") { return "Fastest Claude model" }
+        if name.contains("codex") { return "Optimized for agentic coding" }
+        if harness == .cursorAgent { return "Available through Cursor" }
+        return "General-purpose model"
+    }
+}
+
+private struct EffortChooser: View {
+    @Binding var selection: ReasoningEffort
+    let efforts: [ReasoningEffort]
+    let harness: HarnessKind
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Reasoning effort", systemImage: "chart.bar.fill")
+                    .font(.headline)
+                Spacer()
+                Text(selection.displayName).foregroundStyle(.secondary)
+            }
+            Slider(value: indexBinding, in: 0...Double(max(0, efforts.count - 1)), step: 1)
+            HStack {
+                Text("Faster")
+                Spacer()
+                Text("Deeper")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            Text(harness == .claudeCode
+                ? "Applied through your Claude Code session. Scroll the chip to adjust."
+                : "Applied to the next Codex turn. Scroll the chip to adjust.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(width: 300)
+    }
+
+    private var indexBinding: Binding<Double> {
+        Binding(
+            get: { Double(efforts.firstIndex(of: selection) ?? min(2, max(0, efforts.count - 1))) },
+            set: {
+                guard !efforts.isEmpty else { return }
+                selection = efforts[Int($0.rounded()).clamped(to: 0...(efforts.count - 1))]
+            }
+        )
+    }
+}
+
+private extension Comparable {
+    func clamped(to limits: ClosedRange<Self>) -> Self {
+        min(max(self, limits.lowerBound), limits.upperBound)
+    }
+}
+
+/// How much of the model's context this conversation has used.
+private struct ContextMeter: View {
+    let used: Int
+    let window: Int
+
+    private var fraction: Double {
+        min(1, Double(used) / Double(window))
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text("Context")
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .foregroundStyle(.secondary)
+            ProgressView(value: fraction)
+                .progressViewStyle(.linear)
+                .frame(width: 48)
+                .tint(fraction > 0.9 ? .orange : .accentColor)
+            Text("\(Int(fraction * 100))%")
+                .font(.system(size: OreTheme.Font.caption, design: .rounded).monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .help("\(used.formatted()) of \(window.formatted()) tokens in the current model context")
+    }
+}
+
+/// A hard failure raised right above the composer so it can't be missed — most
+/// often a usage/rate limit the user needs to act on before sending again.
+private struct ProminentErrorBanner: View {
+    let error: ChatState.ProminentError
+    let onDismiss: () -> Void
+
+    private var tint: Color { error.isUsageLimit ? OreTheme.warning : .red }
+    private var icon: String {
+        error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
+    }
+    private var title: String {
+        error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: OreTheme.Space.sm) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tint)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                Text(.init(error.message))
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(12)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(tint.opacity(0.35), lineWidth: 1)
+        }
+    }
+}
+
+/// A tool call the agent is blocked on.
+private struct PermissionCard: View {
+    let request: PermissionRequest
+    let onDecision: (PermissionDecision) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+                Text(request.displayName ?? request.toolName).fontWeight(.semibold)
+                Spacer()
+            }
+
+            if let summary = request.summary, !summary.isEmpty {
+                Text(summary)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+            }
+
+            HStack(spacing: 8) {
+                Button("Allow") { onDecision(.allow) }
+                    .buttonStyle(OrePrimaryButtonStyle())
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+
+                Button("Deny") {
+                    onDecision(.deny(reason: "The user denied this in ORE."))
+                }
+                .buttonStyle(OreSecondaryButtonStyle())
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+
+                // Harness-suggested shortcuts, kept as raw payloads so what we
+                // send back is exactly what was offered.
+                ForEach(Array(request.suggestions.enumerated()), id: \.offset) { _, suggestion in
+                    Button(suggestion.title) { onDecision(.allowWithSuggestion(suggestion.raw)) }
+                        .buttonStyle(.link)
+                }
+
+                Spacer()
+            }
+        }
+        .oreCard(padding: 12)
+    }
+}
+
+private struct PlanApprovalCard: View {
+    let markdown: String
+    let onApprove: (String) -> Void
+    let onReject: (String) -> Void
+    @State private var feedback = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            Label("Plan ready for review", systemImage: "checklist")
+                .fontWeight(.semibold)
+            Text(markdown).lineLimit(8).textSelection(.enabled)
+            TextField("Optional feedback…", text: $feedback)
+            HStack {
+                Button("Approve") { onApprove("") }.buttonStyle(OrePrimaryButtonStyle())
+                Button("Approve with Feedback") { onApprove(feedback) }
+                    .disabled(feedback.isEmpty)
+                    .buttonStyle(OreSecondaryButtonStyle())
+                Button("Reject / Revise") { onReject(feedback) }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                Spacer()
+            }
+        }
+        .oreCard(padding: 12)
+    }
+}
+
+private struct MessageQueueCard: View {
+    @Binding var messages: [QueuedMessageRecord]
+    let onSave: (Int64, String) async -> Void
+    let onDelete: (Int64) async -> Void
+
+    var body: some View {
+        DisclosureGroup("Queued messages (\(messages.count))") {
+            VStack(spacing: 6) {
+                ForEach(messages.indices, id: \.self) { index in
+                    HStack {
+                        TextField("Queued message", text: $messages[index].text)
+                            .onSubmit {
+                                guard let id = messages[index].id else { return }
+                                Task { await onSave(id, messages[index].text) }
+                            }
+                        Button(role: .destructive) {
+                            guard let id = messages[index].id else { return }
+                            Task { await onDelete(id) }
+                        } label: { Image(systemName: "trash") }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.top, 6)
+        }
+        .oreCard(padding: 12, radius: 14)
+    }
+}
+
+/// The agent asking the user something directly.
+private struct QuestionCard: View {
+    let question: AgentQuestion
+    let harness: HarnessKind
+    let onAnswer: (String) -> Void
+    @State private var freeform = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                HarnessMark(harness: harness, size: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Agent needs your input")
+                        .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text(question.prompt)
+                        .font(.system(size: OreTheme.Font.title, weight: .semibold))
+                }
+                Spacer(minLength: 0)
+            }
+
+            if !question.options.isEmpty {
+                VStack(spacing: 6) {
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                        Button { onAnswer(option.label) } label: {
+                            HStack(alignment: .top, spacing: 9) {
+                                Text("\(index + 1)")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Color.accentColor)
+                                    .frame(width: 22, height: 22)
+                                    .background(Color.accentColor.opacity(0.10), in: Circle())
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(option.label)
+                                        .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    if let detail = option.detail, !detail.isEmpty {
+                                        Text(detail)
+                                            .font(.system(size: OreTheme.Font.caption))
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                                Image(systemName: "arrow.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10))
+                            .contentShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                        .buttonStyle(OrePressableButtonStyle())
+                        .help(option.detail ?? "")
+                    }
+                }
+            }
+
+            if question.allowsFreeform {
+                HStack(spacing: 8) {
+                    TextField("Or answer in your own words…", text: $freeform)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .frame(height: 34)
+                        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(OreTheme.hairline))
+                        .onSubmit { submit() }
+                    Button(action: submit) {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 12, weight: .bold))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.circle)
+                    .disabled(freeform.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .oreComposerSurface(padding: 12)
+    }
+
+    private func submit() {
+        let answer = freeform.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else { return }
+        onAnswer(answer)
+        freeform = ""
+    }
+}
+
+private struct ComposerModeTag: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .background(tint.opacity(0.09), in: Capsule())
+            .overlay(Capsule().stroke(tint.opacity(0.18), lineWidth: 1))
+            .accessibilityLabel("\(title) mode")
+    }
+}
+
+private struct BusyTabSheen: View {
+    let reduceMotion: Bool
+    @State private var isAnimating = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            if reduceMotion {
+                Color.accentColor.opacity(0.07)
+            } else {
+                LinearGradient(
+                    colors: [.clear, Color.accentColor.opacity(0.04), Color.accentColor.opacity(0.20), Color.accentColor.opacity(0.04), .clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: max(80, geometry.size.width * 0.72))
+                .offset(x: isAnimating ? geometry.size.width : -geometry.size.width)
+                .onAppear {
+                    withAnimation(.linear(duration: 1.35).repeatForever(autoreverses: false)) {
+                        isAnimating = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Comments left on the diff, waiting to go out with the next message.
+private struct DraftCommentsBar: View {
+    let comments: [DiffCommentReference]
+    let onRemove: (Int) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                ForEach(Array(comments.enumerated()), id: \.offset) { index, comment in
+                    HStack(spacing: 4) {
+                        Text("\((comment.filePath as NSString).lastPathComponent):\(comment.startLine)")
+                            .font(.caption2.monospaced())
+                        Button {
+                            onRemove(index)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").font(.system(size: 9))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(OreTheme.subduedFill, in: Capsule())
+                    .help(comment.body)
+                }
+            }
+            .padding(.horizontal, OreTheme.Space.md)
+        }
+        .frame(height: 28)
+    }
+}

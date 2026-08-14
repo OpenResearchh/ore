@@ -415,6 +415,118 @@ struct GitHubUpdaterVersionTests {
         // A malformed tag sorts as zeros rather than pretending to be newer.
         #expect(!GitHubUpdater.isNewer("garbage", than: "0.1.0"))
     }
+
+    @Test func displayVersionAddsALeadingVOnce() {
+        #expect(GitHubUpdater.displayVersion("0.2.0") == "v0.2.0")
+        #expect(GitHubUpdater.displayVersion("v0.2.0") == "v0.2.0")
+        #expect(GitHubUpdater.displayVersion("V1.0") == "V1.0")
+    }
+
+    @Test func prefersDmgOverZip() {
+        let assets: [[String: Any]] = [
+            [
+                "name": "ORE-0.2.0.zip",
+                "browser_download_url": "https://example.com/ORE-0.2.0.zip",
+                "id": 1,
+            ],
+            [
+                "name": "ORE-0.2.0.dmg",
+                "browser_download_url": "https://example.com/ORE-0.2.0.dmg",
+                "id": 2,
+            ],
+        ]
+        let chosen = GitHubUpdater.preferredAsset(from: assets)
+        #expect(chosen?.name == "ORE-0.2.0.dmg")
+        #expect(chosen?.id == 2)
+    }
+
+    @Test func prefersOREAppInADiskImageLayout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-upd-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("ORE.app"), withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("Applications"),
+            withDestinationURL: URL(fileURLWithPath: "/Applications")
+        )
+        #expect(GitHubUpdater.appBundle(in: root)?.lastPathComponent == "ORE.app")
+        try FileManager.default.removeItem(at: root)
+    }
+
+    @Test func findsNestedAppInAZipLayout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-upd-\(UUID().uuidString)")
+        let nested = root.appendingPathComponent("ORE").appendingPathComponent("ORE.app")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        #expect(GitHubUpdater.appBundle(in: root)?.lastPathComponent == "ORE.app")
+        try FileManager.default.removeItem(at: root)
+    }
+
+    @Test func installDestinationMovesOffADiskImage() {
+        let fromVolume = URL(fileURLWithPath: "/Volumes/ORE/ORE.app")
+        #expect(GitHubUpdater.installDestination(currentBundle: fromVolume).path == "/Applications/ORE.app")
+        let fromApps = URL(fileURLWithPath: "/Applications/ORE.app")
+        #expect(GitHubUpdater.installDestination(currentBundle: fromApps).path == "/Applications/ORE.app")
+        let fromDownloads = URL(fileURLWithPath: "/Users/me/Downloads/ORE.app")
+        #expect(
+            GitHubUpdater.installDestination(currentBundle: fromDownloads).path
+                == "/Users/me/Downloads/ORE.app"
+        )
+    }
+
+    @Test func shellQuoteEscapesEmbeddedQuotes() {
+        #expect(GitHubUpdater.shellQuote("/tmp/ORE.app") == "'/tmp/ORE.app'")
+        #expect(GitHubUpdater.shellQuote("/tmp/O'Reilly.app") == "'/tmp/O'\\''Reilly.app'")
+    }
+
+    @Test func mountPointReadsHdiutilPlist() {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0">
+        <dict>
+            <key>system-entities</key>
+            <array>
+                <dict>
+                    <key>dev-entry</key>
+                    <string>/dev/disk4</string>
+                </dict>
+                <dict>
+                    <key>mount-point</key>
+                    <string>/Volumes/ORE</string>
+                </dict>
+            </array>
+        </dict>
+        </plist>
+        """
+        let mount = GitHubUpdater.mountPoint(fromPlist: Data(xml.utf8))
+        #expect(mount?.path == "/Volumes/ORE")
+    }
+
+    @Test func parsePicksTheDmgAsset() {
+        let object: [String: Any] = [
+            "tag_name": "v0.2.0",
+            "name": "ORE v0.2.0",
+            "html_url": "https://github.com/OpenResearchh/ore/releases/tag/v0.2.0",
+            "assets": [
+                [
+                    "name": "ORE-0.2.0.zip",
+                    "browser_download_url": "https://example.com/ORE-0.2.0.zip",
+                    "id": 11,
+                ],
+                [
+                    "name": "ORE-0.2.0.dmg",
+                    "browser_download_url": "https://example.com/ORE-0.2.0.dmg",
+                    "id": 12,
+                ],
+            ],
+        ]
+        let release = GitHubUpdater.parse(object)
+        #expect(release?.version == "v0.2.0")
+        #expect(release?.assetName == "ORE-0.2.0.dmg")
+        #expect(release?.assetID == 12)
+        #expect(release?.downloadURL?.lastPathComponent == "ORE-0.2.0.dmg")
+    }
 }
 
 struct ToolChangeStatsTests {

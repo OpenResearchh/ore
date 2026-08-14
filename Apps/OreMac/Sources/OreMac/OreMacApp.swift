@@ -222,6 +222,7 @@ struct RootView: View {
             detail
         }
         .overlay(alignment: .top) { banners }
+        .overlay { GitHubUpdatePrompt() }
         .sheet(isPresented: $isShowingNewWorkspace) { NewWorkspaceSheet() }
         .sheet(isPresented: $isShowingPalette) { CommandPalette() }
         .sheet(isPresented: $isShowingFilePalette) {

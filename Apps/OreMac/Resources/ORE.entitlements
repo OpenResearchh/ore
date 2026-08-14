@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  ORE is not sandboxed, and can't be: it spawns the user's own agent CLIs,
+	  reads and writes git repositories anywhere on disk, and creates worktrees
+	  outside any container. A sandboxed build would be unable to do the one
+	  thing the app is for.
+
+	  It is distributed with a hardened runtime and notarization instead, which
+	  is what Gatekeeper actually checks for a Developer ID app.
+	-->
+
+	<!-- Sparkle's updater runs as a separate process and needs to be allowed
+	     to launch from inside the bundle. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Agent CLIs are JIT-free, but Node-based ones map writable executable
+	     pages; without this they crash under the hardened runtime. -->
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+
+	<!-- The child processes ORE spawns inherit its environment deliberately —
+	     that is how a user's version managers and PATH reach the agent CLI. -->
+	<key>com.apple.security.inherit</key>
+	<false/>
+</dict>
+</plist>

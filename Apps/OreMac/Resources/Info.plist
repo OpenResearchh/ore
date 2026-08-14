@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>ORE</string>
+	<key>CFBundleDisplayName</key>
+	<string>ORE</string>
+	<key>CFBundleExecutable</key>
+	<string>OreMac</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.ore.OreMac</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<!-- ORE drives the user's own CLIs and worktrees anywhere on disk, so it
+	     runs unsandboxed. A sandboxed build could not spawn `claude` or write
+	     to a repository outside its container. -->
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+
+	<!--
+	  Sparkle. A build without these keys still runs; the Check for Updates
+	  item disables itself rather than failing on a missing feed, which is what
+	  a development build should do.
+
+	  SUPublicEDKey is the EdDSA public key whose private half signs each
+	  release. Without it Sparkle would accept anything the feed served, so a
+	  compromised host would be enough to ship code — set it before publishing.
+	-->
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<!-- Filled in by Scripts/release.sh from ORE_APPCAST_URL. -->
+	<!-- <key>SUFeedURL</key><string>https://…/appcast.xml</string> -->
+	<!-- <key>SUPublicEDKey</key><string>…</string> -->
+</dict>
+</plist>

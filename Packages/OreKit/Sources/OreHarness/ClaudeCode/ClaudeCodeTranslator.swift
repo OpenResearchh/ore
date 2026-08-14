@@ -144,6 +144,16 @@ struct ClaudeCodeTranslator {
                 append(status: .idle, to: &output)
             }
 
+        case "compact_boundary":
+            // Claude Code compacted its own context. Surface it so the meter's
+            // drop has a visible cause and the transcript isn't silently stitched.
+            let meta = try? decoder.decode(ClaudeWire.CompactBoundary.self, from: data)
+            output.events.append(.contextCompacted(ContextCompaction(
+                turnID: currentTurnID,
+                trigger: meta?.compactMetadata?.trigger,
+                preTokens: meta?.compactMetadata?.preTokens
+            )))
+
         default:
             // hook_started / hook_response and friends: diagnostics, not chat.
             break

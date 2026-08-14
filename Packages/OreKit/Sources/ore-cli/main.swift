@@ -412,6 +412,8 @@ actor EventPrinter {
             return "! \(error.message)" + (error.detail.map { "\n    \($0)" } ?? "")
         case .sessionEnded(let ended):
             return "· session ended (exit \(ended.exitCode.map(String.init) ?? "?"))"
+        case .contextCompacted(let compaction):
+            return "· \(compaction.summary)"
         }
     }
 }

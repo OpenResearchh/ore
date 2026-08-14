@@ -108,6 +108,10 @@ struct TranscriptView: NSViewRepresentable {
         /// once per (row, width) rather than on every scroll tick.
         private var heightCache: [String: CGFloat] = [:]
         private var cachedWidth: CGFloat = 0
+        /// The turn-rail inputs last pushed, so a streaming delta (which changes
+        /// neither) doesn't force the rail to redraw and rebuild tracking areas.
+        private var railTurnRows: [Int] = []
+        private var railTotalRows = 0
 
         init(
             persistenceKey: String,
@@ -169,10 +173,16 @@ struct TranscriptView: NSViewRepresentable {
                 tableView.reloadData()
             }
 
-            container?.turnRail.update(
-                turnRows: newRows.indices.filter { newRows[$0].kind == .userMessage },
-                totalRows: newRows.count
-            )
+            // The rail only depends on where the user messages sit and the total
+            // row count — neither changes while text streams into the last row.
+            // Skipping the redraw + tracking-area rebuild on every delta is what
+            // keeps streaming cheap.
+            let turnRows = newRows.indices.filter { newRows[$0].kind == .userMessage }
+            if turnRows != railTurnRows || newRows.count != railTotalRows {
+                railTurnRows = turnRows
+                railTotalRows = newRows.count
+                container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
+            }
 
             if previous.isEmpty, !newRows.isEmpty,
                let scrollView = tableView.enclosingScrollView {
@@ -277,9 +287,25 @@ struct TranscriptView: NSViewRepresentable {
             guard let tableView, let rail = container?.turnRail else { return }
             let visible = tableView.rows(in: tableView.visibleRect)
             let middle = visible.location + max(visible.length / 2, 0)
-            rail.activeRow = rail.turnRows.min {
-                abs($0 - middle) < abs($1 - middle)
+            rail.activeRow = Self.nearest(to: middle, in: rail.turnRows)
+        }
+
+        /// Closest value in an ascending array, in O(log n). The rail resolves
+        /// this on every scroll tick; a linear scan over every user message was
+        /// work a fast scroll could feel in a long conversation.
+        private static func nearest(to target: Int, in sorted: [Int]) -> Int? {
+            guard !sorted.isEmpty else { return nil }
+            var low = 0
+            var high = sorted.count - 1
+            while low < high {
+                let mid = (low + high) / 2
+                if sorted[mid] < target { low = mid + 1 } else { high = mid }
             }
+            // `low` is the first element >= target; its predecessor may be nearer.
+            if low > 0, abs(sorted[low - 1] - target) <= abs(sorted[low] - target) {
+                return sorted[low - 1]
+            }
+            return sorted[low]
         }
     }
 }
@@ -317,7 +343,9 @@ final class TranscriptContainerView: NSView {
 final class TurnRailView: NSView {
     var turnRows: [Int] = []
     var totalRows = 0
-    var activeRow: Int? { didSet { needsDisplay = true } }
+    // Only a genuine change is worth a redraw; the scroll observer sets this on
+    // every tick, and most ticks leave the active turn exactly where it was.
+    var activeRow: Int? { didSet { if oldValue != activeRow { needsDisplay = true } } }
     var onSelectRow: ((Int) -> Void)?
     private var isHovering = false
 
@@ -741,6 +769,7 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
             hasher.combine(row.activitySignature)
+            hasher.combine(row.subagentChildCount)
             return hasher.finalize()
         }
 
@@ -1008,6 +1037,23 @@ final class TranscriptCell: NSTableCellView {
                     ]
                 ))
             }
+        }
+        // A subagent (Task) row is a collapsible group: show how many steps ran
+        // inside it and a disclosure chevron, and stop here — its children are
+        // separate rows below, so the noisy launch blob isn't worth showing.
+        if let steps = row.subagentChildCount {
+            result.append(NSAttributedString(
+                string: "  · \(steps) step\(steps == 1 ? "" : "s")",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            ))
+            result.append(NSAttributedString(
+                string: row.isExpanded ? "   ⌄" : "   ›",
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor]
+            ))
+            return result
         }
         if !item.detail.isEmpty {
             result.append(NSAttributedString(

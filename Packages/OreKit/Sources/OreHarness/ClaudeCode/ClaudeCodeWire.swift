@@ -51,6 +51,26 @@ enum ClaudeWire {
         var state: String?
     }
 
+    /// Emitted when Claude Code auto-compacts its own context to stay under the
+    /// window: `{"type":"system","subtype":"compact_boundary","compact_metadata":…}`.
+    struct CompactBoundary: Decodable {
+        var compactMetadata: Metadata?
+
+        enum CodingKeys: String, CodingKey {
+            case compactMetadata = "compact_metadata"
+        }
+
+        struct Metadata: Decodable {
+            var trigger: String?
+            var preTokens: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case trigger
+                case preTokens = "pre_tokens"
+            }
+        }
+    }
+
     // MARK: - Assistant / user messages
 
     struct AssistantMessage: Decodable {

@@ -351,6 +351,9 @@ public struct BlockRecord: Codable, FetchableRecord, PersistableRecord, Sendable
         case plan
         case permission
         case question
+        /// A transcript marker that isn't chat — e.g. the harness auto-compacted
+        /// its context. Replayed as a divider.
+        case notice
     }
 
     public var id: String

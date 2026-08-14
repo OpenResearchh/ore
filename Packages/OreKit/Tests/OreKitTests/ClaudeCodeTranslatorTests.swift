@@ -64,6 +64,26 @@ struct ClaudeCodeTranslatorTests {
         #expect(completed[0].usage?.outputTokens ?? 0 > 0)
     }
 
+    @Test func autoCompactionSurfacesAsAContextCompactedEvent() {
+        // Claude Code compacts its own context and announces it with a
+        // `compact_boundary` system line; ORE surfaces that so the transcript —
+        // and the context meter's drop — isn't left unexplained.
+        let transcript = """
+        {"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":152000}}
+        """
+        let events = ClaudeCodeTranscriptReplay.events(transcript: transcript)
+        guard case .contextCompacted(let compaction)? = events.first(where: {
+            if case .contextCompacted = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no contextCompacted event")
+            return
+        }
+        #expect(compaction.trigger == "auto")
+        #expect(compaction.preTokens == 152_000)
+        #expect(compaction.summary.contains("152000"))
+    }
+
     @Test func subscriptionSessionsNeverReportADollarCost() {
         // The fixture's `result` carries `total_cost_usd`, but the user is on a
         // subscription and is not billed per token. Surfacing that number would

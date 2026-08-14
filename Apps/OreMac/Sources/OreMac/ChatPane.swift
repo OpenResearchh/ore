@@ -381,7 +381,44 @@ struct ChatPane: View {
                 result.append(row)
             }
         }
-        return result
+        return nestSubagents(result)
+    }
+
+    /// Folds each subagent's tool uses under the Task ("Agent") row that spawned
+    /// them, so a subagent reads as its own collapsible group rather than a flat
+    /// indented run. A subagent's children appear only when its Agent row is
+    /// expanded; a normal transcript with no subagents passes through untouched.
+    private func nestSubagents(_ rows: [TranscriptRow]) -> [TranscriptRow] {
+        let childrenByParent = Dictionary(
+            grouping: rows.filter { $0.parentToolCallID != nil },
+            by: { $0.parentToolCallID! }
+        )
+        guard !childrenByParent.isEmpty else { return rows }
+        let present = Set(rows.compactMap(\.toolCallID))
+
+        var output: [TranscriptRow] = []
+        func emit(_ row: TranscriptRow) {
+            var item = row
+            if item.kind == .toolCall || item.kind == .thinking
+                || item.kind == .error || item.kind == .activityGroup {
+                item.isExpanded = expandedActivityGroups.contains(row.id)
+            }
+            if let id = row.toolCallID, let children = childrenByParent[id] {
+                item.subagentChildCount = children.count
+                output.append(item)
+                if item.isExpanded { children.forEach(emit) }
+            } else {
+                output.append(item)
+            }
+        }
+        for row in rows {
+            // A subagent child is emitted beneath its Agent, not at the top
+            // level — unless its Agent isn't shown here, in which case it stays
+            // inline so it never silently disappears.
+            if let parent = row.parentToolCallID, present.contains(parent) { continue }
+            emit(row)
+        }
+        return output
     }
 
     private static func isActivity(_ row: TranscriptRow) -> Bool {

@@ -196,20 +196,22 @@ public enum SuggestedGitActionResolver {
             )
         }
 
-        if context.unpushedCommitCount > 0
-            || (!context.hasUpstream && context.commitsAheadOfBase > 0) {
-            return .push(
-                commitCount: context.unpushedCommitCount,
-                isFirstPush: !context.hasUpstream
-            )
-        }
-
+        // No PR yet: opening one publishes the branch in the same step (the core
+        // pushes `-u` before `gh pr create`), so the flow never stops at a
+        // separate "Publish branch" button first — that was the extra click. A
+        // branch with no commits ahead of base has nothing to open a PR from.
         guard let pullRequest = context.pullRequest, pullRequest.isOpen else {
-            guard context.hasUpstream, context.commitsAheadOfBase > 0 else { return .none }
+            guard context.commitsAheadOfBase > 0 else { return .none }
             return .createPullRequest(
                 base: context.parentBranch ?? context.baseBranch,
                 isStacked: context.parentBranch != nil
             )
+        }
+
+        // A PR is already open: new local commits update it, so push them before
+        // reading the PR's checks and review state.
+        if context.unpushedCommitCount > 0 {
+            return .push(commitCount: context.unpushedCommitCount, isFirstPush: false)
         }
 
         if pullRequest.hasConflicts {

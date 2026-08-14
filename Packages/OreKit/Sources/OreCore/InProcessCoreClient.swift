@@ -555,7 +555,12 @@ public actor InProcessCoreClient: CoreClient {
     private func createPullRequest(
         _ id: WorkspaceID, title: String, body: String, base: String, draft: Bool
     ) async throws -> String {
-        let (record, _, _) = try await workspaceAndGit(id)
+        let (record, git, worktree) = try await workspaceAndGit(id)
+        // Publishing is part of opening a PR now, not a step before it: `gh pr
+        // create --head` needs the branch on the remote, so push (and set
+        // upstream) first. This is a no-op — "Everything up-to-date" — when the
+        // branch is already published, so it stays safe to re-run.
+        try await git.runSerialized(["push", "-u", "origin", record.branch], in: worktree)
         let github = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
         let url = try await github.createPullRequest(
             branch: record.branch,

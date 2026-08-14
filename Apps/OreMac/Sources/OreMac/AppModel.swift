@@ -235,18 +235,25 @@ final class AppModel {
         case .text:
             return TranscriptRow(
                 id: block.id, turnID: turnID, kind: .assistantText,
-                text: block.text, isComplete: true, createdAt: block.createdAt
+                text: block.text,
+                parentToolCallID: block.parentToolCallID.map(ToolCallID.init(rawValue:)),
+                isComplete: true, createdAt: block.createdAt
             )
         case .thinking:
             return TranscriptRow(
                 id: block.id, turnID: turnID, kind: .thinking,
-                text: block.text, isComplete: true, createdAt: block.createdAt
+                text: block.text,
+                parentToolCallID: block.parentToolCallID.map(ToolCallID.init(rawValue:)),
+                isComplete: true, createdAt: block.createdAt
             )
         case .toolCall:
+            // Restore the subagent link so a reloaded transcript nests each
+            // Task's tool uses under it, exactly as a live one does.
             return TranscriptRow(
                 id: block.id, turnID: turnID, kind: .toolCall,
                 text: block.text, toolName: block.toolName,
                 toolCallID: block.toolCallID.map(ToolCallID.init(rawValue:)),
+                parentToolCallID: block.parentToolCallID.map(ToolCallID.init(rawValue:)),
                 toolInput: block.decodedPayload,
                 isComplete: true, createdAt: block.createdAt
             )
@@ -263,6 +270,11 @@ final class AppModel {
             // Both are resolved by the time history is read; replaying them
             // would show a prompt nobody can answer.
             return nil
+        case .notice:
+            return TranscriptRow(
+                id: block.id, turnID: turnID, kind: .divider,
+                text: block.text, isComplete: true, createdAt: block.createdAt
+            )
         }
     }
 

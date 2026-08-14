@@ -52,12 +52,14 @@ struct SuggestedGitActionTests {
         #expect(action.title == "Commit 3 files")
     }
 
-    @Test func aBranchWithNoUpstreamIsPublishedRatherThanPushed() {
+    @Test func anUnpublishedBranchGoesStraightToCreatePR() {
+        // Publishing is folded into "Create pull request" (the core pushes `-u`
+        // before `gh pr create`), so an unpushed branch with work no longer stops
+        // at a separate "Publish branch" button first.
         let action = SuggestedGitActionResolver.resolve(GitActionContext(
-            unpushedCommitCount: 2, hasUpstream: false
+            commitsAheadOfBase: 2, hasUpstream: false, baseBranch: "main"
         ))
-        #expect(action == .push(commitCount: 2, isFirstPush: true))
-        #expect(action.title == "Publish branch")
+        #expect(action == .createPullRequest(base: "main", isStacked: false))
     }
 
     @Test func pushedWorkWithNoPullRequestOffersToOpenOne() {
@@ -65,6 +67,19 @@ struct SuggestedGitActionTests {
             commitsAheadOfBase: 2, hasUpstream: true, baseBranch: "main"
         ))
         #expect(action == .createPullRequest(base: "main", isStacked: false))
+    }
+
+    @Test func newCommitsOnAnOpenPullRequestArePushedToUpdateIt() {
+        // Once a PR exists, local commits that aren't on the remote yet update it
+        // — that's the one place a bare push still surfaces in the ready flow.
+        let action = SuggestedGitActionResolver.resolve(GitActionContext(
+            unpushedCommitCount: 3,
+            commitsAheadOfBase: 5,
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("build", "SUCCESS")])
+        ))
+        #expect(action == .push(commitCount: 3, isFirstPush: false))
+        #expect(action.title == "Push 3 commits")
     }
 
     @Test func failingChecksGoToTheAgentRatherThanToTheBrowser() {

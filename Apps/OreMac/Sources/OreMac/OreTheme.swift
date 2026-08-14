@@ -125,6 +125,7 @@ struct OreNavigationSelection: ViewModifier {
 struct OrePrimaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         if #available(macOS 26.0, *) {
             configuration.label
@@ -155,6 +156,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
 }
 
 struct OreSecondaryButtonStyle: ButtonStyle {
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         if #available(macOS 26.0, *) {
             configuration.label
@@ -179,6 +181,7 @@ struct OreSecondaryButtonStyle: ButtonStyle {
 /// surface is intentionally quiet. This is shared by composer controls and
 /// custom tabs so pressing never feels like clicking static text.
 struct OrePressableButtonStyle: ButtonStyle {
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.97 : 1)

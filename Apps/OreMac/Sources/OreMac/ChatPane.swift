@@ -18,7 +18,6 @@ struct ChatPane: View {
     @State private var queuedMessages: [QueuedMessageRecord] = []
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
-    @State private var attachments: [Attachment] = []
     @State private var showModelChooser = false
     @State private var showEffortChooser = false
     @State private var reasoningEffort: ReasoningEffort = .high
@@ -77,6 +76,7 @@ struct ChatPane: View {
                 } else {
                     TranscriptView(
                         rows: displayRows,
+                        worktreePath: workspace.worktreePath,
                         persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
                         onRevert: { revertTarget = $0 },
                         onToggleActivity: { toggleActivity($0) },
@@ -167,7 +167,20 @@ struct ChatPane: View {
             // Hard failures — usage limits especially — belong where the user
             // is about to act, not buried as a red row up in the transcript.
             if let error = chat.prominentError {
-                ProminentErrorBanner(error: error) { chat.dismissProminentError() }
+                ProminentErrorBanner(
+                    error: error,
+                    scheduled: model.scheduledContinuation(for: chatSummary?.id),
+                    onContinueWhenAvailable: scheduleContinuation,
+                    onCancelSchedule: cancelScheduledContinuation,
+                    onDismiss: { chat.dismissProminentError() }
+                )
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, OreTheme.Space.md)
+                    .padding(.top, OreTheme.Space.sm)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
+                ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
                     .frame(maxWidth: OreTheme.contentMaxWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, OreTheme.Space.md)
@@ -218,11 +231,15 @@ struct ChatPane: View {
             queuedMessages = await model.queuedMessages(for: id)
         }
         .onChange(of: draft) { _, value in
-            attachments.removeAll { attachment in
+            guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            var next = chat.draftAttachments
+            next.removeAll { attachment in
                 !attachment.relativePath.hasPrefix(".context/attachments/")
                     && !value.contains("@\(attachment.displayName)")
             }
-            guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            if next != chat.draftAttachments {
+                model.persistDraftAttachments(next, for: chatSummary.id)
+            }
             model.setDraft(value, for: chatSummary)
         }
         .task(id: chatSummary?.id) {
@@ -502,7 +519,7 @@ struct ChatPane: View {
                 Text(tab.title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if !tab.draftText.isEmpty {
+                if !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
                     Image(systemName: "pencil").font(.system(size: 8))
                 }
                 if tab.queuedMessageCount > 0 {
@@ -636,22 +653,22 @@ struct ChatPane: View {
     private var composer: some View {
         VStack(spacing: OreTheme.Space.sm) {
             if !externalAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(externalAttachments, id: \.offset) { index, attachment in
-                            HStack(spacing: 5) {
-                                SourceFileIcon(path: attachment.displayName, size: 16)
-                                Text("@\(attachment.displayName)").lineLimit(1)
-                                Button { attachments.remove(at: index) } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                }.buttonStyle(.plain)
-                            }
-                            .font(.caption)
-                            .padding(.horizontal, 8).padding(.vertical, 5)
-                            .background(OreTheme.subduedFill, in: Capsule())
+                AttachmentChipStrip(
+                    attachments: externalAttachments.map {
+                        AttachmentChipStrip.IndexedAttachment(index: $0.offset, attachment: $0.element)
+                    },
+                    worktreePath: workspace.worktreePath,
+                    onRemove: { index in
+                        var next = chat.draftAttachments
+                        guard next.indices.contains(index) else { return }
+                        next.remove(at: index)
+                        if let chatSummary {
+                            model.persistDraftAttachments(next, for: chatSummary.id)
+                        } else {
+                            chat.draftAttachments = next
                         }
                     }
-                }
+                )
             }
 
             if !slashCommands.isEmpty {
@@ -718,9 +735,7 @@ struct ChatPane: View {
 
             InlineMentionTextEditor(
                 text: $draft,
-                mentionNames: attachments
-                    .filter { !$0.relativePath.hasPrefix(".context/attachments/") }
-                    .map(\.displayName),
+                mentionNames: chat.draftAttachments.map(\.displayName),
                 onTab: acceptFirstMentionSuggestion,
                 onPaste: handlePasteboard
             )
@@ -1117,7 +1132,7 @@ struct ChatPane: View {
             .buttonStyle(.glassProminent)
             .buttonBorderShape(.circle)
             .tint(.accentColor)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
             .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
         } else {
@@ -1130,7 +1145,7 @@ struct ChatPane: View {
                     .shadow(color: Color.accentColor.opacity(0.16), radius: 3, y: 1)
             }
             .buttonStyle(.plain)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
             .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
         }
@@ -1146,6 +1161,7 @@ struct ChatPane: View {
 
     private func send() {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = chat.draftAttachments
         guard !text.isEmpty || !attachments.isEmpty else { return }
         if text.isEmpty { text = "Review the attached files." }
         model.send(
@@ -1156,7 +1172,11 @@ struct ChatPane: View {
             to: workspace.id
         )
         draft = ""
-        attachments = []
+        if let chatSummary {
+            model.persistDraftAttachments([], for: chatSummary.id)
+        } else {
+            chat.draftAttachments = []
+        }
     }
 
     private func chooseFiles() {
@@ -1183,8 +1203,16 @@ struct ChatPane: View {
     }
 
     private var externalAttachments: [(offset: Int, element: Attachment)] {
-        Array(attachments.enumerated()).filter {
+        Array(chat.draftAttachments.enumerated()).filter {
             $0.element.relativePath.hasPrefix(".context/attachments/")
+        }
+    }
+
+    private func persistAttachments(_ attachments: [Attachment]) {
+        if let chatSummary {
+            model.persistDraftAttachments(attachments, for: chatSummary.id)
+        } else {
+            chat.draftAttachments = attachments
         }
     }
 
@@ -1192,18 +1220,20 @@ struct ChatPane: View {
         let folder = URL(fileURLWithPath: workspace.worktreePath)
             .appendingPathComponent(".context/attachments", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var next = chat.draftAttachments
         for source in urls where source.isFileURL {
             let name = "\(UUID().uuidString.prefix(8))-\(source.lastPathComponent)"
             let destination = folder.appendingPathComponent(name)
             do {
                 try FileManager.default.copyItem(at: source, to: destination)
-                attachments.append(Attachment(
+                next.append(Attachment(
                     relativePath: ".context/attachments/\(name)",
                     displayName: source.lastPathComponent,
                     mimeType: UTType(filenameExtension: source.pathExtension)?.preferredMIMEType
                 ))
             } catch { continue }
         }
+        persistAttachments(next)
     }
 
     /// Attaches whatever was pasted: a copied file lands as a file attachment, a
@@ -1236,6 +1266,7 @@ struct ChatPane: View {
             .appendingPathComponent(".context/attachments", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var added = false
+        var next = chat.draftAttachments
         for image in images {
             guard let tiff = image.tiffRepresentation,
                   let rep = NSBitmapImageRep(data: tiff),
@@ -1245,7 +1276,7 @@ struct ChatPane: View {
             let destination = folder.appendingPathComponent(name)
             do {
                 try png.write(to: destination)
-                attachments.append(Attachment(
+                next.append(Attachment(
                     relativePath: ".context/attachments/\(name)",
                     displayName: display,
                     mimeType: "image/png"
@@ -1253,6 +1284,7 @@ struct ChatPane: View {
                 added = true
             } catch { continue }
         }
+        if added { persistAttachments(next) }
         return added
     }
 
@@ -1268,7 +1300,7 @@ struct ChatPane: View {
         return workspaceFileIndex
             .filter { node in
                 !node.isDirectory
-                    && !attachments.contains(where: { $0.relativePath == node.path })
+                    && !chat.draftAttachments.contains(where: { $0.relativePath == node.path })
                     && (query.isEmpty
                         || node.name.lowercased().contains(query)
                         || node.path.lowercased().contains(query))
@@ -1314,8 +1346,10 @@ struct ChatPane: View {
         displayName: String,
         appendToken: Bool = true
     ) {
-        if !attachments.contains(where: { $0.relativePath == path }) {
-            attachments.append(Attachment(relativePath: path, displayName: displayName))
+        if !chat.draftAttachments.contains(where: { $0.relativePath == path }) {
+            persistAttachments(chat.draftAttachments + [
+                Attachment(relativePath: path, displayName: displayName)
+            ])
         }
         if appendToken {
             if !draft.isEmpty, !draft.last!.isWhitespace { draft.append(" ") }
@@ -1366,6 +1400,24 @@ struct ChatPane: View {
         model.openSourceFile(path, in: workspace.id, line: focusLine)
     }
 
+    private func scheduleContinuation() {
+        guard let chatSummary else { return }
+        let resumeAt = chat.prominentError?.resetsAt
+            ?? chat.rateLimit?.resetsAt
+            ?? UsageLimitReset.parse(chat.prominentError?.message ?? "")
+            ?? Date().addingTimeInterval(60 * 60)
+        model.scheduleContinuation(
+            workspaceID: workspace.id,
+            chatID: chatSummary.id,
+            resumeAt: resumeAt
+        )
+    }
+
+    private func cancelScheduledContinuation() {
+        guard let chatSummary else { return }
+        model.cancelScheduledContinuation(for: chatSummary.id)
+    }
+
     private func run(_ command: ComposerCommand) {
         switch command.name {
         case "/plan":
@@ -1376,7 +1428,9 @@ struct ChatPane: View {
         case "/fix": draft = "Diagnose and fix the issue: "
         case "/explain": draft = "Explain this code clearly: "
         case "/model": draft = ""; showModelChooser = true
-        case "/clear": draft = ""; attachments = []
+        case "/clear":
+            draft = ""
+            persistAttachments([])
         default: break
         }
         composerFocused = true
@@ -1801,6 +1855,9 @@ private struct ContextMeter: View {
 /// often a usage/rate limit the user needs to act on before sending again.
 private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
+    var scheduled: ScheduledContinuation?
+    var onContinueWhenAvailable: () -> Void
+    var onCancelSchedule: () -> Void
     let onDismiss: () -> Void
 
     private var tint: Color { error.isUsageLimit ? OreTheme.warning : .red }
@@ -1810,6 +1867,7 @@ private struct ProminentErrorBanner: View {
     private var title: String {
         error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
     }
+    private var resetDate: Date? { scheduled?.resumeAt ?? error.resetsAt }
 
     var body: some View {
         HStack(alignment: .top, spacing: OreTheme.Space.sm) {
@@ -1818,7 +1876,7 @@ private struct ProminentErrorBanner: View {
                 .foregroundStyle(tint)
                 .padding(.top, 1)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(title)
                     .font(.system(size: OreTheme.Font.body, weight: .semibold))
                 Text(.init(error.message))
@@ -1827,6 +1885,14 @@ private struct ProminentErrorBanner: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                if error.isUsageLimit {
+                    if let scheduled {
+                        scheduledActions(scheduled)
+                    } else {
+                        continueButton
+                    }
+                }
             }
 
             Button(action: onDismiss) {
@@ -1844,6 +1910,72 @@ private struct ProminentErrorBanner: View {
         .overlay {
             RoundedRectangle(cornerRadius: OreTheme.controlRadius)
                 .stroke(tint.opacity(0.35), lineWidth: 1)
+        }
+    }
+
+    private var continueButton: some View {
+        Button(action: onContinueWhenAvailable) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                Text(continueButtonTitle)
+            }
+            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(tint.opacity(0.18), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Automatically continue this chat when the session limit resets")
+    }
+
+    private var continueButtonTitle: String {
+        if let resetDate {
+            return "Continue when it resets · \(UsageLimitReset.format(resetDate))"
+        }
+        return "Continue when it resets"
+    }
+
+    private func scheduledActions(_ scheduled: ScheduledContinuation) -> some View {
+        HStack(spacing: 8) {
+            Label(
+                "Will continue at \(UsageLimitReset.format(scheduled.resumeAt))",
+                systemImage: "checkmark.circle.fill"
+            )
+            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+            .foregroundStyle(.secondary)
+            Button("Cancel", action: onCancelSchedule)
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct ScheduledContinuationBanner: View {
+    let item: ScheduledContinuation
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(OreTheme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Continuing when the limit resets")
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                Text(UsageLimitReset.format(item.resumeAt))
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Button("Cancel", action: onCancel)
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(OreTheme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(OreTheme.warning.opacity(0.35), lineWidth: 1)
         }
     }
 }

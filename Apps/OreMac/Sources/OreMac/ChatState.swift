@@ -28,14 +28,21 @@ final class ChatState {
     struct ProminentError: Equatable {
         var message: String
         var isUsageLimit: Bool
+        var resetsAt: Date?
     }
     private(set) var prominentError: ProminentError?
 
     func dismissProminentError() { prominentError = nil }
 
+    /// Files attached to the unsent draft. Kept on the chat, not the pane, so
+    /// switching tabs restores chips and mention pills instead of leaving bare
+    /// `@pasted-image.png` text.
+    var draftAttachments: [Attachment] = []
+
     private static func looksLikeUsageLimit(_ text: String) -> Bool {
         let value = text.lowercased()
         return value.contains("usage limit")
+            || value.contains("session limit")
             || value.contains("rate limit")
             || value.contains("rate-limit")
             || value.contains("quota")
@@ -129,6 +136,9 @@ final class ChatState {
 
         case .rateLimit(let report):
             rateLimit = report
+            if prominentError?.isUsageLimit == true {
+                prominentError?.resetsAt = report.resetsAt ?? prominentError?.resetsAt
+            }
 
         case .turnCompleted(let result):
             currentTurnID = nil
@@ -143,7 +153,9 @@ final class ChatState {
                 ))
                 prominentError = ProminentError(
                     message: message,
-                    isUsageLimit: Self.looksLikeUsageLimit(message)
+                    isUsageLimit: Self.looksLikeUsageLimit(message),
+                    resetsAt: rateLimit?.resetsAt
+                        ?? UsageLimitReset.parse(message)
                 )
             }
 
@@ -158,7 +170,10 @@ final class ChatState {
             prominentError = ProminentError(
                 message: error.message,
                 isUsageLimit: error.kind == .rateLimited
-                    || Self.looksLikeUsageLimit(error.message)
+                    || Self.looksLikeUsageLimit(error.message),
+                resetsAt: rateLimit?.resetsAt
+                    ?? UsageLimitReset.parse(error.message)
+                    ?? UsageLimitReset.parse(error.detail ?? "")
             )
 
         case .sessionEnded:
@@ -188,15 +203,13 @@ final class ChatState {
         attachments: [Attachment] = [],
         comments: [DiffCommentReference]
     ) {
-        let attachmentLine = attachments.isEmpty
-            ? ""
-            : "\n\n" + attachments.map { "@\($0.displayName)" }.joined(separator: "  ")
         rows.append(TranscriptRow(
             id: "user-\(UUID().uuidString)",
             turnID: currentTurnID ?? TurnID(rawValue: "pending"),
             kind: .userMessage,
-            text: text + attachmentLine,
-            attachedComments: comments
+            text: text,
+            attachedComments: comments,
+            attachments: attachments
         ))
         // Optimistic: the agent hasn't reported anything yet, but the user
         // pressed send and the UI must not look idle.
@@ -314,6 +327,7 @@ struct TranscriptRow: Identifiable, Sendable {
     var isComplete = false
     var permissionRequestID: PermissionRequestID?
     var attachedComments: [DiffCommentReference] = []
+    var attachments: [Attachment] = []
     var groupedRows: [TranscriptRow] = []
     var isExpanded = false
     var createdAt: Date = Date()

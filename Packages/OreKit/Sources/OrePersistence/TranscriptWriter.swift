@@ -22,6 +22,7 @@ public actor TranscriptWriter {
         var nextBlockOrdinal: Int
         var startedAt: Date
         var prompt: String?
+        var promptAttachments: [Attachment]
         var usage: UsageReport?
     }
 
@@ -40,11 +41,13 @@ public actor TranscriptWriter {
     /// Records the prompt that opens the next turn. Called on send, before the
     /// harness has told us anything, so the user's own message is never the
     /// thing that goes missing.
-    public func recordPrompt(_ text: String) {
+    public func recordPrompt(_ text: String, attachments: [Attachment] = []) {
         pendingPrompt = text
+        pendingAttachments = attachments
     }
 
     private var pendingPrompt: String?
+    private var pendingAttachments: [Attachment] = []
 
     public func handle(_ event: AgentEvent) async {
         do {
@@ -87,9 +90,11 @@ public actor TranscriptWriter {
                 ordinal: ordinal,
                 nextBlockOrdinal: 0,
                 startedAt: Date(),
-                prompt: pendingPrompt
+                prompt: pendingPrompt,
+                promptAttachments: pendingAttachments
             )
             pendingPrompt = nil
+            pendingAttachments = []
             currentTurn = state
             try await store.saveTurn(TurnRecord(
                 id: state.id,
@@ -98,6 +103,7 @@ public actor TranscriptWriter {
                 prompt: state.prompt,
                 checkpointCommit: pendingCheckpointCommit,
                 checkpointProviderSessionID: pendingCheckpointSessionID,
+                attachments: state.promptAttachments,
                 startedAt: state.startedAt
             ))
             pendingCheckpointCommit = nil
@@ -212,6 +218,7 @@ public actor TranscriptWriter {
                 checkpointCommit: try await store.turn(result.turnID)?.checkpointCommit,
                 checkpointProviderSessionID:
                     try await store.turn(result.turnID)?.checkpointProviderSessionID,
+                attachments: turn.promptAttachments,
                 startedAt: turn.startedAt,
                 endedAt: Date()
             ))

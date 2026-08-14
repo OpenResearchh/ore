@@ -397,7 +397,13 @@ struct TranscriptWriterTests {
         let (store, writer, sessionID) = try await makeWriter()
         let turnID = TurnID(rawValue: "t1")
 
-        await writer.recordPrompt("add a test")
+        await writer.recordPrompt("add a test", attachments: [
+            Attachment(
+                relativePath: ".context/attachments/shot.png",
+                displayName: "pasted-image.png",
+                mimeType: "image/png"
+            )
+        ])
         for event in [
             AgentEvent.sessionStarted(SessionStarted(
                 sessionID: sessionID, providerSessionID: "p1", harness: .claudeCode,
@@ -428,6 +434,8 @@ struct TranscriptWriterTests {
         let turns = try await store.turns(sessionID: sessionID)
         #expect(turns.count == 1)
         #expect(turns[0].prompt == "add a test")
+        #expect(turns[0].attachments.map(\.relativePath) == [".context/attachments/shot.png"])
+        #expect(turns[0].attachments.first?.displayName == "pasted-image.png")
         #expect(turns[0].outcome == "completed")
         #expect(turns[0].summary == "Added the test.")
         #expect(turns[0].inputTokens == 10)

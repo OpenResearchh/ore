@@ -1,4 +1,5 @@
 import AppKit
+import OreProtocol
 import Testing
 
 @testable import OreMac
@@ -355,3 +356,80 @@ struct SourceFileIconTests {
         #expect(FileVisualIdentity(path: "src", isDirectory: true).symbol == "folder.fill")
     }
 }
+
+@MainActor
+struct UserMessageAttachmentTests {
+    @Test func sentUserBubblesKeepAttachmentChipsInsteadOfPlainTokens() {
+        let row = TranscriptRow(
+            id: "u1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "Look at this",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-image.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                ),
+                Attachment(relativePath: "Sources/App.swift", displayName: "App.swift"),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row)
+        // The typed prose stays; attachments render as chips, not a dumped
+        // `@pasted-image.png` suffix.
+        #expect(rendered.string.contains("Look at this"))
+        #expect(!rendered.string.contains("@pasted-image.png"))
+        var attachmentCount = 0
+        rendered.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            if value != nil { attachmentCount += 1 }
+        }
+        #expect(attachmentCount >= 2)
+    }
+
+    @Test func appendingAUserMessageStoresAttachmentsOnTheRow() {
+        let state = ChatState()
+        state.appendUserMessage(
+            "see this",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/shot.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                )
+            ],
+            comments: []
+        )
+        #expect(state.rows.count == 1)
+        #expect(state.rows[0].text == "see this")
+        #expect(state.rows[0].attachments.map(\.displayName) == ["pasted-image.png"])
+    }
+}
+
+struct UsageLimitResetTests {
+    @Test func parsesProviderResetCopyIntoTheNextWallClock() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let now = calendar.date(from: DateComponents(year: 2026, month: 4, day: 10, hour: 10, minute: 0))!
+        let parsed = UsageLimitReset.parse(
+            "You've hit your session limit · resets 5:30am (UTC)",
+            now: now
+        )
+        #expect(parsed != nil)
+        let hour = calendar.component(.hour, from: parsed!)
+        let minute = calendar.component(.minute, from: parsed!)
+        #expect(hour == 5)
+        #expect(minute == 30)
+        #expect(parsed! > now)
+    }
+
+    @Test func formatsResetTimesWithTheZone() {
+        let date = Date(timeIntervalSince1970: 0)
+        let zone = TimeZone(identifier: "UTC")!
+        let formatted = UsageLimitReset.format(date, timeZone: zone)
+        #expect(formatted.contains(zone.identifier) || formatted.contains("GMT") || formatted.contains("UTC"))
+    }
+}
+

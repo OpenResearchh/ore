@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import OreCore
@@ -79,6 +80,7 @@ final class AppModel {
             isLoaded = true
         }
         startFlushTimer()
+        restoreScheduledContinuations()
     }
 
     /// Flushes coalesced deltas at ~40Hz.
@@ -110,6 +112,8 @@ final class AppModel {
     func shutdown() async {
         eventTask?.cancel()
         flushTask?.cancel()
+        for task in continuationTasks.values { task.cancel() }
+        continuationTasks.removeAll()
         await client.shutdown()
     }
 
@@ -145,6 +149,7 @@ final class AppModel {
     func chat(for id: ChatID) -> ChatState {
         if let existing = chatStates[id] { return existing }
         let state = ChatState()
+        state.draftAttachments = Self.loadDraftAttachments(for: id)
         chatStates[id] = state
         Task { await loadHistory(for: id) }
         return state
@@ -175,6 +180,7 @@ final class AppModel {
                     kind: .userMessage,
                     text: prompt,
                     isComplete: true,
+                    attachments: turn.attachments,
                     createdAt: turn.startedAt
                 ))
             }
@@ -330,6 +336,8 @@ final class AppModel {
     ) {
         let state = chat(for: chatID)
         let comments = state.takeDraftComments()
+        cancelScheduledContinuation(for: chatID)
+        persistDraftAttachments([], for: chatID)
         state.appendUserMessage(text, attachments: attachments, comments: comments)
         Task {
             await client.send(.sendMessage(SendMessageRequest(
@@ -537,6 +545,139 @@ final class AppModel {
     func setDraft(_ text: String, for chat: ChatSummary) {
         upsertChat({ var copy = chat; copy.draftText = text; return copy }())
         Task { await client.send(.setChatDraft(chat.workspaceID, chat.id, text: text)) }
+    }
+
+    func persistDraftAttachments(_ attachments: [Attachment], for chatID: ChatID) {
+        chat(for: chatID).draftAttachments = attachments
+        let key = Self.draftAttachmentsKey(for: chatID)
+        if attachments.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else if let data = try? JSONEncoder().encode(attachments) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private static func loadDraftAttachments(for chatID: ChatID) -> [Attachment] {
+        let key = draftAttachmentsKey(for: chatID)
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([Attachment].self, from: data)) ?? []
+    }
+
+    private static func draftAttachmentsKey(for chatID: ChatID) -> String {
+        "ore.draftAttachments.\(chatID.rawValue)"
+    }
+
+    // MARK: - Scheduled continuation after usage limits
+
+    private(set) var scheduledContinuations: [ChatID: ScheduledContinuation] = [:]
+    private var continuationTasks: [ChatID: Task<Void, Never>] = [:]
+
+    func scheduledContinuation(for chatID: ChatID?) -> ScheduledContinuation? {
+        guard let chatID else { return nil }
+        return scheduledContinuations[chatID]
+    }
+
+    func scheduleContinuation(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        resumeAt: Date,
+        prompt: String = ScheduledContinuation.defaultPrompt
+    ) {
+        let item = ScheduledContinuation(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            resumeAt: resumeAt,
+            prompt: prompt
+        )
+        scheduledContinuations[chatID] = item
+        persistScheduledContinuations()
+        arm(item)
+        scheduleContinuationNotification(item)
+    }
+
+    func cancelScheduledContinuation(for chatID: ChatID) {
+        continuationTasks[chatID]?.cancel()
+        continuationTasks[chatID] = nil
+        scheduledContinuations[chatID] = nil
+        persistScheduledContinuations()
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.continuationNotificationID(for: chatID)])
+    }
+
+    private func restoreScheduledContinuations() {
+        guard let data = UserDefaults.standard.data(forKey: "ore.scheduledContinuations"),
+              let items = try? JSONDecoder().decode([ScheduledContinuation].self, from: data)
+        else { return }
+        for item in items {
+            scheduledContinuations[item.chatID] = item
+            arm(item)
+        }
+    }
+
+    private func persistScheduledContinuations() {
+        let items = Array(scheduledContinuations.values)
+        if items.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "ore.scheduledContinuations")
+        } else if let data = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(data, forKey: "ore.scheduledContinuations")
+        }
+    }
+
+    private func arm(_ item: ScheduledContinuation) {
+        continuationTasks[item.chatID]?.cancel()
+        continuationTasks[item.chatID] = Task { [weak self] in
+            let delay = item.resumeAt.timeIntervalSinceNow
+            if delay > 0 {
+                // A short buffer so the provider has actually opened the window
+                // before we send, rather than racing the reset second.
+                try? await Task.sleep(for: .seconds(delay + 15))
+            }
+            guard !Task.isCancelled else { return }
+            await self?.fireScheduledContinuation(item)
+        }
+    }
+
+    private func fireScheduledContinuation(_ item: ScheduledContinuation) async {
+        guard scheduledContinuations[item.chatID]?.resumeAt == item.resumeAt else { return }
+        scheduledContinuations[item.chatID] = nil
+        continuationTasks[item.chatID] = nil
+        persistScheduledContinuations()
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.continuationNotificationID(for: item.chatID)])
+
+        selectedWorkspaceID = item.workspaceID
+        selectChat(item.chatID, in: item.workspaceID)
+        showChatInCenter(item.workspaceID)
+        NSApp.activate(ignoringOtherApps: true)
+        send(item.prompt, to: item.workspaceID, chatID: item.chatID)
+        postNotification(
+            title: "Continuing \(workspaceName(item.workspaceID))",
+            body: "Session limit reset. Picking up where you left off."
+        )
+    }
+
+    private func scheduleContinuationNotification(_ item: ScheduledContinuation) {
+        let content = UNMutableNotificationContent()
+        content.title = "Session limit reset"
+        content.body = "Continuing \(workspaceName(item.workspaceID)) where you left off."
+        if UserDefaults.standard.object(forKey: "ore.notifications.sound") as? Bool ?? true {
+            content.sound = .default
+        }
+        content.userInfo = [
+            "workspaceID": item.workspaceID.rawValue,
+            "chatID": item.chatID.rawValue,
+        ]
+        let interval = max(item.resumeAt.timeIntervalSinceNow + 15, 1)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        UNUserNotificationCenter.current().add(UNNotificationRequest(
+            identifier: Self.continuationNotificationID(for: item.chatID),
+            content: content,
+            trigger: trigger
+        ))
+    }
+
+    private static func continuationNotificationID(for chatID: ChatID) -> String {
+        "ore.continue.\(chatID.rawValue)"
     }
 
     func cycleChat(in workspaceID: WorkspaceID, offset: Int) {

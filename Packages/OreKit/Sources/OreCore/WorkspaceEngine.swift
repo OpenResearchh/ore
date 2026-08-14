@@ -545,7 +545,7 @@ public actor WorkspaceEngine {
             reasoningEffort: request.reasoningEffort
         )
         try await captureCheckpoint(runtime: runtime)
-        await runtime.transcript?.recordPrompt(text)
+        await runtime.transcript?.recordPrompt(text, attachments: request.attachments)
         try await session.send(UserMessage(
             text: text,
             attachmentPaths: request.attachments.map(\.relativePath),

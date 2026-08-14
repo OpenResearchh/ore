@@ -16,6 +16,7 @@ import SwiftUI
 /// costs one text mutation per delta rather than a re-layout of the document.
 struct TranscriptView: NSViewRepresentable {
     var rows: [TranscriptRow]
+    var worktreePath: String = ""
     var persistenceKey: String
     var onRevert: (TurnID) -> Void
     var onToggleActivity: (String) -> Void
@@ -24,6 +25,7 @@ struct TranscriptView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             persistenceKey: persistenceKey,
+            worktreePath: worktreePath,
             onRevert: onRevert,
             onToggleActivity: onToggleActivity,
             onOpenFile: onOpenFile
@@ -86,6 +88,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.onRevert = onRevert
         context.coordinator.onToggleActivity = onToggleActivity
         context.coordinator.onOpenFile = onOpenFile
+        context.coordinator.worktreePath = worktreePath
         context.coordinator.update(rows: rows)
     }
 
@@ -100,6 +103,7 @@ struct TranscriptView: NSViewRepresentable {
         var onRevert: (TurnID) -> Void
         var onToggleActivity: (String) -> Void
         var onOpenFile: (String) -> Void
+        var worktreePath: String
         let persistenceKey: String
 
         private var rows: [TranscriptRow] = []
@@ -111,11 +115,13 @@ struct TranscriptView: NSViewRepresentable {
 
         init(
             persistenceKey: String,
+            worktreePath: String,
             onRevert: @escaping (TurnID) -> Void,
             onToggleActivity: @escaping (String) -> Void,
             onOpenFile: @escaping (String) -> Void
         ) {
             self.persistenceKey = persistenceKey
+            self.worktreePath = worktreePath
             self.onRevert = onRevert
             self.onToggleActivity = onToggleActivity
             self.onOpenFile = onOpenFile
@@ -140,7 +146,8 @@ struct TranscriptView: NSViewRepresentable {
                     || previous[index].isExpanded != newRows[index].isExpanded
                     || previous[index].toolInput != newRows[index].toolInput
                     || previous[index].resultMetadata != newRows[index].resultMetadata
-                    || previous[index].activitySignature != newRows[index].activitySignature {
+                    || previous[index].activitySignature != newRows[index].activitySignature
+                    || previous[index].attachments != newRows[index].attachments {
                     heightCache.removeValue(forKey: newRows[index].id)
                     changed.insert(index)
                 }
@@ -218,7 +225,7 @@ struct TranscriptView: NSViewRepresentable {
                 max(tableView.bounds.width - TranscriptCell.horizontalInset * 2, 100),
                 TranscriptCell.contentMaxWidth
             )
-            let height = TranscriptCell.height(for: item, width: width)
+            let height = TranscriptCell.height(for: item, width: width, worktreePath: worktreePath)
             heightCache[item.id] = height
             return height
         }
@@ -234,6 +241,7 @@ struct TranscriptView: NSViewRepresentable {
                 as? TranscriptCell ?? TranscriptCell(identifier: identifier)
             cell.configure(
                 with: rows[row],
+                worktreePath: worktreePath,
                 onRevert: onRevert,
                 onToggleActivity: onToggleActivity,
                 onOpenFile: onOpenFile
@@ -527,6 +535,7 @@ final class TranscriptCell: NSTableCellView {
 
     func configure(
         with row: TranscriptRow,
+        worktreePath: String = "",
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void
@@ -537,7 +546,7 @@ final class TranscriptCell: NSTableCellView {
         badgeHeightZero.isActive = badgeString.isEmpty
 
         let isUser = row.kind == .userMessage
-        copyableText = row.text
+        copyableText = Self.copyableText(for: row)
         isUserMessage = isUser
         // The copy button belongs to user messages; it stays hidden until the
         // row is hovered (see mouseEntered/Exited).
@@ -551,14 +560,14 @@ final class TranscriptCell: NSTableCellView {
         userWidthConstraint.isActive = isUser
 
         if isUser {
-            let natural = Self.attributedText(for: row).boundingRect(
+            let natural = Self.attributedText(for: row, worktreePath: worktreePath).boundingRect(
                 with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading]
             ).width + 20
             userWidthConstraint.constant = min(max(120, ceil(natural)), 620)
         }
 
-        let attributedText = Self.attributedText(for: row)
+        let attributedText = Self.attributedText(for: row, worktreePath: worktreePath)
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
         // Activity groups toggle on a click, so their text isn't selectable;
@@ -649,9 +658,9 @@ final class TranscriptCell: NSTableCellView {
 
     // MARK: - Presentation
 
-    static func height(for row: TranscriptRow, width: CGFloat) -> CGFloat {
+    static func height(for row: TranscriptRow, width: CGFloat, worktreePath: String = "") -> CGFloat {
         if row.kind == .divider { return 42 }
-        let attributed = attributedText(for: row)
+        let attributed = attributedText(for: row, worktreePath: worktreePath)
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
         let bounding = attributed.boundingRect(
@@ -670,7 +679,7 @@ final class TranscriptCell: NSTableCellView {
     /// and showing it raw makes the reader parse formatting by eye in the one
     /// place they are trying to read quickly. Measuring and drawing both go
     /// through here so a row's cached height always matches what it draws.
-    static func attributedText(for row: TranscriptRow) -> NSAttributedString {
+    static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         if let cached = renderCache.value(for: row) { return cached }
 
         let rendered: NSAttributedString
@@ -692,7 +701,10 @@ final class TranscriptCell: NSTableCellView {
         case .activityGroup:
             rendered = activityGroupText(for: row)
 
-        case .userMessage, .divider:
+        case .userMessage:
+            rendered = userMessageText(for: row, worktreePath: worktreePath)
+
+        case .divider:
             rendered = NSAttributedString(
                 string: displayText(for: row),
                 attributes: [.font: font(for: row), .foregroundColor: textColor(for: row)]
@@ -720,6 +732,7 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
             hasher.combine(row.activitySignature)
+            hasher.combine(row.attachments)
             return hasher.finalize()
         }
 
@@ -746,6 +759,128 @@ final class TranscriptCell: NSTableCellView {
         default:
             return row.text
         }
+    }
+
+    static func copyableText(for row: TranscriptRow) -> String {
+        guard !row.attachments.isEmpty else { return row.text }
+        let names = row.attachments.map { "@\($0.displayName)" }.joined(separator: "  ")
+        if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return names }
+        return row.text + "\n\n" + names
+    }
+
+    /// User bubbles keep the typed prose, then the same chips and image
+    /// previews the composer uses — a pasted screenshot should not collapse
+    /// into `@pasted-image.png` once it has been sent.
+    private static func userMessageText(
+        for row: TranscriptRow,
+        worktreePath: String
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font(for: row),
+            .foregroundColor: textColor(for: row),
+        ]
+        if !row.text.isEmpty {
+            result.append(styledMentions(row.text, attachments: row.attachments, attributes: attributes))
+        }
+
+        let images = row.attachments.filter(\.isImage)
+        let mentioned = Set(
+            row.attachments
+                .filter { row.text.contains("@\($0.displayName)") }
+                .map(\.relativePath)
+        )
+        let files = row.attachments.filter { !$0.isImage && !mentioned.contains($0.relativePath) }
+        if !images.isEmpty || !files.isEmpty {
+            if result.length > 0 {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+            }
+            for (index, attachment) in images.enumerated() {
+                if index > 0 { result.append(NSAttributedString(string: "  ", attributes: attributes)) }
+                appendImagePreview(attachment, worktreePath: worktreePath, to: result)
+                result.append(NSAttributedString(string: " ", attributes: attributes))
+                appendChip(for: attachment, to: result)
+            }
+            if !images.isEmpty, !files.isEmpty {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+            }
+            for (index, attachment) in files.enumerated() {
+                if index > 0 { result.append(NSAttributedString(string: " ", attributes: attributes)) }
+                appendChip(for: attachment, to: result)
+            }
+        }
+        if result.length == 0 {
+            result.append(NSAttributedString(string: " ", attributes: attributes))
+        }
+        return result
+    }
+
+    private static func styledMentions(
+        _ text: String,
+        attachments: [Attachment],
+        attributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: text, attributes: attributes)
+        let names = attachments.map(\.displayName).filter { !$0.isEmpty }
+        guard !names.isEmpty else { return result }
+        let source = result.string as NSString
+        for name in names {
+            let token = "@\(name)"
+            var search = NSRange(location: 0, length: source.length)
+            while search.length > 0 {
+                let found = source.range(of: token, options: [], range: search)
+                guard found.location != NSNotFound else { break }
+                result.addAttributes([
+                    .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                    .foregroundColor: NSColor.controlAccentColor,
+                    .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
+                ], range: found)
+                let next = NSMaxRange(found)
+                search = NSRange(location: next, length: source.length - next)
+            }
+        }
+        return result
+    }
+
+    private static func appendChip(for attachment: Attachment, to result: NSMutableAttributedString) {
+        let pill = subjectPillImage(
+            identity: FileVisualIdentity(path: attachment.displayName),
+            text: "@\(attachment.displayName)",
+            monospace: false
+        )
+        let cell = NSTextAttachment()
+        cell.image = pill
+        cell.bounds = NSRect(x: 0, y: -5, width: pill.size.width, height: pill.size.height)
+        result.append(NSAttributedString(attachment: cell))
+    }
+
+    private static func appendImagePreview(
+        _ attachment: Attachment,
+        worktreePath: String,
+        to result: NSMutableAttributedString
+    ) {
+        let url = attachment.fileURL(worktreePath: worktreePath)
+        guard let image = NSImage(contentsOf: url) else { return }
+        let maxWidth: CGFloat = 160
+        let maxHeight: CGFloat = 110
+        let size = image.size
+        let scale = min(maxWidth / max(size.width, 1), maxHeight / max(size.height, 1), 1)
+        let width = max(36, ceil(size.width * scale))
+        let height = max(28, ceil(size.height * scale))
+        let thumbnail = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
+            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).addClip()
+            image.draw(
+                in: rect,
+                from: NSRect(origin: .zero, size: size),
+                operation: .copy,
+                fraction: 1
+            )
+            return true
+        }
+        let cell = NSTextAttachment()
+        cell.image = thumbnail
+        cell.bounds = NSRect(x: 0, y: -4, width: width, height: height)
+        result.append(NSAttributedString(attachment: cell))
     }
 
     private static func badgeText(for row: TranscriptRow) -> String {

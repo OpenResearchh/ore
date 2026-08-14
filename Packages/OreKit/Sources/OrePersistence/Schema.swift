@@ -263,6 +263,15 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v4.promptAttachments") { db in
+            // User bubbles need the same chips and image previews as the
+            // composer. The prompt text only holds @-tokens; the files those
+            // tokens refer to live here so a reload can still render them.
+            try db.alter(table: "turn") { table in
+                table.add(column: "promptAttachments", .text).notNull().defaults(to: "[]")
+            }
+        }
+
         return migrator
     }
 }

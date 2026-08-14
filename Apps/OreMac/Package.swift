@@ -48,7 +48,13 @@ let package = Package(
                 .unsafeFlags(["-parse-as-library"])
             ]
         ),
-        .testTarget(name: "OreMacTests", dependencies: ["OreMac"]),
+        .testTarget(
+            name: "OreMacTests",
+            dependencies: [
+                "OreMac",
+                .product(name: "OreProtocol", package: "OreKit"),
+            ]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

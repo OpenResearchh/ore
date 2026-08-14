@@ -280,7 +280,9 @@ public actor ClaudeCodeSession: AgentSession {
                 isRecoverable: false
             )
         }
-        if lowercased.contains("rate limit") || lowercased.contains("usage limit") {
+        if lowercased.contains("rate limit")
+            || lowercased.contains("usage limit")
+            || lowercased.contains("session limit") {
             return SessionError(
                 kind: .rateLimited,
                 message: "Claude Code hit a usage limit.",

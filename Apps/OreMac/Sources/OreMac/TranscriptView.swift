@@ -112,6 +112,12 @@ struct TranscriptView: NSViewRepresentable {
         /// neither) doesn't force the rail to redraw and rebuild tracking areas.
         private var railTurnRows: [Int] = []
         private var railTotalRows = 0
+        /// A saved scroll offset waiting to be applied. Restoring before the
+        /// table has a real width (and therefore measured, correct row heights)
+        /// lands the offset in the empty band above still-unmeasured rows — the
+        /// blank that only fills in once a scroll forces a re-measure. So the
+        /// restore is deferred until the first real layout can honour it.
+        private var pendingScrollRestore: CGFloat?
 
         init(
             persistenceKey: String,
@@ -184,12 +190,11 @@ struct TranscriptView: NSViewRepresentable {
                 container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
             }
 
-            if previous.isEmpty, !newRows.isEmpty,
-               let scrollView = tableView.enclosingScrollView {
+            if previous.isEmpty, !newRows.isEmpty {
                 let saved = UserDefaults.standard.double(forKey: persistenceKey)
                 if saved > 0 {
-                    scrollView.contentView.scroll(to: NSPoint(x: 0, y: saved))
-                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                    pendingScrollRestore = saved
+                    restorePendingScrollIfReady()
                     return
                 }
             }
@@ -200,6 +205,23 @@ struct TranscriptView: NSViewRepresentable {
             if wasAtBottom { scrollToBottom(tableView) }
         }
 
+        /// Applies a deferred scroll restore once the table can honour it — i.e.
+        /// it has a real width, so every row height is measured and the document
+        /// is its true height. Called again from `viewDidResize` for the case
+        /// where the first `update` ran before the view had been sized.
+        private func restorePendingScrollIfReady() {
+            guard let target = pendingScrollRestore,
+                  let tableView,
+                  let scrollView = tableView.enclosingScrollView,
+                  tableView.bounds.width > 1 else { return }
+            // Force the measure now so the offset lands on real content, not the
+            // blank band above rows the table hasn't laid out yet.
+            tableView.layoutSubtreeIfNeeded()
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            pendingScrollRestore = nil
+        }
+
         @objc func viewDidResize(_ notification: Notification) {
             guard let tableView else { return }
             let width = tableView.bounds.width
@@ -207,6 +229,9 @@ struct TranscriptView: NSViewRepresentable {
             cachedWidth = width
             heightCache.removeAll()
             tableView.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+            // A width was just established; a restore that couldn't run on load
+            // (view not yet sized) can finally land correctly.
+            restorePendingScrollIfReady()
         }
 
         @objc func scrollDidChange(_ notification: Notification) {
@@ -224,10 +249,16 @@ struct TranscriptView: NSViewRepresentable {
             let item = rows[row]
             if let cached = heightCache[item.id] { return cached }
 
-            let width = min(
-                max(tableView.bounds.width - TranscriptCell.horizontalInset * 2, 100),
-                TranscriptCell.contentMaxWidth
-            )
+            let available = tableView.bounds.width - TranscriptCell.horizontalInset * 2
+            // Before the table has a real width (the first layout pass reports 0),
+            // measuring would wrap every row's text at a bogus 100pt and cache a
+            // wildly-too-tall height. That inflated the document, so restoring the
+            // scroll position landed in empty space above the content — the blank
+            // band that only filled in once a scroll forced a re-measure. Hand back
+            // a provisional height *without* caching until the width is real.
+            guard available > 1 else { return 44 }
+
+            let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
             let height = TranscriptCell.height(for: item, width: width)
             heightCache[item.id] = height
             return height
@@ -1100,6 +1131,12 @@ final class TranscriptCell: NSTableCellView {
             ))
         }
 
+        // The icon and file-pill summaries stand in for the work while it's
+        // folded away; once expanded, every tool row shows its own icon and
+        // chip in the right place, so repeating them on the header is just
+        // noise. Collapsed only.
+        guard !row.isExpanded else { return result }
+
         var seenIcons: Set<String> = []
         for child in row.groupedRows {
             let icon = processPresentation(for: child).icon
@@ -1123,9 +1160,18 @@ final class TranscriptCell: NSTableCellView {
         // once the agent has finished.
         let changed = changedFiles(in: row.groupedRows)
         if !changed.isEmpty {
-            result.append(NSAttributedString(string: "\n", attributes: secondary))
-            for file in changed.prefix(8) {
-                result.append(NSAttributedString(string: "  "))
+            // The pills sit on their own line with real leading and even gaps,
+            // rather than being wedged onto the end of the count line.
+            let pillLine = NSMutableParagraphStyle()
+            pillLine.paragraphSpacingBefore = 6
+            pillLine.lineSpacing = 4
+            result.append(NSAttributedString(
+                string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 5), .paragraphStyle: pillLine]
+            ))
+            for (index, file) in changed.prefix(8).enumerated() {
+                if index > 0 {
+                    result.append(NSAttributedString(string: "   ", attributes: [.paragraphStyle: pillLine]))
+                }
                 let pill = subjectPillImage(
                     identity: FileVisualIdentity(path: file.path),
                     text: (file.path as NSString).lastPathComponent,
@@ -1143,10 +1189,22 @@ final class TranscriptCell: NSTableCellView {
                     width: pill.size.width,
                     height: pill.size.height
                 )
-                result.append(NSAttributedString(attachment: attachment))
+                let pillString = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
+                pillString.addAttribute(
+                    .paragraphStyle, value: pillLine,
+                    range: NSRange(location: 0, length: pillString.length)
+                )
+                result.append(pillString)
             }
             if changed.count > 8 {
-                result.append(NSAttributedString(string: "  +\(changed.count - 8) more", attributes: secondary))
+                result.append(NSAttributedString(
+                    string: "   +\(changed.count - 8) more",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+                        .foregroundColor: NSColor.secondaryLabelColor,
+                        .paragraphStyle: pillLine,
+                    ]
+                ))
             }
         }
         return result

@@ -402,6 +402,21 @@ struct SourceFileIconTests {
     }
 }
 
+@MainActor
+struct GitHubUpdaterVersionTests {
+    @Test func newerVersionsAreDetectedAcrossComponentsAndPrefixes() {
+        #expect(GitHubUpdater.isNewer("0.2.0", than: "0.1.0"))
+        #expect(GitHubUpdater.isNewer("v0.1.1", than: "0.1.0"))
+        #expect(GitHubUpdater.isNewer("1.0.0", than: "0.9.9"))
+        // A leading `v` and missing components must not fake a difference.
+        #expect(!GitHubUpdater.isNewer("v0.1.0", than: "0.1.0"))
+        #expect(!GitHubUpdater.isNewer("0.1", than: "0.1.0"))
+        #expect(!GitHubUpdater.isNewer("0.1.0", than: "0.2.0"))
+        // A malformed tag sorts as zeros rather than pretending to be newer.
+        #expect(!GitHubUpdater.isNewer("garbage", than: "0.1.0"))
+    }
+}
+
 struct ToolChangeStatsTests {
     @Test func editUsesOldAndNewStringLineCounts() {
         let old = "func a() {\n    return 1\n}\n"

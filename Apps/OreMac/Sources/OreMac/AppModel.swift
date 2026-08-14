@@ -42,6 +42,18 @@ final class AppModel {
     private(set) var filePresentationModes: [WorkspaceID: [String: FilePresentationMode]] = [:]
     private(set) var banners: [Banner] = []
 
+    /// Cached workspace diffs so switching back to a worktree — or opening the
+    /// review pane right after selecting one — paints instantly instead of
+    /// waiting on a cold `git diff`. Keyed by workspace and stamped with the
+    /// git-status generation it was computed against, so a stale entry is shown
+    /// immediately while a fresh one loads in the background.
+    struct DiffSnapshot {
+        var generation: UInt64
+        var diffs: [FileDiff]
+        var gitAction: SuggestedGitAction
+    }
+    private(set) var diffCache: [WorkspaceID: DiffSnapshot] = [:]
+
     private let client: InProcessCoreClient
     private var eventTask: Task<Void, Never>?
     /// Batches streaming deltas so a fast model can't drive the transcript's
@@ -458,8 +470,17 @@ final class AppModel {
         }
     }
 
-    func renameChat(_ chatID: ChatID, in workspaceID: WorkspaceID, to title: String) {
-        Task { await client.send(.renameChat(workspaceID, chatID, title: title)) }
+    func renameChat(
+        _ chatID: ChatID,
+        in workspaceID: WorkspaceID,
+        to title: String,
+        userInitiated: Bool = true
+    ) {
+        Task {
+            await client.send(.renameChat(
+                workspaceID, chatID, title: title, userInitiated: userInitiated
+            ))
+        }
     }
 
     // MARK: - Centre diff tabs
@@ -560,8 +581,10 @@ final class AppModel {
         Task { await client.send(.deleteWorkspace(id, deleteBranch: deleteBranch)) }
     }
 
-    func rename(_ id: WorkspaceID, to name: String) {
-        Task { await client.send(.renameWorkspace(id, name: name)) }
+    func rename(_ id: WorkspaceID, to name: String, userInitiated: Bool = true) {
+        Task {
+            await client.send(.renameWorkspace(id, name: name, userInitiated: userInitiated))
+        }
     }
 
     func setPinned(_ pinned: Bool, for id: WorkspaceID) {
@@ -573,6 +596,8 @@ final class AppModel {
             switch action {
             case .commit:
                 await client.send(.commit(workspace.id, message: workspace.name))
+            case .createGitHubRepo:
+                await client.send(.createGitHubRepo(workspace.id))
             case .push:
                 await client.send(.push(workspace.id))
             case .createPullRequest(let base, _):
@@ -638,6 +663,55 @@ final class AppModel {
 
     func loadGitAction(for id: WorkspaceID) async throws -> SuggestedGitAction {
         try await client.suggestedGitAction(workspaceID: id)
+    }
+
+    /// The last cached diff for a workspace, if any — used to paint the review
+    /// pane instantly on switch before a fresh read completes.
+    func cachedDiff(for id: WorkspaceID) -> DiffSnapshot? { diffCache[id] }
+
+    /// Loads a workspace's diff and suggested git action together, caches the
+    /// result, and returns it. The concurrent reads mean the review pane waits
+    /// on the slower of the two rather than their sum.
+    @discardableResult
+    func refreshDiff(for workspace: WorkspaceSummary) async throws -> DiffSnapshot {
+        async let diffs = loadDiff(for: workspace.id)
+        async let action = loadGitAction(for: workspace.id)
+        let snapshot = DiffSnapshot(
+            generation: workspace.gitStatus.generation,
+            diffs: try await diffs,
+            gitAction: try await action
+        )
+        diffCache[workspace.id] = snapshot
+        return snapshot
+    }
+
+    /// Best-effort background warm-up of a workspace's diff so a later switch is
+    /// instant. Skips work when the cache already matches the current git-status
+    /// generation; failures are swallowed since the real refresh reports them.
+    func prefetchDiff(for workspace: WorkspaceSummary) {
+        if let cached = diffCache[workspace.id],
+           cached.generation == workspace.gitStatus.generation { return }
+        Task(priority: .utility) { [weak self] in
+            _ = try? await self?.refreshDiff(for: workspace)
+        }
+    }
+
+    /// Warms the transcript for a workspace's active chat so its centre column
+    /// shows history immediately on switch instead of the empty state. Reading
+    /// the `ChatState` is enough — it kicks off `loadHistory` on first access.
+    func prefetchHistory(for workspaceID: WorkspaceID) {
+        guard let chatID = activeChatIDs[workspaceID] else { return }
+        if let state = chatStates[chatID], state.hasLoadedHistory { return }
+        _ = chat(for: chatID)
+    }
+
+    /// Warms diffs and transcripts for every workspace shortly after they load,
+    /// so navigating between worktrees feels instant rather than cold.
+    private func warmWorkspaces() {
+        for workspace in workspaces {
+            prefetchDiff(for: workspace)
+            prefetchHistory(for: workspace.id)
+        }
     }
 
     func addDiffComment(_ reference: DiffCommentReference, for id: WorkspaceID) {
@@ -911,11 +985,13 @@ final class AppModel {
                     selectedWorkspaceID = sortedWorkspaces.first?.id
                 }
             }
+            warmWorkspaces()
 
         case .workspaceAdded(let summary):
             upsert(summary)
             rememberIdentityIfPresent(for: summary)
             selectedWorkspaceID = summary.id
+            prefetchDiff(for: summary)
 
         case .workspaceUpdated(let summary):
             upsert(summary)
@@ -977,6 +1053,9 @@ final class AppModel {
         case .gitStatusChanged(let id, let status):
             guard let index = workspaces.firstIndex(where: { $0.id == id }) else { return }
             workspaces[index].gitStatus = status
+            // The tree changed, so any cached diff is now stale — warm a fresh
+            // one in the background so the review pane stays instant.
+            prefetchDiff(for: workspaces[index])
 
         case .harnessProbeCompleted(let probes):
             harnesses = probes
@@ -1135,7 +1214,7 @@ final class AppModel {
                     forKey: "ore.researchIdentity.\(workspace.id.rawValue)"
                 )
                 identityRenamesInFlight.insert(workspace.id)
-                rename(workspace.id, to: identity.name)
+                rename(workspace.id, to: identity.name, userInitiated: false)
             }
             adoptResearchChatTitles(in: workspace.id)
         }
@@ -1154,7 +1233,7 @@ final class AppModel {
             let title = ResearchIdentity.nextResearchTitle(excluding: used, preferred: preferred)
             used.insert(title)
             chatRenamesInFlight.insert(chat.id)
-            renameChat(chat.id, in: workspaceID, to: title)
+            renameChat(chat.id, in: workspaceID, to: title, userInitiated: false)
         }
     }
 

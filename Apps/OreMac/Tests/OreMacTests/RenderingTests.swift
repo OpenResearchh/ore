@@ -355,3 +355,68 @@ struct SourceFileIconTests {
         #expect(FileVisualIdentity(path: "src", isDirectory: true).symbol == "folder.fill")
     }
 }
+
+struct ToolChangeStatsTests {
+    @Test func editUsesOldAndNewStringLineCounts() {
+        let old = "func a() {\n    return 1\n}\n"
+        let new = "func a() {\n    return 2\n}\nfunc b() {}\n"
+        let counts = ToolChangeStats.lineCounts(
+            diff: "",
+            old: old,
+            new: new,
+            content: nil,
+            changeKind: nil,
+            isWrite: false
+        )
+        #expect(counts.insertions == 4)
+        #expect(counts.deletions == 3)
+    }
+
+    @Test func writeCountsContentLines() {
+        let counts = ToolChangeStats.lineCounts(
+            diff: "",
+            old: nil,
+            new: nil,
+            content: "one\ntwo\nthree\n",
+            changeKind: nil,
+            isWrite: true
+        )
+        #expect(counts.insertions == 3)
+        #expect(counts.deletions == 0)
+    }
+
+    @Test func unifiedDiffCountsAddedAndRemovedLines() {
+        let diff = """
+        --- a/App.swift
+        +++ b/App.swift
+        @@ -1,3 +1,4 @@
+         keep
+        -old
+        +new
+        +extra
+        """
+        let counts = ToolChangeStats.lineCounts(
+            diff: diff,
+            old: nil,
+            new: nil,
+            content: nil,
+            changeKind: nil,
+            isWrite: false
+        )
+        #expect(counts.insertions == 2)
+        #expect(counts.deletions == 1)
+    }
+
+    @Test func addedFileWithoutDiffMarkersCountsSnippetLines() {
+        let counts = ToolChangeStats.lineCounts(
+            diff: "ore\n",
+            old: nil,
+            new: nil,
+            content: nil,
+            changeKind: "add",
+            isWrite: false
+        )
+        #expect(counts.insertions == 1)
+        #expect(counts.deletions == 0)
+    }
+}

@@ -99,8 +99,13 @@ private func runGitDiff(in directory: URL) -> String {
     process.standardError = pipe
     do {
         try process.run()
+        // Drain the pipe *before* waiting for exit. A large diff overflows the
+        // 64KB pipe buffer; git then blocks on write while we block on
+        // `waitUntilExit()`, and neither side ever advances — the review agent
+        // hangs on this tool call. Reading to EOF first lets git finish writing.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return String(decoding: data, as: UTF8.self)
     } catch {
         return "Unable to read workspace diff: \(error)"
     }

@@ -220,9 +220,28 @@ struct SuggestedGitActionTests {
         #expect(reason.contains("gh"))
     }
 
-    @Test func aRepositoryWithNoRemoteOffersNothingAfterCommitting() {
+    @Test func aRepositoryWithNoRemoteAndNoCommitsOffersNothing() {
         let action = SuggestedGitActionResolver.resolve(GitActionContext(hasRemote: false))
         #expect(action == .none)
+    }
+
+    @Test func committedWorkWithNoRemoteOffersToCreateTheRepoWhenGitHubIsReady() {
+        // The dead-end "Committed locally" becomes a button once `gh` can make
+        // the repo it was missing.
+        let action = SuggestedGitActionResolver.resolve(GitActionContext(
+            commitsAheadOfBase: 1, hasRemote: false
+        ))
+        #expect(action == .createGitHubRepo)
+    }
+
+    @Test func committedWorkWithNoRemoteAndNoGitHubReportsTheStateHonestly() {
+        // Without `gh` there is nothing to click, so don't pretend otherwise.
+        let action = SuggestedGitActionResolver.resolve(GitActionContext(
+            commitsAheadOfBase: 1,
+            hasRemote: false,
+            gitHubStatus: GitHubClient.Status(isInstalled: false, isAuthenticated: false)
+        ))
+        #expect(action == .committedNoRemote)
     }
 
     @Test func aMergedPullRequestIsTerminal() {

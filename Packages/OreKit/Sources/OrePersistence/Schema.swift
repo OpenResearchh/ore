@@ -263,6 +263,19 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v4.userNamed") { db in
+            // A name/title the user typed must survive the first turn's
+            // auto-titling. Without a persisted flag, a manual rename made
+            // before any activity looked identical to an auto-assigned
+            // placeholder and was overwritten by the prompt-derived title.
+            try db.alter(table: "workspace") { table in
+                table.add(column: "isNameUserSet", .boolean).notNull().defaults(to: false)
+            }
+            try db.alter(table: "chat") { table in
+                table.add(column: "isTitleUserSet", .boolean).notNull().defaults(to: false)
+            }
+        }
+
         return migrator
     }
 }

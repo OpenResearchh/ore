@@ -122,6 +122,19 @@ struct OreMacApp: App {
                 }
                 .keyboardShortcut("w", modifiers: .command)
 
+                // ⌥⌘←/→ moves between tabs (Chrome's idiom); ⇧⌘[ / ⇧⌘] do the
+                // same. Plain ⌘←/→ is intentionally avoided — it's move-to-line-
+                // start/end inside the composer, which the arrows must not steal.
+                Button("Previous Tab") {
+                    if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: -1) }
+                }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+
+                Button("Next Tab") {
+                    if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: 1) }
+                }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+
                 Button("Previous Chat") {
                     if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: -1) }
                 }
@@ -474,7 +487,7 @@ private struct KeyboardShortcutsView: View {
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
         ("Open file", "⌘P"),
         ("New tab", "⌘T"), ("Close tab", "⌘W"),
-        ("Previous / next tab", "⇧⌘[  ⇧⌘]"), ("Cancel turn", "⌘."),
+        ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"), ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),
     ]

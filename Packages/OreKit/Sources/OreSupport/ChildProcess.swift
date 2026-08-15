@@ -58,6 +58,30 @@ public final class ChildProcess: @unchecked Sendable {
         signal(SIGPIPE, SIG_IGN)
     }()
 
+    /// Serializes the launch itself.
+    ///
+    /// swift-corelibs-foundation's `Process.run()` is not safe to call from
+    /// several threads at once: it manipulates process-global state (signal
+    /// handling and the fd table) between fork and exec, and concurrent launches
+    /// segfault. ORE spawns child processes from every workspace at once, so
+    /// this is reached routinely rather than in theory.
+    ///
+    /// The lock covers only the fork/exec, not the child's lifetime — launching
+    /// is microseconds, and the streams are already wired up before we get here.
+    /// Darwin's implementation is `posix_spawn`-based and thread-safe, so it is
+    /// left alone.
+    private static let launchLock = NSLock()
+
+    private static func launch(_ process: Process) throws {
+        #if canImport(Darwin)
+        try process.run()
+        #else
+        launchLock.lock()
+        defer { launchLock.unlock() }
+        try process.run()
+        #endif
+    }
+
     public init(
         executablePath: String,
         arguments: [String],
@@ -98,7 +122,7 @@ public final class ChildProcess: @unchecked Sendable {
         )
 
         do {
-            try process.run()
+            try ChildProcess.launch(process)
         } catch {
             throw ChildProcessError.launchFailed(
                 executablePath: executablePath,

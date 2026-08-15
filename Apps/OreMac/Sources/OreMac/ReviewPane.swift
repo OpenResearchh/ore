@@ -48,6 +48,18 @@ private struct DiffTreeNode: Identifiable {
                 )
             }
     }
+
+    static func folderPaths(in nodes: [DiffTreeNode]) -> Set<String> {
+        var result: Set<String> = []
+        func walk(_ nodes: [DiffTreeNode]) {
+            for node in nodes where node.file == nil {
+                result.insert(node.path)
+                walk(node.children ?? [])
+            }
+        }
+        walk(nodes)
+        return result
+    }
 }
 
 private struct VisibleDiffTreeNode: Identifiable {
@@ -85,8 +97,12 @@ struct ReviewPane: View {
     @State private var isLoadingFiles = false
     @State private var expandedFileFolders: Set<String> = []
     @State private var expandedDiffFolders: Set<String> = []
+    @State private var knownDiffFolders: Set<String> = []
+    @State private var hasLoadedOnce = false
+    @AppStorage("ore.review.changesLayout") private var changesLayoutRaw = "tree"
 
     private enum ReviewTab: Hashable { case allFiles, changes }
+    private var isTreeLayout: Bool { changesLayoutRaw != "list" }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -101,9 +117,33 @@ struct ReviewPane: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .task(id: workspace.id) { await refresh() }
-        // The diff is only worth recomputing when the tree actually changed.
+        .task(id: workspace.id) {
+            knownDiffFolders = []
+            expandedDiffFolders = []
+            // Paint the last-known diff for this workspace immediately — a warm
+            // cache makes the switch feel instant, and it never lingers on the
+            // previously selected workspace's changes. Only a cold cache falls
+            // back to the loading spinner.
+            seedFromCache()
+            hasLoadedOnce = model.cachedDiff(for: workspace.id) != nil
+            await refresh()
+        }
+        // Silent catch-up: the agent writing files should grow this list in
+        // place, not flash a spinner over it.
         .task(id: workspace.gitStatus.generation) { await refresh() }
+    }
+
+    /// Show the cached diff for this workspace at once, or clear whatever diff
+    /// was carried over from the previously selected workspace.
+    private func seedFromCache() {
+        if let cached = model.cachedDiff(for: workspace.id) {
+            diffs = cached.diffs
+            gitAction = cached.gitAction
+            knownDiffFolders = DiffTreeNode.folderPaths(in: DiffTreeNode.build(from: cached.diffs))
+        } else {
+            diffs = []
+            gitAction = .none
+        }
     }
 
     // File browsing and changes are destinations. Review is an action, so it is
@@ -324,7 +364,7 @@ struct ReviewPane: View {
 
     private var emptyState: some View {
         VStack(spacing: OreTheme.Space.sm) {
-            if isLoading {
+            if isLoading && !hasLoadedOnce {
                 ProgressView()
             } else if let loadError {
                 // "Couldn't read git" is a different fact from "nothing changed",
@@ -359,10 +399,11 @@ struct ReviewPane: View {
 
     private var fileList: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: OreTheme.Space.sm) {
                 Text("\(diffs.count) file\(diffs.count == 1 ? "" : "s")")
                     .foregroundStyle(.secondary)
                 Spacer()
+                changesLayoutToggle
                 Text("\(viewedPaths.count)/\(diffs.count) viewed")
                     .foregroundStyle(.secondary)
                 Text("+\(diffs.reduce(0) { $0 + $1.insertions })")
@@ -377,31 +418,37 @@ struct ReviewPane: View {
             Divider()
 
             List {
-                ForEach(visibleDiffTree) { item in
-                    let node = item.node
-                    if let file = node.file {
-                        fileRow(file, showFolder: false, depth: item.depth)
-                    } else {
-                        Button { toggleDiffFolder(node.path) } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: expandedDiffFolders.contains(node.path)
-                                    ? "chevron.down" : "chevron.right")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                                    .frame(width: 10)
-                                SourceFileIcon(path: node.path, isDirectory: true, size: 16)
-                                Text(node.name)
-                                    .font(.system(size: OreTheme.Font.body, weight: .medium))
-                                Spacer(minLength: 0)
-                                Text("\(node.fileCount)")
-                                    .font(.system(size: OreTheme.Font.caption).monospacedDigit())
-                                    .foregroundStyle(.tertiary)
+                if isTreeLayout {
+                    ForEach(visibleDiffTree) { item in
+                        let node = item.node
+                        if let file = node.file {
+                            fileRow(file, showFolder: false, depth: item.depth)
+                        } else {
+                            Button { toggleDiffFolder(node.path) } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: expandedDiffFolders.contains(node.path)
+                                        ? "chevron.down" : "chevron.right")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: 10)
+                                    SourceFileIcon(path: node.path, isDirectory: true, size: 16)
+                                    Text(node.name)
+                                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                                    Spacer(minLength: 0)
+                                    Text("\(node.fileCount)")
+                                        .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(.leading, CGFloat(item.depth) * 16)
+                                .frame(minHeight: OreTheme.RowHeight.row)
+                                .contentShape(Rectangle())
                             }
-                            .padding(.leading, CGFloat(item.depth) * 16)
-                            .frame(minHeight: OreTheme.RowHeight.row)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                    }
+                } else {
+                    ForEach(diffs, id: \.path) { file in
+                        fileRow(file, showFolder: true)
                     }
                 }
             }
@@ -411,9 +458,47 @@ struct ReviewPane: View {
         .background(.ultraThinMaterial)
     }
 
+    private var changesLayoutToggle: some View {
+        HStack(spacing: 0) {
+            layoutButton(
+                "list.bullet.indent",
+                selected: isTreeLayout,
+                help: "Tree view"
+            ) { changesLayoutRaw = "tree" }
+            layoutButton(
+                "list.bullet",
+                selected: !isTreeLayout,
+                help: "File list"
+            ) { changesLayoutRaw = "list" }
+        }
+        .padding(2)
+        .background(OreTheme.subduedFill, in: Capsule())
+    }
+
+    private func layoutButton(
+        _ systemImage: String,
+        selected: Bool,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .frame(width: 22, height: 18)
+                .background(selected ? OreTheme.selectedFill : Color.clear, in: Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
     private func fileRow(_ file: FileDiff, showFolder: Bool, depth: Int = 0) -> some View {
         HStack(spacing: 8) {
-            Color.clear.frame(width: 10, height: 1)
+            if !showFolder {
+                Color.clear.frame(width: 10, height: 1)
+            }
             Text(statusLetter(file.status))
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundStyle(color(for: file.status))
@@ -521,19 +606,27 @@ struct ReviewPane: View {
     // MARK: - Behaviour
 
     private func refresh() async {
-        isLoading = true
-        isLoadingFiles = true
-        defer { isLoading = false }
+        let showLoader = !hasLoadedOnce && diffs.isEmpty
+        if showLoader { isLoading = true }
+        if fileTree.isEmpty { isLoadingFiles = true }
+        defer {
+            isLoading = false
+            isLoadingFiles = false
+            hasLoadedOnce = true
+        }
         async let files = model.workspaceFiles(for: workspace)
         do {
-            let loaded = try await model.loadDiff(for: workspace.id)
-            let action = try await model.loadGitAction(for: workspace.id)
+            // Load through the shared cache so the diff we just read also warms
+            // the next switch back to this workspace.
+            let snapshot = try await model.refreshDiff(for: workspace)
+            let loaded = snapshot.diffs
             let stored = await model.loadViewedFiles(for: workspace.id)
             diffs = loaded
-            gitAction = action
+            gitAction = snapshot.gitAction
             viewedPaths = Set(loaded.compactMap { file in
                 stored[file.path] == contentHash(file) ? file.path : nil
             })
+            expandNewDiffFolders(in: loaded)
             loadError = nil
         } catch {
             // Leave any diff we already have on screen; overwriting a good diff
@@ -542,7 +635,14 @@ struct ReviewPane: View {
             loadError = error.localizedDescription
         }
         fileTree = await files
-        isLoadingFiles = false
+    }
+
+    /// Folders the user hasn't seen yet start expanded so a live agent writing
+    /// nested files doesn't hide them behind collapsed tree nodes.
+    private func expandNewDiffFolders(in loaded: [FileDiff]) {
+        let folders = DiffTreeNode.folderPaths(in: DiffTreeNode.build(from: loaded))
+        expandedDiffFolders.formUnion(folders.subtracting(knownDiffFolders))
+        knownDiffFolders = folders
     }
 
     private func toggleViewed(_ path: String) {
@@ -634,7 +734,7 @@ struct DiffDocumentView: View {
                 sourceEditor
             } else if let file {
                 diffScroll(file)
-            } else if isLoading {
+            } else if isLoading && file == nil {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: OreTheme.Space.sm) {
@@ -874,7 +974,8 @@ struct DiffDocumentView: View {
     // MARK: - Data
 
     private func load() async {
-        isLoading = true
+        let showLoader = file == nil && sourceText.isEmpty
+        if showLoader { isLoading = true }
         defer { isLoading = false }
         async let loadedSource = try? model.fileContents(path: path, in: workspace)
         let diffs = (try? await model.loadDiff(for: workspace.id)) ?? []
@@ -1513,6 +1614,7 @@ private struct GitActionBar: View {
         switch action {
         case .none: return "checkmark.circle"
         case .committedNoRemote: return "checkmark.circle.badge.questionmark"
+        case .createGitHubRepo: return "plus.rectangle.on.folder"
         case .commit: return "square.and.arrow.down"
         case .push: return "arrow.up.circle"
         case .createPullRequest: return "arrow.triangle.pull"

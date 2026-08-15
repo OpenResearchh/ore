@@ -125,7 +125,7 @@ struct ProtocolBoundaryTests {
             )),
             .switchChatHarness(workspaceID, chatID, harness: .claudeCode, model: "opus"),
             .setChatModel(workspaceID, chatID, model: "sonnet"),
-            .renameChat(workspaceID, chatID, title: "Broken Symmetry"),
+            .renameChat(workspaceID, chatID, title: "Broken Symmetry", userInitiated: true),
             .setChatDraft(workspaceID, chatID, text: "draft"),
             .resolveChatPermission(workspaceID, chatID, "permission", .allow),
             .revertChatToCheckpoint(workspaceID, chatID, "turn"),

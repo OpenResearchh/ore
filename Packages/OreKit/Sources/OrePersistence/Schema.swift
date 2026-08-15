@@ -272,6 +272,23 @@ public enum OreSchema {
             }
         }
 
+        // Two branches both reached for "v4" and both shipped. The duplicated
+        // prefix is left alone on purpose: a migration's name is its identity,
+        // so renaming either one would make databases that already ran it try
+        // to run it again and fail on the existing column.
+        migrator.registerMigration("v4.userNamed") { db in
+            // A name/title the user typed must survive the first turn's
+            // auto-titling. Without a persisted flag, a manual rename made
+            // before any activity looked identical to an auto-assigned
+            // placeholder and was overwritten by the prompt-derived title.
+            try db.alter(table: "workspace") { table in
+                table.add(column: "isNameUserSet", .boolean).notNull().defaults(to: false)
+            }
+            try db.alter(table: "chat") { table in
+                table.add(column: "isTitleUserSet", .boolean).notNull().defaults(to: false)
+            }
+        }
+
         migrator.registerMigration("v5.archiveMetadata") { db in
             // The archived browser answers "when did I park this, and what did
             // it give back?" — the worktree's size at archive time is the disk

@@ -10,6 +10,7 @@ struct OreMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
     @State private var updater = Updater()
+    @State private var githubUpdater = GitHubUpdater()
     @State private var launchFailure: String?
     @State private var isShowingNewWorkspace = false
     @State private var isShowingPalette = false
@@ -58,6 +59,7 @@ struct OreMacApp: App {
             )
             .environment(model)
             .environment(updater)
+            .environment(githubUpdater)
             // Match the combined pane minimums while leaving enough room for a
             // real navigation sidebar; narrower windows collapse columns using
             // NavigationSplitView instead of crushing labels and controls.
@@ -65,6 +67,10 @@ struct OreMacApp: App {
             .task {
                 model.start()
                 await requestNotificationPermission()
+                // Sparkle owns updates for a signed, appcast-wired build; only
+                // fall back to the GitHub-releases check when it isn't configured
+                // (every unsigned build we pass around today).
+                if !updater.isConfigured { await githubUpdater.check() }
             }
             .onDisappear {
                 Task { await model.shutdown() }
@@ -97,6 +103,7 @@ struct OreMacApp: App {
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand().environment(updater)
+                GitHubUpdateCommand().environment(githubUpdater)
             }
             CommandGroup(after: .toolbar) {
                 Button("Command Palette") { isShowingPalette = true }
@@ -136,6 +143,19 @@ struct OreMacApp: App {
                     }
                 }
                 .keyboardShortcut("w", modifiers: .command)
+
+                // ⌥⌘←/→ moves between tabs (Chrome's idiom); ⇧⌘[ / ⇧⌘] do the
+                // same. Plain ⌘←/→ is intentionally avoided — it's move-to-line-
+                // start/end inside the composer, which the arrows must not steal.
+                Button("Previous Tab") {
+                    if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: -1) }
+                }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+
+                Button("Next Tab") {
+                    if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: 1) }
+                }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
 
                 Button("Previous Chat") {
                     if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: -1) }
@@ -217,6 +237,7 @@ struct RootView: View {
             detail
         }
         .overlay(alignment: .top) { banners }
+        .overlay { GitHubUpdatePrompt() }
         .sheet(isPresented: $isShowingNewWorkspace) { NewWorkspaceSheet() }
         .sheet(isPresented: $isShowingPalette) { CommandPalette() }
         .sheet(isPresented: $isShowingFilePalette) {
@@ -576,7 +597,7 @@ private struct KeyboardShortcutsView: View {
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
         ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
         ("New tab", "⌘T"), ("Close tab", "⌘W"),
-        ("Previous / next tab", "⇧⌘[  ⇧⌘]"), ("Cancel turn", "⌘."),
+        ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"), ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),
     ]

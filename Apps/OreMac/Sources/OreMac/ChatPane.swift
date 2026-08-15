@@ -18,6 +18,9 @@ struct ChatPane: View {
     @State private var queuedMessages: [QueuedMessageRecord] = []
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
+    /// Attachment relative paths that live as inline chips in the draft (pasted
+    /// images) rather than in the attachment shelf above the composer.
+    @State private var inlinePastedPaths: Set<String> = []
     @State private var showModelChooser = false
     @State private var showEffortChooser = false
     @State private var reasoningEffort: ReasoningEffort = .high
@@ -34,6 +37,15 @@ struct ChatPane: View {
 
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
+
+    /// The draft's attachments, stored on the chat rather than in this view's
+    /// `@State` so switching tabs restores chips and mention pills instead of
+    /// leaving bare `@pasted-image.png` text behind. Kept as a settable property
+    /// so the composer reads and writes it exactly as it would local state.
+    private var attachments: [Attachment] {
+        get { chat.draftAttachments }
+        nonmutating set { persistAttachments(newValue) }
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -91,24 +103,9 @@ struct ChatPane: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-
-                if chat.isBusy {
-                    HStack {
-                        AgentWorkingPill(
-                            harness: chatSummary?.harness ?? workspace.harness,
-                            status: chat.status,
-                            startedAt: chat.turnStartedAt,
-                            isStarting: !chat.hasTurnEventArrived,
-                            onStop: { model.interrupt(workspace.id) }
-                        )
-                        Spacer(minLength: 0)
-                    }
-                    .frame(maxWidth: OreTheme.contentMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, OreTheme.Space.lg)
-                    .padding(.bottom, OreTheme.Space.sm)
-                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
-                }
+                // The "agent is working" state now lives on the composer itself
+                // (an animated border plus an inline status row), so there is no
+                // longer a separate floating pill hovering over the transcript.
             }
             // Transition snapshots of an infinitely-sized empty view could
             // paint over sibling split-view columns while changing tabs. The
@@ -248,14 +245,23 @@ struct ChatPane: View {
             queuedMessages = await model.queuedMessages(for: id)
         }
         .onChange(of: draft) { _, value in
+            // The guard keeps a tab switch from writing the previous tab's text
+            // into the newly selected chat before its draft has loaded.
             guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            // Mentions and inline pasted images live as `@name` tokens in the
+            // draft; drop the attachment once its token is gone. Shelf files
+            // (attached, not inline) persist regardless of the text.
             var next = chat.draftAttachments
             next.removeAll { attachment in
-                !attachment.relativePath.hasPrefix(".context/attachments/")
-                    && !value.contains("@\(attachment.displayName)")
+                let isInline = !attachment.relativePath.hasPrefix(".context/attachments/")
+                    || inlinePastedPaths.contains(attachment.relativePath)
+                return isInline && !value.contains("@\(attachment.displayName)")
             }
             if next != chat.draftAttachments {
                 model.persistDraftAttachments(next, for: chatSummary.id)
+            }
+            inlinePastedPaths = inlinePastedPaths.filter { path in
+                next.contains { $0.relativePath == path }
             }
             model.setDraft(value, for: chatSummary)
         }
@@ -371,7 +377,10 @@ struct ChatPane: View {
             }
             result.append(contentsOf: present(turn: slice, isActive: turn == activeTurn))
         }
-        return result
+        // Subagent nesting runs last, over the assembled transcript: a
+        // subagent's rows have to find their Agent row wherever the turn layout
+        // put it, including inside an expanded activity section.
+        return nestSubagents(result)
     }
 
     /// Lays out one turn's rows.
@@ -442,6 +451,43 @@ struct ChatPane: View {
         footer.createdAt = rows.last?.createdAt ?? Date()
         result.append(footer)
         return result
+    }
+
+    /// Folds each subagent's tool uses under the Task ("Agent") row that spawned
+    /// them, so a subagent reads as its own collapsible group rather than a flat
+    /// indented run. A subagent's children appear only when its Agent row is
+    /// expanded; a normal transcript with no subagents passes through untouched.
+    private func nestSubagents(_ rows: [TranscriptRow]) -> [TranscriptRow] {
+        let childrenByParent = Dictionary(
+            grouping: rows.filter { $0.parentToolCallID != nil },
+            by: { $0.parentToolCallID! }
+        )
+        guard !childrenByParent.isEmpty else { return rows }
+        let present = Set(rows.compactMap(\.toolCallID))
+
+        var output: [TranscriptRow] = []
+        func emit(_ row: TranscriptRow) {
+            var item = row
+            if item.kind == .toolCall || item.kind == .thinking
+                || item.kind == .error || item.kind == .activityGroup {
+                item.isExpanded = expandedActivityGroups.contains(row.id)
+            }
+            if let id = row.toolCallID, let children = childrenByParent[id] {
+                item.subagentChildCount = children.count
+                output.append(item)
+                if item.isExpanded { children.forEach(emit) }
+            } else {
+                output.append(item)
+            }
+        }
+        for row in rows {
+            // A subagent child is emitted beneath its Agent, not at the top
+            // level — unless its Agent isn't shown here, in which case it stays
+            // inline so it never silently disappears.
+            if let parent = row.parentToolCallID, present.contains(parent) { continue }
+            emit(row)
+        }
+        return output
     }
 
     /// Which of a turn's rows fold away once it is done.
@@ -629,9 +675,14 @@ struct ChatPane: View {
         let tabState = model.chat(for: tab.id)
         let isWorking = tabState.isBusy
         return HStack(spacing: 6) {
-            HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected)
+            HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected && !isWorking)
             HStack(spacing: 6) {
-                if tab.hasUnread {
+                // A working tab pulses an accent dot; an idle-but-unread one
+                // shows the static blue dot. Either way the marker sits where
+                // the eye already lands, so it reads at a glance.
+                if isWorking {
+                    BusyTabDot(reduceMotion: reduceMotion)
+                } else if tab.hasUnread {
                     Circle().fill(.blue).frame(width: 6, height: 6)
                 }
                 Text(tab.title)
@@ -656,24 +707,35 @@ struct ChatPane: View {
         .padding(.horizontal, 10)
         .frame(maxWidth: 190, minHeight: 28)
         .foregroundStyle(isSelected ? .primary : .secondary)
+        // The active tab is at full strength; every other tab recedes — even a
+        // working one — so which tab you're actually in is never in doubt. A
+        // busy background tab still keeps enough presence to notice its dot.
+        .opacity(isSelected ? 1 : (isWorking ? 0.85 : 0.55))
         .oreNavigationSelection(
             isSelected: isSelected,
             isHovered: hoveredTabKey == "chat:\(tab.id.rawValue)"
         )
         .overlay {
-            if isWorking {
+            // The sheen signals "working" only on background tabs; the active
+            // tab already owns the accent underline and doesn't need it too.
+            if isWorking && !isSelected {
                 BusyTabSheen(reduceMotion: reduceMotion)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .allowsHitTesting(false)
             }
         }
-        .overlay {
-            if isWorking {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.accentColor.opacity(0.30), lineWidth: 1)
-                    .allowsHitTesting(false)
+        .overlay(alignment: .bottom) {
+            // A solid accent underline is the single unambiguous "you are here"
+            // marker, independent of how many other tabs are busy.
+            if isSelected {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.accentColor)
+                    .frame(height: 2.5)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 1)
             }
         }
+        .animation(.easeOut(duration: 0.18), value: isSelected)
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onHover { hovering in
             let key = "chat:\(tab.id.rawValue)"
@@ -770,6 +832,20 @@ struct ChatPane: View {
 
     private var composer: some View {
         VStack(spacing: OreTheme.Space.sm) {
+            if chat.isBusy {
+                ComposerBusyStatus(
+                    harness: chatSummary?.harness ?? workspace.harness,
+                    status: chat.status,
+                    startedAt: chat.turnStartedAt,
+                    // Booting a one-shot CLI takes seconds before its first
+                    // event; the status row says so rather than claiming work
+                    // is already happening.
+                    isStarting: !chat.hasTurnEventArrived,
+                    onStop: { model.interrupt(workspace.id) }
+                )
+                .transition(.opacity)
+            }
+
             if !externalAttachments.isEmpty {
                 AttachmentChipStrip(
                     attachments: externalAttachments.map {
@@ -844,9 +920,15 @@ struct ChatPane: View {
 
             InlineMentionTextEditor(
                 text: $draft,
-                mentionNames: chat.draftAttachments.map(\.displayName),
+                mentionNames: attachments
+                    .filter {
+                        !$0.relativePath.hasPrefix(".context/attachments/")
+                            || inlinePastedPaths.contains($0.relativePath)
+                    }
+                    .map(\.displayName),
                 onTab: acceptFirstMentionSuggestion,
-                onPaste: handlePasteboard
+                onPaste: handlePasteboard,
+                previewURL: previewURL(for:)
             )
                 .frame(height: min(max(composerTextHeight + 16, 38), 200))
                 .focused($composerFocused)
@@ -883,7 +965,10 @@ struct ChatPane: View {
                 composerToolbar(for: tab)
             }
         }
-        .oreComposerSurface(padding: 10)
+        // While the agent runs, the composer's own border animates — the input
+        // box *is* the progress indicator, not a chip floating beside it.
+        .oreComposerSurface(padding: 10, isBusy: chat.isBusy, reduceMotion: reduceMotion)
+        .animation(.easeOut(duration: 0.2), value: chat.isBusy)
         // Left-aligned to sit in the same column as the transcript, rather than
         // centring while the prose above it starts at the leading edge.
         .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -1270,22 +1355,21 @@ struct ChatPane: View {
 
     private func send() {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = chat.draftAttachments
-        guard !text.isEmpty || !attachments.isEmpty else { return }
+        let outgoing = attachments
+        guard !text.isEmpty || !outgoing.isEmpty else { return }
         if text.isEmpty { text = "Review the attached files." }
         model.send(
             text,
-            attachments: attachments,
+            attachments: outgoing,
             effort: chatSummary.map { supportsEffort(for: $0) } == true ? reasoningEffort : nil,
             serviceTier: chatSummary.map { supportsFastMode($0) } == true && fastModeEnabled ? "fast" : nil,
             to: workspace.id
         )
         draft = ""
-        if let chatSummary {
-            model.persistDraftAttachments([], for: chatSummary.id)
-        } else {
-            chat.draftAttachments = []
-        }
+        // Cleared, not discarded: the files were just sent, so the copies under
+        // .context/attachments are still referenced by the message.
+        attachments = []
+        inlinePastedPaths = []
     }
 
     private func chooseFiles() {
@@ -1314,6 +1398,7 @@ struct ChatPane: View {
     private var externalAttachments: [(offset: Int, element: Attachment)] {
         Array(chat.draftAttachments.enumerated()).filter {
             $0.element.relativePath.hasPrefix(".context/attachments/")
+                && !inlinePastedPaths.contains($0.element.relativePath)
         }
     }
 
@@ -1350,6 +1435,15 @@ struct ChatPane: View {
         )
     }
 
+    /// A file URL to preview when the pointer rests on an inline `@name` token —
+    /// only image attachments have something worth showing.
+    private func previewURL(for name: String) -> URL? {
+        guard let attachment = attachments.first(where: { $0.displayName == name }),
+              attachment.mimeType?.hasPrefix("image/") == true else { return nil }
+        return URL(fileURLWithPath: workspace.worktreePath)
+            .appendingPathComponent(attachment.relativePath)
+    }
+
     private func addFiles(_ urls: [URL]) {
         let folder = URL(fileURLWithPath: workspace.worktreePath)
             .appendingPathComponent(".context/attachments", isDirectory: true)
@@ -1370,16 +1464,16 @@ struct ChatPane: View {
         persistAttachments(next)
     }
 
-    /// Attaches whatever was pasted: a copied file lands as a file attachment, a
-    /// copied/screenshot image is written out as a PNG and attached. Returns true
-    /// when it consumed the paste so the editor doesn't also insert text.
-    private func handlePasteboard(_ pasteboard: NSPasteboard) -> Bool {
+    /// Attaches whatever was pasted: a copied file lands as a shelf attachment; a
+    /// copied/screenshot image is written out as a PNG and dropped in as an inline
+    /// chip at the caret, so it reads where it was pasted rather than in a shelf.
+    private func handlePasteboard(_ pasteboard: NSPasteboard) -> PasteOutcome {
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL], !urls.isEmpty {
             addFiles(urls)
-            return true
+            return .consumed
         }
         if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
             as? [NSImage], !images.isEmpty {
@@ -1392,34 +1486,52 @@ struct ChatPane: View {
                 return addPastedImages([image])
             }
         }
-        return false
+        return .ignored
     }
 
-    private func addPastedImages(_ images: [NSImage]) -> Bool {
+    /// Writes each pasted image out and returns the `@name` tokens to insert at
+    /// the caret. `.consumed` (no tokens) if nothing could be encoded.
+    private func addPastedImages(_ images: [NSImage]) -> PasteOutcome {
         let folder = URL(fileURLWithPath: workspace.worktreePath)
             .appendingPathComponent(".context/attachments", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        var added = false
-        var next = chat.draftAttachments
+        var tokens: [String] = []
         for image in images {
             guard let tiff = image.tiffRepresentation,
                   let rep = NSBitmapImageRep(data: tiff),
                   let png = rep.representation(using: .png, properties: [:]) else { continue }
-            let display = "pasted-image.png"
+            let display = uniquePastedImageName()
             let name = "\(UUID().uuidString.prefix(8))-\(display)"
             let destination = folder.appendingPathComponent(name)
             do {
                 try png.write(to: destination)
-                next.append(Attachment(
-                    relativePath: ".context/attachments/\(name)",
+                let relativePath = ".context/attachments/\(name)"
+                attachments.append(Attachment(
+                    relativePath: relativePath,
                     displayName: display,
                     mimeType: "image/png"
                 ))
-                added = true
+                inlinePastedPaths.insert(relativePath)
+                tokens.append("@\(display)")
             } catch { continue }
         }
-        if added { persistAttachments(next) }
-        return added
+        guard !tokens.isEmpty else { return .consumed }
+        // A trailing space leaves the caret outside the styled token, so the next
+        // keystroke types plainly — the same feel as inserting a file mention.
+        return .insert(tokens.joined(separator: " ") + " ")
+    }
+
+    /// A draft-unique display name so each inline `@pasted-image.png` token maps to
+    /// exactly one attachment (two pastes would otherwise collide on the token).
+    private func uniquePastedImageName() -> String {
+        let existing = Set(attachments.map(\.displayName))
+        var candidate = "pasted-image.png"
+        var index = 1
+        while existing.contains(candidate) {
+            index += 1
+            candidate = "pasted-image-\(index).png"
+        }
+        return candidate
     }
 
     private var slashCommands: [ComposerCommand] {
@@ -1591,7 +1703,10 @@ private struct ComposerCommand: Identifiable {
 /// A stable overlay rather than another transcript row. It makes work obvious
 /// at a glance while keeping streamed text from repeatedly inserting/removing
 /// loading content and shifting the scroll position.
-private struct AgentWorkingPill: View {
+/// The agent's live status, folded into the top of the composer instead of a
+/// pill floating over the transcript. It reads as part of the input box — a
+/// quiet row above the text, paired with the composer's animated busy border.
+private struct ComposerBusyStatus: View {
     let harness: HarnessKind
     let status: AgentStatus
     var startedAt: Date?
@@ -1602,32 +1717,32 @@ private struct AgentWorkingPill: View {
         HStack(spacing: 7) {
             ProgressView()
                 .controlSize(.small)
+                .scaleEffect(0.8)
             Text(label)
-                .font(.system(size: OreTheme.Font.body, weight: .medium))
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .foregroundStyle(.secondary)
             if let startedAt {
                 // A live counter that ticks each second while the turn runs.
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(Self.elapsed(from: startedAt, to: context.date))
-                        .font(.system(size: OreTheme.Font.body, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.tertiary)
                 }
             }
+            Spacer(minLength: 0)
             Button(action: onStop) {
-                Image(systemName: "stop.fill")
-                    .font(.system(size: 9, weight: .bold))
-                    .frame(width: 20, height: 20)
-                    .background(.red.opacity(0.12), in: Circle())
+                HStack(spacing: 4) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 8, weight: .bold))
+                    Text("Stop")
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                }
+                .foregroundStyle(.red)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.red)
+            .buttonStyle(OrePressableButtonStyle())
             .help("Stop the running turn (⌘.)")
         }
-        .padding(.leading, 11)
-        .padding(.trailing, 6)
-        .frame(height: 30)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
-        .shadow(color: .black.opacity(0.06), radius: 4, y: 1)
+        .padding(.horizontal, 2)
     }
 
     private var label: String {
@@ -2388,6 +2503,27 @@ private struct ComposerModeTag: View {
             .background(tint.opacity(0.09), in: Capsule())
             .overlay(Capsule().stroke(tint.opacity(0.18), lineWidth: 1))
             .accessibilityLabel("\(title) mode")
+    }
+}
+
+/// A small accent dot that breathes while an agent works, so a background tab
+/// reads as "running" even after the sheen is dimmed by the tab's reduced
+/// opacity.
+private struct BusyTabDot: View {
+    let reduceMotion: Bool
+    @State private var pulse = false
+
+    var body: some View {
+        Circle()
+            .fill(Color.accentColor)
+            .frame(width: 6, height: 6)
+            .opacity(reduceMotion ? 1 : (pulse ? 0.3 : 1))
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            }
     }
 }
 

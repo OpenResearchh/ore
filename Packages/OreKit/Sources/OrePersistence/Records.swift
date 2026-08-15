@@ -47,6 +47,9 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     public var sortIndex: Int
     public var createdAt: Date
     public var lastActivityAt: Date?
+    /// The user typed this name. When set, automatic research-identity and
+    /// first-prompt renaming leave it alone.
+    public var isNameUserSet: Bool
 
     public init(
         id: WorkspaceID,
@@ -67,7 +70,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         hasUnread: Bool = false,
         sortIndex: Int = 0,
         createdAt: Date = Date(),
-        lastActivityAt: Date? = nil
+        lastActivityAt: Date? = nil,
+        isNameUserSet: Bool = false
     ) {
         self.id = id.rawValue
         self.name = name
@@ -88,6 +92,7 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         self.sortIndex = sortIndex
         self.createdAt = createdAt
         self.lastActivityAt = lastActivityAt
+        self.isNameUserSet = isNameUserSet
     }
 
     public var workspaceID: WorkspaceID { WorkspaceID(rawValue: id) }
@@ -178,6 +183,9 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
     public var sortIndex: Int
     public var createdAt: Date
     public var lastActivityAt: Date?
+    /// The user typed this title. When set, the first message's auto-titling
+    /// leaves it alone.
+    public var isTitleUserSet: Bool
 
     public init(
         id: ChatID,
@@ -191,7 +199,8 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         isClosed: Bool = false,
         sortIndex: Int = 0,
         createdAt: Date = Date(),
-        lastActivityAt: Date? = nil
+        lastActivityAt: Date? = nil,
+        isTitleUserSet: Bool = false
     ) {
         self.id = id.rawValue
         self.workspaceID = workspaceID.rawValue
@@ -205,6 +214,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         self.sortIndex = sortIndex
         self.createdAt = createdAt
         self.lastActivityAt = lastActivityAt
+        self.isTitleUserSet = isTitleUserSet
     }
 
     public var chatID: ChatID { ChatID(rawValue: id) }
@@ -368,6 +378,9 @@ public struct BlockRecord: Codable, FetchableRecord, PersistableRecord, Sendable
         case plan
         case permission
         case question
+        /// A transcript marker that isn't chat — e.g. the harness auto-compacted
+        /// its context. Replayed as a divider.
+        case notice
     }
 
     public var id: String

@@ -24,6 +24,12 @@ struct Sidebar: View {
         var path: String
         var name: String
         var workspaces: [WorkspaceSummary]
+
+        /// The most recent activity across the group's workspaces, used to float
+        /// the last-worked-in project to the top of the sidebar.
+        var latestActivity: Date? {
+            workspaces.compactMap(\.lastActivity).max()
+        }
     }
 
     private var repositoryGroups: [RepositoryGroup] {
@@ -35,7 +41,22 @@ struct Sidebar: View {
                     workspaces: workspaces
                 )
             }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            // Most recently worked-in project on top: the one you touched last is
+            // the one you're most likely coming back to. `sortedWorkspaces` is
+            // already recency-ordered, so a group's latest activity is its first
+            // workspace's.
+            .sorted { ($0.latestActivity ?? .distantPast) > ($1.latestActivity ?? .distantPast) }
+    }
+
+    /// ⌘1–9 jumps to a workspace by its position in `sortedWorkspaces`. Mapping
+    /// each of the first nine to its number lets the sidebar show the shortcut
+    /// inline, so switching between parallel agents is discoverable, not hidden.
+    private var workspaceShortcuts: [WorkspaceID: Int] {
+        var result: [WorkspaceID: Int] = [:]
+        for (index, workspace) in model.sortedWorkspaces.prefix(9).enumerated() {
+            result[workspace.id] = index + 1
+        }
+        return result
     }
 
     var body: some View {
@@ -51,6 +72,7 @@ struct Sidebar: View {
                             workspace: workspace,
                             chats: model.chats(for: workspace.id),
                             isSelected: model.selectedWorkspaceID == workspace.id,
+                            shortcutIndex: workspaceShortcuts[workspace.id],
                             onRename: {
                                 renameText = workspace.name
                                 renameWorkspace = workspace
@@ -70,6 +92,16 @@ struct Sidebar: View {
                 } label: {
                     RepositoryRow(repository: repository.name, workspaces: repository.workspaces)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        // The chevron alone was a small target; the whole header
+                        // row toggles expansion now, which is what a click here
+                        // reads as.
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            let binding = repositoryBinding(repository.path)
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                binding.wrappedValue.toggle()
+                            }
+                        }
                 }
                 .listRowSeparator(.hidden)
             }
@@ -296,6 +328,9 @@ private struct WorkspaceRow: View {
     let workspace: WorkspaceSummary
     let chats: [ChatSummary]
     let isSelected: Bool
+    /// The ⌘-number that jumps here, when this workspace is one of the first
+    /// nine. Shown small in the row so the shortcut is discoverable.
+    var shortcutIndex: Int?
     let onRename: () -> Void
     @State private var isHovering = false
 
@@ -356,6 +391,12 @@ private struct WorkspaceRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("Rename workspace")
+            } else if let shortcutIndex {
+                Text("⌘\(shortcutIndex)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .frame(minWidth: 24)
+                    .help("Jump here with ⌘\(shortcutIndex)")
             }
         }
         .frame(minHeight: 44)

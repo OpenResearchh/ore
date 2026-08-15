@@ -23,6 +23,32 @@ public enum AgentEvent: Sendable, Codable, Hashable {
     case turnCompleted(TurnResult)
     case sessionError(SessionError)
     case sessionEnded(SessionEnded)
+    /// The harness auto-compacted its own context (summarised older history to
+    /// stay under the window). ORE doesn't drive this — it surfaces it, so the
+    /// transcript shows a marker instead of the conversation silently continuing.
+    case contextCompacted(ContextCompaction)
+}
+
+public struct ContextCompaction: Sendable, Codable, Hashable {
+    public var turnID: TurnID?
+    /// "auto" when the harness hit the window, "manual" when the user asked.
+    public var trigger: String?
+    /// Tokens in context just before compaction, when the harness reports it.
+    public var preTokens: Int?
+
+    public init(turnID: TurnID? = nil, trigger: String? = nil, preTokens: Int? = nil) {
+        self.turnID = turnID
+        self.trigger = trigger
+        self.preTokens = preTokens
+    }
+
+    /// A short line for the transcript divider.
+    public var summary: String {
+        if let preTokens {
+            return "Context automatically compacted at \(preTokens) tokens"
+        }
+        return "Context automatically compacted"
+    }
 }
 
 // MARK: - Session lifecycle

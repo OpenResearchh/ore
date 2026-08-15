@@ -76,15 +76,70 @@ struct OreCard: ViewModifier {
 /// the existing material treatment.
 struct OreComposerSurface: ViewModifier {
     var padding: CGFloat = 10
+    /// While an agent runs, the surface draws an animated accent border so the
+    /// composer itself is the progress indicator.
+    var isBusy: Bool = false
+    var reduceMotion: Bool = false
+
+    private static let glassRadius: CGFloat = 20
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
             content
                 .padding(padding)
-                .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                .glassEffect(.regular, in: .rect(cornerRadius: Self.glassRadius))
+                .overlay { busyBorder(cornerRadius: Self.glassRadius) }
         } else {
-            content.modifier(OreCard(padding: padding, radius: OreTheme.cardRadius))
+            content
+                .modifier(OreCard(padding: padding, radius: OreTheme.cardRadius))
+                .overlay { busyBorder(cornerRadius: OreTheme.cardRadius) }
+        }
+    }
+
+    @ViewBuilder
+    private func busyBorder(cornerRadius: CGFloat) -> some View {
+        if isBusy {
+            OreComposerBusyBorder(cornerRadius: cornerRadius, reduceMotion: reduceMotion)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+/// A flowing accent highlight that sweeps around the composer's edge while the
+/// agent works. With reduced motion it settles into a steady accent outline.
+struct OreComposerBusyBorder: View {
+    let cornerRadius: CGFloat
+    let reduceMotion: Bool
+    @State private var angle: Double = 0
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        Group {
+            if reduceMotion {
+                shape.strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5)
+            } else {
+                shape
+                    .strokeBorder(
+                        AngularGradient(
+                            gradient: Gradient(colors: [
+                                Color.accentColor.opacity(0.0),
+                                Color.accentColor.opacity(0.15),
+                                Color.accentColor.opacity(0.85),
+                                Color.accentColor.opacity(0.15),
+                                Color.accentColor.opacity(0.0),
+                            ]),
+                            center: .center,
+                            angle: .degrees(angle)
+                        ),
+                        lineWidth: 1.75
+                    )
+                    .onAppear {
+                        withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) {
+                            angle = 360
+                        }
+                    }
+            }
         }
     }
 }
@@ -198,8 +253,12 @@ extension View {
         modifier(OreCard(padding: padding, radius: radius))
     }
 
-    func oreComposerSurface(padding: CGFloat = 10) -> some View {
-        modifier(OreComposerSurface(padding: padding))
+    func oreComposerSurface(
+        padding: CGFloat = 10,
+        isBusy: Bool = false,
+        reduceMotion: Bool = false
+    ) -> some View {
+        modifier(OreComposerSurface(padding: padding, isBusy: isBusy, reduceMotion: reduceMotion))
     }
 
     func oreNavigationSurface() -> some View {

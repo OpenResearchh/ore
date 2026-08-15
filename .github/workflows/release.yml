@@ -1,0 +1,56 @@
+name: Release
+
+# On every merge to master: bump the patch version, build an (ad-hoc signed)
+# DMG, and publish it as a GitHub Release. The in-app GitHub updater
+# (GitHubUpdater.swift) checks these releases and offers the newer build.
+#
+# The version-bump commit is pushed with GITHUB_TOKEN, whose pushes do not
+# retrigger workflows, so this can't loop; the `[skip ci]` marker and the guard
+# below are belt-and-braces.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
+    name: Bump, build DMG, publish
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Apps/OreMac
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version
+        id: bump
+        run: echo "version=$(./Scripts/bump-version.sh patch)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit the bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
+          git push origin HEAD:master
+
+      - name: Build the DMG
+        run: ./Scripts/make-dmg.sh release
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.bump.outputs.version }}" \
+            ".build/ORE-${{ steps.bump.outputs.version }}.dmg" \
+            --title "ORE v${{ steps.bump.outputs.version }}" \
+            --generate-notes \
+            --target "$(git rev-parse HEAD)"

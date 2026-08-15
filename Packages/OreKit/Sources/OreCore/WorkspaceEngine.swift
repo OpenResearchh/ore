@@ -248,12 +248,19 @@ public actor WorkspaceEngine {
         return try await summary(for: runtime)
     }
 
-    public func renameChat(_ chatID: ChatID, title: String) async throws -> ChatSummary {
+    public func renameChat(
+        _ chatID: ChatID,
+        title: String,
+        userInitiated: Bool = false
+    ) async throws -> ChatSummary {
         let runtime = try await runtime(for: chatID)
         let proposed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !proposed.isEmpty else { return try await summary(for: runtime) }
         let used = Set(chats.values.filter { $0.record.chatID != chatID }.map { $0.record.title })
         runtime.record.title = ResearchIdentity.unique(proposed, excluding: used)
+        // A name the user typed is theirs to keep; automatic research-title
+        // assignment must not claim it, so it only ever sets the flag true.
+        if userInitiated { runtime.record.isTitleUserSet = true }
         try await store.saveChat(runtime.record)
         publishChatChange(runtime)
         return try await summary(for: runtime)
@@ -526,10 +533,13 @@ public actor WorkspaceEngine {
         // workspace keeps the workspace's name forever, since it never matches
         // the "Chat " prefix. A title the user typed is left alone.
         let currentTitle = runtime.record.title
-        let isPlaceholderTitle = currentTitle.isEmpty
-            || currentTitle.hasPrefix("Chat ")
-            || currentTitle == record.name
-            || runtime.record.lastActivityAt == nil
+        // A title the user typed is never a placeholder — the whole point of
+        // the flag is that a rename made before the first turn survives it.
+        let isPlaceholderTitle = !runtime.record.isTitleUserSet
+            && (currentTitle.isEmpty
+                || currentTitle.hasPrefix("Chat ")
+                || currentTitle == record.name
+                || runtime.record.lastActivityAt == nil)
         if isPlaceholderTitle {
             let normalized = ResearchIdentity.taskTitle(from: request.text, fallback: currentTitle)
             if !normalized.isEmpty {
@@ -544,7 +554,8 @@ public actor WorkspaceEngine {
                     runtime.isGeneratingTitle = true
                     let expectedChatTitle = runtime.record.title
                     let expectedWorkspaceName = record.name
-                    let shouldRenameWorkspace = ResearchIdentity.matching(nameOrSlug: record.name) != nil
+                    let shouldRenameWorkspace = !record.isNameUserSet
+                        && ResearchIdentity.matching(nameOrSlug: record.name) != nil
                     Task { [weak self] in
                         await self?.generateAndApplyTitle(
                             for: runtime.record.chatID,
@@ -1288,8 +1299,11 @@ public actor WorkspaceEngine {
         summaryContinuation?.yield(summary())
     }
 
-    public func rename(_ name: String) async throws {
+    public func rename(_ name: String, userInitiated: Bool = false) async throws {
         record.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A name the user typed is theirs to keep; automatic research-identity
+        // assignment must not claim it, so it only ever sets the flag true.
+        if userInitiated { record.isNameUserSet = true }
         try await persistRecord()
         publishSummaryChange()
     }

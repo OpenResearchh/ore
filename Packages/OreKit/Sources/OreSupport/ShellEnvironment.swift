@@ -88,6 +88,36 @@ public enum ShellEnvironment {
         return environment
     }
 
+    /// The shell to run a user's script through.
+    ///
+    /// `$SHELL` is the right answer when it's set and real, but it is routinely
+    /// absent in a non-interactive context — a container, a launchd job, CI —
+    /// and hardcoding zsh as the fallback meant that on any machine without it
+    /// (every Linux image) the shell simply failed to launch. The candidates are
+    /// tried in order of how much of the user's setup they carry.
+    public static var loginShellPath: String {
+        let candidates = [
+            ProcessInfo.processInfo.environment["SHELL"],
+            "/bin/zsh", "/bin/bash", "/bin/sh",
+        ]
+        for candidate in candidates.compactMap({ $0 }) where isExecutable(candidate) {
+            return candidate
+        }
+        return "/bin/sh"
+    }
+
+    /// How to ask `shell` to run a one-off command.
+    ///
+    /// `-l` loads the user's profile, which is the point — but it is a bash/zsh
+    /// extension, and passing it to a POSIX `sh` (dash, on most Linux images)
+    /// makes the shell reject the whole invocation.
+    public static func commandArguments(for shell: String, script: String) -> [String] {
+        let name = (shell as NSString).lastPathComponent
+        return (name == "zsh" || name == "bash")
+            ? ["-lc", script]
+            : ["-c", script]
+    }
+
     /// Finds an executable on the resolved `PATH`.
     public static func locate(
         _ executable: String,
@@ -138,7 +168,7 @@ public enum ShellEnvironment {
 
         if environment["HOME"]?.isEmpty != false { environment["HOME"] = home }
         if environment["SHELL"]?.isEmpty != false {
-            environment["SHELL"] = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+            environment["SHELL"] = loginShellPath
         }
         if environment["TERM"]?.isEmpty != false { environment["TERM"] = "xterm-256color" }
         return environment

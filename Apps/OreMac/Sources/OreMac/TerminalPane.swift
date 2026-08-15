@@ -84,7 +84,9 @@ final class TerminalRegistry {
         }
 
         // A login shell, so the user's aliases, prompt and version managers are
-        // all present — the same environment their own terminal has.
+        // all present — the same environment their own terminal has. zsh is the
+        // fallback rather than sh because this only ever runs on macOS, where
+        // it is both present and the system default.
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         terminal.startProcess(
             executable: shell,

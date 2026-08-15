@@ -720,13 +720,26 @@ public actor InProcessCoreClient: CoreClient {
     /// Runs a lifecycle script in the worktree, through the user's login shell
     /// so their version managers and aliases apply.
     private func runScript(_ script: String, in directory: URL, workspaceID: WorkspaceID) async {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        guard let process = try? ChildProcess(
-            executablePath: shell,
-            arguments: ["-lc", script],
-            workingDirectory: directory,
-            environment: ShellEnvironment.childEnvironment()
-        ) else { return }
+        let shell = ShellEnvironment.loginShellPath
+        let process: ChildProcess
+        do {
+            process = try ChildProcess(
+                executablePath: shell,
+                arguments: ShellEnvironment.commandArguments(for: shell, script: script),
+                workingDirectory: directory,
+                environment: ShellEnvironment.childEnvironment()
+            )
+        } catch {
+            // Silently returning here is how a setup script that never ran
+            // looked identical to one that succeeded — the worktree just came
+            // up missing whatever it was supposed to create.
+            continuation.yield(.commandFailed(CommandFailure(
+                workspaceID: workspaceID,
+                message: "The setup script couldn't be started.",
+                detail: "\(shell): \(describe(error))"
+            )))
+            return
+        }
         process.closeStandardInput()
 
         let output = await process.stdoutChunks.collectText()

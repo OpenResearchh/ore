@@ -18,7 +18,6 @@ struct ChatPane: View {
     @State private var queuedMessages: [QueuedMessageRecord] = []
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
-    @State private var attachments: [Attachment] = []
     /// Attachment relative paths that live as inline chips in the draft (pasted
     /// images) rather than in the attachment shelf above the composer.
     @State private var inlinePastedPaths: Set<String> = []
@@ -38,6 +37,15 @@ struct ChatPane: View {
 
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
+
+    /// The draft's attachments, stored on the chat rather than in this view's
+    /// `@State` so switching tabs restores chips and mention pills instead of
+    /// leaving bare `@pasted-image.png` text behind. Kept as a settable property
+    /// so the composer reads and writes it exactly as it would local state.
+    private var attachments: [Attachment] {
+        get { chat.draftAttachments }
+        nonmutating set { persistAttachments(newValue) }
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -80,10 +88,18 @@ struct ChatPane: View {
                 } else {
                     TranscriptView(
                         rows: displayRows,
+                        worktreePath: workspace.worktreePath,
                         persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
                         onRevert: { revertTarget = $0 },
                         onToggleActivity: { toggleActivity($0) },
-                        onOpenFile: { openAgentFile($0) }
+                        onOpenFile: { openAgentFile($0) },
+                        onTurnAction: { turn, action in
+                            switch action {
+                            case .fork: model.forkChat(into: workspace.id)
+                            case .revert: revertTarget = turn
+                            }
+                        },
+                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -117,12 +133,18 @@ struct ChatPane: View {
 
             if case .proposal(let markdown, let requestID) = chat.plan {
                 PlanApprovalCard(markdown: markdown) { feedback in
+                    // Dismiss first, and unconditionally. The card used to
+                    // linger until a `permissionResolved` that a proposal
+                    // without a request id never sends — which is why a second
+                    // proposal left two cards and answering one kept the other.
+                    chat.dismissPlan()
                     if let requestID {
                         model.resolvePermission(requestID, decision: .allow, for: workspace.id)
                     }
                     model.setPermissionMode(.default, for: workspace.id)
                     if !feedback.isEmpty { model.send(feedback, to: workspace.id) }
                 } onReject: { feedback in
+                    chat.dismissPlan()
                     if let requestID {
                         model.resolvePermission(
                             requestID,
@@ -134,6 +156,9 @@ struct ChatPane: View {
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.top, OreTheme.Space.sm)
+                // A new proposal must reset the card's own feedback field;
+                // without an identity SwiftUI reuses the previous card's state.
+                .id(requestID?.rawValue ?? markdown)
             }
 
             if !queuedMessages.isEmpty {
@@ -156,7 +181,20 @@ struct ChatPane: View {
             // Hard failures — usage limits especially — belong where the user
             // is about to act, not buried as a red row up in the transcript.
             if let error = chat.prominentError {
-                ProminentErrorBanner(error: error) { chat.dismissProminentError() }
+                ProminentErrorBanner(
+                    error: error,
+                    scheduled: model.scheduledContinuation(for: chatSummary?.id),
+                    onContinueWhenAvailable: scheduleContinuation,
+                    onCancelSchedule: cancelScheduledContinuation,
+                    onDismiss: { chat.dismissProminentError() }
+                )
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, OreTheme.Space.md)
+                    .padding(.top, OreTheme.Space.sm)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
+                ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
                     .frame(maxWidth: OreTheme.contentMaxWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, OreTheme.Space.md)
@@ -207,18 +245,24 @@ struct ChatPane: View {
             queuedMessages = await model.queuedMessages(for: id)
         }
         .onChange(of: draft) { _, value in
+            // The guard keeps a tab switch from writing the previous tab's text
+            // into the newly selected chat before its draft has loaded.
+            guard let chatSummary, draftOwnerID == chatSummary.id else { return }
             // Mentions and inline pasted images live as `@name` tokens in the
             // draft; drop the attachment once its token is gone. Shelf files
             // (attached, not inline) persist regardless of the text.
-            attachments.removeAll { attachment in
+            var next = chat.draftAttachments
+            next.removeAll { attachment in
                 let isInline = !attachment.relativePath.hasPrefix(".context/attachments/")
                     || inlinePastedPaths.contains(attachment.relativePath)
                 return isInline && !value.contains("@\(attachment.displayName)")
             }
-            inlinePastedPaths = inlinePastedPaths.filter { path in
-                attachments.contains { $0.relativePath == path }
+            if next != chat.draftAttachments {
+                model.persistDraftAttachments(next, for: chatSummary.id)
             }
-            guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            inlinePastedPaths = inlinePastedPaths.filter { path in
+                next.contains { $0.relativePath == path }
+            }
             model.setDraft(value, for: chatSummary)
         }
         .task(id: chatSummary?.id) {
@@ -310,78 +354,103 @@ struct ChatPane: View {
             return row
         }
 
-        // A turn's activity folds into one collapsed "N tool calls" group only
-        // once that turn is fully finished. While the agent is still working the
-        // live turn stays expanded, so its tool calls (and any preamble text)
-        // read inline until the final response has actually landed. Gating on a
-        // completed assistant block instead collapsed the group the moment an
-        // early preamble line finished — hiding the work mid-turn.
+        // A finished turn reads as three things: what the agent did (collapsed),
+        // what it concluded (always visible), and what that cost. While the
+        // agent is still working the live turn stays fully expanded, so its
+        // tool calls read inline until the final response has landed.
         let activeTurn: TurnID? = chat.isBusy ? visible.last?.turnID : nil
-        let completedTurns = Set(visible.compactMap { row in
-            row.turnID == activeTurn ? nil : row.turnID
-        })
-        // The index of the last tool/thinking/error row per completed turn.
-        // Assistant text *after* it is the response; assistant text *before* it
-        // is interstitial narration ("let me read…") that reads exactly like the
-        // answer — so it folds into the group too, and only the trailing block
-        // stays as prose.
-        var lastActivityIndex: [TurnID: Int] = [:]
-        for (index, row) in visible.enumerated()
-        where Self.isActivity(row) && completedTurns.contains(row.turnID) {
-            lastActivityIndex[row.turnID] = index
-        }
-        func isGrouped(_ row: TranscriptRow, at index: Int) -> Bool {
-            guard let last = lastActivityIndex[row.turnID] else { return false }
-            if Self.isActivity(row) { return true }
-            return row.kind == .assistantText && index < last
-        }
-        let groupedByTurn = Dictionary(
-            grouping: visible.enumerated()
-                .filter { isGrouped($0.element, at: $0.offset) }
-                .map(\.element),
-            by: \.turnID
-        )
+        let subjects = Self.taskSubjects(in: visible)
 
         var result: [TranscriptRow] = []
-        for (index, row) in visible.enumerated() {
-            if isGrouped(row, at: index) {
-                guard lastActivityIndex[row.turnID] == index,
-                      let activities = groupedByTurn[row.turnID]
-                else { continue }
-                let tools = activities.filter { $0.kind == .toolCall }.count
-                let messages = activities.filter {
-                    $0.kind == .thinking || $0.kind == .assistantText
-                }.count
-                let errors = activities.filter { $0.kind == .error || $0.isError }.count
-                var parts: [String] = []
-                if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
-                if messages > 0 { parts.append("\(messages) message\(messages == 1 ? "" : "s")") }
-                if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
-                let id = "activity-\(row.turnID.rawValue)"
-                let expanded = expandedActivityGroups.contains(id)
-                result.append(TranscriptRow(
-                    id: id,
-                    turnID: row.turnID,
-                    kind: .activityGroup,
-                    text: parts.isEmpty ? "Activity" : parts.joined(separator: ", "),
-                    groupedRows: activities,
-                    isExpanded: expanded
-                ))
-                // Insert virtualized child rows when requested, but leave every
-                // tool result collapsed. This keeps a 100-call turn quick to
-                // open and lets Bash/Edit/Read details expand independently.
+        var index = visible.startIndex
+        while index < visible.endIndex {
+            // Turns arrive contiguously, so one pass over the transcript can
+            // slice it into turns without sorting or grouping into a dictionary
+            // — which is also what keeps the original order intact.
+            let turn = visible[index].turnID
+            var slice: [TranscriptRow] = []
+            while index < visible.endIndex, visible[index].turnID == turn {
+                var row = visible[index]
+                row.resolvedSubject = Self.taskSubject(for: row, in: subjects)
+                slice.append(row)
+                index += 1
+            }
+            result.append(contentsOf: present(turn: slice, isActive: turn == activeTurn))
+        }
+        // Subagent nesting runs last, over the assembled transcript: a
+        // subagent's rows have to find their Agent row wherever the turn layout
+        // put it, including inside an expanded activity section.
+        return nestSubagents(result)
+    }
+
+    /// Lays out one turn's rows.
+    ///
+    /// Everything the agent did on the way to its answer folds into a single
+    /// collapsed section placed where the work happened; the last thing it said
+    /// stays visible below as the turn's outcome. A live turn is returned
+    /// untouched — collapsing work in progress hides the only thing worth
+    /// watching.
+    private func present(turn rows: [TranscriptRow], isActive: Bool) -> [TranscriptRow] {
+        guard !isActive, let turnID = rows.first?.turnID else { return rows }
+
+        // The answer is the last non-empty assistant block; everything before
+        // it is preamble and folds away with the tool calls. Found once, not
+        // per row — this runs on every transcript update while text streams.
+        let answer = rows.lastIndex {
+            $0.kind == .assistantText
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let collapsible = rows.indices.filter { Self.isCollapsible(rows[$0], isAnswer: $0 == answer) }
+        // A turn that only answered has nothing to hide and nothing to report:
+        // no tools ran, no files changed. It stays a bare response rather than
+        // gaining an empty section and a footer saying so.
+        guard let firstCollapsibleIndex = collapsible.first else { return rows }
+
+        let hidden = Set(collapsible)
+        let collapsed = collapsible.map { rows[$0] }
+        let groupID = "activity-\(turnID.rawValue)"
+        let expanded = expandedActivityGroups.contains(groupID)
+
+        var group = TranscriptRow(
+            id: groupID,
+            turnID: turnID,
+            kind: .activityGroup,
+            text: Self.activitySummary(for: collapsed),
+            groupedRows: collapsed,
+            isExpanded: expanded
+        )
+        group.createdAt = collapsed.first?.createdAt ?? Date()
+
+        var result: [TranscriptRow] = []
+        for (offset, row) in rows.enumerated() {
+            if offset == firstCollapsibleIndex {
+                result.append(group)
+                // Child rows are virtualized in only when the section is open,
+                // and each keeps its own expansion, so a 100-call turn stays
+                // quick to open and Bash/Edit/Read details expand separately.
                 if expanded {
-                    result.append(contentsOf: activities.map { child in
+                    result.append(contentsOf: collapsed.map { child in
                         var item = child
                         item.isExpanded = expandedActivityGroups.contains(child.id)
                         return item
                     })
                 }
-            } else {
-                result.append(row)
+                continue
             }
+            guard !hidden.contains(offset) else { continue }
+            result.append(row)
         }
-        return nestSubagents(result)
+
+        var footer = TranscriptRow(
+            id: "footer-\(turnID.rawValue)",
+            turnID: turnID,
+            kind: .turnFooter,
+            text: "",
+            groupedRows: rows
+        )
+        footer.createdAt = rows.last?.createdAt ?? Date()
+        result.append(footer)
+        return result
     }
 
     /// Folds each subagent's tool uses under the Task ("Agent") row that spawned
@@ -421,8 +490,71 @@ struct ChatPane: View {
         return output
     }
 
-    private static func isActivity(_ row: TranscriptRow) -> Bool {
-        row.kind == .toolCall || row.kind == .thinking || row.kind == .error
+    /// Which of a turn's rows fold away once it is done.
+    ///
+    /// Tool calls and thinking always do. Assistant prose does too — except the
+    /// last block, which is the answer the whole turn was for. Without that
+    /// exception a chatty turn showed three or four separate prose blocks and
+    /// nothing marked which one was the conclusion.
+    private static func isCollapsible(_ row: TranscriptRow, isAnswer: Bool) -> Bool {
+        switch row.kind {
+        case .toolCall, .thinking, .error:
+            return true
+        case .assistantText:
+            return !isAnswer
+        case .userMessage, .plan, .divider, .activityGroup, .turnFooter:
+            return false
+        }
+    }
+
+    private static func activitySummary(for rows: [TranscriptRow]) -> String {
+        let tools = rows.filter { $0.kind == .toolCall }.count
+        let thoughts = rows.filter { $0.kind == .thinking }.count
+        let notes = rows.filter { $0.kind == .assistantText }.count
+        let errors = rows.filter { $0.kind == .error || $0.isError }.count
+        var parts: [String] = []
+        if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
+        if thoughts > 0 { parts.append("\(thoughts) thought\(thoughts == 1 ? "" : "s")") }
+        if notes > 0 { parts.append("\(notes) note\(notes == 1 ? "" : "s")") }
+        if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
+        return parts.isEmpty ? "Activity" : parts.joined(separator: ", ")
+    }
+
+    /// Task ids mapped to the subject they were created with.
+    ///
+    /// `TaskUpdate` identifies its task by id alone, so on its own it can only
+    /// say "Task 8". The subject lives in the `TaskCreate` that made it, and
+    /// the id it was assigned comes back in that call's result.
+    private static func taskSubjects(in rows: [TranscriptRow]) -> [String: String] {
+        var subjects: [String: String] = [:]
+        for row in rows where row.kind == .toolCall {
+            // Suffix, not equality: the same tool arrives namespaced when it
+            // comes through MCP (`mcp__ore__TaskCreate`).
+            guard (row.toolName ?? "").lowercased().hasSuffix("taskcreate"),
+                  let subject = row.toolInput?["subject"]?.stringValue,
+                  let id = firstNumber(in: row.resultText ?? "")
+            else { continue }
+            subjects[id] = subject
+        }
+        return subjects
+    }
+
+    private static func taskSubject(
+        for row: TranscriptRow,
+        in subjects: [String: String]
+    ) -> String? {
+        guard row.kind == .toolCall,
+              (row.toolName ?? "").lowercased().contains("task") else { return nil }
+        if let subject = row.toolInput?["subject"]?.stringValue { return subject }
+        guard let id = row.toolInput?["taskId"]?.stringValue
+            ?? row.toolInput?["taskId"]?.intValue.map(String.init)
+        else { return nil }
+        return subjects[id]
+    }
+
+    private static func firstNumber(in text: String) -> String? {
+        let digits = text.drop { !$0.isNumber }.prefix { $0.isNumber }
+        return digits.isEmpty ? nil : String(digits)
     }
 
     private static func isMeaningfulError(_ text: String, result: String?) -> Bool {
@@ -556,7 +688,7 @@ struct ChatPane: View {
                 Text(tab.title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if !tab.draftText.isEmpty {
+                if !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
                     Image(systemName: "pencil").font(.system(size: 8))
                 }
                 if tab.queuedMessageCount > 0 {
@@ -705,28 +837,23 @@ struct ChatPane: View {
                     harness: chatSummary?.harness ?? workspace.harness,
                     status: chat.status,
                     startedAt: chat.turnStartedAt,
+                    // Booting a one-shot CLI takes seconds before its first
+                    // event; the status row says so rather than claiming work
+                    // is already happening.
+                    isStarting: !chat.hasTurnEventArrived,
                     onStop: { model.interrupt(workspace.id) }
                 )
                 .transition(.opacity)
             }
 
             if !externalAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(externalAttachments, id: \.offset) { index, attachment in
-                            HStack(spacing: 5) {
-                                SourceFileIcon(path: attachment.displayName, size: 16)
-                                Text("@\(attachment.displayName)").lineLimit(1)
-                                Button { attachments.remove(at: index) } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                }.buttonStyle(.plain)
-                            }
-                            .font(.caption)
-                            .padding(.horizontal, 8).padding(.vertical, 5)
-                            .background(OreTheme.subduedFill, in: Capsule())
-                        }
-                    }
-                }
+                AttachmentChipStrip(
+                    attachments: externalAttachments.map {
+                        AttachmentChipStrip.IndexedAttachment(index: $0.offset, attachment: $0.element)
+                    },
+                    worktreePath: workspace.worktreePath,
+                    onRemove: { index in discardAttachments(at: IndexSet(integer: index)) }
+                )
             }
 
             if !slashCommands.isEmpty {
@@ -1199,7 +1326,7 @@ struct ChatPane: View {
             .buttonStyle(.glassProminent)
             .buttonBorderShape(.circle)
             .tint(.accentColor)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
             .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
         } else {
@@ -1212,7 +1339,7 @@ struct ChatPane: View {
                     .shadow(color: Color.accentColor.opacity(0.16), radius: 3, y: 1)
             }
             .buttonStyle(.plain)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
             .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
         }
@@ -1228,16 +1355,19 @@ struct ChatPane: View {
 
     private func send() {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !attachments.isEmpty else { return }
+        let outgoing = attachments
+        guard !text.isEmpty || !outgoing.isEmpty else { return }
         if text.isEmpty { text = "Review the attached files." }
         model.send(
             text,
-            attachments: attachments,
+            attachments: outgoing,
             effort: chatSummary.map { supportsEffort(for: $0) } == true ? reasoningEffort : nil,
             serviceTier: chatSummary.map { supportsFastMode($0) } == true && fastModeEnabled ? "fast" : nil,
             to: workspace.id
         )
         draft = ""
+        // Cleared, not discarded: the files were just sent, so the copies under
+        // .context/attachments are still referenced by the message.
         attachments = []
         inlinePastedPaths = []
     }
@@ -1266,10 +1396,43 @@ struct ChatPane: View {
     }
 
     private var externalAttachments: [(offset: Int, element: Attachment)] {
-        Array(attachments.enumerated()).filter {
+        Array(chat.draftAttachments.enumerated()).filter {
             $0.element.relativePath.hasPrefix(".context/attachments/")
                 && !inlinePastedPaths.contains($0.element.relativePath)
         }
+    }
+
+    private func persistAttachments(_ attachments: [Attachment]) {
+        if let chatSummary {
+            model.persistDraftAttachments(attachments, for: chatSummary.id)
+        } else {
+            chat.draftAttachments = attachments
+        }
+    }
+
+    /// Takes an attachment off the draft *and* off the disk.
+    ///
+    /// Dropping a file on the composer copies it into `.context/attachments/`.
+    /// Removing the chip used to drop only the reference, so every screenshot
+    /// the user pasted and then thought better of stayed in the worktree
+    /// forever. Only ORE's own copies are deleted — a chip pointing at a file
+    /// that already lived in the workspace is just a reference to it.
+    private func discardAttachments(at indices: IndexSet) {
+        var next = chat.draftAttachments
+        for index in indices.sorted(by: >) {
+            guard next.indices.contains(index) else { continue }
+            deleteCopiedFile(next.remove(at: index))
+        }
+        persistAttachments(next)
+    }
+
+    private func deleteCopiedFile(_ attachment: Attachment) {
+        guard attachment.relativePath.hasPrefix(".context/attachments/"),
+              !attachment.relativePath.contains("..")
+        else { return }
+        try? FileManager.default.removeItem(
+            at: attachment.fileURL(worktreePath: workspace.worktreePath)
+        )
     }
 
     /// A file URL to preview when the pointer rests on an inline `@name` token —
@@ -1285,18 +1448,20 @@ struct ChatPane: View {
         let folder = URL(fileURLWithPath: workspace.worktreePath)
             .appendingPathComponent(".context/attachments", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var next = chat.draftAttachments
         for source in urls where source.isFileURL {
             let name = "\(UUID().uuidString.prefix(8))-\(source.lastPathComponent)"
             let destination = folder.appendingPathComponent(name)
             do {
                 try FileManager.default.copyItem(at: source, to: destination)
-                attachments.append(Attachment(
+                next.append(Attachment(
                     relativePath: ".context/attachments/\(name)",
                     displayName: source.lastPathComponent,
                     mimeType: UTType(filenameExtension: source.pathExtension)?.preferredMIMEType
                 ))
             } catch { continue }
         }
+        persistAttachments(next)
     }
 
     /// Attaches whatever was pasted: a copied file lands as a shelf attachment; a
@@ -1381,7 +1546,7 @@ struct ChatPane: View {
         return workspaceFileIndex
             .filter { node in
                 !node.isDirectory
-                    && !attachments.contains(where: { $0.relativePath == node.path })
+                    && !chat.draftAttachments.contains(where: { $0.relativePath == node.path })
                     && (query.isEmpty
                         || node.name.lowercased().contains(query)
                         || node.path.lowercased().contains(query))
@@ -1427,8 +1592,10 @@ struct ChatPane: View {
         displayName: String,
         appendToken: Bool = true
     ) {
-        if !attachments.contains(where: { $0.relativePath == path }) {
-            attachments.append(Attachment(relativePath: path, displayName: displayName))
+        if !chat.draftAttachments.contains(where: { $0.relativePath == path }) {
+            persistAttachments(chat.draftAttachments + [
+                Attachment(relativePath: path, displayName: displayName)
+            ])
         }
         if appendToken {
             if !draft.isEmpty, !draft.last!.isWhitespace { draft.append(" ") }
@@ -1479,6 +1646,24 @@ struct ChatPane: View {
         model.openSourceFile(path, in: workspace.id, line: focusLine)
     }
 
+    private func scheduleContinuation() {
+        guard let chatSummary else { return }
+        let resumeAt = chat.prominentError?.resetsAt
+            ?? chat.rateLimit?.resetsAt
+            ?? UsageLimitReset.parse(chat.prominentError?.message ?? "")
+            ?? Date().addingTimeInterval(60 * 60)
+        model.scheduleContinuation(
+            workspaceID: workspace.id,
+            chatID: chatSummary.id,
+            resumeAt: resumeAt
+        )
+    }
+
+    private func cancelScheduledContinuation() {
+        guard let chatSummary else { return }
+        model.cancelScheduledContinuation(for: chatSummary.id)
+    }
+
     private func run(_ command: ComposerCommand) {
         switch command.name {
         case "/plan":
@@ -1489,7 +1674,9 @@ struct ChatPane: View {
         case "/fix": draft = "Diagnose and fix the issue: "
         case "/explain": draft = "Explain this code clearly: "
         case "/model": draft = ""; showModelChooser = true
-        case "/clear": draft = ""; attachments = []
+        case "/clear":
+            draft = ""
+            discardAttachments(at: IndexSet(chat.draftAttachments.indices))
         default: break
         }
         composerFocused = true
@@ -1523,6 +1710,7 @@ private struct ComposerBusyStatus: View {
     let harness: HarnessKind
     let status: AgentStatus
     var startedAt: Date?
+    var isStarting: Bool = false
     let onStop: () -> Void
 
     var body: some View {
@@ -1558,6 +1746,9 @@ private struct ComposerBusyStatus: View {
     }
 
     private var label: String {
+        // Booting a one-shot CLI can take several seconds before any event
+        // arrives; name that state rather than claiming work is happening.
+        if isStarting { return "Starting \(harness.displayName)…" }
         switch status {
         case .runningTool: return "\(harness.displayName) is running a tool"
         case .thinking: return "\(harness.displayName) is thinking"
@@ -1579,6 +1770,11 @@ private struct ResearchEmptyState: View {
     let title: String?
     let seed: String
     let onSuggestion: (String) -> Void
+
+    /// Enriched biography from the local corpus (Wikipedia-backed). Loads
+    /// after first render; the hardcoded fact covers the gap and any failure.
+    @State private var profile: ScientistCorpus.Profile?
+    @State private var portrait: NSImage?
 
     private struct Starter: Identifiable {
         let title: String
@@ -1626,6 +1822,17 @@ private struct ResearchEmptyState: View {
                 .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: identity?.slug) {
+            profile = nil
+            portrait = nil
+            guard let identity else { return }
+            let loaded = await ScientistCorpus.shared.profile(for: identity)
+            guard !Task.isCancelled else { return }
+            profile = loaded
+            if let loaded, let url = ScientistCorpus.shared.imageURL(for: loaded) {
+                portrait = NSImage(contentsOf: url)
+            }
+        }
     }
 
     private func content(compact: Bool, singleColumn: Bool) -> some View {
@@ -1647,40 +1854,22 @@ private struct ResearchEmptyState: View {
                     .foregroundStyle(.secondary)
             }
 
-            LazyVGrid(
-                columns: singleColumn
-                    ? [GridItem(.flexible())]
-                    : [GridItem(.flexible()), GridItem(.flexible())],
-                spacing: compact ? 7 : 10
-            ) {
-                ForEach(starters) { starter in
-                    Button { onSuggestion(starter.prompt) } label: {
-                        HStack(alignment: .top, spacing: 11) {
-                            Image(systemName: starter.icon)
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(Color.accentColor)
-                                .frame(width: 28, height: 28)
-                                .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(starter.title)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text(starter.detail)
-                                    .font(.system(size: 11.5))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(compact ? 8 : 11)
-                        .frame(maxWidth: .infinity, minHeight: compact ? 50 : 66, alignment: .leading)
-                        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
-                        }
-                        .contentShape(RoundedRectangle(cornerRadius: 13))
-                    }
-                    .buttonStyle(OrePressableButtonStyle())
+            if let identity {
+                spotlightCard(identity: identity, compact: compact)
+            }
+
+            // The starters earn one compact row of chips, not four cards —
+            // the scientist is the centerpiece, and the real call to action
+            // is the composer below.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: compact ? 6 : 8) {
+                    ForEach(starters) { starter in starterChip(starter, compact: compact) }
+                }
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                    spacing: compact ? 6 : 8
+                ) {
+                    ForEach(starters) { starter in starterChip(starter, compact: compact) }
                 }
             }
 
@@ -1699,20 +1888,85 @@ private struct ResearchEmptyState: View {
                 }
             }
 
-            if let identity {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "lightbulb.min")
-                        .foregroundStyle(.secondary)
-                    Text("\(identity.name): \(identity.fact)")
-                        .font(.system(size: compact ? 10.5 : 11.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(compact ? 1 : nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.top, 2)
-            }
         }
         .padding(.vertical, compact ? 6 : 44)
+    }
+
+    /// The scientist this workspace is named for, given real presence:
+    /// portrait, a few sentences of biography from the corpus, and a link out.
+    /// Falls back to a monogram and the catalog's one-line fact offline.
+    private func spotlightCard(identity: ResearchIdentity, compact: Bool) -> some View {
+        HStack(alignment: .top, spacing: compact ? 10 : 14) {
+            Group {
+                if let portrait {
+                    Image(nsImage: portrait)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Text(Self.monogram(for: identity.name))
+                        .font(.system(size: compact ? 18 : 24, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.accentColor.opacity(0.12))
+                }
+            }
+            .frame(width: compact ? 52 : 72, height: compact ? 52 : 72)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(identity.name)
+                    .font(.system(size: compact ? 13.5 : 15, weight: .semibold))
+                Text(profile?.descriptionLine ?? "\(identity.field) · \(identity.region)")
+                    .font(.system(size: compact ? 10.5 : 11.5))
+                    .foregroundStyle(.secondary)
+                Text(profile?.extract ?? identity.fact)
+                    .font(.system(size: compact ? 11 : 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(compact ? 2 : 4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 1)
+                if let page = profile?.pageURL, let url = URL(string: page) {
+                    Link("Learn more on Wikipedia", destination: url)
+                        .font(.system(size: compact ? 10.5 : 11.5))
+                        .padding(.top, 1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(compact ? 10 : 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
+        }
+    }
+
+    private func starterChip(_ starter: Starter, compact: Bool) -> some View {
+        Button { onSuggestion(starter.prompt) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: starter.icon)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                Text(starter.title)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: compact ? 24 : 28)
+            .background(OreTheme.subduedFill, in: Capsule())
+            .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .help(starter.detail)
+    }
+
+    private static func monogram(for name: String) -> String {
+        let initials = name.split(separator: " ")
+            .compactMap(\.first)
+            .prefix(2)
+        return String(initials)
     }
 
     private struct Hint {
@@ -1917,6 +2171,9 @@ private struct ContextMeter: View {
 /// often a usage/rate limit the user needs to act on before sending again.
 private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
+    var scheduled: ScheduledContinuation?
+    var onContinueWhenAvailable: () -> Void
+    var onCancelSchedule: () -> Void
     let onDismiss: () -> Void
 
     private var tint: Color { error.isUsageLimit ? OreTheme.warning : .red }
@@ -1926,6 +2183,7 @@ private struct ProminentErrorBanner: View {
     private var title: String {
         error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
     }
+    private var resetDate: Date? { scheduled?.resumeAt ?? error.resetsAt }
 
     var body: some View {
         HStack(alignment: .top, spacing: OreTheme.Space.sm) {
@@ -1934,7 +2192,7 @@ private struct ProminentErrorBanner: View {
                 .foregroundStyle(tint)
                 .padding(.top, 1)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(title)
                     .font(.system(size: OreTheme.Font.body, weight: .semibold))
                 Text(.init(error.message))
@@ -1943,6 +2201,14 @@ private struct ProminentErrorBanner: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                if error.isUsageLimit {
+                    if let scheduled {
+                        scheduledActions(scheduled)
+                    } else {
+                        continueButton
+                    }
+                }
             }
 
             Button(action: onDismiss) {
@@ -1960,6 +2226,72 @@ private struct ProminentErrorBanner: View {
         .overlay {
             RoundedRectangle(cornerRadius: OreTheme.controlRadius)
                 .stroke(tint.opacity(0.35), lineWidth: 1)
+        }
+    }
+
+    private var continueButton: some View {
+        Button(action: onContinueWhenAvailable) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                Text(continueButtonTitle)
+            }
+            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(tint.opacity(0.18), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Automatically continue this chat when the session limit resets")
+    }
+
+    private var continueButtonTitle: String {
+        if let resetDate {
+            return "Continue when it resets · \(UsageLimitReset.format(resetDate))"
+        }
+        return "Continue when it resets"
+    }
+
+    private func scheduledActions(_ scheduled: ScheduledContinuation) -> some View {
+        HStack(spacing: 8) {
+            Label(
+                "Will continue at \(UsageLimitReset.format(scheduled.resumeAt))",
+                systemImage: "checkmark.circle.fill"
+            )
+            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+            .foregroundStyle(.secondary)
+            Button("Cancel", action: onCancelSchedule)
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .buttonStyle(.plain)
+        }
+    }
+}
+
+private struct ScheduledContinuationBanner: View {
+    let item: ScheduledContinuation
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(OreTheme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Continuing when the limit resets")
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                Text(UsageLimitReset.format(item.resumeAt))
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Button("Cancel", action: onCancel)
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(OreTheme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(OreTheme.warning.opacity(0.35), lineWidth: 1)
         }
     }
 }

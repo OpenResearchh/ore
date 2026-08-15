@@ -32,8 +32,22 @@ final class TerminalRegistry {
     /// Tab order and titles, per workspace. Observed, so opening or closing a
     /// tab updates the dock's strip.
     private(set) var tabs: [WorkspaceID: [TerminalTab]] = [:]
+    /// Which tab is showing, per workspace. Held here rather than in the pane's
+    /// `@State` so the collapsed dock can list the open terminals and switch to
+    /// one directly — the pane is not in the hierarchy to be asked.
+    private(set) var activeTabIDs: [WorkspaceID: UUID] = [:]
     /// Localhost URLs seen in output, per workspace.
     private(set) var detectedURLs: [WorkspaceID: [URL]] = [:]
+
+    func activeTab(for workspaceID: WorkspaceID) -> UUID? {
+        let open = tabs[workspaceID] ?? []
+        if let id = activeTabIDs[workspaceID], open.contains(where: { $0.id == id }) { return id }
+        return open.first?.id
+    }
+
+    func selectTab(_ tabID: UUID, for workspaceID: WorkspaceID) {
+        activeTabIDs[workspaceID] = tabID
+    }
 
     /// Ensures a workspace has at least one terminal, returning its tabs. Called
     /// off the view-update path (from `.task`) so seeding never mutates state
@@ -52,6 +66,7 @@ final class TerminalRegistry {
         let tab = TerminalTab(id: UUID(), title: "Terminal \(index)")
         tabs[workspaceID, default: []].append(tab)
         _ = view(for: tab.id, workspaceID: workspaceID, workingDirectory: workingDirectory)
+        activeTabIDs[workspaceID] = tab.id
         return tab
     }
 
@@ -69,7 +84,9 @@ final class TerminalRegistry {
         }
 
         // A login shell, so the user's aliases, prompt and version managers are
-        // all present — the same environment their own terminal has.
+        // all present — the same environment their own terminal has. zsh is the
+        // fallback rather than sh because this only ever runs on macOS, where
+        // it is both present and the system default.
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         terminal.startProcess(
             executable: shell,
@@ -84,6 +101,9 @@ final class TerminalRegistry {
     func closeTab(_ tabID: UUID, for workspaceID: WorkspaceID) {
         views[workspaceID]?.removeValue(forKey: tabID)?.terminate()
         tabs[workspaceID]?.removeAll { $0.id == tabID }
+        if activeTabIDs[workspaceID] == tabID {
+            activeTabIDs[workspaceID] = tabs[workspaceID]?.first?.id
+        }
     }
 
     /// Sends a command to a workspace's first terminal (creating it if needed),
@@ -98,11 +118,16 @@ final class TerminalRegistry {
         views[workspaceID]?.values.forEach { $0.terminate() }
         views.removeValue(forKey: workspaceID)
         tabs.removeValue(forKey: workspaceID)
+        activeTabIDs.removeValue(forKey: workspaceID)
         detectedURLs.removeValue(forKey: workspaceID)
     }
 
     func closeAll() {
-        for id in views.keys { closeTerminal(for: id) }
+        // Iterating `views.keys` directly while `closeTerminal` mutates the
+        // dictionary skipped entries; a snapshot closes every workspace, and
+        // `tabs` is included so a workspace whose views were never realised
+        // still gets its bookkeeping cleared.
+        for id in Set(views.keys).union(tabs.keys) { closeTerminal(for: id) }
     }
 
     private func recordURL(_ url: URL, for workspaceID: WorkspaceID) {
@@ -195,10 +220,10 @@ struct TerminalPane: View {
     var onCollapse: () -> Void = {}
 
     @State private var environment: InProcessCoreClient.WorkspaceEnvironment?
-    @State private var activeTabID: UUID?
     @State private var hoveredTabID: UUID?
 
     private var registry: TerminalRegistry { .shared }
+    private var activeTabID: UUID? { registry.activeTab(for: workspace.id) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -223,10 +248,7 @@ struct TerminalPane: View {
             let env = await model.workspaceEnvironment(for: workspace.id)
             environment = env
             guard let env else { return }
-            let tabs = registry.ensureTabs(for: workspace.id, workingDirectory: env.worktreePath)
-            if activeTabID == nil || !tabs.contains(where: { $0.id == activeTabID }) {
-                activeTabID = tabs.first?.id
-            }
+            registry.ensureTabs(for: workspace.id, workingDirectory: env.worktreePath)
         }
     }
 
@@ -266,7 +288,7 @@ struct TerminalPane: View {
 
     private func terminalTabLabel(_ tab: TerminalTab) -> some View {
         let isSelected = activeTabID == tab.id
-        return Button { activeTabID = tab.id } label: {
+        return Button { registry.selectTab(tab.id, for: workspace.id) } label: {
             HStack(spacing: 6) {
                 Image(systemName: "terminal").font(.system(size: OreTheme.Font.body))
                     .foregroundStyle(.secondary)
@@ -322,14 +344,11 @@ struct TerminalPane: View {
 
     private func addTerminal() {
         guard let environment else { return }
-        activeTabID = registry.addTab(
-            for: workspace.id, workingDirectory: environment.worktreePath
-        ).id
+        registry.addTab(for: workspace.id, workingDirectory: environment.worktreePath)
     }
 
     private func closeTerminal(_ tab: TerminalTab) {
         registry.closeTab(tab.id, for: workspace.id)
-        if activeTabID == tab.id { activeTabID = registry.tabs[workspace.id]?.first?.id }
     }
 
     private func runScript(_ script: String) {

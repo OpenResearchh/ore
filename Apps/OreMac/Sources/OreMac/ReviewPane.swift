@@ -110,6 +110,7 @@ struct ReviewPane: View {
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
             content
                 .frame(maxHeight: .infinity)
+            ShipStatusPanel(workspace: workspace)
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
             GitActionBar(action: gitAction, workspace: workspace) {
                 await refresh()
@@ -1197,6 +1198,282 @@ private struct CommentSheet: View {
     }
 }
 
+/// The GitLens-style strip above the action bar: what's committed but not
+/// shipped, and what CI thinks of what was. Two tabs — Commits (unpushed
+/// work) and Checks (the PR's live check runs) — with the panel switching
+/// itself to Checks when runs start or change state, since that's the moment
+/// the user is actually waiting on.
+private struct ShipStatusPanel: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+
+    /// ~a quarter of a typical review pane; user-resizable and persisted.
+    @AppStorage("ore.reviewShipHeight") private var height = 200.0
+    @State private var dragStart: CGFloat?
+    @State private var tab: ShipTab = .commits
+    @State private var hoveredTab: ShipTab?
+    @State private var commits: [CommitInfo] = []
+    @State private var pullRequest: GitHubClient.PullRequest?
+    /// Signature of the last seen check states. Auto-switching happens only
+    /// when this changes, so a user's manual tab choice survives quiet polls.
+    @State private var checksFingerprint: Int?
+
+    private enum ShipTab: Hashable { case commits, checks }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            resizeHandle
+            header
+            list
+                .frame(height: max(80, min(height, 400) - 34))
+        }
+        .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)") {
+            await load()
+            // While checks run, poll — CI progress has no local filesystem
+            // event to ride on. The task dies with the view, so a hidden
+            // panel costs no gh calls.
+            while !Task.isCancelled, pullRequest?.hasRunningChecks == true {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled else { return }
+                await load()
+            }
+        }
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(OreTheme.hairline)
+            .frame(height: 5)
+            .overlay {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 34, height: 2)
+            }
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeUpDown.push() }
+                else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = height }
+                    height = min(max((dragStart ?? height) - value.translation.height, 120), 400)
+                }
+                .onEnded { _ in dragStart = nil })
+            .help("Drag to resize")
+    }
+
+    private var header: some View {
+        HStack(spacing: OreTheme.Space.xs) {
+            segment("Commits", count: commits.count, target: .commits)
+            segment("Checks", count: activeCheckCount, target: .checks)
+            Spacer(minLength: 0)
+            if pullRequest?.hasRunningChecks == true {
+                ProgressView().controlSize(.mini)
+            }
+        }
+        .padding(.horizontal, OreTheme.Space.sm)
+        .frame(height: 29)
+        .background(.bar)
+    }
+
+    /// Running or failing checks are the ones worth counting; a wall of green
+    /// needs no number.
+    private var activeCheckCount: Int? {
+        guard let pullRequest, !pullRequest.checks.isEmpty else { return nil }
+        let active = pullRequest.checks.filter { !$0.isComplete || !$0.isSuccess }.count
+        return active > 0 ? active : pullRequest.checks.count
+    }
+
+    private func segment(_ title: String, count: Int?, target: ShipTab) -> some View {
+        let isSelected = tab == target
+        return Button { tab = target } label: {
+            HStack(spacing: 5) {
+                Text(title)
+                    .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
+                if let count, count > 0 {
+                    Text("\(count)")
+                        .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 21)
+            .background(
+                isSelected ? OreTheme.selectedFill
+                    : hoveredTab == target ? OreTheme.subduedFill : .clear,
+                in: Capsule()
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .foregroundStyle(isSelected ? .primary : .secondary)
+        .fixedSize(horizontal: true, vertical: false)
+        .onHover { hovering in
+            if hovering { hoveredTab = target }
+            else if hoveredTab == target { hoveredTab = nil }
+        }
+    }
+
+    @ViewBuilder
+    private var list: some View {
+        switch tab {
+        case .commits: commitsList
+        case .checks: checksList
+        }
+    }
+
+    private var commitsList: some View {
+        Group {
+            if commits.isEmpty {
+                shipEmpty(
+                    icon: "checkmark.circle",
+                    text: workspace.gitStatus.hasUncommittedChanges
+                        ? "No commits yet" : "Everything pushed"
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(commits) { commit in
+                            commitRow(commit)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+    }
+
+    private func commitRow(_ commit: CommitInfo) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: OreTheme.Space.sm) {
+            Text(commit.shortSHA)
+                .font(.system(size: OreTheme.Font.caption, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(commit.subject)
+                    .font(.system(size: OreTheme.Font.body))
+                    .lineLimit(1)
+                Text("\(commit.author) · \(commit.date.formatted(.relative(presentation: .named)))")
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, OreTheme.Space.sm)
+        .padding(.vertical, 4)
+    }
+
+    private var checksList: some View {
+        Group {
+            if let pullRequest, !pullRequest.checks.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(pullRequest.checks, id: \.self) { check in
+                            checkRow(check)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+            } else if pullRequest != nil {
+                shipEmpty(icon: "checklist", text: "No checks reported")
+            } else {
+                shipEmpty(icon: "arrow.triangle.pull", text: "No pull request yet")
+            }
+        }
+    }
+
+    private func checkRow(_ check: GitHubClient.CheckRun) -> some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Group {
+                if !check.isComplete {
+                    ProgressView().controlSize(.mini)
+                } else if check.isSuccess {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                } else {
+                    Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+                }
+            }
+            .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(check.name)
+                    .font(.system(size: OreTheme.Font.body))
+                    .lineLimit(1)
+                if let workflow = check.workflow, !workflow.isEmpty {
+                    Text(workflow)
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            if let duration = check.duration {
+                Text(Self.format(duration: duration))
+                    .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            if let link = check.link, let url = URL(string: link) {
+                Button { NSWorkspace.shared.open(url) } label: {
+                    Image(systemName: "arrow.up.right.square")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Open this check on GitHub")
+            }
+        }
+        .padding(.horizontal, OreTheme.Space.sm)
+        .padding(.vertical, 4)
+    }
+
+    private func shipEmpty(icon: String, text: String) -> some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Image(systemName: icon)
+            Text(text)
+        }
+        .font(.system(size: OreTheme.Font.body))
+        .foregroundStyle(.tertiary)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private static func format(duration: TimeInterval) -> String {
+        let total = max(0, Int(duration))
+        let minutes = total / 60, seconds = total % 60
+        return minutes > 0 ? "\(minutes)m \(seconds)s" : "\(seconds)s"
+    }
+
+    private func load() async {
+        async let loadedCommits = model.loadUnpushedCommits(for: workspace.id)
+        async let loadedPR = model.loadPullRequestStatus(for: workspace.id)
+        commits = await loadedCommits
+        let pr = await loadedPR
+        pullRequest = pr
+
+        // Auto-switch to Checks when runs appear or progress; return to
+        // Commits when a PR (and its checks) go away entirely.
+        guard let pr, !pr.checks.isEmpty else {
+            checksFingerprint = nil
+            if tab == .checks { tab = .commits }
+            return
+        }
+        var hasher = Hasher()
+        for check in pr.checks {
+            hasher.combine(check.name)
+            hasher.combine(check.state)
+        }
+        let fingerprint = hasher.finalize()
+        if fingerprint != checksFingerprint {
+            let hadPrevious = checksFingerprint != nil
+            checksFingerprint = fingerprint
+            // Progress mid-run, or a fresh run starting, pulls focus; the
+            // very first fetch after opening the pane does so only when
+            // something is actually running.
+            if pr.hasRunningChecks || hadPrevious {
+                tab = .checks
+            }
+        }
+    }
+}
+
 /// The single most prominent control in the app: the next step to ship this
 /// work, whatever that currently is.
 private struct GitActionBar: View {
@@ -1237,7 +1514,32 @@ private struct GitActionBar: View {
 
     private var bar: some View {
         Group {
-            if action.isActionable {
+            if case .merged = action {
+                // Merged is an end state with an obvious next step, not a
+                // passive banner: continue on a fresh branch, or park the
+                // workspace now that its work has landed.
+                HStack(spacing: OreTheme.Space.sm) {
+                    Image(systemName: icon).foregroundStyle(.green)
+                    Text(action.title)
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button("Continue from merged PR") {
+                        model.continueAfterMerge(workspace.id)
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(500))
+                            await onRefresh()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Pull the updated base and continue on a fresh branch")
+                    Button("Archive") { model.requestArchive(workspace.id) }
+                        .controlSize(.small)
+                        .help("Archive this workspace — frees the worktree's disk space")
+                    refreshButton
+                }
+            } else if action.isActionable {
                 HStack(spacing: OreTheme.Space.sm) {
                     refreshButton
                     Spacer(minLength: 0)

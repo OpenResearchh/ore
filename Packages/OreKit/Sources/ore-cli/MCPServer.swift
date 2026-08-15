@@ -115,5 +115,10 @@ private func writeMCP(_ object: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: object),
           let line = String(data: data, encoding: .utf8) else { return }
     print(line)
-    fflush(stdout)
+    // `fflush(nil)` rather than `fflush(stdout)`: glibc declares `stdout` as a
+    // mutable global, which Swift 6 rejects as shared mutable state, so naming
+    // it here broke the Linux build while compiling fine against Darwin. A null
+    // argument flushes every open output stream, which for a CLI whose whole job
+    // is writing framed JSON to stdout is the same thing.
+    fflush(nil)
 }

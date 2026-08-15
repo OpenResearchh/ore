@@ -203,12 +203,30 @@ public actor GitHubClient {
         public var state: String
         public var link: String?
         public var workflow: String?
+        /// Present for CheckRun-shaped rollup entries; legacy commit statuses
+        /// carry no timestamps, so both stay optional.
+        public var startedAt: Date?
+        public var completedAt: Date?
 
-        public init(name: String, state: String, link: String? = nil, workflow: String? = nil) {
+        public init(
+            name: String,
+            state: String,
+            link: String? = nil,
+            workflow: String? = nil,
+            startedAt: Date? = nil,
+            completedAt: Date? = nil
+        ) {
             self.name = name
             self.state = state
             self.link = link
             self.workflow = workflow
+            self.startedAt = startedAt
+            self.completedAt = completedAt
+        }
+
+        public var duration: TimeInterval? {
+            guard let startedAt, let completedAt else { return nil }
+            return completedAt.timeIntervalSince(startedAt)
         }
 
         public var isComplete: Bool {
@@ -402,6 +420,8 @@ public actor GitHubClient {
                 var detailsUrl: String?
                 var targetUrl: String?
                 var workflowName: String?
+                var startedAt: String?
+                var completedAt: String?
             }
         }
 
@@ -412,6 +432,7 @@ public actor GitHubClient {
         // The rollup mixes two shapes: check runs (status + conclusion) and
         // legacy commit statuses (state). Normalizing here keeps that out of
         // the state machine.
+        let timestamps = ISO8601DateFormatter()
         let checks = (payload.statusCheckRollup ?? []).map { entry -> CheckRun in
             let state: String
             if let status = entry.status, status.uppercased() != "COMPLETED" {
@@ -423,7 +444,9 @@ public actor GitHubClient {
                 name: entry.name ?? entry.context ?? "check",
                 state: state,
                 link: entry.detailsUrl ?? entry.targetUrl,
-                workflow: entry.workflowName
+                workflow: entry.workflowName,
+                startedAt: entry.startedAt.flatMap(timestamps.date(from:)),
+                completedAt: entry.completedAt.flatMap(timestamps.date(from:))
             )
         }
 

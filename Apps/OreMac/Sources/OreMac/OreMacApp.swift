@@ -30,7 +30,12 @@ struct OreMacApp: App {
             ) ? [.cursorAgent] : []
             _model = State(initialValue: AppModel(client: InProcessCoreClient(
                 store: store,
-                harnessRegistry: .standard(enabledExperimental: experimental),
+                harnessRegistry: .standard(
+                    enabledExperimental: experimental,
+                    cursorAllowUnprompted: UserDefaults.standard.bool(
+                        forKey: "ore.cursorAllowUnprompted"
+                    )
+                ),
                 allowAPIKeyFallback: UserDefaults.standard.bool(forKey: "ore.apiKeyFallback")
             )))
         } catch {
@@ -85,6 +90,16 @@ struct OreMacApp: App {
                 // ⇧⌘N opens the full picker to choose project, seed, and harness.
                 Button("New Workspace…") { isShowingNewWorkspace = true }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
+
+                Divider()
+
+                // ⌃⌘A — Mail's archive chord. Stages a confirmation; archiving
+                // stops the agent and removes the checkout from disk.
+                Button("Archive Workspace") {
+                    if let id = model.selectedWorkspaceID { model.requestArchive(id) }
+                }
+                .keyboardShortcut("a", modifiers: [.control, .command])
+                .disabled(model.selectedWorkspace == nil)
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand().environment(updater)
@@ -231,6 +246,53 @@ struct RootView: View {
             }
         }
         .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
+        .confirmationDialog(
+            "Archive \u{201C}\(model.pendingArchive?.workspace.name ?? "workspace")\u{201D}?",
+            isPresented: Binding(
+                get: { model.pendingArchive != nil },
+                set: { if !$0 { model.pendingArchive = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Archive") {
+                if let pending = model.pendingArchive { model.archive(pending.id) }
+                model.pendingArchive = nil
+            }
+            Button("Cancel", role: .cancel) { model.pendingArchive = nil }
+        } message: {
+            Text(
+                "This stops the agent and removes the worktree from disk to free "
+                + "space. The branch, uncommitted work, and all chats are "
+                + "preserved — restore it anytime from the Archived section."
+            )
+        }
+        .confirmationDialog(
+            "Permanently delete \u{201C}\(model.pendingArchivedDelete?.workspace.name ?? "workspace")\u{201D}?",
+            isPresented: Binding(
+                get: { model.pendingArchivedDelete != nil },
+                set: { if !$0 { model.pendingArchivedDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Workspace", role: .destructive) {
+                if let pending = model.pendingArchivedDelete {
+                    model.delete(pending.id, deleteBranch: false)
+                }
+                model.pendingArchivedDelete = nil
+            }
+            Button("Delete Workspace and Branch", role: .destructive) {
+                if let pending = model.pendingArchivedDelete {
+                    model.delete(pending.id, deleteBranch: true)
+                }
+                model.pendingArchivedDelete = nil
+            }
+            Button("Cancel", role: .cancel) { model.pendingArchivedDelete = nil }
+        } message: {
+            Text(
+                "This permanently removes the workspace, its chats, and its "
+                + "preserved uncommitted work. This cannot be undone."
+            )
+        }
         .onChange(of: model.attentionCount) { _, count in
             // Dock badge counts workspaces needing attention, not events —
             // it should mean "this many agents are waiting on you".
@@ -300,7 +362,7 @@ struct RootView: View {
                         workspaceMain(workspace)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .layoutPriority(1)
-                        bottomDock
+                        bottomDock(workspace)
                     }
                 }
             }
@@ -398,8 +460,14 @@ struct RootView: View {
     /// Pane controls live where their pane opens. A top-toolbar terminal button
     /// that reveals content at the opposite edge of the window feels spatially
     /// disconnected; this compact dock also makes the keyboard shortcut visible.
-    private var bottomDock: some View {
-        HStack(spacing: OreTheme.Space.sm) {
+    ///
+    /// Collapsing the pane does not close its terminals — their shells keep
+    /// running — so the dock lists them. A bar that said only "Terminal" gave
+    /// no sign that three builds were still going underneath it, and reopening
+    /// always landed on whichever tab happened to be first.
+    private func bottomDock(_ workspace: WorkspaceSummary) -> some View {
+        let tabs = TerminalRegistry.shared.tabs[workspace.id] ?? []
+        return HStack(spacing: OreTheme.Space.sm) {
             Button { bottomPane = .terminal } label: {
                 // An explicit icon + text (not a `Label`) so this matches the
                 // sidebar footer's construction exactly and the two bars sit on
@@ -415,7 +483,19 @@ struct RootView: View {
             .buttonStyle(.plain)
             .keyboardShortcut("t", modifiers: [.command, .option])
             .help("Open the workspace terminal (⌥⌘T)")
-            Spacer()
+
+            if !tabs.isEmpty {
+                Rectangle().fill(OreTheme.hairline).frame(width: 1, height: 16)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: OreTheme.Space.xs) {
+                        ForEach(tabs) { tab in
+                            dockTerminalTab(tab, in: workspace)
+                        }
+                    }
+                }
+            }
+
+            Spacer(minLength: OreTheme.Space.sm)
             Text("⌥⌘T")
                 .font(.system(size: OreTheme.Font.caption, design: .rounded))
                 .foregroundStyle(.tertiary)
@@ -426,6 +506,28 @@ struct RootView: View {
         .overlay(alignment: .top) {
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
         }
+    }
+
+    private func dockTerminalTab(_ tab: TerminalTab, in workspace: WorkspaceSummary) -> some View {
+        let isActive = TerminalRegistry.shared.activeTab(for: workspace.id) == tab.id
+        return Button {
+            TerminalRegistry.shared.selectTab(tab.id, for: workspace.id)
+            bottomPane = .terminal
+        } label: {
+            Text(tab.title)
+                .font(.system(size: OreTheme.Font.caption, weight: isActive ? .semibold : .regular))
+                .lineLimit(1)
+                .foregroundStyle(isActive ? .primary : .secondary)
+                .padding(.horizontal, 8)
+                .frame(height: 22)
+                .background(
+                    isActive ? OreTheme.selectedFill : OreTheme.subduedFill,
+                    in: Capsule()
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .help("Open \(tab.title)")
     }
 
     private var welcome: some View {
@@ -493,7 +595,7 @@ private struct KeyboardShortcutsView: View {
     @Environment(\.dismiss) private var dismiss
     private let shortcuts = [
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
-        ("Open file", "⌘P"),
+        ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
         ("New tab", "⌘T"), ("Close tab", "⌘W"),
         ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"), ("Toggle terminal", "⌥⌘T"),

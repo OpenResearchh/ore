@@ -37,6 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GRDB compiles against the system SQLite, and the Swift container ships
+      # the library but not its headers — so the build failed on a missing
+      # `sqlite3.h` rather than on anything in this repository.
+      - name: Install SQLite headers
+        run: apt-get update && apt-get install -y libsqlite3-dev
+
       # The headless core is written to avoid Apple-only API so that a hosted
       # version of ORE stays possible. That claim is only worth anything if
       # something checks it — the drivers, git engine and persistence all build
@@ -50,7 +56,12 @@ jobs:
 
   app:
     name: OreMac
-    runs-on: macos-15
+    # macOS 26, not 15: the app adopts Liquid Glass behind `if #available`, and
+    # an availability check still has to compile — on the macOS 15 SDK
+    # `glassEffect` and `.glassProminent` don't exist as symbols at all, so the
+    # whole target failed to build. OreKit stays on macos-15 since it uses no
+    # Apple UI API and passes there.
+    runs-on: macos-26
     defaults:
       run:
         working-directory: Apps/OreMac

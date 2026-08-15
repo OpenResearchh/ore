@@ -1,4 +1,5 @@
 import AppKit
+import OreProtocol
 import Testing
 
 @testable import OreMac
@@ -402,6 +403,198 @@ struct SourceFileIconTests {
     }
 }
 
+@MainActor
+struct UserMessageAttachmentTests {
+    @Test func sentUserBubblesKeepAttachmentChipsInsteadOfPlainTokens() {
+        let row = TranscriptRow(
+            id: "u1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "Look at this",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-image.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                ),
+                Attachment(relativePath: "Sources/App.swift", displayName: "App.swift"),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row)
+        // The typed prose stays; attachments render as chips, not a dumped
+        // `@pasted-image.png` suffix.
+        #expect(rendered.string.contains("Look at this"))
+        #expect(!rendered.string.contains("@pasted-image.png"))
+        var attachmentCount = 0
+        rendered.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            if value != nil { attachmentCount += 1 }
+        }
+        #expect(attachmentCount >= 2)
+    }
+
+    @Test func appendingAUserMessageStoresAttachmentsOnTheRow() {
+        let state = ChatState()
+        state.appendUserMessage(
+            "see this",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/shot.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                )
+            ],
+            comments: []
+        )
+        #expect(state.rows.count == 1)
+        #expect(state.rows[0].text == "see this")
+        #expect(state.rows[0].attachments.map(\.displayName) == ["pasted-image.png"])
+    }
+}
+
+/// The transcript rasterises file chips and resolves semantic colours into
+/// bitmaps, then caches the result. Both halves have to notice a light/dark
+/// switch, or a row keeps drawing its dark-mode pills on a light background —
+/// white on white, which reads as the chips having disappeared.
+@MainActor
+struct TranscriptAppearanceTests {
+    private func editRow() -> TranscriptRow {
+        TranscriptRow(
+            id: "tool-appearance",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Edit",
+            toolName: "Edit",
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: .object([
+                "file_path": .string("Sources/App.swift"),
+                "old_string": .string("a"),
+                "new_string": .string("b"),
+            ]),
+            isComplete: true
+        )
+    }
+
+    @Test func switchingAppearanceRerendersRatherThanServingTheCachedBitmap() {
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+
+        application.appearance = NSAppearance(named: .darkAqua)
+        let dark = TranscriptCell.attributedText(for: editRow())
+        let darkPixels = chipPixels(in: dark)
+
+        application.appearance = NSAppearance(named: .aqua)
+        let light = TranscriptCell.attributedText(for: editRow())
+        let lightPixels = chipPixels(in: light)
+
+        // Same row, same text — but the chip must have been drawn again for the
+        // new appearance instead of being served from the cache.
+        #expect(dark.string == light.string)
+        #expect(darkPixels != nil)
+        #expect(lightPixels != nil)
+        #expect(darkPixels != lightPixels)
+    }
+
+    /// The PNG bytes of the row's first inline image — the file chip.
+    private func chipPixels(in text: NSAttributedString) -> Data? {
+        var found: NSImage?
+        text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, stop in
+            if let image = (value as? NSTextAttachment)?.image, image.size.width > 20 {
+                found = image
+                stop.pointee = true
+            }
+        }
+        guard let found, let tiff = found.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+    }
+}
+
+/// The agent's checklist tools name their task by id, so a row that only shows
+/// the tool name is the one thing that cannot say which task it touched.
+@MainActor
+struct ChecklistRowTests {
+    private func row(tool: String, input: JSONValue, subject: String?) -> TranscriptRow {
+        var row = TranscriptRow(
+            id: "task-1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: tool,
+            toolName: tool,
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: input,
+            isComplete: true
+        )
+        row.resolvedSubject = subject
+        return row
+    }
+
+    @Test func completingATaskNamesTheTaskRatherThanTheTool() {
+        let rendered = TranscriptCell.attributedText(for: row(
+            tool: "TaskUpdate",
+            input: .object(["taskId": .string("8"), "status": .string("completed")]),
+            subject: "Fix stuck plan-approval card"
+        ))
+        #expect(rendered.string.contains("Task completed"))
+        #expect(!rendered.string.contains("TaskUpdate"))
+    }
+
+    @Test func theStatusPicksTheWording() {
+        let started = TranscriptCell.attributedText(for: row(
+            tool: "TaskUpdate",
+            input: .object(["taskId": .string("8"), "status": .string("in_progress")]),
+            subject: "Something"
+        ))
+        #expect(started.string.contains("Task started"))
+
+        let created = TranscriptCell.attributedText(for: row(
+            tool: "TaskCreate",
+            input: .object(["subject": .string("Write the thing")]),
+            subject: nil
+        ))
+        #expect(created.string.contains("Task added"))
+    }
+
+    @Test func anMCPNamespacedChecklistToolIsStillRecognised() {
+        let rendered = TranscriptCell.attributedText(for: row(
+            tool: "mcp__ore__TaskUpdate",
+            input: .object(["taskId": .string("3"), "status": .string("completed")]),
+            subject: "Namespaced"
+        ))
+        #expect(rendered.string.contains("Task completed"))
+    }
+}
+
+struct UsageLimitResetTests {
+    @Test func parsesProviderResetCopyIntoTheNextWallClock() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let now = calendar.date(from: DateComponents(year: 2026, month: 4, day: 10, hour: 10, minute: 0))!
+        let parsed = UsageLimitReset.parse(
+            "You've hit your session limit · resets 5:30am (UTC)",
+            now: now
+        )
+        #expect(parsed != nil)
+        let hour = calendar.component(.hour, from: parsed!)
+        let minute = calendar.component(.minute, from: parsed!)
+        #expect(hour == 5)
+        #expect(minute == 30)
+        #expect(parsed! > now)
+    }
+
+    @Test func formatsResetTimesWithTheZone() {
+        let date = Date(timeIntervalSince1970: 0)
+        let zone = TimeZone(identifier: "UTC")!
+        let formatted = UsageLimitReset.format(date, timeZone: zone)
+        #expect(formatted.contains(zone.identifier) || formatted.contains("GMT") || formatted.contains("UTC"))
+    }
+}
+
+// `GitHubUpdater` is main-actor isolated, and this suite lost its annotation in
+// the merge — the `@MainActor` it relied on sat above the conflicted region and
+// ended up attached to the suite that came first.
 @MainActor
 struct GitHubUpdaterVersionTests {
     @Test func newerVersionsAreDetectedAcrossComponentsAndPrefixes() {

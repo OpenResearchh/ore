@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import OreCore
@@ -91,6 +92,7 @@ final class AppModel {
             isLoaded = true
         }
         startFlushTimer()
+        restoreScheduledContinuations()
     }
 
     /// Flushes coalesced deltas at ~40Hz.
@@ -122,6 +124,8 @@ final class AppModel {
     func shutdown() async {
         eventTask?.cancel()
         flushTask?.cancel()
+        for task in continuationTasks.values { task.cancel() }
+        continuationTasks.removeAll()
         await client.shutdown()
     }
 
@@ -157,6 +161,7 @@ final class AppModel {
     func chat(for id: ChatID) -> ChatState {
         if let existing = chatStates[id] { return existing }
         let state = ChatState()
+        state.draftAttachments = Self.loadDraftAttachments(for: id)
         chatStates[id] = state
         Task { await loadHistory(for: id) }
         return state
@@ -187,6 +192,7 @@ final class AppModel {
                     kind: .userMessage,
                     text: prompt,
                     isComplete: true,
+                    attachments: turn.attachments,
                     createdAt: turn.startedAt
                 ))
             }
@@ -354,6 +360,8 @@ final class AppModel {
     ) {
         let state = chat(for: chatID)
         let comments = state.takeDraftComments()
+        cancelScheduledContinuation(for: chatID)
+        persistDraftAttachments([], for: chatID)
         state.appendUserMessage(text, attachments: attachments, comments: comments)
         Task {
             await client.send(.sendMessage(SendMessageRequest(
@@ -439,6 +447,26 @@ final class AppModel {
             harness: workspace?.harness,
             model: workspace?.model,
             permissionMode: workspace?.permissionMode ?? .default
+        ))) }
+    }
+
+    /// Branches the active chat into a new tab.
+    ///
+    /// The new tab resumes the same provider session with a fork, so the agent
+    /// still remembers the conversation while the original tab keeps its own
+    /// copy — two directions from one point, rather than a choice between them.
+    func forkChat(into workspaceID: WorkspaceID) {
+        guard let source = activeChat(for: workspaceID),
+              chatCreationsInFlight.insert(workspaceID).inserted else { return }
+        showChatInCenter(workspaceID)
+        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
+        Task { await client.send(.createChat(CreateChatRequest(
+            workspaceID: workspaceID,
+            title: ResearchIdentity.unique("\(source.title) (fork)", excluding: used),
+            harness: source.harness,
+            model: source.model,
+            permissionMode: source.permissionMode,
+            forkFrom: source.id
         ))) }
     }
 
@@ -572,6 +600,139 @@ final class AppModel {
         Task { await client.send(.setChatDraft(chat.workspaceID, chat.id, text: text)) }
     }
 
+    func persistDraftAttachments(_ attachments: [Attachment], for chatID: ChatID) {
+        chat(for: chatID).draftAttachments = attachments
+        let key = Self.draftAttachmentsKey(for: chatID)
+        if attachments.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else if let data = try? JSONEncoder().encode(attachments) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private static func loadDraftAttachments(for chatID: ChatID) -> [Attachment] {
+        let key = draftAttachmentsKey(for: chatID)
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([Attachment].self, from: data)) ?? []
+    }
+
+    private static func draftAttachmentsKey(for chatID: ChatID) -> String {
+        "ore.draftAttachments.\(chatID.rawValue)"
+    }
+
+    // MARK: - Scheduled continuation after usage limits
+
+    private(set) var scheduledContinuations: [ChatID: ScheduledContinuation] = [:]
+    private var continuationTasks: [ChatID: Task<Void, Never>] = [:]
+
+    func scheduledContinuation(for chatID: ChatID?) -> ScheduledContinuation? {
+        guard let chatID else { return nil }
+        return scheduledContinuations[chatID]
+    }
+
+    func scheduleContinuation(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        resumeAt: Date,
+        prompt: String = ScheduledContinuation.defaultPrompt
+    ) {
+        let item = ScheduledContinuation(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            resumeAt: resumeAt,
+            prompt: prompt
+        )
+        scheduledContinuations[chatID] = item
+        persistScheduledContinuations()
+        arm(item)
+        scheduleContinuationNotification(item)
+    }
+
+    func cancelScheduledContinuation(for chatID: ChatID) {
+        continuationTasks[chatID]?.cancel()
+        continuationTasks[chatID] = nil
+        scheduledContinuations[chatID] = nil
+        persistScheduledContinuations()
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.continuationNotificationID(for: chatID)])
+    }
+
+    private func restoreScheduledContinuations() {
+        guard let data = UserDefaults.standard.data(forKey: "ore.scheduledContinuations"),
+              let items = try? JSONDecoder().decode([ScheduledContinuation].self, from: data)
+        else { return }
+        for item in items {
+            scheduledContinuations[item.chatID] = item
+            arm(item)
+        }
+    }
+
+    private func persistScheduledContinuations() {
+        let items = Array(scheduledContinuations.values)
+        if items.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "ore.scheduledContinuations")
+        } else if let data = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(data, forKey: "ore.scheduledContinuations")
+        }
+    }
+
+    private func arm(_ item: ScheduledContinuation) {
+        continuationTasks[item.chatID]?.cancel()
+        continuationTasks[item.chatID] = Task { [weak self] in
+            let delay = item.resumeAt.timeIntervalSinceNow
+            if delay > 0 {
+                // A short buffer so the provider has actually opened the window
+                // before we send, rather than racing the reset second.
+                try? await Task.sleep(for: .seconds(delay + 15))
+            }
+            guard !Task.isCancelled else { return }
+            await self?.fireScheduledContinuation(item)
+        }
+    }
+
+    private func fireScheduledContinuation(_ item: ScheduledContinuation) async {
+        guard scheduledContinuations[item.chatID]?.resumeAt == item.resumeAt else { return }
+        scheduledContinuations[item.chatID] = nil
+        continuationTasks[item.chatID] = nil
+        persistScheduledContinuations()
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.continuationNotificationID(for: item.chatID)])
+
+        selectedWorkspaceID = item.workspaceID
+        selectChat(item.chatID, in: item.workspaceID)
+        showChatInCenter(item.workspaceID)
+        NSApp.activate(ignoringOtherApps: true)
+        send(item.prompt, to: item.workspaceID, chatID: item.chatID)
+        postNotification(
+            title: "Continuing \(workspaceName(item.workspaceID))",
+            body: "Session limit reset. Picking up where you left off."
+        )
+    }
+
+    private func scheduleContinuationNotification(_ item: ScheduledContinuation) {
+        let content = UNMutableNotificationContent()
+        content.title = "Session limit reset"
+        content.body = "Continuing \(workspaceName(item.workspaceID)) where you left off."
+        if UserDefaults.standard.object(forKey: "ore.notifications.sound") as? Bool ?? true {
+            content.sound = .default
+        }
+        content.userInfo = [
+            "workspaceID": item.workspaceID.rawValue,
+            "chatID": item.chatID.rawValue,
+        ]
+        let interval = max(item.resumeAt.timeIntervalSinceNow + 15, 1)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        UNUserNotificationCenter.current().add(UNNotificationRequest(
+            identifier: Self.continuationNotificationID(for: item.chatID),
+            content: content,
+            trigger: trigger
+        ))
+    }
+
+    private static func continuationNotificationID(for chatID: ChatID) -> String {
+        "ore.continue.\(chatID.rawValue)"
+    }
+
     func cycleChat(in workspaceID: WorkspaceID, offset: Int) {
         let tabs = chats(for: workspaceID)
         guard tabs.count > 1 else { return }
@@ -583,6 +744,36 @@ final class AppModel {
 
     func archive(_ id: WorkspaceID) {
         Task { await client.send(.archiveWorkspace(id)) }
+    }
+
+    /// A workspace staged for the archive confirmation dialog. Confirming
+    /// calls `archive(_:)`; the dialog explains what archiving preserves.
+    struct PendingArchive: Identifiable {
+        let workspace: WorkspaceSummary
+        var id: WorkspaceID { workspace.id }
+    }
+
+    var pendingArchive: PendingArchive?
+
+    /// Archive is reversible but disruptive (it stops the agent and removes
+    /// the checkout), so it always goes through a confirmation.
+    func requestArchive(_ id: WorkspaceID) {
+        guard let workspace = workspaces.first(where: { $0.id == id }), !workspace.isArchived
+        else { return }
+        pendingArchive = PendingArchive(workspace: workspace)
+    }
+
+    /// An archived workspace staged for permanent deletion — the one archive
+    /// action that cannot be undone.
+    struct PendingArchivedDelete: Identifiable {
+        let workspace: WorkspaceSummary
+        var id: WorkspaceID { workspace.id }
+    }
+
+    var pendingArchivedDelete: PendingArchivedDelete?
+
+    func requestPermanentDelete(_ workspace: WorkspaceSummary) {
+        pendingArchivedDelete = PendingArchivedDelete(workspace: workspace)
     }
 
     func unarchive(_ id: WorkspaceID) {
@@ -601,6 +792,12 @@ final class AppModel {
 
     func setPinned(_ pinned: Bool, for id: WorkspaceID) {
         Task { await client.send(.setWorkspacePinned(id, pinned: pinned)) }
+    }
+
+    /// After the PR merged: pull the base and restart the workspace on a fresh
+    /// branch, leaving a memo in the chat so the agent knows what happened.
+    func continueAfterMerge(_ id: WorkspaceID) {
+        Task { await client.send(.continueAfterMerge(id)) }
     }
 
     func performGitAction(_ action: SuggestedGitAction, for workspace: WorkspaceSummary) {
@@ -675,6 +872,14 @@ final class AppModel {
 
     func loadGitAction(for id: WorkspaceID) async throws -> SuggestedGitAction {
         try await client.suggestedGitAction(workspaceID: id)
+    }
+
+    func loadUnpushedCommits(for id: WorkspaceID) async -> [CommitInfo] {
+        (try? await client.unpushedCommits(workspaceID: id)) ?? []
+    }
+
+    func loadPullRequestStatus(for id: WorkspaceID) async -> GitHubClient.PullRequest? {
+        try? await client.pullRequestStatus(workspaceID: id)
     }
 
     /// The last cached diff for a workspace, if any — used to paint the review
@@ -1014,8 +1219,22 @@ final class AppModel {
             workspaces.removeAll { $0.id == id }
             let removed = chatSummaries.filter { $0.workspaceID == id }.map(\.id)
             chatSummaries.removeAll { $0.workspaceID == id }
-            for chatID in removed { chatStates.removeValue(forKey: chatID) }
+            for chatID in removed { forget(chatID) }
             activeChatIDs.removeValue(forKey: id)
+            openFilePaths.removeValue(forKey: id)
+            activeFilePath.removeValue(forKey: id)
+            filePresentationModes.removeValue(forKey: id)
+            fileFocus.removeValue(forKey: id)
+            pendingNewChatMessages.removeValue(forKey: id)
+            identityRenamesInFlight.remove(id)
+            chatCreationsInFlight.remove(id)
+            // The workspace's terminals keep their PTYs and scrollback alive
+            // for as long as the registry holds them, which outlived the
+            // worktree they were running in.
+            TerminalRegistry.shared.closeTerminal(for: id)
+            for key in ["ore.activeChat", "ore.researchIdentity"] {
+                UserDefaults.standard.removeObject(forKey: "\(key).\(id.rawValue)")
+            }
             if selectedWorkspaceID == id { selectedWorkspaceID = sortedWorkspaces.first?.id }
 
         case .agent(let id, let chatID, let agentEvent):
@@ -1050,9 +1269,7 @@ final class AppModel {
             }
 
         case .chatRemoved(_, let chatID):
-            chatOwners.removeValue(forKey: chatID)
-            coalescers.removeValue(forKey: chatID)
-            chatStates.removeValue(forKey: chatID)
+            forget(chatID)
             chatSummaries.removeAll { $0.id == chatID }
 
         case .chatsListed(let workspaceID, let chats):
@@ -1154,6 +1371,30 @@ final class AppModel {
         }
     }
 
+    /// Drops everything keyed by a chat that no longer exists.
+    ///
+    /// Each of these is small, and each used to outlive its chat: a scheduled
+    /// continuation would still fire against a deleted conversation, and the
+    /// per-chat defaults accumulated one set of orphans per chat ever created.
+    private func forget(_ chatID: ChatID) {
+        chatOwners.removeValue(forKey: chatID)
+        coalescers.removeValue(forKey: chatID)
+        chatStates.removeValue(forKey: chatID)
+        chatRenamesInFlight.remove(chatID)
+        continuationTasks.removeValue(forKey: chatID)?.cancel()
+        scheduledContinuations.removeValue(forKey: chatID)
+        persistScheduledContinuations()
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: [Self.continuationNotificationID(for: chatID)]
+        )
+        for key in [
+            "ore.draftAttachments", "ore.chatScroll",
+            "ore.reasoningEffort", "ore.fastMode",
+        ] {
+            UserDefaults.standard.removeObject(forKey: "\(key).\(chatID.rawValue)")
+        }
+    }
+
     private func workspaceName(_ id: WorkspaceID) -> String {
         workspaces.first { $0.id == id }?.name ?? "A workspace"
     }
@@ -1216,6 +1457,16 @@ final class AppModel {
                     identity.slug,
                     forKey: "ore.researchIdentity.\(workspace.id.rawValue)"
                 )
+                // Repair a name the auto-namer poisoned with a provider error
+                // ("You've hit your session limit"). The workspace's real
+                // identity is still on file, so put it back rather than leaving
+                // the window titled with a stale failure.
+                if Self.looksLikeErrorTitle(workspace.name),
+                   workspace.name != identity.name,
+                   !identityRenamesInFlight.contains(workspace.id) {
+                    identityRenamesInFlight.insert(workspace.id)
+                    rename(workspace.id, to: identity.name)
+                }
             } else if Self.isGenericWorkspaceName(workspace.name),
                       !identityRenamesInFlight.contains(workspace.id) {
                 let identity = ResearchIdentity.next(excluding: used)
@@ -1238,9 +1489,13 @@ final class AppModel {
         var used = Set(chats(for: workspaceID, includeClosed: true)
             .filter { !Self.isGenericChatTitle($0.title, workspaceName: workspace.name) }
             .map(\.title))
+        // A title that is really a provider error is renamed whether or not the
+        // chat has run since: it was never a name, so there is no user intent
+        // behind it to preserve.
         for chat in chats(for: workspaceID, includeClosed: true)
-        where Self.isGenericChatTitle(chat.title, workspaceName: workspace.name)
-            && chat.lastActivity == nil
+        where (Self.isGenericChatTitle(chat.title, workspaceName: workspace.name)
+                && chat.lastActivity == nil
+                || Self.looksLikeErrorTitle(chat.title))
             && !chatRenamesInFlight.contains(chat.id) {
             let title = ResearchIdentity.nextResearchTitle(excluding: used, preferred: preferred)
             used.insert(title)
@@ -1254,6 +1509,18 @@ final class AppModel {
         guard UserDefaults.standard.string(forKey: key) == nil,
               let identity = ResearchIdentity.matching(nameOrSlug: workspace.name) else { return }
         UserDefaults.standard.set(identity.slug, forKey: key)
+    }
+
+    /// A name that is actually a failure the auto-namer captured. The naming
+    /// session runs on the same metered subscription as the chat, so when that
+    /// hits a limit the limit notice is what comes back — and it reads exactly
+    /// like a title, which is why it was adopted as one.
+    nonisolated static func looksLikeErrorTitle(_ title: String) -> Bool {
+        let value = title.lowercased()
+        return [
+            "session limit", "usage limit", "rate limit", "rate-limit",
+            "quota", "too many requests", "try again later",
+        ].contains { value.contains($0) }
     }
 
     private nonisolated static func isGenericWorkspaceName(_ name: String) -> Bool {

@@ -25,10 +25,16 @@ public struct HarnessRegistry: Sendable {
     }
 
     /// Everything shipping today.
-    public static func standard(enabledExperimental: Set<HarnessKind> = []) -> HarnessRegistry {
+    ///
+    /// `cursorAllowUnprompted` is passed rather than read from defaults so the
+    /// core stays free of UI storage; only the app knows the user answered yes.
+    public static func standard(
+        enabledExperimental: Set<HarnessKind> = [],
+        cursorAllowUnprompted: Bool = false
+    ) -> HarnessRegistry {
         var harnesses: [any AgentHarness] = [ClaudeCodeHarness(), CodexHarness()]
         if enabledExperimental.contains(.cursorAgent) {
-            harnesses.append(CursorAgentHarness())
+            harnesses.append(CursorAgentHarness(allowUnprompted: cursorAllowUnprompted))
         }
         return HarnessRegistry(
             harnesses: harnesses,

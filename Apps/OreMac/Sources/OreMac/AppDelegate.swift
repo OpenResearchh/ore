@@ -44,7 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationWillTerminate(_ notification: Notification) {
         // Child agent processes are terminated by their sessions on shutdown;
-        // this is the last chance to make sure that happened.
+        // this is the last chance to make sure that happened. Terminal shells
+        // have no session to close them, so they are killed here rather than
+        // left to be reparented when the app goes away.
+        MainActor.assumeIsolated { TerminalRegistry.shared.closeAll() }
         NotificationCenter.default.post(name: .oreApplicationWillTerminate, object: nil)
     }
 }

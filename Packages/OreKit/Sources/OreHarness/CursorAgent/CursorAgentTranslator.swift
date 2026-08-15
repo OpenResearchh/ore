@@ -130,7 +130,8 @@ struct CursorAgentTranslator {
             output.events.append(.toolResult(ToolResult(
                 turnID: turnID,
                 toolCallID: toolCallID,
-                isError: result?["error"] != nil || result?["failure"] != nil,
+                isError: result?["error"] != nil || result?["failure"] != nil
+                    || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
         default:
@@ -170,11 +171,31 @@ struct CursorAgentTranslator {
         if let text = result.stringValue { return text }
         guard let object = result.objectValue else { return "" }
         if let error = object["error"]?.stringValue { return error }
+        // A refused call carries no error string — just the arguments it would
+        // have used. Reported verbatim it looks like an empty success, which is
+        // how "Cursor blocked every command" showed up as a blank row.
+        if let rejected = object["rejected"] {
+            let subject = rejected["command"]?.stringValue
+                ?? rejected["path"]?.stringValue
+                ?? ""
+            let reason = rejected["reason"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+                ?? "no approval channel is available in this CLI"
+            return subject.isEmpty
+                ? "Blocked by Cursor: \(reason)."
+                : "Blocked by Cursor: `\(subject)` (\(reason))."
+        }
         if let success = object["success"] {
             if let text = success.stringValue { return text }
             for key in ["content", "output", "stdout", "text"] {
                 if let value = success[key]?.stringValue { return value }
             }
+            // A shell call reports its streams separately; an exit code with no
+            // output at all is still worth showing as the result.
+            let streams = ["stdout", "stderr"]
+                .compactMap { success[$0]?.stringValue }
+                .filter { !$0.isEmpty }
+            if !streams.isEmpty { return streams.joined(separator: "\n") }
+            if let code = success["exitCode"]?.intValue { return "exited \(code)" }
         }
         return ""
     }

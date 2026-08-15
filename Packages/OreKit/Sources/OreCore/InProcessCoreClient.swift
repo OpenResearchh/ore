@@ -115,6 +115,10 @@ public actor InProcessCoreClient: CoreClient {
         case .mergePullRequest(let id, let method):
             try await mergePullRequest(id, method: method)
 
+        case .continueAfterMerge(let id):
+            try await engine(for: id).continueAfterMerge()
+            try await resync(id)
+
         case .createChat(let request):
             let chat = try await engine(for: request.workspaceID).createChat(request)
             continuation.yield(.chatAdded(chat))
@@ -222,6 +226,10 @@ public actor InProcessCoreClient: CoreClient {
     /// after a relaunch should show the conversation the user left, not an
     /// empty one.
     public func start() async throws {
+        // Pay the login-shell probe now, off the critical path, so the first
+        // agent launch doesn't stall on it.
+        ShellEnvironment.warm()
+
         for record in try await store.workspaces() {
             _ = try? await makeEngine(for: record)
         }
@@ -453,6 +461,12 @@ public actor InProcessCoreClient: CoreClient {
 
         await stopEngine(id)
 
+        // Measure the checkout before it disappears — the reclaimed space is
+        // exactly what the archived browser reports back to the user.
+        let reclaimedBytes = await Task.detached(priority: .utility) {
+            Self.directorySize(at: worktree)
+        }.value
+
         let git = try gitClient(for: record.repositoryPath)
         let manager = WorktreeManager(git: git, root: worktreeRoot)
         let preservedCommit = try await manager.archive(at: worktree, workspaceID: id)
@@ -460,8 +474,31 @@ public actor InProcessCoreClient: CoreClient {
         _ = try await store.updateWorkspace(id) { record in
             record.isArchived = true
             record.archivedStateCommit = preservedCommit
+            record.archivedAt = Date()
+            record.archivedDiskBytes = reclaimedBytes
         }
         try await resync(nil)
+    }
+
+    /// Total allocated size of a directory tree. Best-effort: unreadable
+    /// entries are skipped rather than failing the archive.
+    private nonisolated static func directorySize(at url: URL) -> Int64 {
+        let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return 0 }
+
+        var total: Int64 = 0
+        for case let file as URL in enumerator {
+            guard let values = try? file.resourceValues(forKeys: keys),
+                  values.isRegularFile == true
+            else { continue }
+            total += Int64(values.totalFileAllocatedSize ?? 0)
+        }
+        return total
     }
 
     private func unarchiveWorkspace(_ id: WorkspaceID) async throws {
@@ -485,6 +522,8 @@ public actor InProcessCoreClient: CoreClient {
         let updated = try await store.updateWorkspace(id) { record in
             record.isArchived = false
             record.archivedStateCommit = nil
+            record.archivedAt = nil
+            record.archivedDiskBytes = nil
         }
         if let updated {
             let engine = try await makeEngine(for: updated)
@@ -505,8 +544,11 @@ public actor InProcessCoreClient: CoreClient {
             deleteBranch: deleteBranch ? record.branch : nil,
             force: true
         )
-        // ORE's own refs must not outlive the thing they describe.
+        // ORE's own refs must not outlive the thing they describe. The archive
+        // ref lives outside the checkpoint namespace, so it needs its own
+        // cleanup or it would pin the archived tree in the repository forever.
         try? await CheckpointStore(git: git).removeAll(workspaceID: id)
+        try? await git.runSerialized(["update-ref", "-d", "refs/ore/archive/\(id.rawValue)"])
 
         try await store.deleteWorkspace(id)
         continuation.yield(.workspaceRemoved(id))
@@ -678,13 +720,26 @@ public actor InProcessCoreClient: CoreClient {
     /// Runs a lifecycle script in the worktree, through the user's login shell
     /// so their version managers and aliases apply.
     private func runScript(_ script: String, in directory: URL, workspaceID: WorkspaceID) async {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        guard let process = try? ChildProcess(
-            executablePath: shell,
-            arguments: ["-lc", script],
-            workingDirectory: directory,
-            environment: ShellEnvironment.childEnvironment()
-        ) else { return }
+        let shell = ShellEnvironment.loginShellPath
+        let process: ChildProcess
+        do {
+            process = try ChildProcess(
+                executablePath: shell,
+                arguments: ShellEnvironment.commandArguments(for: shell, script: script),
+                workingDirectory: directory,
+                environment: ShellEnvironment.childEnvironment()
+            )
+        } catch {
+            // Silently returning here is how a setup script that never ran
+            // looked identical to one that succeeded — the worktree just came
+            // up missing whatever it was supposed to create.
+            continuation.yield(.commandFailed(CommandFailure(
+                workspaceID: workspaceID,
+                message: "The setup script couldn't be started.",
+                detail: "\(shell): \(describe(error))"
+            )))
+            return
+        }
         process.closeStandardInput()
 
         let output = await process.stdoutChunks.collectText()
@@ -725,6 +780,17 @@ public actor InProcessCoreClient: CoreClient {
 
     public func suggestedGitAction(workspaceID: WorkspaceID) async throws -> SuggestedGitAction {
         try await engine(for: workspaceID).suggestedGitAction()
+    }
+
+    /// Commits not yet on the upstream (or, without one, not on the base).
+    public func unpushedCommits(workspaceID: WorkspaceID) async throws -> [CommitInfo] {
+        try await engine(for: workspaceID).unpushedCommits()
+    }
+
+    /// The branch's PR with live check runs; nil when gh is missing,
+    /// unauthenticated, or no PR exists.
+    public func pullRequestStatus(workspaceID: WorkspaceID) async throws -> GitHubClient.PullRequest? {
+        try await engine(for: workspaceID).currentPullRequest()
     }
 
     public func addDiffComment(
@@ -844,7 +910,8 @@ private extension CoreCommand {
              .addDiffComment(let id, _), .markFileViewed(let id, _, _),
              .commit(let id, _), .createGitHubRepo(let id), .push(let id),
              .createPullRequest(let id, _, _, _, _),
-             .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _):
+             .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _),
+             .continueAfterMerge(let id):
             return id
         case .resolvePermission(let id, _, _), .answerQuestion(let id, _, _),
              .revertToCheckpoint(let id, _):

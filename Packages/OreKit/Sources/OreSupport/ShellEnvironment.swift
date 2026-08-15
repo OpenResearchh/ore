@@ -50,9 +50,18 @@ public enum ShellEnvironment {
     /// The user's login-shell environment, probed once per app run.
     ///
     /// Falls back to the process environment if the probe fails or times out;
-    /// a degraded `PATH` beats a hung launch.
+    /// a degraded `PATH` beats a hung launch. Either way the result is
+    /// augmented with the directories and variables child CLIs assume exist.
     public static func loginShellEnvironment() -> [String: String] {
-        cache.resolve { probeLoginShell() ?? ProcessInfo.processInfo.environment }
+        cache.resolve { augmented(probeLoginShell() ?? ProcessInfo.processInfo.environment) }
+    }
+
+    /// Fires the login-shell probe off the caller's path so the first harness
+    /// launch never pays the up-to-5s shell startup cost.
+    public static func warm() {
+        Thread.detachNewThread {
+            _ = loginShellEnvironment()
+        }
     }
 
     public static func invalidateCache() {
@@ -77,6 +86,36 @@ public enum ShellEnvironment {
             }
         }
         return environment
+    }
+
+    /// The shell to run a user's script through.
+    ///
+    /// `$SHELL` is the right answer when it's set and real, but it is routinely
+    /// absent in a non-interactive context — a container, a launchd job, CI —
+    /// and hardcoding zsh as the fallback meant that on any machine without it
+    /// (every Linux image) the shell simply failed to launch. The candidates are
+    /// tried in order of how much of the user's setup they carry.
+    public static var loginShellPath: String {
+        let candidates = [
+            ProcessInfo.processInfo.environment["SHELL"],
+            "/bin/zsh", "/bin/bash", "/bin/sh",
+        ]
+        for candidate in candidates.compactMap({ $0 }) where isExecutable(candidate) {
+            return candidate
+        }
+        return "/bin/sh"
+    }
+
+    /// How to ask `shell` to run a one-off command.
+    ///
+    /// `-l` loads the user's profile, which is the point — but it is a bash/zsh
+    /// extension, and passing it to a POSIX `sh` (dash, on most Linux images)
+    /// makes the shell reject the whole invocation.
+    public static func commandArguments(for shell: String, script: String) -> [String] {
+        let name = (shell as NSString).lastPathComponent
+        return (name == "zsh" || name == "bash")
+            ? ["-lc", script]
+            : ["-c", script]
     }
 
     /// Finds an executable on the resolved `PATH`.
@@ -105,6 +144,36 @@ public enum ShellEnvironment {
         loginShellEnvironment()["PATH"] ?? "(no PATH)"
     }
 
+    /// Backfills what a broken or minimal environment leaves out: the common
+    /// tool directories on `PATH`, and the variables (`HOME`, `SHELL`, `TERM`)
+    /// that CLIs and their lifecycle scripts assume are always present.
+    private static func augmented(_ environment: [String: String]) -> [String: String] {
+        var environment = environment
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var path = environment["PATH"] ?? ""
+        var seen = Set(path.split(separator: ":", omittingEmptySubsequences: true).map(String.init))
+        let required = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "\(home)/.local/bin",
+            "\(home)/bin",
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ]
+        for directory in required where !seen.contains(directory) {
+            path = path.isEmpty ? directory : "\(path):\(directory)"
+            seen.insert(directory)
+        }
+        environment["PATH"] = path
+
+        if environment["HOME"]?.isEmpty != false { environment["HOME"] = home }
+        if environment["SHELL"]?.isEmpty != false {
+            environment["SHELL"] = loginShellPath
+        }
+        if environment["TERM"]?.isEmpty != false { environment["TERM"] = "xterm-256color" }
+        return environment
+    }
+
     private static func isExecutable(_ path: String) -> Bool {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
@@ -122,13 +191,19 @@ public enum ShellEnvironment {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         guard isExecutable(shell) else { return nil }
 
+        // Interactive as well as login first: nvm and mise are commonly
+        // initialized in .zshrc / .bashrc rather than the profile. If that
+        // hangs or fails (a profile waiting on input), retry login-only, which
+        // skips the interactive rc files entirely.
+        return probe(shell: shell, flags: "-ilc") ?? probe(shell: shell, flags: "-lc")
+    }
+
+    private static func probe(shell: String, flags: String) -> [String: String]? {
         let begin = "__ORE_ENV_BEGIN__"
         let end = "__ORE_ENV_END__"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
-        // Interactive as well as login: nvm and mise are commonly initialized
-        // in .zshrc / .bashrc rather than the profile.
-        process.arguments = ["-ilc", "printf '%s\\n' \(begin); env -0; printf '%s\\n' \(end)"]
+        process.arguments = [flags, "printf '%s\\n' \(begin); env -0; printf '%s\\n' \(end)"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice

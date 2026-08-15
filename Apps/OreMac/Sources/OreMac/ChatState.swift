@@ -28,14 +28,21 @@ final class ChatState {
     struct ProminentError: Equatable {
         var message: String
         var isUsageLimit: Bool
+        var resetsAt: Date?
     }
     private(set) var prominentError: ProminentError?
 
     func dismissProminentError() { prominentError = nil }
 
+    /// Files attached to the unsent draft. Kept on the chat, not the pane, so
+    /// switching tabs restores chips and mention pills instead of leaving bare
+    /// `@pasted-image.png` text.
+    var draftAttachments: [Attachment] = []
+
     private static func looksLikeUsageLimit(_ text: String) -> Bool {
         let value = text.lowercased()
         return value.contains("usage limit")
+            || value.contains("session limit")
             || value.contains("rate limit")
             || value.contains("rate-limit")
             || value.contains("quota")
@@ -56,6 +63,11 @@ final class ChatState {
     /// while idle.
     private(set) var turnStartedAt: Date?
 
+    /// False between the user pressing send and the harness reporting its
+    /// first turn event — the window where a one-shot CLI (Cursor) is still
+    /// booting and the UI would otherwise look stuck.
+    private(set) var hasTurnEventArrived = true
+
     /// Index of the row a delta should append to, so streaming doesn't scan.
     private var streamingRowIndex: [BlockID: Int] = [:]
     private var currentTurnID: TurnID?
@@ -74,8 +86,11 @@ final class ChatState {
             currentTurnID = turn.turnID
             streamingRowIndex.removeAll()
             turnStartedAt = Date()
-            // A new turn means the user pressed on past the last failure.
+            hasTurnEventArrived = true
+            // A new turn means the user pressed on past the last failure, and
+            // past any plan that was still awaiting an answer.
             prominentError = nil
+            plan = nil
 
         case .textDelta(let delta):
             append(delta: delta, kind: .assistantText)
@@ -119,6 +134,10 @@ final class ChatState {
 
         case .permissionResolved(let resolution):
             if pendingPermission?.id == resolution.id { pendingPermission = nil }
+            // The plan card is gated on the *same* permission request. Without
+            // this it survived its own approval, so a second proposal left two
+            // cards and answering either one left the other on screen forever.
+            resolvePlan(requestID: resolution.id)
 
         case .question(let question):
             pendingQuestion = question
@@ -137,11 +156,15 @@ final class ChatState {
 
         case .rateLimit(let report):
             rateLimit = report
+            if prominentError?.isUsageLimit == true {
+                prominentError?.resetsAt = report.resetsAt ?? prominentError?.resetsAt
+            }
 
         case .turnCompleted(let result):
             currentTurnID = nil
             streamingRowIndex.removeAll()
             turnStartedAt = nil
+            hasTurnEventArrived = true
             if result.outcome == .failed, let message = result.errorMessage {
                 rows.append(TranscriptRow(
                     id: "error-\(result.turnID.rawValue)",
@@ -151,7 +174,9 @@ final class ChatState {
                 ))
                 prominentError = ProminentError(
                     message: message,
-                    isUsageLimit: Self.looksLikeUsageLimit(message)
+                    isUsageLimit: Self.looksLikeUsageLimit(message),
+                    resetsAt: rateLimit?.resetsAt
+                        ?? UsageLimitReset.parse(message)
                 )
             }
 
@@ -166,7 +191,10 @@ final class ChatState {
             prominentError = ProminentError(
                 message: error.message,
                 isUsageLimit: error.kind == .rateLimited
-                    || Self.looksLikeUsageLimit(error.message)
+                    || Self.looksLikeUsageLimit(error.message),
+                resetsAt: rateLimit?.resetsAt
+                    ?? UsageLimitReset.parse(error.message)
+                    ?? UsageLimitReset.parse(error.detail ?? "")
             )
 
         case .sessionEnded:
@@ -208,19 +236,21 @@ final class ChatState {
         attachments: [Attachment] = [],
         comments: [DiffCommentReference]
     ) {
-        let attachmentLine = attachments.isEmpty
-            ? ""
-            : "\n\n" + attachments.map { "@\($0.displayName)" }.joined(separator: "  ")
         rows.append(TranscriptRow(
             id: "user-\(UUID().uuidString)",
             turnID: currentTurnID ?? TurnID(rawValue: "pending"),
             kind: .userMessage,
-            text: text + attachmentLine,
-            attachedComments: comments
+            text: text,
+            attachedComments: comments,
+            attachments: attachments
         ))
         // Optimistic: the agent hasn't reported anything yet, but the user
-        // pressed send and the UI must not look idle.
+        // pressed send and the UI must not look idle. The timer starts now so
+        // a slow-booting CLI still shows elapsed time; `.turnStarted`
+        // overwrites it with the harness's own clock.
         status = .requesting
+        turnStartedAt = Date()
+        hasTurnEventArrived = false
     }
 
     func addDraftComment(_ reference: DiffCommentReference) {
@@ -239,7 +269,24 @@ final class ChatState {
 
     func resolvePermission(_ id: PermissionRequestID) {
         if pendingPermission?.id == id { pendingPermission = nil }
+        resolvePlan(requestID: id)
     }
+
+    /// Dismisses the plan card once its approval has been answered.
+    ///
+    /// A proposal with no request id is informational — the harness is showing
+    /// a plan, not asking about one — so it is dismissed on any resolution
+    /// rather than waiting for an id that will never arrive.
+    private func resolvePlan(requestID: PermissionRequestID) {
+        guard case .proposal(_, let planRequestID) = plan else { return }
+        guard planRequestID == nil || planRequestID == requestID else { return }
+        plan = nil
+    }
+
+    /// The user answered the plan card directly (approve, or reject with
+    /// feedback). Clears it immediately rather than waiting for the harness to
+    /// echo a resolution that, for a plan with no request id, never comes.
+    func dismissPlan() { plan = nil }
 
     func resolveQuestion(_ id: QuestionID) {
         if pendingQuestion?.id == id { pendingQuestion = nil }
@@ -316,6 +363,9 @@ struct TranscriptRow: Identifiable, Sendable {
         /// Intermediate reasoning, progress messages, and tool calls folded
         /// into one turn-level activity section.
         case activityGroup
+        /// The closing line of a finished turn: what it changed, how long it
+        /// took, and the actions that apply to the turn as a whole.
+        case turnFooter
     }
 
     let id: String
@@ -334,6 +384,7 @@ struct TranscriptRow: Identifiable, Sendable {
     var isComplete = false
     var permissionRequestID: PermissionRequestID?
     var attachedComments: [DiffCommentReference] = []
+    var attachments: [Attachment] = []
     var groupedRows: [TranscriptRow] = []
     var isExpanded = false
     /// When this row launched a subagent (a Task tool call), how many tool uses
@@ -341,9 +392,14 @@ struct TranscriptRow: Identifiable, Sendable {
     /// into a collapsible group whose children fold away beneath it.
     var subagentChildCount: Int?
     var createdAt: Date = Date()
+    /// A subject resolved from elsewhere in the transcript rather than from
+    /// this row's own payload. A `TaskUpdate` names its task only by id, so the
+    /// human title has to come from the `TaskCreate` that made it.
+    var resolvedSubject: String?
 
     var activitySignature: Int {
         var hasher = Hasher()
+        hasher.combine(resolvedSubject)
         for row in groupedRows {
             hasher.combine(row.id)
             hasher.combine(row.text)

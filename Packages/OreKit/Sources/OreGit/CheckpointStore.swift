@@ -180,6 +180,28 @@ public actor CheckpointStore {
         }
     }
 
+    /// Drops every checkpoint for a workspace except the given turns.
+    ///
+    /// Every turn parks a commit on a private ref, and a private ref is exactly
+    /// what stops `gc` reclaiming the tree it points at. That is the point
+    /// while the checkpoint is reachable from the UI, and pure cost once it is
+    /// hundreds of turns back — a long-lived workspace otherwise keeps a full
+    /// snapshot of itself for every turn it has ever run.
+    ///
+    /// Which turns to keep is the caller's decision because only it can order
+    /// them. Sorting the refs by their commit date looked equivalent and is
+    /// not: git timestamps have one-second resolution, so several checkpoints
+    /// taken in the same second sort arbitrarily and the pruning would keep an
+    /// arbitrary subset of them.
+    public func prune(workspaceID: WorkspaceID, keeping turns: Set<TurnID>) async throws {
+        let prefix = "refs/ore/ckpt/\(workspaceID.rawValue)"
+        for ref in try await list(workspaceID: workspaceID) {
+            let turn = TurnID(rawValue: String(ref.dropFirst(prefix.count + 1)))
+            guard !turns.contains(turn) else { continue }
+            try? await git.runSerialized(["update-ref", "-d", ref])
+        }
+    }
+
     public static func ref(workspaceID: WorkspaceID, turnID: TurnID) -> String {
         "refs/ore/ckpt/\(workspaceID.rawValue)/\(turnID.rawValue)"
     }

@@ -115,6 +115,10 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
     public var hasUnread: Bool
     public var isPinned: Bool
     public var isArchived: Bool
+    public var archivedAt: Date?
+    /// Disk space the archive reclaimed, measured before the worktree was
+    /// removed. Nil for never-archived workspaces.
+    public var archivedDiskBytes: Int64?
     public var gitStatus: GitStatusSummary
     public var contextUsage: UsageReport?
     public var lastActivity: Date?
@@ -134,6 +138,8 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         hasUnread: Bool = false,
         isPinned: Bool = false,
         isArchived: Bool = false,
+        archivedAt: Date? = nil,
+        archivedDiskBytes: Int64? = nil,
         gitStatus: GitStatusSummary = GitStatusSummary(),
         contextUsage: UsageReport? = nil,
         lastActivity: Date? = nil
@@ -152,6 +158,8 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         self.hasUnread = hasUnread
         self.isPinned = isPinned
         self.isArchived = isArchived
+        self.archivedAt = archivedAt
+        self.archivedDiskBytes = archivedDiskBytes
         self.gitStatus = gitStatus
         self.contextUsage = contextUsage
         self.lastActivity = lastActivity

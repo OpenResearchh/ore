@@ -15,15 +15,26 @@ import SwiftUI
 /// without touching the rest of the table. A streaming paragraph therefore
 /// costs one text mutation per delta rather than a re-layout of the document.
 struct TranscriptView: NSViewRepresentable {
+    /// What the footer's ⋯ menu can do to a finished turn. Copying is handled
+    /// inside the cell, which already holds the turn's rows.
+    enum TurnAction {
+        case fork
+        case revert
+    }
+
     var rows: [TranscriptRow]
+    var worktreePath: String = ""
     var persistenceKey: String
     var onRevert: (TurnID) -> Void
     var onToggleActivity: (String) -> Void
     var onOpenFile: (String) -> Void
+    var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+    var canFork = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             persistenceKey: persistenceKey,
+            worktreePath: worktreePath,
             onRevert: onRevert,
             onToggleActivity: onToggleActivity,
             onOpenFile: onOpenFile
@@ -75,6 +86,12 @@ struct TranscriptView: NSViewRepresentable {
         )
 
         let container = TranscriptContainerView(scrollView: scrollView)
+        // Row bitmaps (file chips, tool icons) bake in resolved colours, so a
+        // light/dark switch has to invalidate and re-measure every row rather
+        // than leaving dark-mode pills painted onto a light transcript.
+        container.onAppearanceChange = { [weak coordinator = context.coordinator] in
+            coordinator?.appearanceChanged()
+        }
         context.coordinator.container = container
         container.turnRail.onSelectRow = { [weak coordinator = context.coordinator] row in
             coordinator?.scroll(to: row)
@@ -86,6 +103,9 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.onRevert = onRevert
         context.coordinator.onToggleActivity = onToggleActivity
         context.coordinator.onOpenFile = onOpenFile
+        context.coordinator.onTurnAction = onTurnAction
+        context.coordinator.canFork = canFork
+        context.coordinator.worktreePath = worktreePath
         context.coordinator.update(rows: rows)
     }
 
@@ -100,6 +120,9 @@ struct TranscriptView: NSViewRepresentable {
         var onRevert: (TurnID) -> Void
         var onToggleActivity: (String) -> Void
         var onOpenFile: (String) -> Void
+        var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+        var canFork = false
+        var worktreePath: String
         let persistenceKey: String
 
         private var rows: [TranscriptRow] = []
@@ -121,11 +144,13 @@ struct TranscriptView: NSViewRepresentable {
 
         init(
             persistenceKey: String,
+            worktreePath: String,
             onRevert: @escaping (TurnID) -> Void,
             onToggleActivity: @escaping (String) -> Void,
             onOpenFile: @escaping (String) -> Void
         ) {
             self.persistenceKey = persistenceKey
+            self.worktreePath = worktreePath
             self.onRevert = onRevert
             self.onToggleActivity = onToggleActivity
             self.onOpenFile = onOpenFile
@@ -150,7 +175,8 @@ struct TranscriptView: NSViewRepresentable {
                     || previous[index].isExpanded != newRows[index].isExpanded
                     || previous[index].toolInput != newRows[index].toolInput
                     || previous[index].resultMetadata != newRows[index].resultMetadata
-                    || previous[index].activitySignature != newRows[index].activitySignature {
+                    || previous[index].activitySignature != newRows[index].activitySignature
+                    || previous[index].attachments != newRows[index].attachments {
                     heightCache.removeValue(forKey: newRows[index].id)
                     changed.insert(index)
                 }
@@ -203,6 +229,13 @@ struct TranscriptView: NSViewRepresentable {
             // bottom; yanking them back while they read is worse than not
             // following at all.
             if wasAtBottom { scrollToBottom(tableView) }
+        }
+
+        func appearanceChanged() {
+            guard let tableView else { return }
+            heightCache.removeAll()
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+            tableView.reloadData()
         }
 
         /// Applies a deferred scroll restore once the table can honour it — i.e.
@@ -259,7 +292,7 @@ struct TranscriptView: NSViewRepresentable {
             guard available > 1 else { return 44 }
 
             let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
-            let height = TranscriptCell.height(for: item, width: width)
+            let height = TranscriptCell.height(for: item, width: width, worktreePath: worktreePath)
             heightCache[item.id] = height
             return height
         }
@@ -275,9 +308,12 @@ struct TranscriptView: NSViewRepresentable {
                 as? TranscriptCell ?? TranscriptCell(identifier: identifier)
             cell.configure(
                 with: rows[row],
+                worktreePath: worktreePath,
+                canFork: canFork,
                 onRevert: onRevert,
                 onToggleActivity: onToggleActivity,
-                onOpenFile: onOpenFile
+                onOpenFile: onOpenFile,
+                onTurnAction: onTurnAction
             )
             return cell
         }
@@ -347,6 +383,12 @@ struct TranscriptView: NSViewRepresentable {
 final class TranscriptContainerView: NSView {
     let scrollView: NSScrollView
     let turnRail = TurnRailView()
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
 
     init(scrollView: NSScrollView) {
         self.scrollView = scrollView
@@ -456,6 +498,7 @@ final class TranscriptCell: NSTableCellView {
     private let badge = NSTextField(labelWithString: "")
     private let contentGuide = NSLayoutGuide()
     private var badgeHeightZero: NSLayoutConstraint!
+    private var labelTrailingConstraint: NSLayoutConstraint!
     private var leadingConstraint: NSLayoutConstraint!
     private var trailingConstraint: NSLayoutConstraint!
     private var bubbleTopConstraint: NSLayoutConstraint!
@@ -465,9 +508,15 @@ final class TranscriptCell: NSTableCellView {
     private var revertAction: (() -> Void)?
     private var toggleActivityAction: (() -> Void)?
     private let copyButton = NSButton()
+    private let menuButton = NSButton()
     private var copyableText = ""
     private var isUserMessage = false
     private var copyTrackingArea: NSTrackingArea?
+    /// The turn a footer row's ⋯ menu acts on, and what it may offer.
+    private var footerTurnID: TurnID?
+    private var footerResponse = ""
+    private var footerCanFork = false
+    private var onTurnAction: ((TurnID, TranscriptView.TurnAction) -> Void)?
 
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -491,10 +540,26 @@ final class TranscriptCell: NSTableCellView {
         copyButton.isHidden = true
         copyButton.toolTip = "Copy message"
         addSubview(copyButton)
+
+        // The turn footer's overflow menu. A real button rather than a glyph in
+        // the attributed string, because the row's text view swallows clicks to
+        // drive expand/collapse.
+        menuButton.isBordered = false
+        menuButton.bezelStyle = .regularSquare
+        menuButton.imagePosition = .imageOnly
+        menuButton.image = NSImage(
+            systemSymbolName: "ellipsis", accessibilityDescription: "Turn actions"
+        )
+        menuButton.contentTintColor = .secondaryLabelColor
+        menuButton.target = self
+        menuButton.action = #selector(showTurnMenu)
+        menuButton.translatesAutoresizingMaskIntoConstraints = false
+        menuButton.isHidden = true
+        menuButton.toolTip = "Actions for this turn"
+        addSubview(menuButton)
         addLayoutGuide(contentGuide)
 
         indentGuide.wantsLayer = true
-        indentGuide.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.6).cgColor
         indentGuide.layer?.cornerRadius = 1
         indentGuide.translatesAutoresizingMaskIntoConstraints = false
         addSubview(indentGuide)
@@ -525,6 +590,9 @@ final class TranscriptCell: NSTableCellView {
         bubble.addSubview(label)
 
         badgeHeightZero = badge.heightAnchor.constraint(equalToConstant: 0)
+        labelTrailingConstraint = label.trailingAnchor.constraint(
+            equalTo: bubble.trailingAnchor, constant: -10
+        )
 
         // A left-aligned content column, not a centred bubble. A short "hi" used
         // to float as a tiny island in the middle of the pane; rows now begin at
@@ -572,7 +640,7 @@ final class TranscriptCell: NSTableCellView {
             badge.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 6),
 
             label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
-            label.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
+            labelTrailingConstraint,
             label.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 2),
             label.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -8),
 
@@ -585,6 +653,11 @@ final class TranscriptCell: NSTableCellView {
             copyButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
             copyButton.widthAnchor.constraint(equalToConstant: 22),
             copyButton.heightAnchor.constraint(equalToConstant: 22),
+
+            menuButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -4),
+            menuButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
+            menuButton.widthAnchor.constraint(equalToConstant: 24),
+            menuButton.heightAnchor.constraint(equalToConstant: 22),
         ])
     }
 
@@ -593,17 +666,31 @@ final class TranscriptCell: NSTableCellView {
 
     func configure(
         with row: TranscriptRow,
+        worktreePath: String = "",
+        canFork: Bool = false,
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
-        onOpenFile: @escaping (String) -> Void
+        onOpenFile: @escaping (String) -> Void,
+        onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in }
     ) {
+        let isFooter = row.kind == .turnFooter
+        menuButton.isHidden = !isFooter
+        // Keep the footer's file chips clear of the ⋯ button they'd otherwise
+        // wrap underneath. `Self.trailingInset` mirrors this in `height(for:)`
+        // so the measured height matches what is drawn.
+        labelTrailingConstraint.constant = -Self.trailingInset(for: row)
+        footerTurnID = isFooter ? row.turnID : nil
+        footerCanFork = canFork
+        footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
+        self.onTurnAction = onTurnAction
+
         let badgeString = Self.badgeText(for: row)
         badge.stringValue = badgeString
         badge.isHidden = badgeString.isEmpty
         badgeHeightZero.isActive = badgeString.isEmpty
 
         let isUser = row.kind == .userMessage
-        copyableText = row.text
+        copyableText = Self.copyableText(for: row)
         isUserMessage = isUser
         // The copy button belongs to user messages; it stays hidden until the
         // row is hovered (see mouseEntered/Exited).
@@ -621,14 +708,14 @@ final class TranscriptCell: NSTableCellView {
         userWidthConstraint.isActive = isUser
 
         if isUser {
-            let natural = Self.attributedText(for: row).boundingRect(
+            let natural = Self.attributedText(for: row, worktreePath: worktreePath).boundingRect(
                 with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading]
             ).width + 20
             userWidthConstraint.constant = min(max(120, ceil(natural)), 620)
         }
 
-        let attributedText = Self.attributedText(for: row)
+        let attributedText = Self.attributedText(for: row, worktreePath: worktreePath)
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
         // Activity groups toggle on a click, so their text isn't selectable;
@@ -651,10 +738,19 @@ final class TranscriptCell: NSTableCellView {
         label.onSingleClick = isProcess ? { onToggleActivity(row.id) } : nil
         label.onDoubleClick = row.kind == .userMessage ? { onRevert(row.turnID) } : nil
 
+        // `cgColor` snapshots a dynamic colour against the appearance current
+        // at this instant, so every layer colour is re-resolved on each
+        // configure rather than set once in `init` — the transcript reloads on
+        // an appearance change precisely so this runs again.
         bubble.layer?.backgroundColor = Self.background(for: row).cgColor
         bubble.layer?.borderWidth = 0
         bubble.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
-        revertAction = { onRevert(row.turnID) }
+        indentGuide.layer?.backgroundColor = NSColor.separatorColor
+            .withAlphaComponent(0.6).cgColor
+        // Double-click reverts, but only on a user message — the gesture means
+        // "go back to what I asked here". On any other row, and especially on
+        // the new footer, it would be an unexplained destructive action.
+        revertAction = isUser ? { onRevert(row.turnID) } : nil
         toggleActivityAction = isProcess
             ? { onToggleActivity(row.id) }
             : nil
@@ -707,6 +803,66 @@ final class TranscriptCell: NSTableCellView {
         NSPasteboard.general.setString(copyableText, forType: .string)
     }
 
+    @objc private func showTurnMenu() {
+        guard footerTurnID != nil else { return }
+        let menu = NSMenu()
+
+        if !footerResponse.isEmpty {
+            let copy = NSMenuItem(
+                title: "Copy Response", action: #selector(copyFooterResponse), keyEquivalent: ""
+            )
+            copy.target = self
+            menu.addItem(copy)
+        }
+        // Offered only where the harness can actually branch a session. A menu
+        // entry that silently starts an unrelated chat would be worse than not
+        // offering the action at all.
+        if footerCanFork {
+            let fork = NSMenuItem(
+                title: "Fork to New Tab", action: #selector(forkTurn), keyEquivalent: ""
+            )
+            fork.target = self
+            fork.toolTip = "Continue this conversation in a new tab, leaving this one intact"
+            menu.addItem(fork)
+        }
+        menu.addItem(.separator())
+        let revert = NSMenuItem(
+            title: "Revert to Before This Turn", action: #selector(revertTurn), keyEquivalent: ""
+        )
+        revert.target = self
+        menu.addItem(revert)
+
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: menuButton.bounds.height),
+            in: menuButton
+        )
+    }
+
+    @objc private func copyFooterResponse() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(footerResponse, forType: .string)
+    }
+
+    @objc private func forkTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .fork)
+    }
+
+    @objc private func revertTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .revert)
+    }
+
+    /// The block the turn ended on — the answer, as opposed to the preamble
+    /// that led up to it.
+    private static func finalResponse(in rows: [TranscriptRow]) -> String {
+        rows.last {
+            $0.kind == .assistantText
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }?.text ?? ""
+    }
+
     /// Right-click a user message to copy it, in addition to the hover button.
     override func menu(for event: NSEvent) -> NSMenu? {
         guard isUserMessage else { return super.menu(for: event) }
@@ -719,13 +875,22 @@ final class TranscriptCell: NSTableCellView {
 
     // MARK: - Presentation
 
-    static func height(for row: TranscriptRow, width: CGFloat) -> CGFloat {
+    /// Space kept free at the bubble's trailing edge. Only the turn footer
+    /// needs it, for its ⋯ button.
+    static func trailingInset(for row: TranscriptRow) -> CGFloat {
+        row.kind == .turnFooter ? 34 : 10
+    }
+
+    static func height(for row: TranscriptRow, width: CGFloat, worktreePath: String = "") -> CGFloat {
         if row.kind == .divider { return 42 }
-        let attributed = attributedText(for: row)
+        let attributed = attributedText(for: row, worktreePath: worktreePath)
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
         let bounding = attributed.boundingRect(
-            with: NSSize(width: bubbleWidth - 20, height: .greatestFiniteMagnitude),
+            with: NSSize(
+                width: bubbleWidth - 10 - trailingInset(for: row),
+                height: .greatestFiniteMagnitude
+            ),
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         // Text, plus the bubble's own padding (16), plus the cell's vertical
@@ -750,8 +915,9 @@ final class TranscriptCell: NSTableCellView {
     /// and showing it raw makes the reader parse formatting by eye in the one
     /// place they are trying to read quickly. Measuring and drawing both go
     /// through here so a row's cached height always matches what it draws.
-    static func attributedText(for row: TranscriptRow) -> NSAttributedString {
-        if let cached = renderCache.value(for: row) { return cached }
+    static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
+        let appearance = currentAppearance.name.rawValue
+        if let cached = renderCache.value(for: row, appearance: appearance) { return cached }
 
         let rendered: NSAttributedString
         switch row.kind {
@@ -772,14 +938,20 @@ final class TranscriptCell: NSTableCellView {
         case .activityGroup:
             rendered = activityGroupText(for: row)
 
-        case .userMessage, .divider:
+        case .turnFooter:
+            rendered = turnFooterText(for: row)
+
+        case .userMessage:
+            rendered = userMessageText(for: row, worktreePath: worktreePath)
+
+        case .divider:
             rendered = NSAttributedString(
                 string: displayText(for: row),
                 attributes: [.font: font(for: row), .foregroundColor: textColor(for: row)]
             )
         }
 
-        renderCache.store(rendered, for: row)
+        renderCache.store(rendered, for: row, appearance: appearance)
         return rendered
     }
 
@@ -791,8 +963,13 @@ final class TranscriptCell: NSTableCellView {
     struct RenderCache {
         private var entries: [String: (signature: Int, value: NSAttributedString)] = [:]
 
-        private func signature(for row: TranscriptRow) -> Int {
+        /// Rendered rows bake in resolved colours and rasterised chips, so the
+        /// appearance is part of a row's identity — a light/dark switch has to
+        /// invalidate every entry. It is passed in rather than read here
+        /// because the cache itself is not main-actor isolated.
+        private func signature(for row: TranscriptRow, appearance: String) -> Int {
             var hasher = Hasher()
+            hasher.combine(appearance)
             hasher.combine(row.text)
             hasher.combine(row.resultText)
             hasher.combine(row.isComplete)
@@ -800,19 +977,46 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
             hasher.combine(row.activitySignature)
+            hasher.combine(row.attachments)
             hasher.combine(row.subagentChildCount)
             return hasher.finalize()
         }
 
-        func value(for row: TranscriptRow) -> NSAttributedString? {
-            guard let entry = entries[row.id], entry.signature == signature(for: row)
+        func value(for row: TranscriptRow, appearance: String) -> NSAttributedString? {
+            guard let entry = entries[row.id],
+                  entry.signature == signature(for: row, appearance: appearance)
             else { return nil }
             return entry.value
         }
 
-        mutating func store(_ value: NSAttributedString, for row: TranscriptRow) {
-            if entries.count > 2000 { entries.removeAll(keepingCapacity: true) }
-            entries[row.id] = (signature(for: row), value)
+        mutating func store(
+            _ value: NSAttributedString,
+            for row: TranscriptRow,
+            appearance: String
+        ) {
+            if entries.count >= Self.capacity { evictOldest() }
+            recency[row.id] = tick
+            tick += 1
+            entries[row.id] = (signature(for: row, appearance: appearance), value)
+        }
+
+        private static let capacity = 2_000
+        private var recency: [String: UInt64] = [:]
+        private var tick: UInt64 = 0
+
+        /// Drops the least recently rendered half.
+        ///
+        /// Clearing the whole cache at the cap meant a transcript longer than
+        /// the cap re-parsed every visible row on the next scroll tick, over and
+        /// over. Evicting the cold half keeps the rows the reader is actually
+        /// looking at warm.
+        private mutating func evictOldest() {
+            let survivors = recency.sorted { $0.value > $1.value }
+                .prefix(Self.capacity / 2)
+                .map(\.key)
+            let keep = Set(survivors)
+            entries = entries.filter { keep.contains($0.key) }
+            recency = recency.filter { keep.contains($0.key) }
         }
     }
 
@@ -829,13 +1033,137 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
+    static func copyableText(for row: TranscriptRow) -> String {
+        guard !row.attachments.isEmpty else { return row.text }
+        let names = row.attachments.map { "@\($0.displayName)" }.joined(separator: "  ")
+        if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return names }
+        return row.text + "\n\n" + names
+    }
+
+    /// User bubbles keep the typed prose, then the same chips and image
+    /// previews the composer uses — a pasted screenshot should not collapse
+    /// into `@pasted-image.png` once it has been sent.
+    private static func userMessageText(
+        for row: TranscriptRow,
+        worktreePath: String
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font(for: row),
+            .foregroundColor: textColor(for: row),
+        ]
+        if !row.text.isEmpty {
+            result.append(styledMentions(row.text, attachments: row.attachments, attributes: attributes))
+        }
+
+        let images = row.attachments.filter(\.isImage)
+        let mentioned = Set(
+            row.attachments
+                .filter { row.text.contains("@\($0.displayName)") }
+                .map(\.relativePath)
+        )
+        let files = row.attachments.filter { !$0.isImage && !mentioned.contains($0.relativePath) }
+        if !images.isEmpty || !files.isEmpty {
+            if result.length > 0 {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+            }
+            for (index, attachment) in images.enumerated() {
+                if index > 0 { result.append(NSAttributedString(string: "  ", attributes: attributes)) }
+                appendImagePreview(attachment, worktreePath: worktreePath, to: result)
+                result.append(NSAttributedString(string: " ", attributes: attributes))
+                appendChip(for: attachment, to: result)
+            }
+            if !images.isEmpty, !files.isEmpty {
+                result.append(NSAttributedString(string: "\n", attributes: attributes))
+            }
+            for (index, attachment) in files.enumerated() {
+                if index > 0 { result.append(NSAttributedString(string: " ", attributes: attributes)) }
+                appendChip(for: attachment, to: result)
+            }
+        }
+        if result.length == 0 {
+            result.append(NSAttributedString(string: " ", attributes: attributes))
+        }
+        return result
+    }
+
+    private static func styledMentions(
+        _ text: String,
+        attachments: [Attachment],
+        attributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: text, attributes: attributes)
+        let names = attachments.map(\.displayName).filter { !$0.isEmpty }
+        guard !names.isEmpty else { return result }
+        let source = result.string as NSString
+        for name in names {
+            let token = "@\(name)"
+            var search = NSRange(location: 0, length: source.length)
+            while search.length > 0 {
+                let found = source.range(of: token, options: [], range: search)
+                guard found.location != NSNotFound else { break }
+                result.addAttributes([
+                    .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                    .foregroundColor: NSColor.controlAccentColor,
+                    .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
+                ], range: found)
+                let next = NSMaxRange(found)
+                search = NSRange(location: next, length: source.length - next)
+            }
+        }
+        return result
+    }
+
+    private static func appendChip(for attachment: Attachment, to result: NSMutableAttributedString) {
+        let pill = subjectPillImage(
+            identity: FileVisualIdentity(path: attachment.displayName),
+            text: "@\(attachment.displayName)",
+            monospace: false,
+            tint: .controlAccentColor
+        )
+        let cell = NSTextAttachment()
+        cell.image = pill
+        cell.bounds = NSRect(x: 0, y: -5, width: pill.size.width, height: pill.size.height)
+        result.append(NSAttributedString(attachment: cell))
+    }
+
+    private static func appendImagePreview(
+        _ attachment: Attachment,
+        worktreePath: String,
+        to result: NSMutableAttributedString
+    ) {
+        let url = attachment.fileURL(worktreePath: worktreePath)
+        guard let image = NSImage(contentsOf: url) else { return }
+        let maxWidth: CGFloat = 160
+        let maxHeight: CGFloat = 110
+        let size = image.size
+        let scale = min(maxWidth / max(size.width, 1), maxHeight / max(size.height, 1), 1)
+        let width = max(36, ceil(size.width * scale))
+        let height = max(28, ceil(size.height * scale))
+        let thumbnail = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
+            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).addClip()
+            image.draw(
+                in: rect,
+                from: NSRect(origin: .zero, size: size),
+                operation: .copy,
+                fraction: 1
+            )
+            return true
+        }
+        let cell = NSTextAttachment()
+        cell.image = thumbnail
+        cell.bounds = NSRect(x: 0, y: -4, width: width, height: height)
+        result.append(NSAttributedString(attachment: cell))
+    }
+
     private static func badgeText(for row: TranscriptRow) -> String {
         switch row.kind {
         // The visual treatment already says who is talking — a tinted block for
         // the user, plain prose for the agent — so "YOU"/"AGENT" on every row
         // was noise. Badges remain only where they carry something the styling
         // can't: which tool ran, and error / plan callouts.
-        case .userMessage, .assistantText, .thinking, .divider, .activityGroup, .toolCall, .error:
+        case .userMessage, .assistantText, .thinking, .divider, .activityGroup,
+             .toolCall, .error, .turnFooter:
             return ""
         case .plan:
             return "PLAN"
@@ -846,7 +1174,7 @@ final class TranscriptCell: NSTableCellView {
         switch row.kind {
         case .toolCall:
             return .monospacedSystemFont(ofSize: 12, weight: .regular)
-        case .activityGroup:
+        case .activityGroup, .turnFooter:
             return .systemFont(ofSize: 12, weight: .regular)
         case .thinking:
             return .systemFont(ofSize: 13)
@@ -861,7 +1189,7 @@ final class TranscriptCell: NSTableCellView {
 
     private static func textColor(for row: TranscriptRow) -> NSColor {
         switch row.kind {
-        case .thinking, .divider, .activityGroup: return .secondaryLabelColor
+        case .thinking, .divider, .activityGroup, .turnFooter: return .secondaryLabelColor
         case .error: return .systemRed
         default: return .labelColor
         }
@@ -880,6 +1208,7 @@ final class TranscriptCell: NSTableCellView {
         case .error: return .systemRed.withAlphaComponent(0.08)
         case .assistantText: return .clear
         case .divider: return .clear
+        case .turnFooter: return .clear
         }
     }
 
@@ -898,6 +1227,14 @@ final class TranscriptCell: NSTableCellView {
 
     /// A small rounded, tinted pill for a file reference or command argument,
     /// drawn as an image so it can sit inline in the attributed transcript text.
+    ///
+    /// Drawing happens inside an explicit appearance because `lockFocus()`
+    /// resolves dynamic colours against whatever appearance is current and then
+    /// freezes the result into a bitmap. Rendered while the app was dark, a
+    /// pill keeps its white label forever — which, on a light transcript, is
+    /// white on white: the chips simply vanish. The bitmap cache is keyed on
+    /// the appearance for the same reason (see `RenderCache`).
+    ///
     /// File chips pick up the language colour; tool chips use the tool tint.
     /// Edit/Write chips also carry +/− line counts so the size of the change
     /// is visible without expanding the row.
@@ -908,6 +1245,35 @@ final class TranscriptCell: NSTableCellView {
         tint: NSColor,
         insertions: Int = 0,
         deletions: Int = 0
+    ) -> NSImage {
+        var image = NSImage()
+        currentAppearance.performAsCurrentDrawingAppearance {
+            image = drawSubjectPill(
+                identity: identity,
+                text: text,
+                monospace: monospace,
+                insertions: insertions,
+                deletions: deletions
+            )
+        }
+        return image
+    }
+
+    /// The appearance transcript bitmaps are rendered against.
+    ///
+    /// `NSApp.effectiveAppearance` rather than a view's: these are static
+    /// drawing helpers with no view in scope, and the transcript never differs
+    /// from the app's appearance anyway.
+    static var currentAppearance: NSAppearance {
+        NSApp?.effectiveAppearance ?? NSAppearance(named: .aqua) ?? NSAppearance()
+    }
+
+    private static func drawSubjectPill(
+        identity: FileVisualIdentity?,
+        text: String,
+        monospace: Bool,
+        insertions: Int,
+        deletions: Int
     ) -> NSImage {
         let font = monospace
             ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -1155,57 +1521,81 @@ final class TranscriptCell: NSTableCellView {
             result.append(NSAttributedString(attachment: attachment))
             if seenIcons.count == 6 { break }
         }
+        // The files this turn changed used to hang off this line too. They
+        // belong to the turn, not to its hidden work, so they live in the
+        // footer now — where they stay visible whether or not the section is
+        // expanded.
+        return result
+    }
 
-        // The files this turn changed, as small pills — what actually landed,
-        // once the agent has finished.
-        let changed = changedFiles(in: row.groupedRows)
-        if !changed.isEmpty {
-            // The pills sit on their own line with real leading and even gaps,
-            // rather than being wedged onto the end of the count line.
-            let pillLine = NSMutableParagraphStyle()
-            pillLine.paragraphSpacingBefore = 6
-            pillLine.lineSpacing = 4
+    /// The closing line of a finished turn: how long it took and what it
+    /// actually changed.
+    ///
+    /// The same facts are available by expanding the activity section and
+    /// reading every Edit, which is precisely the work this saves. Files come
+    /// from the turn's own edit calls rather than the working tree, so the line
+    /// keeps describing *that* turn after later turns change more.
+    private static func turnFooterText(for row: TranscriptRow) -> NSAttributedString {
+        let secondary: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+        ]
+        let result = NSMutableAttributedString()
+
+        if let first = row.groupedRows.first?.createdAt,
+           let last = row.groupedRows.last?.createdAt,
+           last.timeIntervalSince(first) >= 1 {
             result.append(NSAttributedString(
-                string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 5), .paragraphStyle: pillLine]
+                string: elapsedLabel(last.timeIntervalSince(first)),
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
             ))
-            for (index, file) in changed.prefix(8).enumerated() {
-                if index > 0 {
-                    result.append(NSAttributedString(string: "   ", attributes: [.paragraphStyle: pillLine]))
-                }
-                let pill = subjectPillImage(
-                    identity: FileVisualIdentity(path: file.path),
-                    text: (file.path as NSString).lastPathComponent,
-                    monospace: false,
-                    tint: .systemOrange,
-                    insertions: file.insertions,
-                    deletions: file.deletions
-                )
-                let attachment = NSTextAttachment()
-                attachment.image = pill
-                let rowFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
-                attachment.bounds = NSRect(
-                    x: 0,
-                    y: (rowFont.capHeight - pill.size.height) / 2,
-                    width: pill.size.width,
-                    height: pill.size.height
-                )
-                let pillString = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
-                pillString.addAttribute(
-                    .paragraphStyle, value: pillLine,
-                    range: NSRange(location: 0, length: pillString.length)
-                )
-                result.append(pillString)
+        }
+
+        let changed = changedFiles(in: row.groupedRows)
+        if changed.isEmpty {
+            if result.length == 0 {
+                result.append(NSAttributedString(string: "No files changed", attributes: secondary))
             }
-            if changed.count > 8 {
-                result.append(NSAttributedString(
-                    string: "   +\(changed.count - 8) more",
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
-                        .foregroundColor: NSColor.secondaryLabelColor,
-                        .paragraphStyle: pillLine,
-                    ]
-                ))
+            return result
+        }
+
+        if result.length > 0 { result.append(NSAttributedString(string: "   ", attributes: secondary)) }
+        for (index, file) in changed.prefix(8).enumerated() {
+            if index > 0 { result.append(NSAttributedString(string: "   ", attributes: secondary)) }
+            // The chip carries its own +/− counts, so the footer doesn't append
+            // them again alongside it.
+            let pill = subjectPillImage(
+                identity: FileVisualIdentity(path: file.path),
+                text: (file.path as NSString).lastPathComponent,
+                monospace: false,
+                tint: .systemOrange,
+                insertions: file.insertions,
+                deletions: file.deletions
+            )
+            let attachment = NSTextAttachment()
+            attachment.image = pill
+            let rowFont = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+            attachment.bounds = NSRect(
+                x: 0,
+                y: (rowFont.capHeight - pill.size.height) / 2,
+                width: pill.size.width,
+                height: pill.size.height
+            )
+            let start = result.length
+            result.append(NSAttributedString(attachment: attachment))
+            if let url = MarkdownRenderer.fileReferenceURL(file.path) {
+                result.addAttribute(
+                    .link, value: url, range: NSRange(location: start, length: result.length - start)
+                )
             }
+        }
+        if changed.count > 8 {
+            result.append(NSAttributedString(
+                string: "   +\(changed.count - 8) more", attributes: secondary
+            ))
         }
         return result
     }
@@ -1249,6 +1639,15 @@ final class TranscriptCell: NSTableCellView {
         let tool = (row.toolName ?? "").lowercased()
         let key = ((row.toolName ?? "") + " " + row.text).lowercased()
         let input = row.toolInput
+
+        // The agent's own checklist. These used to fall through to the generic
+        // gear, so a row said "TaskUpdate" and nothing else — the one thing it
+        // could not tell you was which task. The subject is carried on the row
+        // (resolved from the TaskCreate that named it) because an update
+        // identifies its task by id alone.
+        if let checklist = checklistPresentation(tool: tool, row: row, input: input) {
+            return checklist
+        }
 
         // Subagent tasks are a first-class thing the harness does, so they get
         // their own icon and read "created" while running, "completed" once the
@@ -1419,6 +1818,55 @@ final class TranscriptCell: NSTableCellView {
             return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .systemPurple, subject: compact(query))
         }
         return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
+    }
+
+    /// The agent's task list, as a row that names the task it touched.
+    ///
+    /// Returns nil for anything that isn't one of these tools, so the caller
+    /// falls through to its normal matching.
+    private static func checklistPresentation(
+        tool: String,
+        row: TranscriptRow,
+        input: JSONValue?
+    ) -> ProcessPresentation? {
+        let subject = row.resolvedSubject
+            ?? input?["subject"]?.stringValue
+            ?? input?["taskId"]?.stringValue.map { "Task \($0)" }
+
+        // Matched by suffix so the MCP-namespaced spelling
+        // (`mcp__ore__TaskUpdate`) lands on the same presentation.
+        let name = ["taskcreate", "taskupdate", "tasklist", "taskget"]
+            .first { tool.hasSuffix($0) }
+        switch name {
+        case "taskcreate":
+            return ProcessPresentation(
+                icon: "plus.circle", title: "Task added",
+                detail: row.resultText ?? "", tint: .controlAccentColor,
+                subject: subject.map { compact($0, limit: 72) }
+            )
+        case "taskupdate":
+            let status = input?["status"]?.stringValue ?? ""
+            let (icon, title, tint): (String, String, NSColor) = switch status {
+            case "completed": ("checkmark.circle.fill", "Task completed", .systemGreen)
+            case "in_progress": ("circle.lefthalf.filled", "Task started", .controlAccentColor)
+            case "pending": ("circle", "Task reopened", .secondaryLabelColor)
+            case "deleted": ("trash", "Task removed", .secondaryLabelColor)
+            default: ("pencil.circle", "Task updated", .secondaryLabelColor)
+            }
+            return ProcessPresentation(
+                icon: icon, title: title,
+                detail: row.resultText ?? "", tint: row.isError ? .systemRed : tint,
+                subject: subject.map { compact($0, limit: 72) }
+            )
+        case "tasklist", "taskget":
+            return ProcessPresentation(
+                icon: "checklist", title: name == "tasklist" ? "Reviewed tasks" : "Read task",
+                detail: row.resultText ?? "", tint: .secondaryLabelColor,
+                subject: subject.map { compact($0, limit: 72) }
+            )
+        default:
+            return nil
+        }
     }
 
     private static func meaningful(_ text: String) -> Bool {

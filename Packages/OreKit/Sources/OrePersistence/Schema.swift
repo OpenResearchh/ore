@@ -263,6 +263,19 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v4.promptAttachments") { db in
+            // User bubbles need the same chips and image previews as the
+            // composer. The prompt text only holds @-tokens; the files those
+            // tokens refer to live here so a reload can still render them.
+            try db.alter(table: "turn") { table in
+                table.add(column: "promptAttachments", .text).notNull().defaults(to: "[]")
+            }
+        }
+
+        // Two branches both reached for "v4" and both shipped. The duplicated
+        // prefix is left alone on purpose: a migration's name is its identity,
+        // so renaming either one would make databases that already ran it try
+        // to run it again and fail on the existing column.
         migrator.registerMigration("v4.userNamed") { db in
             // A name/title the user typed must survive the first turn's
             // auto-titling. Without a persisted flag, a manual rename made
@@ -273,6 +286,17 @@ public enum OreSchema {
             }
             try db.alter(table: "chat") { table in
                 table.add(column: "isTitleUserSet", .boolean).notNull().defaults(to: false)
+            }
+        }
+
+        migrator.registerMigration("v5.archiveMetadata") { db in
+            // The archived browser answers "when did I park this, and what did
+            // it give back?" — the worktree's size at archive time is the disk
+            // space reclaimed, and it can't be recomputed once the checkout is
+            // gone.
+            try db.alter(table: "workspace") { table in
+                table.add(column: "archivedAt", .datetime)
+                table.add(column: "archivedDiskBytes", .integer)
             }
         }
 

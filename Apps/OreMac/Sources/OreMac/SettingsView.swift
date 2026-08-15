@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage("ore.defaultModel") private var defaultModel = ""
     @AppStorage("ore.branchPrefix") private var branchPrefix = "ore"
     @AppStorage("ore.cursorExperimental") private var cursorExperimental = false
+    @AppStorage("ore.cursorAllowUnprompted") private var cursorAllowUnprompted = false
     @AppStorage("ore.apiKeyFallback") private var apiKeyFallback = false
     @AppStorage("ore.notifications.enabled") private var notifications = true
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
@@ -328,6 +329,9 @@ struct SettingsView: View {
                 Toggle("Allow API-key fallback", isOn: $apiKeyFallback)
                 if selectedHarness == .cursorAgent {
                     Toggle("Enable experimental Cursor Agent (restart required)", isOn: $cursorExperimental)
+                    Toggle("Run tools unprompted in Bypass mode (restart required)", isOn: $cursorAllowUnprompted)
+                    Text("Cursor's CLI has no approval channel. ORE normally lets Cursor's auto-review classifier decide each tool call; this runs every command instead, with no prompt, whenever the chat is in Bypass Permissions.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 

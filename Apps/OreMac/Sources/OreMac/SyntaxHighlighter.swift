@@ -37,7 +37,7 @@ final class SyntaxHighlighter: @unchecked Sendable {
         }
     }
 
-    private nonisolated(unsafe) static let aliases: [String: String] = [
+    private static let aliases: [String: String] = [
         "py": "python",
         "jsonc": "json",
         "js": "javascript",
@@ -202,7 +202,7 @@ enum SyntaxTheme {
         }
     }
 
-    private nonisolated(unsafe) static let table: [String: NSColor] = [
+    private static let table: [String: NSColor] = [
         "keyword": .systemPink,
         "conditional": .systemPink,
         "repeat": .systemPink,
@@ -361,7 +361,7 @@ enum HighlightQueries {
 /// that an unfamiliar language still reads as code rather than as a wall of
 /// uniform text.
 enum RegexHighlighter {
-    private nonisolated(unsafe) static let keywords: Set<String> = [
+    private static let keywords: Set<String> = [
         "func", "function", "def", "class", "struct", "enum", "interface", "trait",
         "let", "var", "const", "val", "if", "else", "elif", "for", "while", "loop",
         "return", "import", "from", "package", "use", "using", "include", "require",

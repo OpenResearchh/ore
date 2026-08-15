@@ -77,16 +77,23 @@ struct Sidebar: View {
             if !model.archivedWorkspaces.isEmpty {
                 Section(isExpanded: $showArchived) {
                     ForEach(model.archivedWorkspaces) { workspace in
-                        HStack {
-                            Text(workspace.name)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Restore") { model.unarchive(workspace.id) }
-                                .buttonStyle(.link)
-                        }
+                        ArchivedWorkspaceRow(workspace: workspace)
+                            .contextMenu {
+                                Button("Restore") { model.unarchive(workspace.id) }
+                                Button("Copy Branch Name") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(
+                                        workspace.branch, forType: .string
+                                    )
+                                }
+                                Divider()
+                                Button("Delete Permanently…", role: .destructive) {
+                                    model.requestPermanentDelete(workspace)
+                                }
+                            }
                     }
                 } header: {
-                    Text("Archived (\(model.archivedWorkspaces.count))")
+                    Text(archivedHeader)
                 }
             }
         }
@@ -139,6 +146,16 @@ struct Sidebar: View {
             }
             Button("Cancel", role: .cancel) { renameWorkspace = nil }
         }
+    }
+
+    /// "Archived (3) · 1.2 GB freed" — the total makes the payoff of parking
+    /// finished work visible at a glance.
+    private var archivedHeader: String {
+        let workspaces = model.archivedWorkspaces
+        let freedBytes = workspaces.compactMap(\.archivedDiskBytes).reduce(0, +)
+        guard freedBytes > 0 else { return "Archived (\(workspaces.count))" }
+        let freed = ByteCountFormatter.string(fromByteCount: freedBytes, countStyle: .file)
+        return "Archived (\(workspaces.count)) · \(freed) freed"
     }
 
     private func repositoryBinding(_ path: String) -> Binding<Bool> {
@@ -194,10 +211,56 @@ struct Sidebar: View {
             ))
         }
         Divider()
-        Button("Archive") { model.archive(workspace.id) }
+        Button("Archive…") { model.requestArchive(workspace.id) }
         Button("Delete…", role: .destructive) {
             model.delete(workspace.id, deleteBranch: false)
         }
+    }
+}
+
+/// One parked workspace: what it was, when it was parked, and what parking it
+/// gave back. Restore is inline because it's the only action that brings the
+/// row back to life; everything else lives in the context menu.
+private struct ArchivedWorkspaceRow: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workspace.name)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(workspace.branch)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let detail {
+                        Text("·").font(.system(size: 10.5))
+                        Text(detail).font(.system(size: 10.5))
+                    }
+                }
+                .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: OreTheme.Space.sm)
+            Button("Restore") { model.unarchive(workspace.id) }
+                .buttonStyle(.link)
+                .font(.system(size: OreTheme.Font.body))
+        }
+        .padding(.vertical, 1)
+    }
+
+    private var detail: String? {
+        var parts: [String] = []
+        if let archivedAt = workspace.archivedAt {
+            parts.append(archivedAt.formatted(.relative(presentation: .named)))
+        }
+        if let bytes = workspace.archivedDiskBytes, bytes > 0 {
+            let freed = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            parts.append("freed \(freed)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 

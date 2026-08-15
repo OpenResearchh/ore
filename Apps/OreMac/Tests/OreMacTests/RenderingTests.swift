@@ -408,6 +408,119 @@ struct UserMessageAttachmentTests {
     }
 }
 
+/// The transcript rasterises file chips and resolves semantic colours into
+/// bitmaps, then caches the result. Both halves have to notice a light/dark
+/// switch, or a row keeps drawing its dark-mode pills on a light background —
+/// white on white, which reads as the chips having disappeared.
+@MainActor
+struct TranscriptAppearanceTests {
+    private func editRow() -> TranscriptRow {
+        TranscriptRow(
+            id: "tool-appearance",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Edit",
+            toolName: "Edit",
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: .object([
+                "file_path": .string("Sources/App.swift"),
+                "old_string": .string("a"),
+                "new_string": .string("b"),
+            ]),
+            isComplete: true
+        )
+    }
+
+    @Test func switchingAppearanceRerendersRatherThanServingTheCachedBitmap() {
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+
+        application.appearance = NSAppearance(named: .darkAqua)
+        let dark = TranscriptCell.attributedText(for: editRow())
+        let darkPixels = chipPixels(in: dark)
+
+        application.appearance = NSAppearance(named: .aqua)
+        let light = TranscriptCell.attributedText(for: editRow())
+        let lightPixels = chipPixels(in: light)
+
+        // Same row, same text — but the chip must have been drawn again for the
+        // new appearance instead of being served from the cache.
+        #expect(dark.string == light.string)
+        #expect(darkPixels != nil)
+        #expect(lightPixels != nil)
+        #expect(darkPixels != lightPixels)
+    }
+
+    /// The PNG bytes of the row's first inline image — the file chip.
+    private func chipPixels(in text: NSAttributedString) -> Data? {
+        var found: NSImage?
+        text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, stop in
+            if let image = (value as? NSTextAttachment)?.image, image.size.width > 20 {
+                found = image
+                stop.pointee = true
+            }
+        }
+        guard let found, let tiff = found.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+    }
+}
+
+/// The agent's checklist tools name their task by id, so a row that only shows
+/// the tool name is the one thing that cannot say which task it touched.
+@MainActor
+struct ChecklistRowTests {
+    private func row(tool: String, input: JSONValue, subject: String?) -> TranscriptRow {
+        var row = TranscriptRow(
+            id: "task-1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: tool,
+            toolName: tool,
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: input,
+            isComplete: true
+        )
+        row.resolvedSubject = subject
+        return row
+    }
+
+    @Test func completingATaskNamesTheTaskRatherThanTheTool() {
+        let rendered = TranscriptCell.attributedText(for: row(
+            tool: "TaskUpdate",
+            input: .object(["taskId": .string("8"), "status": .string("completed")]),
+            subject: "Fix stuck plan-approval card"
+        ))
+        #expect(rendered.string.contains("Task completed"))
+        #expect(!rendered.string.contains("TaskUpdate"))
+    }
+
+    @Test func theStatusPicksTheWording() {
+        let started = TranscriptCell.attributedText(for: row(
+            tool: "TaskUpdate",
+            input: .object(["taskId": .string("8"), "status": .string("in_progress")]),
+            subject: "Something"
+        ))
+        #expect(started.string.contains("Task started"))
+
+        let created = TranscriptCell.attributedText(for: row(
+            tool: "TaskCreate",
+            input: .object(["subject": .string("Write the thing")]),
+            subject: nil
+        ))
+        #expect(created.string.contains("Task added"))
+    }
+
+    @Test func anMCPNamespacedChecklistToolIsStillRecognised() {
+        let rendered = TranscriptCell.attributedText(for: row(
+            tool: "mcp__ore__TaskUpdate",
+            input: .object(["taskId": .string("3"), "status": .string("completed")]),
+            subject: "Namespaced"
+        ))
+        #expect(rendered.string.contains("Task completed"))
+    }
+}
+
 struct UsageLimitResetTests {
     @Test func parsesProviderResetCopyIntoTheNextWallClock() {
         var calendar = Calendar(identifier: .gregorian)

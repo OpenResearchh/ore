@@ -80,7 +80,14 @@ struct ChatPane: View {
                         persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
                         onRevert: { revertTarget = $0 },
                         onToggleActivity: { toggleActivity($0) },
-                        onOpenFile: { openAgentFile($0) }
+                        onOpenFile: { openAgentFile($0) },
+                        onTurnAction: { turn, action in
+                            switch action {
+                            case .fork: model.forkChat(into: workspace.id)
+                            case .revert: revertTarget = turn
+                            }
+                        },
+                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -91,6 +98,7 @@ struct ChatPane: View {
                             harness: chatSummary?.harness ?? workspace.harness,
                             status: chat.status,
                             startedAt: chat.turnStartedAt,
+                            isStarting: !chat.hasTurnEventArrived,
                             onStop: { model.interrupt(workspace.id) }
                         )
                         Spacer(minLength: 0)
@@ -128,12 +136,18 @@ struct ChatPane: View {
 
             if case .proposal(let markdown, let requestID) = chat.plan {
                 PlanApprovalCard(markdown: markdown) { feedback in
+                    // Dismiss first, and unconditionally. The card used to
+                    // linger until a `permissionResolved` that a proposal
+                    // without a request id never sends — which is why a second
+                    // proposal left two cards and answering one kept the other.
+                    chat.dismissPlan()
                     if let requestID {
                         model.resolvePermission(requestID, decision: .allow, for: workspace.id)
                     }
                     model.setPermissionMode(.default, for: workspace.id)
                     if !feedback.isEmpty { model.send(feedback, to: workspace.id) }
                 } onReject: { feedback in
+                    chat.dismissPlan()
                     if let requestID {
                         model.resolvePermission(
                             requestID,
@@ -145,6 +159,9 @@ struct ChatPane: View {
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.top, OreTheme.Space.sm)
+                // A new proposal must reset the card's own feedback field;
+                // without an identity SwiftUI reuses the previous card's state.
+                .id(requestID?.rawValue ?? markdown)
             }
 
             if !queuedMessages.isEmpty {
@@ -331,66 +348,167 @@ struct ChatPane: View {
             return row
         }
 
-        // A turn's activity folds into one collapsed "N tool calls" group only
-        // once that turn is fully finished. While the agent is still working the
-        // live turn stays expanded, so its tool calls (and any preamble text)
-        // read inline until the final response has actually landed. Gating on a
-        // completed assistant block instead collapsed the group the moment an
-        // early preamble line finished — hiding the work mid-turn.
+        // A finished turn reads as three things: what the agent did (collapsed),
+        // what it concluded (always visible), and what that cost. While the
+        // agent is still working the live turn stays fully expanded, so its
+        // tool calls read inline until the final response has landed.
         let activeTurn: TurnID? = chat.isBusy ? visible.last?.turnID : nil
-        let completedTurns = Set(visible.compactMap { row in
-            row.turnID == activeTurn ? nil : row.turnID
-        })
-        let groupedByTurn = Dictionary(grouping: visible.filter {
-            Self.isActivity($0) && completedTurns.contains($0.turnID)
-        }, by: \.turnID)
-        let lastActivityIndex = Dictionary(uniqueKeysWithValues: groupedByTurn.compactMap { turn, rows in
-            visible.lastIndex(where: { $0.turnID == turn && Self.isActivity($0) })
-                .map { (turn, $0) }
-        })
+        let subjects = Self.taskSubjects(in: visible)
 
         var result: [TranscriptRow] = []
-        for (index, row) in visible.enumerated() {
-            if Self.isActivity(row), completedTurns.contains(row.turnID) {
-                guard lastActivityIndex[row.turnID] == index,
-                      let activities = groupedByTurn[row.turnID]
-                else { continue }
-                let tools = activities.filter { $0.kind == .toolCall }.count
-                let messages = activities.filter { $0.kind == .thinking }.count
-                let errors = activities.filter { $0.kind == .error || $0.isError }.count
-                var parts: [String] = []
-                if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
-                if messages > 0 { parts.append("\(messages) message\(messages == 1 ? "" : "s")") }
-                if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
-                let id = "activity-\(row.turnID.rawValue)"
-                let expanded = expandedActivityGroups.contains(id)
-                result.append(TranscriptRow(
-                    id: id,
-                    turnID: row.turnID,
-                    kind: .activityGroup,
-                    text: parts.isEmpty ? "Activity" : parts.joined(separator: ", "),
-                    groupedRows: activities,
-                    isExpanded: expanded
-                ))
-                // Insert virtualized child rows when requested, but leave every
-                // tool result collapsed. This keeps a 100-call turn quick to
-                // open and lets Bash/Edit/Read details expand independently.
+        var index = visible.startIndex
+        while index < visible.endIndex {
+            // Turns arrive contiguously, so one pass over the transcript can
+            // slice it into turns without sorting or grouping into a dictionary
+            // — which is also what keeps the original order intact.
+            let turn = visible[index].turnID
+            var slice: [TranscriptRow] = []
+            while index < visible.endIndex, visible[index].turnID == turn {
+                var row = visible[index]
+                row.resolvedSubject = Self.taskSubject(for: row, in: subjects)
+                slice.append(row)
+                index += 1
+            }
+            result.append(contentsOf: present(turn: slice, isActive: turn == activeTurn))
+        }
+        return result
+    }
+
+    /// Lays out one turn's rows.
+    ///
+    /// Everything the agent did on the way to its answer folds into a single
+    /// collapsed section placed where the work happened; the last thing it said
+    /// stays visible below as the turn's outcome. A live turn is returned
+    /// untouched — collapsing work in progress hides the only thing worth
+    /// watching.
+    private func present(turn rows: [TranscriptRow], isActive: Bool) -> [TranscriptRow] {
+        guard !isActive, let turnID = rows.first?.turnID else { return rows }
+
+        // The answer is the last non-empty assistant block; everything before
+        // it is preamble and folds away with the tool calls. Found once, not
+        // per row — this runs on every transcript update while text streams.
+        let answer = rows.lastIndex {
+            $0.kind == .assistantText
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let collapsible = rows.indices.filter { Self.isCollapsible(rows[$0], isAnswer: $0 == answer) }
+        // A turn that only answered has nothing to hide and nothing to report:
+        // no tools ran, no files changed. It stays a bare response rather than
+        // gaining an empty section and a footer saying so.
+        guard let firstCollapsibleIndex = collapsible.first else { return rows }
+
+        let hidden = Set(collapsible)
+        let collapsed = collapsible.map { rows[$0] }
+        let groupID = "activity-\(turnID.rawValue)"
+        let expanded = expandedActivityGroups.contains(groupID)
+
+        var group = TranscriptRow(
+            id: groupID,
+            turnID: turnID,
+            kind: .activityGroup,
+            text: Self.activitySummary(for: collapsed),
+            groupedRows: collapsed,
+            isExpanded: expanded
+        )
+        group.createdAt = collapsed.first?.createdAt ?? Date()
+
+        var result: [TranscriptRow] = []
+        for (offset, row) in rows.enumerated() {
+            if offset == firstCollapsibleIndex {
+                result.append(group)
+                // Child rows are virtualized in only when the section is open,
+                // and each keeps its own expansion, so a 100-call turn stays
+                // quick to open and Bash/Edit/Read details expand separately.
                 if expanded {
-                    result.append(contentsOf: activities.map { child in
+                    result.append(contentsOf: collapsed.map { child in
                         var item = child
                         item.isExpanded = expandedActivityGroups.contains(child.id)
                         return item
                     })
                 }
-            } else {
-                result.append(row)
+                continue
             }
+            guard !hidden.contains(offset) else { continue }
+            result.append(row)
         }
+
+        var footer = TranscriptRow(
+            id: "footer-\(turnID.rawValue)",
+            turnID: turnID,
+            kind: .turnFooter,
+            text: "",
+            groupedRows: rows
+        )
+        footer.createdAt = rows.last?.createdAt ?? Date()
+        result.append(footer)
         return result
     }
 
-    private static func isActivity(_ row: TranscriptRow) -> Bool {
-        row.kind == .toolCall || row.kind == .thinking || row.kind == .error
+    /// Which of a turn's rows fold away once it is done.
+    ///
+    /// Tool calls and thinking always do. Assistant prose does too — except the
+    /// last block, which is the answer the whole turn was for. Without that
+    /// exception a chatty turn showed three or four separate prose blocks and
+    /// nothing marked which one was the conclusion.
+    private static func isCollapsible(_ row: TranscriptRow, isAnswer: Bool) -> Bool {
+        switch row.kind {
+        case .toolCall, .thinking, .error:
+            return true
+        case .assistantText:
+            return !isAnswer
+        case .userMessage, .plan, .divider, .activityGroup, .turnFooter:
+            return false
+        }
+    }
+
+    private static func activitySummary(for rows: [TranscriptRow]) -> String {
+        let tools = rows.filter { $0.kind == .toolCall }.count
+        let thoughts = rows.filter { $0.kind == .thinking }.count
+        let notes = rows.filter { $0.kind == .assistantText }.count
+        let errors = rows.filter { $0.kind == .error || $0.isError }.count
+        var parts: [String] = []
+        if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
+        if thoughts > 0 { parts.append("\(thoughts) thought\(thoughts == 1 ? "" : "s")") }
+        if notes > 0 { parts.append("\(notes) note\(notes == 1 ? "" : "s")") }
+        if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
+        return parts.isEmpty ? "Activity" : parts.joined(separator: ", ")
+    }
+
+    /// Task ids mapped to the subject they were created with.
+    ///
+    /// `TaskUpdate` identifies its task by id alone, so on its own it can only
+    /// say "Task 8". The subject lives in the `TaskCreate` that made it, and
+    /// the id it was assigned comes back in that call's result.
+    private static func taskSubjects(in rows: [TranscriptRow]) -> [String: String] {
+        var subjects: [String: String] = [:]
+        for row in rows where row.kind == .toolCall {
+            // Suffix, not equality: the same tool arrives namespaced when it
+            // comes through MCP (`mcp__ore__TaskCreate`).
+            guard (row.toolName ?? "").lowercased().hasSuffix("taskcreate"),
+                  let subject = row.toolInput?["subject"]?.stringValue,
+                  let id = firstNumber(in: row.resultText ?? "")
+            else { continue }
+            subjects[id] = subject
+        }
+        return subjects
+    }
+
+    private static func taskSubject(
+        for row: TranscriptRow,
+        in subjects: [String: String]
+    ) -> String? {
+        guard row.kind == .toolCall,
+              (row.toolName ?? "").lowercased().contains("task") else { return nil }
+        if let subject = row.toolInput?["subject"]?.stringValue { return subject }
+        guard let id = row.toolInput?["taskId"]?.stringValue
+            ?? row.toolInput?["taskId"]?.intValue.map(String.init)
+        else { return nil }
+        return subjects[id]
+    }
+
+    private static func firstNumber(in text: String) -> String? {
+        let digits = text.drop { !$0.isNumber }.prefix { $0.isNumber }
+        return digits.isEmpty ? nil : String(digits)
     }
 
     private static func isMeaningfulError(_ text: String, result: String?) -> Bool {
@@ -658,16 +776,7 @@ struct ChatPane: View {
                         AttachmentChipStrip.IndexedAttachment(index: $0.offset, attachment: $0.element)
                     },
                     worktreePath: workspace.worktreePath,
-                    onRemove: { index in
-                        var next = chat.draftAttachments
-                        guard next.indices.contains(index) else { return }
-                        next.remove(at: index)
-                        if let chatSummary {
-                            model.persistDraftAttachments(next, for: chatSummary.id)
-                        } else {
-                            chat.draftAttachments = next
-                        }
-                    }
+                    onRemove: { index in discardAttachments(at: IndexSet(integer: index)) }
                 )
             }
 
@@ -1216,6 +1325,31 @@ struct ChatPane: View {
         }
     }
 
+    /// Takes an attachment off the draft *and* off the disk.
+    ///
+    /// Dropping a file on the composer copies it into `.context/attachments/`.
+    /// Removing the chip used to drop only the reference, so every screenshot
+    /// the user pasted and then thought better of stayed in the worktree
+    /// forever. Only ORE's own copies are deleted — a chip pointing at a file
+    /// that already lived in the workspace is just a reference to it.
+    private func discardAttachments(at indices: IndexSet) {
+        var next = chat.draftAttachments
+        for index in indices.sorted(by: >) {
+            guard next.indices.contains(index) else { continue }
+            deleteCopiedFile(next.remove(at: index))
+        }
+        persistAttachments(next)
+    }
+
+    private func deleteCopiedFile(_ attachment: Attachment) {
+        guard attachment.relativePath.hasPrefix(".context/attachments/"),
+              !attachment.relativePath.contains("..")
+        else { return }
+        try? FileManager.default.removeItem(
+            at: attachment.fileURL(worktreePath: workspace.worktreePath)
+        )
+    }
+
     private func addFiles(_ urls: [URL]) {
         let folder = URL(fileURLWithPath: workspace.worktreePath)
             .appendingPathComponent(".context/attachments", isDirectory: true)
@@ -1430,7 +1564,7 @@ struct ChatPane: View {
         case "/model": draft = ""; showModelChooser = true
         case "/clear":
             draft = ""
-            persistAttachments([])
+            discardAttachments(at: IndexSet(chat.draftAttachments.indices))
         default: break
         }
         composerFocused = true
@@ -1461,6 +1595,7 @@ private struct AgentWorkingPill: View {
     let harness: HarnessKind
     let status: AgentStatus
     var startedAt: Date?
+    var isStarting: Bool = false
     let onStop: () -> Void
 
     var body: some View {
@@ -1496,6 +1631,9 @@ private struct AgentWorkingPill: View {
     }
 
     private var label: String {
+        // Booting a one-shot CLI can take several seconds before any event
+        // arrives; name that state rather than claiming work is happening.
+        if isStarting { return "Starting \(harness.displayName)…" }
         switch status {
         case .runningTool: return "\(harness.displayName) is running a tool"
         case .thinking: return "\(harness.displayName) is thinking"
@@ -1517,6 +1655,11 @@ private struct ResearchEmptyState: View {
     let title: String?
     let seed: String
     let onSuggestion: (String) -> Void
+
+    /// Enriched biography from the local corpus (Wikipedia-backed). Loads
+    /// after first render; the hardcoded fact covers the gap and any failure.
+    @State private var profile: ScientistCorpus.Profile?
+    @State private var portrait: NSImage?
 
     private struct Starter: Identifiable {
         let title: String
@@ -1564,6 +1707,17 @@ private struct ResearchEmptyState: View {
                 .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: identity?.slug) {
+            profile = nil
+            portrait = nil
+            guard let identity else { return }
+            let loaded = await ScientistCorpus.shared.profile(for: identity)
+            guard !Task.isCancelled else { return }
+            profile = loaded
+            if let loaded, let url = ScientistCorpus.shared.imageURL(for: loaded) {
+                portrait = NSImage(contentsOf: url)
+            }
+        }
     }
 
     private func content(compact: Bool, singleColumn: Bool) -> some View {
@@ -1585,40 +1739,22 @@ private struct ResearchEmptyState: View {
                     .foregroundStyle(.secondary)
             }
 
-            LazyVGrid(
-                columns: singleColumn
-                    ? [GridItem(.flexible())]
-                    : [GridItem(.flexible()), GridItem(.flexible())],
-                spacing: compact ? 7 : 10
-            ) {
-                ForEach(starters) { starter in
-                    Button { onSuggestion(starter.prompt) } label: {
-                        HStack(alignment: .top, spacing: 11) {
-                            Image(systemName: starter.icon)
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(Color.accentColor)
-                                .frame(width: 28, height: 28)
-                                .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(starter.title)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text(starter.detail)
-                                    .font(.system(size: 11.5))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .padding(compact ? 8 : 11)
-                        .frame(maxWidth: .infinity, minHeight: compact ? 50 : 66, alignment: .leading)
-                        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
-                        }
-                        .contentShape(RoundedRectangle(cornerRadius: 13))
-                    }
-                    .buttonStyle(OrePressableButtonStyle())
+            if let identity {
+                spotlightCard(identity: identity, compact: compact)
+            }
+
+            // The starters earn one compact row of chips, not four cards —
+            // the scientist is the centerpiece, and the real call to action
+            // is the composer below.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: compact ? 6 : 8) {
+                    ForEach(starters) { starter in starterChip(starter, compact: compact) }
+                }
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                    spacing: compact ? 6 : 8
+                ) {
+                    ForEach(starters) { starter in starterChip(starter, compact: compact) }
                 }
             }
 
@@ -1637,20 +1773,85 @@ private struct ResearchEmptyState: View {
                 }
             }
 
-            if let identity {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "lightbulb.min")
-                        .foregroundStyle(.secondary)
-                    Text("\(identity.name): \(identity.fact)")
-                        .font(.system(size: compact ? 10.5 : 11.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(compact ? 1 : nil)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.top, 2)
-            }
         }
         .padding(.vertical, compact ? 6 : 44)
+    }
+
+    /// The scientist this workspace is named for, given real presence:
+    /// portrait, a few sentences of biography from the corpus, and a link out.
+    /// Falls back to a monogram and the catalog's one-line fact offline.
+    private func spotlightCard(identity: ResearchIdentity, compact: Bool) -> some View {
+        HStack(alignment: .top, spacing: compact ? 10 : 14) {
+            Group {
+                if let portrait {
+                    Image(nsImage: portrait)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Text(Self.monogram(for: identity.name))
+                        .font(.system(size: compact ? 18 : 24, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.accentColor.opacity(0.12))
+                }
+            }
+            .frame(width: compact ? 52 : 72, height: compact ? 52 : 72)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(identity.name)
+                    .font(.system(size: compact ? 13.5 : 15, weight: .semibold))
+                Text(profile?.descriptionLine ?? "\(identity.field) · \(identity.region)")
+                    .font(.system(size: compact ? 10.5 : 11.5))
+                    .foregroundStyle(.secondary)
+                Text(profile?.extract ?? identity.fact)
+                    .font(.system(size: compact ? 11 : 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(compact ? 2 : 4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 1)
+                if let page = profile?.pageURL, let url = URL(string: page) {
+                    Link("Learn more on Wikipedia", destination: url)
+                        .font(.system(size: compact ? 10.5 : 11.5))
+                        .padding(.top, 1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(compact ? 10 : 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
+        }
+    }
+
+    private func starterChip(_ starter: Starter, compact: Bool) -> some View {
+        Button { onSuggestion(starter.prompt) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: starter.icon)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                Text(starter.title)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: compact ? 24 : 28)
+            .background(OreTheme.subduedFill, in: Capsule())
+            .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(OrePressableButtonStyle())
+        .help(starter.detail)
+    }
+
+    private static func monogram(for name: String) -> String {
+        let initials = name.split(separator: " ")
+            .compactMap(\.first)
+            .prefix(2)
+        return String(initials)
     }
 
     private struct Hint {

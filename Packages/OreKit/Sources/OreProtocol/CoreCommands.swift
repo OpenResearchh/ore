@@ -25,6 +25,9 @@ public enum CoreCommand: Sendable, Codable {
     case createPullRequest(WorkspaceID, title: String, body: String, base: String, draft: Bool)
     case retargetPullRequest(WorkspaceID, number: Int, base: String)
     case mergePullRequest(WorkspaceID, method: String)
+    /// After the PR merges: fetch the base, restart the workspace on a fresh
+    /// branch cut from it, and leave a memo in the chat so the agent knows.
+    case continueAfterMerge(WorkspaceID)
 
     // Chat
     case createChat(CreateChatRequest)
@@ -162,19 +165,26 @@ public struct CreateChatRequest: Sendable, Codable {
     public var harness: HarnessKind?
     public var model: String?
     public var permissionMode: PermissionMode
+    /// Start the new chat from another chat's provider session, branching it
+    /// rather than continuing it. The source conversation is untouched, so the
+    /// user can try a second direction from the same point without losing the
+    /// first. Ignored when the harness cannot fork (`supportsSessionFork`).
+    public var forkFrom: ChatID?
 
     public init(
         workspaceID: WorkspaceID,
         title: String? = nil,
         harness: HarnessKind? = nil,
         model: String? = nil,
-        permissionMode: PermissionMode = .default
+        permissionMode: PermissionMode = .default,
+        forkFrom: ChatID? = nil
     ) {
         self.workspaceID = workspaceID
         self.title = title
         self.harness = harness
         self.model = model
         self.permissionMode = permissionMode
+        self.forkFrom = forkFrom
     }
 }
 

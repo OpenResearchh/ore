@@ -6,16 +6,22 @@ import OreSupport
 /// own Cursor plan.
 ///
 /// **Experimental, and behind a flag.** The plan for this driver assumed an ACP
-/// mode with a real `session/request_permission` channel; the shipping CLI
-/// (2026.04) has no such subcommand, so the only machine-readable interface is
+/// mode with a real `session/request_permission` channel; the shipping CLI has
+/// no such subcommand, so the only machine-readable interface is
 /// `--print --output-format stream-json`, which streams output but offers no
 /// way to answer a permission prompt.
 ///
-/// That is a genuine capability gap, not a detail to paper over. The honest
-/// options were to auto-pass `--force` — which would let an agent run any
-/// command with no prompt the user ever saw — or to declare the gap and let the
-/// UI degrade. This driver does the latter: `permissionModel` is `.none`, and
-/// running without prompts requires the user to opt in explicitly.
+/// That is a genuine capability gap, not a detail to paper over. It is also not
+/// a reason to ship an agent that silently cannot work: with no approval
+/// channel *and* no approval policy, the CLI rejects every shell and write call
+/// — the turn returns `result: {rejected: …}` and the agent reports it was
+/// "blocked by the environment". So this driver passes `--auto-review`, whose
+/// server-side classifier runs the safe calls and refuses the rest. That is a
+/// real policy the user can reason about, unlike `--force`, which runs anything
+/// at all and therefore still requires an explicit opt-in.
+///
+/// `permissionModel` stays `.none`: the UI must not offer an approve button
+/// there is no channel to answer on.
 public struct CursorAgentHarness: AgentHarness {
     public let kind: HarnessKind = .cursorAgent
 
@@ -39,8 +45,9 @@ public struct CursorAgentHarness: AgentHarness {
     }
 
     public var executablePathOverride: String?
-    /// Opt-in, never inferred. Without it the agent cannot run tools that need
-    /// approval, and the UI says so.
+    /// Opt-in, never inferred. Escalates the tool policy from `--auto-review`
+    /// (a classifier decides) to `--force` (anything runs), which is a choice
+    /// only the user can make.
     public var allowUnprompted: Bool
 
     public init(executablePathOverride: String? = nil, allowUnprompted: Bool = false) {
@@ -76,8 +83,9 @@ public struct CursorAgentHarness: AgentHarness {
             executablePath: path,
             version: version,
             authState: authState,
-            diagnostic: "Experimental: this CLI has no approval channel, so tool "
-                + "permissions cannot be prompted for."
+            diagnostic: "Experimental: this CLI has no approval channel. Tool "
+                + "calls are decided by Cursor's auto-review classifier"
+                + (allowUnprompted ? ", or run unprompted in Bypass mode." : ".")
         )
     }
 
@@ -195,15 +203,27 @@ public actor CursorAgentSession: AgentSession {
             throw HarnessError.unsupportedCapability("sending while a turn is running")
         }
 
-        let process = try ChildProcess(
-            executablePath: executablePath,
-            arguments: arguments(for: message.renderedText),
-            workingDirectory: configuration.workingDirectory,
-            environment: ShellEnvironment.childEnvironment(
-                overrides: configuration.environmentOverrides,
-                allowProviderCredentials: configuration.allowAPIKeyFallback
+        // The CLI takes several seconds to boot before its first JSON line.
+        // Reflect activity immediately so the UI isn't blank meanwhile; the
+        // translator's real events take over once the process starts talking.
+        continuation.yield(.statusChanged(.requesting))
+
+        let process: ChildProcess
+        do {
+            process = try ChildProcess(
+                executablePath: executablePath,
+                arguments: arguments(for: message.renderedText),
+                workingDirectory: configuration.workingDirectory,
+                environment: ShellEnvironment.childEnvironment(
+                    overrides: configuration.environmentOverrides,
+                    allowProviderCredentials: configuration.allowAPIKeyFallback
+                )
             )
-        )
+        } catch {
+            // Undo the optimistic status or the spinner runs forever.
+            continuation.yield(.statusChanged(.failed))
+            throw error
+        }
         currentProcess = process
         process.closeStandardInput()
 
@@ -233,10 +253,18 @@ public actor CursorAgentSession: AgentSession {
         if let providerSessionID {
             arguments += ["--resume", providerSessionID]
         }
-        // Never inferred from a permission mode: an agent running any command
-        // with no prompt has to be something the user chose.
+        // A tool policy is not optional here. There is no approval channel, so
+        // without one of these flags every shell and write call comes back
+        // `rejected` and the agent can only read — which reads to the user as
+        // "the agent is broken", not "the agent asked and nobody answered".
+        //
+        // `--force` runs anything and so stays behind the explicit opt-in;
+        // `--auto-review` is the default because refusing on a classifier's
+        // judgement is a policy, whereas refusing everything is a defect.
         if allowUnprompted, configuration.permissionMode == .bypassPermissions {
             arguments.append("--force")
+        } else if configuration.permissionMode != .plan {
+            arguments.append("--auto-review")
         }
         arguments += configuration.extraArguments
         arguments.append(prompt)

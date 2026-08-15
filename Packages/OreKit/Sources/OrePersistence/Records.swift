@@ -39,6 +39,10 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     public var isArchived: Bool
     /// Commit holding uncommitted work preserved at archive time.
     public var archivedStateCommit: String?
+    public var archivedAt: Date?
+    /// Worktree size at archive time — the disk space the archive reclaimed.
+    /// Recorded then because the checkout no longer exists to measure later.
+    public var archivedDiskBytes: Int64?
     public var hasUnread: Bool
     public var sortIndex: Int
     public var createdAt: Date
@@ -58,6 +62,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         isPinned: Bool = false,
         isArchived: Bool = false,
         archivedStateCommit: String? = nil,
+        archivedAt: Date? = nil,
+        archivedDiskBytes: Int64? = nil,
         hasUnread: Bool = false,
         sortIndex: Int = 0,
         createdAt: Date = Date(),
@@ -76,6 +82,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         self.isPinned = isPinned
         self.isArchived = isArchived
         self.archivedStateCommit = archivedStateCommit
+        self.archivedAt = archivedAt
+        self.archivedDiskBytes = archivedDiskBytes
         self.hasUnread = hasUnread
         self.sortIndex = sortIndex
         self.createdAt = createdAt
@@ -107,6 +115,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
             hasUnread: hasUnread,
             isPinned: isPinned,
             isArchived: isArchived,
+            archivedAt: archivedAt,
+            archivedDiskBytes: archivedDiskBytes,
             gitStatus: gitStatus,
             contextUsage: contextUsage,
             lastActivity: lastActivityAt

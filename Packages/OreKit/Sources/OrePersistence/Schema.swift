@@ -272,6 +272,17 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v5.archiveMetadata") { db in
+            // The archived browser answers "when did I park this, and what did
+            // it give back?" — the worktree's size at archive time is the disk
+            // space reclaimed, and it can't be recomputed once the checkout is
+            // gone.
+            try db.alter(table: "workspace") { table in
+                table.add(column: "archivedAt", .datetime)
+                table.add(column: "archivedDiskBytes", .integer)
+            }
+        }
+
         return migrator
     }
 }

@@ -63,6 +63,11 @@ final class ChatState {
     /// while idle.
     private(set) var turnStartedAt: Date?
 
+    /// False between the user pressing send and the harness reporting its
+    /// first turn event — the window where a one-shot CLI (Cursor) is still
+    /// booting and the UI would otherwise look stuck.
+    private(set) var hasTurnEventArrived = true
+
     /// Index of the row a delta should append to, so streaming doesn't scan.
     private var streamingRowIndex: [BlockID: Int] = [:]
     private var currentTurnID: TurnID?
@@ -81,8 +86,11 @@ final class ChatState {
             currentTurnID = turn.turnID
             streamingRowIndex.removeAll()
             turnStartedAt = Date()
-            // A new turn means the user pressed on past the last failure.
+            hasTurnEventArrived = true
+            // A new turn means the user pressed on past the last failure, and
+            // past any plan that was still awaiting an answer.
             prominentError = nil
+            plan = nil
 
         case .textDelta(let delta):
             append(delta: delta, kind: .assistantText)
@@ -126,6 +134,10 @@ final class ChatState {
 
         case .permissionResolved(let resolution):
             if pendingPermission?.id == resolution.id { pendingPermission = nil }
+            // The plan card is gated on the *same* permission request. Without
+            // this it survived its own approval, so a second proposal left two
+            // cards and answering either one left the other on screen forever.
+            resolvePlan(requestID: resolution.id)
 
         case .question(let question):
             pendingQuestion = question
@@ -144,6 +156,7 @@ final class ChatState {
             currentTurnID = nil
             streamingRowIndex.removeAll()
             turnStartedAt = nil
+            hasTurnEventArrived = true
             if result.outcome == .failed, let message = result.errorMessage {
                 rows.append(TranscriptRow(
                     id: "error-\(result.turnID.rawValue)",
@@ -212,8 +225,12 @@ final class ChatState {
             attachments: attachments
         ))
         // Optimistic: the agent hasn't reported anything yet, but the user
-        // pressed send and the UI must not look idle.
+        // pressed send and the UI must not look idle. The timer starts now so
+        // a slow-booting CLI still shows elapsed time; `.turnStarted`
+        // overwrites it with the harness's own clock.
         status = .requesting
+        turnStartedAt = Date()
+        hasTurnEventArrived = false
     }
 
     func addDraftComment(_ reference: DiffCommentReference) {
@@ -232,7 +249,24 @@ final class ChatState {
 
     func resolvePermission(_ id: PermissionRequestID) {
         if pendingPermission?.id == id { pendingPermission = nil }
+        resolvePlan(requestID: id)
     }
+
+    /// Dismisses the plan card once its approval has been answered.
+    ///
+    /// A proposal with no request id is informational — the harness is showing
+    /// a plan, not asking about one — so it is dismissed on any resolution
+    /// rather than waiting for an id that will never arrive.
+    private func resolvePlan(requestID: PermissionRequestID) {
+        guard case .proposal(_, let planRequestID) = plan else { return }
+        guard planRequestID == nil || planRequestID == requestID else { return }
+        plan = nil
+    }
+
+    /// The user answered the plan card directly (approve, or reject with
+    /// feedback). Clears it immediately rather than waiting for the harness to
+    /// echo a resolution that, for a plan with no request id, never comes.
+    func dismissPlan() { plan = nil }
 
     func resolveQuestion(_ id: QuestionID) {
         if pendingQuestion?.id == id { pendingQuestion = nil }
@@ -309,6 +343,9 @@ struct TranscriptRow: Identifiable, Sendable {
         /// Intermediate reasoning, progress messages, and tool calls folded
         /// into one turn-level activity section.
         case activityGroup
+        /// The closing line of a finished turn: what it changed, how long it
+        /// took, and the actions that apply to the turn as a whole.
+        case turnFooter
     }
 
     let id: String
@@ -331,9 +368,14 @@ struct TranscriptRow: Identifiable, Sendable {
     var groupedRows: [TranscriptRow] = []
     var isExpanded = false
     var createdAt: Date = Date()
+    /// A subject resolved from elsewhere in the transcript rather than from
+    /// this row's own payload. A `TaskUpdate` names its task only by id, so the
+    /// human title has to come from the `TaskCreate` that made it.
+    var resolvedSubject: String?
 
     var activitySignature: Int {
         var hasher = Hasher()
+        hasher.combine(resolvedSubject)
         for row in groupedRows {
             hasher.combine(row.id)
             hasher.combine(row.text)

@@ -39,6 +39,79 @@ struct CheckpointTests {
         #expect(result.deletedPaths == ["extra.swift"])
     }
 
+    @Test func pruningKeepsTheNewestCheckpointsAndDropsTheRest() async throws {
+        // Each checkpoint ref pins a whole tree and is precisely what stops gc
+        // reclaiming it, so a workspace that ran hundreds of turns kept a full
+        // snapshot for every one of them.
+        let (fixture, worktree) = try await makeWorkspace()
+        let store = CheckpointStore(git: fixture.git)
+        let workspaceID = WorkspaceID(rawValue: "ws1")
+
+        for turn in 1...6 {
+            try fixture.write("app.swift", "let version = \(turn)\n", in: worktree)
+            _ = try await store.capture(
+                worktree: worktree,
+                workspaceID: workspaceID,
+                turnID: TurnID(rawValue: "turn\(turn)")
+            )
+        }
+        #expect(try await store.list(workspaceID: workspaceID).count == 6)
+
+        try await store.prune(
+            workspaceID: workspaceID,
+            keeping: [TurnID(rawValue: "turn5"), TurnID(rawValue: "turn6")]
+        )
+
+        let remaining = try await store.list(workspaceID: workspaceID)
+        #expect(remaining.count == 2)
+        #expect(remaining.allSatisfy { $0.hasSuffix("turn5") || $0.hasSuffix("turn6") })
+    }
+
+    @Test func aKeptCheckpointIsStillRevertableAfterPruning() async throws {
+        // Pruning must drop refs without disturbing the trees the survivors
+        // point at — a checkpoint you cannot restore is not a checkpoint.
+        let (fixture, worktree) = try await makeWorkspace()
+        let store = CheckpointStore(git: fixture.git)
+        let workspaceID = WorkspaceID(rawValue: "ws1")
+
+        try fixture.write("app.swift", "let version = 1\n", in: worktree)
+        _ = try await store.capture(
+            worktree: worktree, workspaceID: workspaceID, turnID: TurnID(rawValue: "old")
+        )
+        try fixture.write("app.swift", "let version = 2\n", in: worktree)
+        let kept = try await store.capture(
+            worktree: worktree, workspaceID: workspaceID, turnID: TurnID(rawValue: "kept")
+        )
+
+        try await store.prune(workspaceID: workspaceID, keeping: [TurnID(rawValue: "kept")])
+
+        try fixture.write("app.swift", "let version = 3\n", in: worktree)
+        try await store.restore(worktree: worktree, to: kept)
+        #expect(fixture.read("app.swift", in: worktree) == "let version = 2\n")
+    }
+
+    @Test func pruningLeavesOtherWorkspacesAlone() async throws {
+        let (fixture, worktree) = try await makeWorkspace()
+        let store = CheckpointStore(git: fixture.git)
+        let mine = WorkspaceID(rawValue: "ws1")
+        let theirs = WorkspaceID(rawValue: "ws2")
+
+        for turn in 1...3 {
+            try fixture.write("app.swift", "let version = \(turn)\n", in: worktree)
+            _ = try await store.capture(
+                worktree: worktree, workspaceID: mine, turnID: TurnID(rawValue: "turn\(turn)")
+            )
+            _ = try await store.capture(
+                worktree: worktree, workspaceID: theirs, turnID: TurnID(rawValue: "turn\(turn)")
+            )
+        }
+
+        try await store.prune(workspaceID: mine, keeping: [TurnID(rawValue: "turn3")])
+
+        #expect(try await store.list(workspaceID: mine).count == 1)
+        #expect(try await store.list(workspaceID: theirs).count == 3)
+    }
+
     @Test func revertNeverTouchesIgnoredFiles() async throws {
         // Deleting someone's .env or build cache in the name of a revert is
         // not a trade worth making.

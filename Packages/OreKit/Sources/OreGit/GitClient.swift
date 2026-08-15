@@ -133,6 +133,38 @@ public actor GitClient {
         (try? await run(["show-ref", "--verify", "--quiet", "refs/heads/\(name)"])) != nil
     }
 
+    /// Commits in a revision range, newest first.
+    ///
+    /// Fields are separated by unit-separator and records by record-separator
+    /// control characters, so subjects containing any printable character —
+    /// including newlines-adjacent punctuation — parse intact.
+    public func commits(
+        range: String, in directory: URL? = nil, limit: Int = 50
+    ) async throws -> [CommitInfo] {
+        let output = try await run([
+            "log", "--max-count=\(limit)",
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1e",
+            range,
+        ], in: directory)
+
+        let formatter = ISO8601DateFormatter()
+        return output.standardOutput
+            .split(separator: "\u{1e}", omittingEmptySubsequences: true)
+            .compactMap { record in
+                let fields = record
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(separator: "\u{1f}", omittingEmptySubsequences: false)
+                guard fields.count >= 5 else { return nil }
+                return CommitInfo(
+                    sha: String(fields[0]),
+                    shortSHA: String(fields[1]),
+                    subject: String(fields[2]),
+                    author: String(fields[3]),
+                    date: formatter.date(from: String(fields[4])) ?? Date()
+                )
+            }
+    }
+
     /// The repository's default branch, in the order a developer would guess:
     /// what the remote says its HEAD is, then the usual names, then whatever is
     /// currently checked out.
@@ -164,6 +196,26 @@ public actor GitClient {
             .split(separator: "\n")
             .map { String($0).replacingOccurrences(of: "origin/", with: "") }
             .filter { !$0.isEmpty && $0 != "HEAD" }
+    }
+}
+
+/// One commit as the ship panel shows it: enough to recognize the work, not
+/// the full object.
+public struct CommitInfo: Sendable, Hashable, Codable, Identifiable {
+    public var sha: String
+    public var shortSHA: String
+    public var subject: String
+    public var author: String
+    public var date: Date
+
+    public var id: String { sha }
+
+    public init(sha: String, shortSHA: String, subject: String, author: String, date: Date) {
+        self.sha = sha
+        self.shortSHA = shortSHA
+        self.subject = subject
+        self.author = author
+        self.date = date
     }
 }
 

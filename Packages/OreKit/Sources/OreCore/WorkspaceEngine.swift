@@ -47,6 +47,11 @@ public actor WorkspaceEngine {
         var isGeneratingTitle = false
         var handoffContext: String?
         var queuedMessageCount = 0
+        /// Workspace-level facts the agent must learn on its next real turn
+        /// (e.g. "your PR merged; you're on a fresh branch now"). Prepended to
+        /// the next outgoing message and cleared — a note in the database
+        /// alone never reaches a resumed provider session's context.
+        var pendingContextNotes: [String] = []
 
         init(record: ChatRecord) { self.record = record }
     }
@@ -185,7 +190,12 @@ public actor WorkspaceEngine {
         try await loadChats()
         let index = try await store.nextChatSortIndex(workspaceID: workspaceID)
         let defaultRuntime = try await runtime(for: nil)
+        // A fork inherits the source chat's agent and model, not the
+        // workspace's: branching a conversation onto a different model would
+        // hand the new session a transcript its model never produced.
+        let source = request.forkFrom.flatMap { chats[$0] }
         let harness = request.harness
+            ?? source.flatMap { HarnessKind(rawValue: $0.record.harness) }
             ?? HarnessKind(rawValue: defaultRuntime.record.harness) ?? .claudeCode
         let chat = ChatRecord(
             id: ChatID.generate(),
@@ -193,7 +203,7 @@ public actor WorkspaceEngine {
             title: request.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? "Chat \(index + 1)",
             harness: harness,
-            model: request.model ?? defaultRuntime.record.model,
+            model: request.model ?? source?.record.model ?? defaultRuntime.record.model,
             permissionMode: request.permissionMode,
             sortIndex: index
         )
@@ -201,7 +211,32 @@ public actor WorkspaceEngine {
         let runtime = ChatRuntime(record: chat)
         chats[chat.chatID] = runtime
         publishChatChange(runtime)
+        if let source { await forkSession(from: source, into: runtime, harness: harness) }
         return try await summary(for: runtime)
+    }
+
+    /// Branches the source chat's provider session into the new chat.
+    ///
+    /// Best-effort by design: the fork is a convenience, and a harness that
+    /// cannot fork — or a source that has never run — should still yield a
+    /// usable empty chat rather than failing the creation the user asked for.
+    private func forkSession(
+        from source: ChatRuntime,
+        into runtime: ChatRuntime,
+        harness harnessKind: HarnessKind
+    ) async {
+        guard harnessRegistry.harness(for: harnessKind)?.capabilities.supportsSessionFork == true,
+              let previous = try? await store.latestSession(for: source.record.chatID),
+              let providerSessionID = previous.providerSessionID
+        else { return }
+        _ = try? await ensureSession(
+            SessionRequest(
+                harness: harnessKind,
+                model: runtime.record.model,
+                resume: .fork(providerSessionID: providerSessionID)
+            ),
+            chatID: runtime.record.chatID
+        )
     }
 
     public func closeChat(_ chatID: ChatID, closed: Bool = true) async throws -> ChatSummary {
@@ -473,8 +508,16 @@ public actor WorkspaceEngine {
     @discardableResult
     public func send(_ request: SendMessageRequest) async throws -> Bool {
         let runtime = try await runtime(for: request.chatID)
-        let text = composeMessage(request)
+        var text = composeMessage(request)
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+
+        if !runtime.pendingContextNotes.isEmpty {
+            let notes = runtime.pendingContextNotes
+                .map { "[ORE workspace note] \($0)" }
+                .joined(separator: "\n")
+            text = "\(notes)\n\n\(text)"
+            runtime.pendingContextNotes.removeAll()
+        }
 
         // Titles the user hasn't chosen give way to one drawn from the first
         // prompt: an empty title, the "Chat N" fallback from createChat, or the
@@ -657,7 +700,13 @@ public actor WorkspaceEngine {
                     case .textDelta(let delta): streamed += delta.text
                     case .blockCompleted(let block) where block.kind == .text:
                         completedBlocks.append(block.text)
-                    case .turnCompleted:
+                    case .turnCompleted(let result):
+                        // A failed naming turn still produces prose — a usage
+                        // limit notice, a provider error — and that prose is
+                        // shaped exactly like a title. Adopting it is how a
+                        // workspace ended up called "You've hit your session
+                        // limit". Nothing a failed turn said is a name.
+                        guard result.outcome == .completed else { return nil }
                         return completedBlocks.last ?? streamed
                     case .sessionError, .sessionEnded:
                         return nil
@@ -692,7 +741,24 @@ public actor WorkspaceEngine {
         let words = title.split(whereSeparator: \.isWhitespace).prefix(6)
         title = words.joined(separator: " ")
         guard words.count >= 2, title.count <= 64 else { return nil }
+        guard !isRefusalOrError(title) else { return nil }
         return title
+    }
+
+    /// A second gate behind the failed-turn check, for providers that report a
+    /// limit or refusal as ordinary assistant text on a turn they call
+    /// successful. Short apologies and quota notices pass every structural test
+    /// a title has — length, word count, no punctuation — so they have to be
+    /// recognised by what they say.
+    private static func isRefusalOrError(_ title: String) -> Bool {
+        let value = title.lowercased()
+        let markers = [
+            "session limit", "usage limit", "rate limit", "rate-limit",
+            "quota", "too many requests", "try again later", "upgrade to",
+            "i can't", "i cannot", "i'm unable", "i am unable", "sorry",
+            "unable to", "error", "failed to", "no response",
+        ]
+        return markers.contains { value.contains($0) }
     }
 
     /// Folds diff comments into the prompt with enough anchoring that the agent
@@ -786,6 +852,33 @@ public actor WorkspaceEngine {
             commit: checkpoint.commit,
             providerSessionID: checkpoint.providerSessionID
         )
+        await pruneCheckpoints()
+    }
+
+    /// How many turns back a revert can still reach. Deep on purpose: pruning a
+    /// checkpoint makes that turn unrevertable, so it must only ever reach
+    /// history nobody is going back to.
+    private static let checkpointDepth = 250
+
+    /// Drops checkpoint refs for turns far enough back that no one will revert
+    /// to them, so a long-lived workspace stops accumulating one pinned tree
+    /// per turn it has ever run.
+    ///
+    /// Best-effort, and always after the checkpoint the current turn needs:
+    /// losing old snapshots is a cost worth paying, failing to take a new one
+    /// is not.
+    private func pruneCheckpoints() async {
+        var turns: [TurnRecord] = []
+        for chatID in chats.keys {
+            turns += (try? await store.turns(chatID: chatID)) ?? []
+        }
+        guard turns.count > Self.checkpointDepth else { return }
+        let keep = Set(
+            turns.sorted { $0.startedAt > $1.startedAt }
+                .prefix(Self.checkpointDepth)
+                .map { TurnID(rawValue: $0.id) }
+        )
+        try? await checkpoints.prune(workspaceID: workspaceID, keeping: keep)
     }
 
     /// Reverts the workspace to the state a turn started from.
@@ -932,6 +1025,123 @@ public actor WorkspaceEngine {
             """,
             queueIfBusy: false
         ))
+    }
+
+    /// Rolls the workspace forward after its PR merged: fetch the base, cut a
+    /// fresh branch from `origin/<base>`, and leave a memo in the chat so the
+    /// next agent turn knows the ground moved under it.
+    ///
+    /// A fresh branch rather than a rebase: the merged branch's work now lives
+    /// in the base, and continuing on top of it would show already-merged
+    /// commits in every diff and PR that follows.
+    public func continueAfterMerge() async throws {
+        guard let pullRequest = await gitHub.pullRequest(forBranch: record.branch),
+              pullRequest.isMerged
+        else { throw OreCoreError.pullRequestNotMerged(record.branch) }
+
+        // Uncommitted work would be stranded on the old branch by the switch;
+        // make the user decide (commit, or discard) before continuing.
+        let liveStatus = await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus
+        guard !liveStatus.hasUncommittedChanges else {
+            throw OreCoreError.uncommittedChanges
+        }
+
+        let base = pullRequest.baseRefName.isEmpty ? record.baseBranch : pullRequest.baseRefName
+        try await git.runSerialized(["fetch", "origin", base], in: worktreeURL)
+
+        // ore/foo → ore/foo-2 → ore/foo-3…, reusing the numbering idiom from
+        // WorktreeManager.uniqueBranch.
+        let stem = record.branch.replacingOccurrences(
+            of: #"-\d+$"#, with: "", options: .regularExpression
+        )
+        var newBranch = "\(stem)-2"
+        var suffix = 2
+        while await git.branchExists(newBranch) {
+            suffix += 1
+            newBranch = "\(stem)-\(suffix)"
+            if suffix > 999 { throw GitError.branchExists(name: stem) }
+        }
+
+        try await git.runSerialized(
+            ["switch", "-c", newBranch, "origin/\(base)"], in: worktreeURL
+        )
+        let baseSHA = (try? await git.run(
+            ["rev-parse", "--short", "HEAD"], in: worktreeURL
+        ).trimmedStandardOutput) ?? "HEAD"
+
+        let oldBranch = record.branch
+        record.branch = newBranch
+        record.baseBranch = base
+        try await persistRecord()
+        publishSummaryChange()
+        await statusWatcher?.refreshNow()
+
+        let memo = """
+        PR #\(pullRequest.number) (\(pullRequest.title)) was merged into \(base). \
+        The old branch `\(oldBranch)` is done; this workspace continues on the fresh \
+        branch `\(newBranch)`, cut from updated `origin/\(base)` at \(baseSHA).
+        """
+        try await recordWorkspaceMemo(memo)
+    }
+
+    /// Persists a memo as a synthetic completed turn (so it renders in the
+    /// transcript and is search-indexed) and stages it as a context note for
+    /// the agent's next real turn.
+    private func recordWorkspaceMemo(_ memo: String) async throws {
+        let runtime = try await runtime(for: nil)
+        let chatID = runtime.record.chatID
+
+        let session: SessionRecord
+        if let existing = try await store.latestSession(for: chatID) {
+            session = existing
+        } else {
+            session = SessionRecord(
+                id: SessionID.generate(),
+                workspaceID: workspaceID,
+                chatID: chatID,
+                harness: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode,
+                model: runtime.record.model
+            )
+            try await store.saveSession(session)
+        }
+
+        let turnID = TurnID.generate()
+        let now = Date()
+        try await store.saveTurn(TurnRecord(
+            id: turnID,
+            sessionID: SessionID(rawValue: session.id),
+            ordinal: try await store.nextTurnOrdinal(sessionID: SessionID(rawValue: session.id)),
+            outcome: .completed,
+            summary: memo,
+            startedAt: now,
+            endedAt: now
+        ))
+        try await store.appendBlock(BlockRecord(
+            id: "memo-\(turnID.rawValue)",
+            turnID: turnID,
+            ordinal: 0,
+            kind: .text,
+            text: memo
+        ))
+
+        runtime.pendingContextNotes.append(memo)
+        runtime.record.hasUnread = true
+        try? await store.saveChat(runtime.record)
+        publishChatChange(runtime)
+    }
+
+    /// The commits the ship panel lists: not yet pushed to the upstream, or —
+    /// before a first push creates one — everything ahead of the base.
+    public func unpushedCommits(limit: Int = 50) async -> [CommitInfo] {
+        let range = await hasUpstream()
+            ? "@{upstream}..HEAD"
+            : "\(record.baseBranch)..HEAD"
+        return (try? await git.commits(range: range, in: worktreeURL, limit: limit)) ?? []
+    }
+
+    public func currentPullRequest() async -> GitHubClient.PullRequest? {
+        guard await gitHub.status().isAuthenticated else { return nil }
+        return await gitHub.pullRequest(forBranch: record.branch)
     }
 
     private func unpushedCommitCount() async -> Int {
@@ -1161,6 +1371,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case harnessUnavailable(HarnessKind)
     case modelChangeRequiresIdle(ChatID)
     case noPullRequest(String)
+    case pullRequestNotMerged(String)
+    case uncommittedChanges
 
     public var description: String {
         switch self {
@@ -1175,6 +1387,10 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "This harness can only change models between turns."
         case .noPullRequest(let branch):
             return "No pull request exists for \(branch)."
+        case .pullRequestNotMerged(let branch):
+            return "The pull request for \(branch) has not been merged."
+        case .uncommittedChanges:
+            return "There are uncommitted changes. Commit or discard them before continuing."
         }
     }
 }

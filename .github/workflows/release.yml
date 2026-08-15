@@ -22,7 +22,10 @@ jobs:
   release:
     if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
     name: Bump, build DMG, publish
-    runs-on: macos-15
+    # Must match the OreMac CI job: the DMG builds the same target, which needs
+    # the macOS 26 SDK for the Liquid Glass symbols behind its availability
+    # checks.
+    runs-on: macos-26
     defaults:
       run:
         working-directory: Apps/OreMac

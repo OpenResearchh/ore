@@ -44,4 +44,45 @@ struct CursorTranslatorTests {
         #expect(toolCall?.input["file_path"]?.stringValue == "/tmp/x.txt")
         #expect(all.contains { if case .toolResult(let r) = $0 { return !r.isError }; return false })
     }
+
+    @Test func metadataKeysAreNotEmittedAsToolCalls() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"toolCallId":"c1","startedAtMs":1,"hookAdditionalContexts":[{"type":"hook"}],"readToolCall":{"args":{"path":"/tmp/App.swift"}}},"timestamp_ms":1}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"toolCallId":"c1","readToolCall":{"args":{"path":"/tmp/App.swift"},"result":{"success":{"content":"hi"}}}},"timestamp_ms":2}"#,
+        ])
+        let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
+        #expect(calls.count == 1)
+        #expect(calls.first?.name == "Read")
+        #expect(calls.first?.input["file_path"]?.stringValue == "/tmp/App.swift")
+        #expect(calls.first?.displayName == "App.swift")
+        let names = calls.map(\.name)
+        #expect(!names.contains("Toolcallid"))
+        #expect(!names.contains("Startedatms"))
+        #expect(!names.contains("Hookadditionalcontexts"))
+    }
+
+    @Test func hookOnlyToolCallRecordsAreDropped() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"c2","tool_call":{"toolCallId":"c2","startedAtMs":1,"hookAdditionalContexts":[{"foo":1}]},"timestamp_ms":1}"#,
+        ])
+        #expect(all.allSatisfy { if case .toolCall = $0 { return false }; return true })
+    }
+
+    @Test func cursorSpecificToolsMapOntoKnownNames() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"lints","tool_call":{"readLintsToolCall":{"args":{"path":"/tmp/App.swift"}}}}"#,
+            #"{"type":"tool_call","subtype":"started","call_id":"ls","tool_call":{"lsToolCall":{"args":{"targetDirectory":"/tmp/Sources"}}}}"#,
+            #"{"type":"tool_call","subtype":"started","call_id":"del","tool_call":{"deleteToolCall":{"args":{"path":"/tmp/gone.swift"}}}}"#,
+            #"{"type":"tool_call","subtype":"started","call_id":"sem","tool_call":{"semSearchToolCall":{"args":{"query":"hover preview"}}}}"#,
+        ])
+        let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
+        let byID = Dictionary(uniqueKeysWithValues: calls.map { ($0.id.rawValue, $0) })
+        #expect(byID["lints"]?.name == "ReadLints")
+        #expect(byID["lints"]?.displayName == "App.swift")
+        #expect(byID["ls"]?.name == "LS")
+        #expect(byID["ls"]?.input["file_path"]?.stringValue == "/tmp/Sources")
+        #expect(byID["del"]?.name == "Delete")
+        #expect(byID["sem"]?.name == "Grep")
+        #expect(byID["sem"]?.input["pattern"]?.stringValue == "hover preview")
+    }
 }

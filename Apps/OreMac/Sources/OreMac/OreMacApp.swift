@@ -299,11 +299,16 @@ struct RootView: View {
             NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
         }
         .toolbar {
+            if let workspace = model.selectedWorkspace {
+                ToolbarItem(placement: .primaryAction) {
+                    GitActionToolbar(workspace: workspace)
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button { showsReview.toggle() } label: {
                     Label(
                         showsReview ? "Hide Review" : "Show Review",
-                        systemImage: showsReview ? "sidebar.right" : "sidebar.right"
+                        systemImage: "sidebar.right"
                     )
                     .symbolVariant(showsReview ? .fill : .none)
                 }
@@ -367,6 +372,11 @@ struct RootView: View {
                 }
             }
             .id(workspace.id)
+            .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)") {
+                // The git action lives in the window toolbar now, so it has to
+                // stay current even when the review pane is closed.
+                model.prefetchDiff(for: workspace)
+            }
         } else {
             welcome
         }
@@ -502,7 +512,7 @@ struct RootView: View {
         }
         .padding(.horizontal, OreTheme.Space.md)
         .frame(height: OreTheme.RowHeight.bar)
-        .background(.bar)
+        .background(OreTheme.Surface.chrome)
         .overlay(alignment: .top) {
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
         }
@@ -555,7 +565,7 @@ struct RootView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(OreTheme.Space.xl)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(OreTheme.Surface.chrome)
     }
 
     private var banners: some View {

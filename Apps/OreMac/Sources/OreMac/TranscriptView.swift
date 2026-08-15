@@ -51,6 +51,9 @@ struct TranscriptView: NSViewRepresentable {
         tableView.usesAutomaticRowHeights = false
         tableView.rowSizeStyle = .custom
 
+        tableView.wantsLayer = true
+        tableView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+
         let column = NSTableColumn(identifier: .init("transcript"))
         column.resizingMask = .autoresizingMask
         tableView.addTableColumn(column)
@@ -62,12 +65,15 @@ struct TranscriptView: NSViewRepresentable {
         let scrollView = NSScrollView()
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
+        scrollView.backgroundColor = .textBackgroundColor
         scrollView.automaticallyAdjustsContentInsets = false
-        // The busy pill overlays the bottom-left of the transcript. Permanent
-        // bottom breathing room means it never covers the latest line and its
-        // appearance cannot push the document around while text streams.
-        scrollView.contentInsets = NSEdgeInsets(top: 12, left: 0, bottom: 46, right: 0)
+        scrollView.usesPredominantAxisScrolling = true
+        // Overlay scrollers keep the table width stable while scrolling, so
+        // a scroller appearing cannot invalidate every row height mid-gesture.
+        scrollView.contentInsets = NSEdgeInsets(top: 10, left: 0, bottom: 12, right: 0)
 
         // Row heights depend on width, so a resize invalidates the cache.
         NotificationCenter.default.addObserver(
@@ -141,6 +147,11 @@ struct TranscriptView: NSViewRepresentable {
         /// blank that only fills in once a scroll forces a re-measure. So the
         /// restore is deferred until the first real layout can honour it.
         private var pendingScrollRestore: CGFloat?
+        /// Coalesces UserDefaults writes so a trackpad flick isn't hundreds of
+        /// preference-file hits — those stalls are what made fast scrolling feel
+        /// like the table was fighting the gesture.
+        private var persistScrollWork: DispatchWorkItem?
+        private var prefetchWork: DispatchWorkItem?
 
         init(
             persistenceKey: String,
@@ -229,12 +240,15 @@ struct TranscriptView: NSViewRepresentable {
             // bottom; yanking them back while they read is worse than not
             // following at all.
             if wasAtBottom { scrollToBottom(tableView) }
+            if previous.count != newRows.count {
+                prefetchHeights(in: tableView, immediateVisible: true)
+            }
         }
 
         func appearanceChanged() {
             guard let tableView else { return }
             heightCache.removeAll()
-            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+            prefetchHeights(in: tableView, immediateVisible: true)
             tableView.reloadData()
         }
 
@@ -261,7 +275,7 @@ struct TranscriptView: NSViewRepresentable {
             guard abs(width - cachedWidth) > 1 else { return }
             cachedWidth = width
             heightCache.removeAll()
-            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(rows.indices))
+            prefetchHeights(in: tableView, immediateVisible: true)
             // A width was just established; a restore that couldn't run on load
             // (view not yet sized) can finally land correctly.
             restorePendingScrollIfReady()
@@ -269,7 +283,13 @@ struct TranscriptView: NSViewRepresentable {
 
         @objc func scrollDidChange(_ notification: Notification) {
             guard let clip = notification.object as? NSClipView else { return }
-            UserDefaults.standard.set(clip.bounds.origin.y, forKey: persistenceKey)
+            let y = clip.bounds.origin.y
+            persistScrollWork?.cancel()
+            let work = DispatchWorkItem { [persistenceKey] in
+                UserDefaults.standard.set(y, forKey: persistenceKey)
+            }
+            persistScrollWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
             updateActiveTurn()
         }
 
@@ -289,7 +309,7 @@ struct TranscriptView: NSViewRepresentable {
             // scroll position landed in empty space above the content — the blank
             // band that only filled in once a scroll forced a re-measure. Hand back
             // a provisional height *without* caching until the width is real.
-            guard available > 1 else { return 44 }
+            guard available > 1 else { return TranscriptCell.estimatedHeight(for: item) }
 
             let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
             let height = TranscriptCell.height(for: item, width: width, worktreePath: worktreePath)
@@ -319,6 +339,46 @@ struct TranscriptView: NSViewRepresentable {
         }
 
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
+
+        /// Measure the rows the reader can see *now*, then fill in the rest on
+        /// the next turn of the run loop. NSTableView otherwise asks for heights
+        /// only as rows enter the viewport, which is the blank band at the top
+        /// and bottom of a fast flick — those rows still had the placeholder
+        /// height until they were asked about.
+        private func prefetchHeights(in tableView: NSTableView, immediateVisible: Bool) {
+            guard tableView.bounds.width > 1, !rows.isEmpty else { return }
+            let visible = tableView.rows(in: tableView.visibleRect)
+            // `rows(in:)` reports NSNotFound when the rect holds no rows; letting
+            // that flow into the range math would make `start` exceed `end` and
+            // trap. Anchor to the top instead so the deferred full pass still runs.
+            let anchor = visible.location == NSNotFound ? 0 : visible.location
+            let start = max(0, anchor - 40)
+            let end = min(rows.count, max(anchor + max(visible.length, 1) + 60, start + 1))
+            for index in start..<end {
+                _ = self.tableView(tableView, heightOfRow: index)
+            }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                context.allowsImplicitAnimation = false
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: start..<end))
+            }
+
+            prefetchWork?.cancel()
+            guard immediateVisible, heightCache.count < rows.count else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let tableView = self.tableView, !self.rows.isEmpty else { return }
+                for index in self.rows.indices {
+                    _ = self.tableView(tableView, heightOfRow: index)
+                }
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0
+                    context.allowsImplicitAnimation = false
+                    tableView.noteHeightOfRows(withIndexesChanged: IndexSet(self.rows.indices))
+                }
+            }
+            prefetchWork = work
+            DispatchQueue.main.async(execute: work)
+        }
 
         // MARK: - Scrolling
 
@@ -482,10 +542,45 @@ private extension Array where Element == TranscriptRow {
     }
 }
 
+/// Lays out transcript text the same way the cell's `NSTextView` does, so a
+/// row's table height matches what is actually drawn. `NSAttributedString.boundingRect`
+/// disagrees with TextKit once code-block `NSTextTable`s or attachment chips
+/// are involved, and that disagreement is the empty gap under a finished reply.
+@MainActor
+enum TranscriptHeightMeasurer {
+    private static let textView: NSTextView = {
+        let view = NSTextView(frame: .zero)
+        view.isRichText = true
+        view.isHorizontallyResizable = false
+        view.isVerticallyResizable = true
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = false
+        view.textContainer?.lineBreakMode = .byWordWrapping
+        return view
+    }()
+
+    static func height(of string: NSAttributedString, width: CGFloat) -> CGFloat {
+        guard width > 1, string.length > 0 else { return 0 }
+        guard let container = textView.textContainer,
+              let layoutManager = textView.layoutManager else {
+            return ceil(string.boundingRect(
+                with: NSSize(width: width, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin]
+            ).height)
+        }
+        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        textView.textStorage?.setAttributedString(string)
+        layoutManager.ensureLayout(for: container)
+        return ceil(layoutManager.usedRect(for: container).height)
+    }
+}
+
 /// One transcript row, drawn with TextKit.
 final class TranscriptCell: NSTableCellView {
     static let horizontalInset: CGFloat = 24
-    static let contentMaxWidth: CGFloat = 920
+    static let contentMaxWidth: CGFloat = OreTheme.contentMaxWidth
     private static let verticalInset: CGFloat = 8
 
     /// Rows produced inside a subagent are indented under it; this is the
@@ -523,7 +618,8 @@ final class TranscriptCell: NSTableCellView {
         self.identifier = identifier
 
         bubble.wantsLayer = true
-        bubble.layer?.cornerRadius = 12
+        bubble.layer?.cornerRadius = OreTheme.controlRadius
+        bubble.layer?.cornerCurve = .continuous
         bubble.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bubble)
 
@@ -716,6 +812,7 @@ final class TranscriptCell: NSTableCellView {
         }
 
         let attributedText = Self.attributedText(for: row, worktreePath: worktreePath)
+        label.dismissAttachmentPreview()
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
         // Activity groups toggle on a click, so their text isn't selectable;
@@ -882,21 +979,32 @@ final class TranscriptCell: NSTableCellView {
     }
 
     static func height(for row: TranscriptRow, width: CGFloat, worktreePath: String = "") -> CGFloat {
-        if row.kind == .divider { return 42 }
+        if row.kind == .divider { return 36 }
         let attributed = attributedText(for: row, worktreePath: worktreePath)
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
-        let bounding = attributed.boundingRect(
-            with: NSSize(
-                width: bubbleWidth - 10 - trailingInset(for: row),
-                height: .greatestFiniteMagnitude
-            ),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        )
-        // Text, plus the bubble's own padding (16), plus the cell's vertical
-        // inset — and the badge line only when there is a badge to show.
+        let textWidth = max(1, bubbleWidth - 10 - trailingInset(for: row))
+        // TextKit, not `boundingRect`. Markdown with `NSTextTable` code blocks
+        // (and attachment chips) makes boundingRect invent a height far taller
+        // than the text view actually draws — the empty gap between a reply and
+        // its footer. Measuring through the same layout manager the cell uses
+        // keeps those two numbers identical.
+        let textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
         let badgeLine: CGFloat = badgeText(for: row).isEmpty ? 0 : 14
-        return ceil(bounding.height) + 16 + verticalInset(for: row) * 2 + badgeLine
+        return ceil(textHeight) + 16 + verticalInset(for: row) * 2 + badgeLine
+    }
+
+    /// Placeholder used only before the table has a real width. Kind-specific
+    /// so an unmeasured assistant reply doesn't collapse to a 20pt stub (the
+    /// blank strip at the edge of a fast scroll).
+    static func estimatedHeight(for row: TranscriptRow) -> CGFloat {
+        switch row.kind {
+        case .assistantText, .plan: return 72
+        case .userMessage: return 44
+        case .turnFooter: return 28
+        case .divider: return 36
+        case .toolCall, .thinking, .activityGroup, .error: return 28
+        }
     }
 
     /// Process rows — tool calls, thinking, the collapsed activity group — sit
@@ -904,7 +1012,8 @@ final class TranscriptCell: NSTableCellView {
     /// rather than a widely-spaced list competing with the answer.
     private static func verticalInset(for row: TranscriptRow) -> CGFloat {
         switch row.kind {
-        case .toolCall, .thinking, .activityGroup, .error: return 5
+        case .toolCall, .thinking, .activityGroup, .error: return 4
+        case .turnFooter: return 4
         default: return verticalInset
         }
     }
@@ -1040,9 +1149,10 @@ final class TranscriptCell: NSTableCellView {
         return row.text + "\n\n" + names
     }
 
-    /// User bubbles keep the typed prose, then the same chips and image
-    /// previews the composer uses — a pasted screenshot should not collapse
-    /// into `@pasted-image.png` once it has been sent.
+    /// User bubbles keep the typed prose, then chips for attachments that were
+    /// not already written as `@name` tokens. Images and long pasted text are
+    /// chips (or styled tokens) with a hover preview — the same treatment as
+    /// the composer — rather than a tiny thumbnail or a wall of pasted prose.
     private static func userMessageText(
         for row: TranscriptRow,
         worktreePath: String
@@ -1053,32 +1163,36 @@ final class TranscriptCell: NSTableCellView {
             .foregroundColor: textColor(for: row),
         ]
         if !row.text.isEmpty {
-            result.append(styledMentions(row.text, attachments: row.attachments, attributes: attributes))
+            result.append(styledMentions(
+                row.text,
+                attachments: row.attachments,
+                worktreePath: worktreePath,
+                attributes: attributes
+            ))
         }
 
-        let images = row.attachments.filter(\.isImage)
         let mentioned = Set(
             row.attachments
                 .filter { row.text.contains("@\($0.displayName)") }
                 .map(\.relativePath)
         )
-        let files = row.attachments.filter { !$0.isImage && !mentioned.contains($0.relativePath) }
+        let extras = row.attachments.filter { !mentioned.contains($0.relativePath) }
+        let images = extras.filter(\.isImage)
+        let files = extras.filter { !$0.isImage }
         if !images.isEmpty || !files.isEmpty {
             if result.length > 0 {
                 result.append(NSAttributedString(string: "\n", attributes: attributes))
             }
             for (index, attachment) in images.enumerated() {
                 if index > 0 { result.append(NSAttributedString(string: "  ", attributes: attributes)) }
-                appendImagePreview(attachment, worktreePath: worktreePath, to: result)
-                result.append(NSAttributedString(string: " ", attributes: attributes))
-                appendChip(for: attachment, to: result)
+                appendChip(for: attachment, worktreePath: worktreePath, to: result)
             }
             if !images.isEmpty, !files.isEmpty {
                 result.append(NSAttributedString(string: "\n", attributes: attributes))
             }
             for (index, attachment) in files.enumerated() {
                 if index > 0 { result.append(NSAttributedString(string: " ", attributes: attributes)) }
-                appendChip(for: attachment, to: result)
+                appendChip(for: attachment, worktreePath: worktreePath, to: result)
             }
         }
         if result.length == 0 {
@@ -1090,23 +1204,29 @@ final class TranscriptCell: NSTableCellView {
     private static func styledMentions(
         _ text: String,
         attachments: [Attachment],
+        worktreePath: String,
         attributes: [NSAttributedString.Key: Any]
     ) -> NSAttributedString {
         let result = NSMutableAttributedString(string: text, attributes: attributes)
-        let names = attachments.map(\.displayName).filter { !$0.isEmpty }
-        guard !names.isEmpty else { return result }
+        let named = attachments.filter { !$0.displayName.isEmpty }
+        guard !named.isEmpty else { return result }
         let source = result.string as NSString
-        for name in names {
-            let token = "@\(name)"
+        for attachment in named {
+            let token = "@\(attachment.displayName)"
             var search = NSRange(location: 0, length: source.length)
             while search.length > 0 {
                 let found = source.range(of: token, options: [], range: search)
                 guard found.location != NSNotFound else { break }
-                result.addAttributes([
+                var tokenAttributes: [NSAttributedString.Key: Any] = [
                     .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
                     .foregroundColor: NSColor.controlAccentColor,
                     .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
-                ], range: found)
+                ]
+                if attachment.isHoverPreviewable {
+                    tokenAttributes[.oreAttachmentPreview] = attachment.fileURL(worktreePath: worktreePath)
+                    tokenAttributes[.cursor] = NSCursor.pointingHand
+                }
+                result.addAttributes(tokenAttributes, range: found)
                 let next = NSMaxRange(found)
                 search = NSRange(location: next, length: source.length - next)
             }
@@ -1114,7 +1234,11 @@ final class TranscriptCell: NSTableCellView {
         return result
     }
 
-    private static func appendChip(for attachment: Attachment, to result: NSMutableAttributedString) {
+    private static func appendChip(
+        for attachment: Attachment,
+        worktreePath: String,
+        to result: NSMutableAttributedString
+    ) {
         let pill = subjectPillImage(
             identity: FileVisualIdentity(path: attachment.displayName),
             text: "@\(attachment.displayName)",
@@ -1124,36 +1248,17 @@ final class TranscriptCell: NSTableCellView {
         let cell = NSTextAttachment()
         cell.image = pill
         cell.bounds = NSRect(x: 0, y: -5, width: pill.size.width, height: pill.size.height)
+        let start = result.length
         result.append(NSAttributedString(attachment: cell))
-    }
-
-    private static func appendImagePreview(
-        _ attachment: Attachment,
-        worktreePath: String,
-        to result: NSMutableAttributedString
-    ) {
-        let url = attachment.fileURL(worktreePath: worktreePath)
-        guard let image = NSImage(contentsOf: url) else { return }
-        let maxWidth: CGFloat = 160
-        let maxHeight: CGFloat = 110
-        let size = image.size
-        let scale = min(maxWidth / max(size.width, 1), maxHeight / max(size.height, 1), 1)
-        let width = max(36, ceil(size.width * scale))
-        let height = max(28, ceil(size.height * scale))
-        let thumbnail = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
-            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).addClip()
-            image.draw(
-                in: rect,
-                from: NSRect(origin: .zero, size: size),
-                operation: .copy,
-                fraction: 1
+        if attachment.isHoverPreviewable {
+            let range = NSRange(location: start, length: result.length - start)
+            result.addAttribute(
+                .oreAttachmentPreview,
+                value: attachment.fileURL(worktreePath: worktreePath),
+                range: range
             )
-            return true
+            result.addAttribute(.cursor, value: NSCursor.pointingHand, range: range)
         }
-        let cell = NSTextAttachment()
-        cell.image = thumbnail
-        cell.bounds = NSRect(x: 0, y: -4, width: width, height: height)
-        result.append(NSAttributedString(attachment: cell))
     }
 
     private static func badgeText(for row: TranscriptRow) -> String {
@@ -1173,17 +1278,17 @@ final class TranscriptCell: NSTableCellView {
     private static func font(for row: TranscriptRow) -> NSFont {
         switch row.kind {
         case .toolCall:
-            return .monospacedSystemFont(ofSize: 12, weight: .regular)
+            return .monospacedSystemFont(ofSize: OreTheme.Font.caption, weight: .regular)
         case .activityGroup, .turnFooter:
-            return .systemFont(ofSize: 12, weight: .regular)
+            return .systemFont(ofSize: OreTheme.Font.caption, weight: .regular)
         case .thinking:
-            return .systemFont(ofSize: 13)
+            return .systemFont(ofSize: OreTheme.Font.body)
         case .divider:
-            return .systemFont(ofSize: 11, weight: .medium)
-        case .assistantText, .plan:
-            return .systemFont(ofSize: 15)
+            return .systemFont(ofSize: OreTheme.Font.caption, weight: .medium)
+        case .assistantText, .plan, .userMessage:
+            return .systemFont(ofSize: OreTheme.Font.prose)
         default:
-            return .systemFont(ofSize: 14)
+            return .systemFont(ofSize: OreTheme.Font.prose)
         }
     }
 
@@ -1252,6 +1357,7 @@ final class TranscriptCell: NSTableCellView {
                 identity: identity,
                 text: text,
                 monospace: monospace,
+                tint: tint,
                 insertions: insertions,
                 deletions: deletions
             )
@@ -1272,6 +1378,7 @@ final class TranscriptCell: NSTableCellView {
         identity: FileVisualIdentity?,
         text: String,
         monospace: Bool,
+        tint: NSColor,
         insertions: Int,
         deletions: Int
     ) -> NSImage {
@@ -1312,11 +1419,18 @@ final class TranscriptCell: NSTableCellView {
         let image = NSImage(size: NSSize(width: max(1, width), height: max(1, height)))
         image.lockFocus()
         let rect = NSRect(x: 0.5, y: 0.5, width: width - 1, height: height - 1)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
-        NSColor.secondaryLabelColor.withAlphaComponent(0.10).setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: OreTheme.chipRadius, yRadius: OreTheme.chipRadius)
+        let fill = identity == nil
+            ? tint.withAlphaComponent(0.16)
+            : NSColor.secondaryLabelColor.withAlphaComponent(0.10)
+        fill.setFill()
         path.fill()
         path.lineWidth = 1
-        NSColor.separatorColor.setStroke()
+        if identity == nil {
+            tint.withAlphaComponent(0.35).setStroke()
+        } else {
+            NSColor.separatorColor.withAlphaComponent(0.55).setStroke()
+        }
         path.stroke()
         var x = hPad
         if let identity {
@@ -1691,6 +1805,46 @@ final class TranscriptCell: NSTableCellView {
             )
         }
 
+        // Cursor (and similar) lints/list/delete calls must be classified
+        // before the generic "read"/"file" matchers — "ReadLints" contains
+        // "read" and would otherwise show as a file read.
+        if tool.contains("lint") {
+            let path = input?["file_path"]?.stringValue ?? input?["path"]?.stringValue
+            return ProcessPresentation(
+                icon: "checkmark.seal",
+                title: "Lints",
+                detail: row.resultText ?? path ?? row.text,
+                tint: row.isError ? .systemRed : .systemTeal,
+                fileIdentity: path.map { FileVisualIdentity(path: $0) },
+                subject: path.map { ($0 as NSString).lastPathComponent } ?? compact(row.text),
+                filePath: path
+            )
+        }
+        if tool == "ls" || tool == "list" {
+            let path = input?["file_path"]?.stringValue ?? input?["path"]?.stringValue
+            return ProcessPresentation(
+                icon: "folder",
+                title: "List",
+                detail: row.resultText ?? path ?? row.text,
+                tint: .systemBlue,
+                fileIdentity: path.map { FileVisualIdentity(path: $0, isDirectory: true) },
+                subject: path.map { ($0 as NSString).lastPathComponent } ?? compact(row.text),
+                filePath: path
+            )
+        }
+        if tool == "delete" || tool == "remove" {
+            let path = input?["file_path"]?.stringValue ?? input?["path"]?.stringValue
+            return ProcessPresentation(
+                icon: "trash",
+                title: "Delete",
+                detail: row.resultText ?? path ?? row.text,
+                tint: row.isError ? .systemRed : .systemOrange,
+                fileIdentity: path.map { FileVisualIdentity(path: $0) },
+                subject: path.map { ($0 as NSString).lastPathComponent } ?? compact(row.text),
+                filePath: path
+            )
+        }
+
         let directPath = input?["file_path"]?.stringValue
             ?? input?["path"]?.stringValue
             ?? input?[0]?["path"]?.stringValue
@@ -1984,11 +2138,40 @@ enum ToolChangeStats {
 /// the row's click gestures, so tapping the text still toggles an activity
 /// group (single click) or reverts to a checkpoint (double click) exactly as
 /// the enclosing cell used to. Without this, making the text selectable would
-/// have swallowed those clicks into a text selection.
+/// have swallowed those clicks into a text selection. Image and pasted-text
+/// chips and `@` tokens use the same hover preview as the composer.
 private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
     var onSingleClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onOpenFile: ((String) -> Void)?
+
+    private var hoverTracking: NSTrackingArea?
+    private let attachmentPreview = AttachmentPreviewController()
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let options: NSTrackingArea.Options = [
+            .mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect,
+        ]
+        let area = NSTrackingArea(rect: bounds, options: options, owner: self)
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateAttachmentPreview(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        dismissAttachmentPreview()
+    }
+
+    func dismissAttachmentPreview() {
+        attachmentPreview.dismiss()
+    }
 
     override func mouseDown(with event: NSEvent) {
         // Let NSTextView dispatch links before the row's expand/collapse click.
@@ -2015,6 +2198,42 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
         else { return false }
         onOpenFile?(path)
         return true
+    }
+
+    private func updateAttachmentPreview(at point: NSPoint) {
+        guard let layoutManager, let textContainer, let textStorage,
+              textStorage.length > 0 else {
+            dismissAttachmentPreview()
+            return
+        }
+        let origin = textContainerOrigin
+        let containerPoint = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+        guard layoutManager.usedRect(for: textContainer).contains(containerPoint) else {
+            dismissAttachmentPreview()
+            return
+        }
+        let glyph = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
+        let character = layoutManager.characterIndexForGlyph(at: glyph)
+        guard character < textStorage.length else {
+            dismissAttachmentPreview()
+            return
+        }
+        var range = NSRange()
+        guard let url = textStorage.attribute(
+            .oreAttachmentPreview,
+            at: character,
+            effectiveRange: &range
+        ) as? URL else {
+            dismissAttachmentPreview()
+            return
+        }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: range, actualCharacterRange: nil
+        )
+        var anchor = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        anchor.origin.x += origin.x
+        anchor.origin.y += origin.y
+        attachmentPreview.show(url: url, from: self, anchor: anchor)
     }
 
     private func link(at event: NSEvent) -> Any? {

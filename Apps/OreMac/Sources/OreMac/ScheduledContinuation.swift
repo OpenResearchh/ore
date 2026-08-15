@@ -85,16 +85,56 @@ enum UsageLimitReset {
 extension Attachment {
     var isImage: Bool {
         if let mimeType, mimeType.hasPrefix("image/") { return true }
-        let ext = (relativePath as NSString).pathExtension.lowercased()
-        if Self.imageExtensions.contains(ext) { return true }
-        return Self.imageExtensions.contains((displayName as NSString).pathExtension.lowercased())
+        return hasExtension(in: Self.imageExtensions)
+    }
+
+    var isText: Bool {
+        if let mimeType, mimeType.hasPrefix("text/") { return true }
+        return hasExtension(in: Self.textExtensions)
+    }
+
+    /// Images, and text files we copied into `.context/attachments/` (pasted
+    /// screenshots and long pastes), can pop a hover preview. Workspace file
+    /// mentions stay tokens — previewing a whole source file on hover would be
+    /// noise.
+    var isHoverPreviewable: Bool {
+        if isImage { return true }
+        return isText && relativePath.hasPrefix(".context/attachments/")
     }
 
     func fileURL(worktreePath: String) -> URL {
         URL(fileURLWithPath: worktreePath).appendingPathComponent(relativePath)
     }
 
+    /// A short sentence stays in the composer; a dump of logs, a function, or a
+    /// long paragraph becomes `@pasted-text.txt` so the bubble doesn't become a
+    /// wall of pasted prose.
+    static func shouldAttachPastedText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.count >= minimumPastedCharacters { return true }
+        let lines = trimmed.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        return lines.count >= minimumPastedLines
+    }
+
+    static let minimumPastedLines = 12
+    static let minimumPastedCharacters = 1_500
+
+    private func hasExtension(in set: Set<String>) -> Bool {
+        Self.hasExtension(in: set, path: relativePath, name: displayName)
+    }
+
+    private static func hasExtension(in set: Set<String>, path: String, name: String) -> Bool {
+        set.contains((path as NSString).pathExtension.lowercased())
+            || set.contains((name as NSString).pathExtension.lowercased())
+    }
+
     private static let imageExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp",
+    ]
+
+    private static let textExtensions: Set<String> = [
+        "txt", "md", "markdown", "json", "csv", "log", "xml", "yml", "yaml",
+        "html", "css", "toml", "ini", "env", "sh",
     ]
 }

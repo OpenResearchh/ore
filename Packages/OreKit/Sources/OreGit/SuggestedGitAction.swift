@@ -76,9 +76,59 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
     /// routed into the chat instead of run directly.
     public var delegatesToAgent: Bool {
         switch self {
-        case .fixFailingChecks, .resolveConflicts: return true
-        default: return false
+        case .commit, .createPullRequest, .fixFailingChecks, .resolveConflicts:
+            return true
+        default:
+            return false
         }
+    }
+
+    /// Prompt dropped into the composer when the user clicks Commit or Create PR.
+    /// Nil for actions that still run git/`gh` directly.
+    public var agentDraftPrompt: String? {
+        switch self {
+        case .commit(let count, let insertions, let deletions):
+            return GitShipPrompt.commit(
+                fileCount: count, insertions: insertions, deletions: deletions
+            )
+        case .createPullRequest(let base, let isStacked):
+            return GitShipPrompt.pullRequest(base: base, isStacked: isStacked)
+        default:
+            return nil
+        }
+    }
+}
+
+/// Composer text for shipping actions that the agent should carry out with its
+/// own tools — inspect the diff, write the message, then run git/`gh`.
+public enum GitShipPrompt: Sendable {
+    public static func commit(fileCount: Int? = nil, insertions: Int = 0, deletions: Int = 0) -> String {
+        var lines = [
+            "Inspect the working tree (staged and unstaged) and recent `git log` style, then write a commit message that matches this repo — why the change exists, not a file list.",
+        ]
+        if let fileCount {
+            let files = "\(fileCount) file\(fileCount == 1 ? "" : "s")"
+            lines.append(
+                "There are currently \(files) changed (+\(insertions)/−\(deletions)). Stage what belongs in this commit; leave unrelated WIP unstaged."
+            )
+        } else {
+            lines.append("Stage what belongs in this commit; leave unrelated WIP unstaged.")
+        }
+        lines.append("Then commit. Do not push.")
+        return lines.joined(separator: "\n\n")
+    }
+
+    public static func pullRequest(base: String, isStacked: Bool) -> String {
+        var lines = [
+            "Inspect the commits and the full diff against `\(base)`. Write a pull-request title and body in this repo's style: a short title, a summary of what changed and why, and a test plan.",
+            "Then create the PR onto `\(base)` with `gh pr create`. Do not merge it.",
+        ]
+        if isStacked {
+            lines.append(
+                "This branch is stacked; open the PR onto `\(base)` (the parent), not the repository's default branch."
+            )
+        }
+        return lines.joined(separator: "\n\n")
     }
 }
 

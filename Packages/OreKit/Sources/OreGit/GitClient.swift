@@ -135,34 +135,19 @@ public actor GitClient {
 
     /// Commits in a revision range, newest first.
     ///
-    /// Fields are separated by unit-separator and records by record-separator
-    /// control characters, so subjects containing any printable character —
-    /// including newlines-adjacent punctuation — parse intact.
+    /// Fields are separated by unit-separator so subjects containing any
+    /// printable character parse intact. `--shortstat` follows each record so
+    /// the ship panel can show +/− without a second git call per commit.
     public func commits(
         range: String, in directory: URL? = nil, limit: Int = 50
     ) async throws -> [CommitInfo] {
         let output = try await run([
             "log", "--max-count=\(limit)",
-            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1e",
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%aI",
+            "--shortstat",
             range,
         ], in: directory)
-
-        let formatter = ISO8601DateFormatter()
-        return output.standardOutput
-            .split(separator: "\u{1e}", omittingEmptySubsequences: true)
-            .compactMap { record in
-                let fields = record
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .split(separator: "\u{1f}", omittingEmptySubsequences: false)
-                guard fields.count >= 5 else { return nil }
-                return CommitInfo(
-                    sha: String(fields[0]),
-                    shortSHA: String(fields[1]),
-                    subject: String(fields[2]),
-                    author: String(fields[3]),
-                    date: formatter.date(from: String(fields[4])) ?? Date()
-                )
-            }
+        return CommitInfo.parseLog(output.standardOutput)
     }
 
     /// The repository's default branch, in the order a developer would guess:
@@ -207,15 +192,101 @@ public struct CommitInfo: Sendable, Hashable, Codable, Identifiable {
     public var subject: String
     public var author: String
     public var date: Date
+    public var filesChanged: Int
+    public var insertions: Int
+    public var deletions: Int
 
     public var id: String { sha }
 
-    public init(sha: String, shortSHA: String, subject: String, author: String, date: Date) {
+    public init(
+        sha: String,
+        shortSHA: String,
+        subject: String,
+        author: String,
+        date: Date,
+        filesChanged: Int = 0,
+        insertions: Int = 0,
+        deletions: Int = 0
+    ) {
         self.sha = sha
         self.shortSHA = shortSHA
         self.subject = subject
         self.author = author
         self.date = date
+        self.filesChanged = filesChanged
+        self.insertions = insertions
+        self.deletions = deletions
+    }
+
+    /// Parses `git log --format=%H%x1f%h%x1f%s%x1f%an%x1f%aI --shortstat`.
+    static func parseLog(_ raw: String) -> [CommitInfo] {
+        let formatter = ISO8601DateFormatter()
+        var commits: [CommitInfo] = []
+        var pending: (
+            sha: String, shortSHA: String, subject: String, author: String, date: Date
+        )?
+        var filesChanged = 0, insertions = 0, deletions = 0
+
+        func flush() {
+            guard let pending else { return }
+            commits.append(CommitInfo(
+                sha: pending.sha,
+                shortSHA: pending.shortSHA,
+                subject: pending.subject,
+                author: pending.author,
+                date: pending.date,
+                filesChanged: filesChanged,
+                insertions: insertions,
+                deletions: deletions
+            ))
+            filesChanged = 0
+            insertions = 0
+            deletions = 0
+        }
+
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            let value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.contains("\u{1f}") {
+                flush()
+                let fields = value.split(separator: "\u{1f}", omittingEmptySubsequences: false)
+                guard fields.count >= 5 else {
+                    pending = nil
+                    continue
+                }
+                pending = (
+                    String(fields[0]),
+                    String(fields[1]),
+                    String(fields[2]),
+                    String(fields[3]),
+                    formatter.date(from: String(fields[4])) ?? Date()
+                )
+            } else if let stats = Self.parseShortstat(value) {
+                filesChanged = stats.files
+                insertions = stats.insertions
+                deletions = stats.deletions
+            }
+        }
+        flush()
+        return commits
+    }
+
+    static func parseShortstat(_ line: String) -> (files: Int, insertions: Int, deletions: Int)? {
+        let value = line.trimmingCharacters(in: .whitespaces)
+        guard value.contains("changed") else { return nil }
+        func count(matching pattern: String) -> Int {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(
+                    in: value, range: NSRange(value.startIndex..., in: value)
+                  ),
+                  let range = Range(match.range(at: 1), in: value)
+            else { return 0 }
+            return Int(value[range]) ?? 0
+        }
+        return (
+            count(matching: #"(\d+) files? changed"#),
+            count(matching: #"(\d+) insertions?\(\+\)"#),
+            count(matching: #"(\d+) deletions?\(-\)"#)
+        )
     }
 }
 

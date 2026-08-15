@@ -16,6 +16,122 @@ enum PasteOutcome {
     case insert(String)
 }
 
+extension NSAttributedString.Key {
+    /// File URL of an attachment that should pop up when the pointer rests on
+    /// this range — pasted images and long text, in both the composer and the
+    /// transcript.
+    static let oreAttachmentPreview = NSAttributedString.Key("ore.attachmentPreview")
+}
+
+/// Shared hover popover for image and text attachments. The composer and the
+/// transcript both show this instead of inlining a tiny thumbnail or a wall of
+/// pasted prose next to the chip.
+@MainActor
+final class AttachmentPreviewController {
+    private var popover: NSPopover?
+    private var shownURL: URL?
+
+    func show(url: URL, from view: NSView, anchor: NSRect) {
+        if shownURL == url, popover?.isShown == true { return }
+        dismiss()
+        let content: NSView
+        if Self.isImageURL(url), let image = NSImage(contentsOf: url) {
+            content = imagePreview(image)
+        } else if let text = try? String(contentsOf: url, encoding: .utf8) {
+            content = textPreview(text)
+        } else if let image = NSImage(contentsOf: url) {
+            content = imagePreview(image)
+        } else {
+            return
+        }
+
+        let controller = NSViewController()
+        controller.view = content
+        let popover = NSPopover()
+        popover.behavior = .semitransient
+        popover.animates = false
+        popover.contentSize = content.frame.size
+        popover.contentViewController = controller
+        popover.show(relativeTo: anchor, of: view, preferredEdge: .maxY)
+        self.popover = popover
+        shownURL = url
+    }
+
+    func dismiss() {
+        popover?.performClose(nil)
+        popover = nil
+        shownURL = nil
+    }
+
+    private func imagePreview(_ image: NSImage) -> NSView {
+        let cap = NSSize(width: 320, height: 320)
+        let aspect = image.size.width / max(1, image.size.height)
+        var width = min(cap.width, max(1, image.size.width))
+        var height = width / max(0.01, aspect)
+        if height > cap.height { height = cap.height; width = height * aspect }
+
+        let padding: CGFloat = 6
+        let container = NSView(frame: NSRect(
+            x: 0, y: 0, width: width + padding * 2, height: height + padding * 2
+        ))
+        let imageView = NSImageView(frame: NSRect(x: padding, y: padding, width: width, height: height))
+        imageView.image = image
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        container.addSubview(imageView)
+        return container
+    }
+
+    private func textPreview(_ text: String) -> NSView {
+        let display = text.count > 8_000 ? String(text.prefix(8_000)) + "\n…" : text
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let cap = NSSize(width: 420, height: 260)
+        let padding: CGFloat = 8
+        let innerWidth = cap.width - padding * 2
+        let measured = (display as NSString).boundingRect(
+            with: NSSize(width: innerWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: attributes
+        )
+        let width = min(cap.width, max(240, ceil(measured.width) + padding * 2 + 12))
+        let height = min(cap.height, max(72, ceil(measured.height) + padding * 2))
+
+        let textView = NSTextView(frame: NSRect(
+            x: 0, y: 0,
+            width: width,
+            height: max(height, ceil(measured.height) + padding * 2)
+        ))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = font
+        textView.textColor = .labelColor
+        textView.string = display
+        textView.textContainerInset = NSSize(width: padding, height: padding)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineFragmentPadding = 0
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = ceil(measured.height) + padding * 2 > cap.height
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.documentView = textView
+        return scroll
+    }
+
+    private static func isImageURL(_ url: URL) -> Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp"]
+            .contains(url.pathExtension.lowercased())
+    }
+}
+
 struct InlineMentionTextEditor: NSViewRepresentable {
     @Binding var text: String
     var mentionNames: [String]
@@ -176,7 +292,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             paragraph.lineSpacing = 2
             paragraph.lineBreakMode = .byWordWrapping
             let base: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 15),
+                .font: NSFont.systemFont(ofSize: OreTheme.Font.prose),
                 .foregroundColor: NSColor.labelColor,
                 .paragraphStyle: paragraph,
             ]
@@ -192,7 +308,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
                     let found = source.range(of: token, options: [], range: search)
                     guard found.location != NSNotFound else { break }
                     storage.addAttributes([
-                        .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                        .font: NSFont.systemFont(ofSize: OreTheme.Font.prose, weight: .semibold),
                         .foregroundColor: NSColor.controlAccentColor,
                         .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
                     ], range: found)
@@ -208,19 +324,17 @@ struct InlineMentionTextEditor: NSViewRepresentable {
     }
 }
 
-/// An `NSTextView` that lets the composer intercept paste, so a copied file or
-/// image lands as an attachment (a pasted image becomes an inline chip at the
-/// caret) instead of its path/nothing being typed in. It also shows a hover
-/// preview of an inline token's file, so an attached image can be reviewed
-/// without leaving the composer.
+/// An `NSTextView` that lets the composer intercept paste, so a copied file,
+/// image, or long text dump lands as an attachment (an inline `@name` chip at
+/// the caret) instead of its path or a wall of prose being typed in. Hovering
+/// a chip previews the file.
 final class PromptTextView: NSTextView {
     var onPaste: ((NSPasteboard) -> PasteOutcome)?
     var previewURL: ((String) -> URL?)?
     var mentionNames: [String] = []
 
     private var hoverTracking: NSTrackingArea?
-    private var previewPopover: NSPopover?
-    private var previewedToken: String?
+    private let attachmentPreview = AttachmentPreviewController()
 
     /// Runs the composer's paste handler and applies its verdict. Returns true
     /// when the paste was ours (so the caller skips the default paste).
@@ -312,7 +426,13 @@ final class PromptTextView: NSTextView {
                 guard found.location != NSNotFound else { break }
                 if charIndex >= found.location, charIndex < NSMaxRange(found),
                    let url = previewURL(name) {
-                    showPreview(name: name, tokenRange: found, url: url)
+                    let glyphRange = layoutManager.glyphRange(
+                        forCharacterRange: found, actualCharacterRange: nil
+                    )
+                    var anchor = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                    anchor.origin.x += origin.x
+                    anchor.origin.y += origin.y
+                    attachmentPreview.show(url: url, from: self, anchor: anchor)
                     return
                 }
                 let next = NSMaxRange(found)
@@ -322,50 +442,7 @@ final class PromptTextView: NSTextView {
         dismissPreview()
     }
 
-    private func showPreview(name: String, tokenRange: NSRange, url: URL) {
-        if previewedToken == name, previewPopover?.isShown == true { return }
-        dismissPreview()
-        guard let layoutManager, let textContainer,
-              let image = NSImage(contentsOf: url) else { return }
-
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: tokenRange, actualCharacterRange: nil
-        )
-        var anchor = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-        anchor.origin.x += textContainerOrigin.x
-        anchor.origin.y += textContainerOrigin.y
-
-        // Fit the image within a tidy cap while keeping its aspect ratio.
-        let cap = NSSize(width: 320, height: 320)
-        let aspect = image.size.width / max(1, image.size.height)
-        var width = min(cap.width, max(1, image.size.width))
-        var height = width / max(0.01, aspect)
-        if height > cap.height { height = cap.height; width = height * aspect }
-
-        let padding: CGFloat = 6
-        let container = NSView(frame: NSRect(
-            x: 0, y: 0, width: width + padding * 2, height: height + padding * 2
-        ))
-        let imageView = NSImageView(frame: NSRect(x: padding, y: padding, width: width, height: height))
-        imageView.image = image
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        container.addSubview(imageView)
-
-        let controller = NSViewController()
-        controller.view = container
-        let popover = NSPopover()
-        popover.behavior = .semitransient
-        popover.animates = false
-        popover.contentSize = container.frame.size
-        popover.contentViewController = controller
-        popover.show(relativeTo: anchor, of: self, preferredEdge: .maxY)
-        previewPopover = popover
-        previewedToken = name
-    }
-
     private func dismissPreview() {
-        previewPopover?.performClose(nil)
-        previewPopover = nil
-        previewedToken = nil
+        attachmentPreview.dismiss()
     }
 }

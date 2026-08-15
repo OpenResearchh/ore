@@ -435,6 +435,154 @@ struct UserMessageAttachmentTests {
         #expect(attachmentCount >= 2)
     }
 
+    @Test func imageAttachmentsUseHoverPreviewInsteadOfInlineThumbnails() {
+        let row = TranscriptRow(
+            id: "u-preview",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "Look at this",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-image.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                ),
+                Attachment(relativePath: "Sources/App.swift", displayName: "App.swift"),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
+        var previewCount = 0
+        var tallAttachments = 0
+        rendered.enumerateAttributes(
+            in: NSRange(location: 0, length: rendered.length)
+        ) { attributes, _, _ in
+            if attributes[.oreAttachmentPreview] != nil { previewCount += 1 }
+            if let attachment = attributes[.attachment] as? NSTextAttachment,
+               attachment.bounds.height > 36 {
+                tallAttachments += 1
+            }
+        }
+        #expect(previewCount == 1)
+        #expect(tallAttachments == 0)
+    }
+
+    @Test func mentionedImageTokensAreNotDuplicatedAsChips() {
+        let row = TranscriptRow(
+            id: "u-token",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "See @pasted-image.png please",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-image.png",
+                    displayName: "pasted-image.png",
+                    mimeType: "image/png"
+                ),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
+        #expect(rendered.string.contains("@pasted-image.png"))
+        var attachmentCount = 0
+        var previewCount = 0
+        rendered.enumerateAttributes(
+            in: NSRange(location: 0, length: rendered.length)
+        ) { attributes, _, _ in
+            if attributes[.attachment] != nil { attachmentCount += 1 }
+            if attributes[.oreAttachmentPreview] != nil { previewCount += 1 }
+        }
+        #expect(attachmentCount == 0)
+        #expect(previewCount == 1)
+    }
+
+    @Test func longPastedTextBecomesAnAttachmentRatherThanInlineProse() {
+        #expect(!Attachment.shouldAttachPastedText("Please fix this."))
+        #expect(!Attachment.shouldAttachPastedText("a\nb\nc\nd\ne"))
+        let manyLines = (1...Attachment.minimumPastedLines).map { "line \($0)" }.joined(separator: "\n")
+        #expect(Attachment.shouldAttachPastedText(manyLines))
+        let longParagraph = String(repeating: "x", count: Attachment.minimumPastedCharacters)
+        #expect(Attachment.shouldAttachPastedText(longParagraph))
+    }
+
+    @Test func pastedTextChipsUseHoverPreviewInUserBubbles() {
+        let row = TranscriptRow(
+            id: "u-text",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "Please review",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-text.txt",
+                    displayName: "pasted-text.txt",
+                    mimeType: "text/plain"
+                ),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
+        #expect(rendered.string.contains("Please review"))
+        #expect(!rendered.string.contains("@pasted-text.txt"))
+        var previewCount = 0
+        var attachmentCount = 0
+        rendered.enumerateAttributes(
+            in: NSRange(location: 0, length: rendered.length)
+        ) { attributes, _, _ in
+            if attributes[.attachment] != nil { attachmentCount += 1 }
+            if attributes[.oreAttachmentPreview] != nil { previewCount += 1 }
+        }
+        #expect(attachmentCount == 1)
+        #expect(previewCount == 1)
+    }
+
+    @Test func mentionedPastedTextTokensAreNotDuplicatedAsChips() {
+        let row = TranscriptRow(
+            id: "u-text-token",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "See @pasted-text.txt please",
+            attachments: [
+                Attachment(
+                    relativePath: ".context/attachments/abcd-pasted-text.txt",
+                    displayName: "pasted-text.txt",
+                    mimeType: "text/plain"
+                ),
+            ]
+        )
+        let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
+        #expect(rendered.string.contains("@pasted-text.txt"))
+        var attachmentCount = 0
+        var previewCount = 0
+        rendered.enumerateAttributes(
+            in: NSRange(location: 0, length: rendered.length)
+        ) { attributes, _, _ in
+            if attributes[.attachment] != nil { attachmentCount += 1 }
+            if attributes[.oreAttachmentPreview] != nil { previewCount += 1 }
+        }
+        #expect(attachmentCount == 0)
+        #expect(previewCount == 1)
+    }
+
+    @Test func lintAndListToolRowsAreLabeled() {
+        let lints = TranscriptRow(
+            id: "tool-lints",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "App.swift",
+            toolName: "ReadLints",
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: .object(["file_path": .string("Sources/App.swift")])
+        )
+        let list = TranscriptRow(
+            id: "tool-ls",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Sources",
+            toolName: "LS",
+            toolCallID: ToolCallID(rawValue: "c2"),
+            toolInput: .object(["file_path": .string("Sources")])
+        )
+        #expect(TranscriptCell.attributedText(for: lints).string.contains("Lints"))
+        #expect(TranscriptCell.attributedText(for: list).string.contains("List"))
+    }
+
     @Test func appendingAUserMessageStoresAttachmentsOnTheRow() {
         let state = ChatState()
         state.appendUserMessage(
@@ -784,5 +932,34 @@ struct ToolChangeStatsTests {
         )
         #expect(counts.insertions == 1)
         #expect(counts.deletions == 0)
+    }
+}
+
+@MainActor
+struct TranscriptHeightTests {
+    @Test func shortProseDoesNotInventAGap() {
+        let text = NSAttributedString(
+            string: "Hello, this is a short reply.",
+            attributes: [.font: NSFont.systemFont(ofSize: OreTheme.Font.prose)]
+        )
+        let height = TranscriptHeightMeasurer.height(of: text, width: 680)
+        #expect(height > 12)
+        #expect(height < 48)
+    }
+
+    @Test func codeBlockHeightStaysWithinTheDrawnTable() {
+        let rendered = MarkdownRenderer(
+            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
+            highlighter: SyntaxHighlighter.shared
+        ).render("Here is some code:\n\n```swift\nfunc f() {}\n```\n")
+        let textKit = TranscriptHeightMeasurer.height(of: rendered, width: 680)
+        let bounding = ceil(rendered.boundingRect(
+            with: NSSize(width: 680, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+        #expect(textKit > 24)
+        // The whole reason this measurer exists: boundingRect overstates
+        // NSTextTable code blocks, which became the empty gap under a reply.
+        #expect(textKit <= bounding)
     }
 }

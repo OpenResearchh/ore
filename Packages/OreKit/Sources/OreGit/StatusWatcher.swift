@@ -140,20 +140,21 @@ public actor StatusWatcher {
     }
 
     /// Adds insertion/deletion counts, which `git status` doesn't provide.
+    /// Staged and unstaged are read separately so the ship panel can show each
+    /// side without double-counting a partially staged file.
     private func annotateLineCounts(_ snapshot: inout GitStatusSnapshot) async {
         guard !snapshot.files.isEmpty else { return }
-        guard let output = try? await git.run(
-            ["diff", "--numstat", "-z", "HEAD", "--"],
+        async let stagedOutput = git.run(
+            ["diff", "--numstat", "-z", "--cached", "HEAD", "--"],
             in: worktreeURL
-        ) else { return }
-
-        let counts = NumstatParser.parse(output.standardOutput)
-        for index in snapshot.files.indices {
-            guard let entry = counts[snapshot.files[index].path] else { continue }
-            snapshot.files[index].insertions = entry.insertions
-            snapshot.files[index].deletions = entry.deletions
-            snapshot.files[index].isBinary = entry.isBinary
-        }
+        )
+        async let unstagedOutput = git.run(
+            ["diff", "--numstat", "-z", "--"],
+            in: worktreeURL
+        )
+        let stagedCounts = (try? await stagedOutput).map { NumstatParser.parse($0.standardOutput) } ?? [:]
+        let unstagedCounts = (try? await unstagedOutput).map { NumstatParser.parse($0.standardOutput) } ?? [:]
+        snapshot.applyLineCounts(staged: stagedCounts, unstaged: unstagedCounts)
     }
 }
 
@@ -168,10 +169,35 @@ extension GitStatusSnapshot {
             hasher.combine(file.path)
             hasher.combine(file.status)
             hasher.combine(file.isStaged)
+            hasher.combine(file.isUnstaged)
             hasher.combine(file.insertions)
             hasher.combine(file.deletions)
         }
         return hasher.finalize()
+    }
+
+    mutating func applyLineCounts(
+        staged: [String: NumstatParser.Entry],
+        unstaged: [String: NumstatParser.Entry]
+    ) {
+        for index in files.indices {
+            let path = files[index].path
+            let stagedEntry = staged[path]
+            let unstagedEntry = unstaged[path]
+            let plus = (stagedEntry?.insertions ?? 0) + (unstagedEntry?.insertions ?? 0)
+            let minus = (stagedEntry?.deletions ?? 0) + (unstagedEntry?.deletions ?? 0)
+            if plus > 0 || minus > 0 {
+                files[index].insertions = plus
+                files[index].deletions = minus
+            }
+            files[index].isBinary = stagedEntry?.isBinary == true || unstagedEntry?.isBinary == true
+        }
+        stagedFileCount = files.filter(\.isStaged).count
+        unstagedFileCount = files.filter(\.isUnstaged).count
+        stagedInsertions = files.filter(\.isStaged).reduce(0) { $0 + (staged[$1.path]?.insertions ?? 0) }
+        stagedDeletions = files.filter(\.isStaged).reduce(0) { $0 + (staged[$1.path]?.deletions ?? 0) }
+        unstagedInsertions = files.filter(\.isUnstaged).reduce(0) { $0 + (unstaged[$1.path]?.insertions ?? 0) }
+        unstagedDeletions = files.filter(\.isUnstaged).reduce(0) { $0 + (unstaged[$1.path]?.deletions ?? 0) }
     }
 }
 

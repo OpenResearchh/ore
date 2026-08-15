@@ -86,7 +86,6 @@ struct ReviewPane: View {
     let workspace: WorkspaceSummary
 
     @State private var diffs: [FileDiff] = []
-    @State private var gitAction: SuggestedGitAction = .none
     @State private var isLoading = false
     @State private var viewedPaths: Set<String> = []
     @State private var loadError: String?
@@ -99,6 +98,7 @@ struct ReviewPane: View {
     @State private var expandedDiffFolders: Set<String> = []
     @State private var knownDiffFolders: Set<String> = []
     @State private var hasLoadedOnce = false
+    @State private var workingTree: GitStatusSnapshot?
     @AppStorage("ore.review.changesLayout") private var changesLayoutRaw = "tree"
 
     private enum ReviewTab: Hashable { case allFiles, changes }
@@ -111,12 +111,8 @@ struct ReviewPane: View {
             content
                 .frame(maxHeight: .infinity)
             ShipStatusPanel(workspace: workspace)
-            Rectangle().fill(OreTheme.hairline).frame(height: 1)
-            GitActionBar(action: gitAction, workspace: workspace) {
-                await refresh()
-            }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(OreTheme.Surface.chrome)
         .task(id: workspace.id) {
             knownDiffFolders = []
             expandedDiffFolders = []
@@ -138,11 +134,9 @@ struct ReviewPane: View {
     private func seedFromCache() {
         if let cached = model.cachedDiff(for: workspace.id) {
             diffs = cached.diffs
-            gitAction = cached.gitAction
             knownDiffFolders = DiffTreeNode.folderPaths(in: DiffTreeNode.build(from: cached.diffs))
         } else {
             diffs = []
-            gitAction = .none
         }
     }
 
@@ -268,7 +262,7 @@ struct ReviewPane: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .background(.ultraThinMaterial)
+        .background(OreTheme.Surface.well)
     }
 
     private func fileTreeRow(
@@ -418,44 +412,22 @@ struct ReviewPane: View {
             Divider()
 
             List {
-                if isTreeLayout {
-                    ForEach(visibleDiffTree) { item in
-                        let node = item.node
-                        if let file = node.file {
-                            fileRow(file, showFolder: false, depth: item.depth)
-                        } else {
-                            Button { toggleDiffFolder(node.path) } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: expandedDiffFolders.contains(node.path)
-                                        ? "chevron.down" : "chevron.right")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundStyle(.tertiary)
-                                        .frame(width: 10)
-                                    SourceFileIcon(path: node.path, isDirectory: true, size: 16)
-                                    Text(node.name)
-                                        .font(.system(size: OreTheme.Font.body, weight: .medium))
-                                    Spacer(minLength: 0)
-                                    Text("\(node.fileCount)")
-                                        .font(.system(size: OreTheme.Font.caption).monospacedDigit())
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.leading, CGFloat(item.depth) * 16)
-                                .frame(minHeight: OreTheme.RowHeight.row)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                if showsChangeBuckets {
+                    ForEach(ChangeBucket.allCases.filter { !diffs(in: $0).isEmpty }) { bucket in
+                        Section {
+                            changeRows(for: diffs(in: bucket))
+                        } header: {
+                            changeSectionHeader(bucket, files: diffs(in: bucket))
                         }
                     }
                 } else {
-                    ForEach(diffs, id: \.path) { file in
-                        fileRow(file, showFolder: true)
-                    }
+                    changeRows(for: diffs)
                 }
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
         }
-        .background(.ultraThinMaterial)
+        .background(OreTheme.Surface.well)
     }
 
     private var changesLayoutToggle: some View {
@@ -523,7 +495,7 @@ struct ReviewPane: View {
                     .layoutPriority(1)
             }
             .font(.system(size: OreTheme.Font.body))
-            .strikethrough(viewedPaths.contains(file.path), color: .secondary)
+            .opacity(viewedPaths.contains(file.path) ? 0.55 : 1)
 
             Spacer(minLength: 4)
 
@@ -539,8 +511,8 @@ struct ReviewPane: View {
             }
 
             Button { toggleViewed(file.path) } label: {
-                Image(systemName: viewedPaths.contains(file.path) ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(viewedPaths.contains(file.path) ? Color.accentColor : .secondary)
+                Image(systemName: viewedPaths.contains(file.path) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(viewedPaths.contains(file.path) ? Color.accentColor : Color.secondary.opacity(0.45))
                     .font(.system(size: 12))
             }
             .buttonStyle(.plain)
@@ -567,11 +539,102 @@ struct ReviewPane: View {
         }
     }
 
-    private var diffTree: [DiffTreeNode] {
-        DiffTreeNode.build(from: diffs)
+    private enum ChangeBucket: String, CaseIterable, Identifiable {
+        case unstaged, staged, committed
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .unstaged: "Unstaged"
+            case .staged: "Staged"
+            case .committed: "Committed"
+            }
+        }
     }
 
-    private var visibleDiffTree: [VisibleDiffTreeNode] {
+    private var unstagedPaths: Set<String> {
+        Set((workingTree?.files ?? []).filter(\.isUnstaged).map(\.path))
+    }
+
+    private var stagedPaths: Set<String> {
+        Set((workingTree?.files ?? []).filter(\.isStaged).map(\.path))
+    }
+
+    private var showsChangeBuckets: Bool {
+        !unstagedPaths.isEmpty || !stagedPaths.isEmpty
+    }
+
+    private func bucket(for path: String) -> ChangeBucket {
+        if unstagedPaths.contains(path) { return .unstaged }
+        if stagedPaths.contains(path) { return .staged }
+        return .committed
+    }
+
+    private func diffs(in bucket: ChangeBucket) -> [FileDiff] {
+        diffs.filter { self.bucket(for: $0.path) == bucket }
+    }
+
+    private func changeSectionHeader(_ bucket: ChangeBucket, files: [FileDiff]) -> some View {
+        HStack(spacing: 8) {
+            Text(bucket.title)
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Text("\(files.count)")
+                .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+            let plus = files.reduce(0) { $0 + $1.insertions }
+            let minus = files.reduce(0) { $0 + $1.deletions }
+            if plus > 0 {
+                Text("+\(plus)")
+                    .foregroundStyle(OreTheme.added)
+            }
+            if minus > 0 {
+                Text("−\(minus)")
+                    .foregroundStyle(OreTheme.removed)
+            }
+        }
+        .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+    }
+
+    @ViewBuilder
+    private func changeRows(for files: [FileDiff]) -> some View {
+        if isTreeLayout {
+            ForEach(visibleDiffTree(from: files)) { item in
+                let node = item.node
+                if let file = node.file {
+                    fileRow(file, showFolder: false, depth: item.depth)
+                } else {
+                    Button { toggleDiffFolder(node.path) } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: expandedDiffFolders.contains(node.path)
+                                ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 10)
+                            SourceFileIcon(path: node.path, isDirectory: true, size: 16)
+                            Text(node.name)
+                                .font(.system(size: OreTheme.Font.body, weight: .medium))
+                            Spacer(minLength: 0)
+                            Text("\(node.fileCount)")
+                                .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.leading, CGFloat(item.depth) * 16)
+                        .frame(minHeight: OreTheme.RowHeight.row)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        } else {
+            ForEach(files, id: \.path) { file in
+                fileRow(file, showFolder: true)
+            }
+        }
+    }
+
+    private func visibleDiffTree(from files: [FileDiff]) -> [VisibleDiffTreeNode] {
         var result: [VisibleDiffTreeNode] = []
         func append(_ nodes: [DiffTreeNode], depth: Int) {
             for node in nodes {
@@ -581,7 +644,7 @@ struct ReviewPane: View {
                 }
             }
         }
-        append(diffTree, depth: 0)
+        append(DiffTreeNode.build(from: files), depth: 0)
         return result
     }
 
@@ -615,14 +678,15 @@ struct ReviewPane: View {
             hasLoadedOnce = true
         }
         async let files = model.workspaceFiles(for: workspace)
+        async let tree = model.loadWorkingTreeStatus(for: workspace.id)
         do {
             // Load through the shared cache so the diff we just read also warms
             // the next switch back to this workspace.
             let snapshot = try await model.refreshDiff(for: workspace)
             let loaded = snapshot.diffs
+            workingTree = await tree
             let stored = await model.loadViewedFiles(for: workspace.id)
             diffs = loaded
-            gitAction = snapshot.gitAction
             viewedPaths = Set(loaded.compactMap { file in
                 stored[file.path] == contentHash(file) ? file.path : nil
             })
@@ -633,6 +697,7 @@ struct ReviewPane: View {
             // on a transient failure would be its own bug. The banner tells the
             // truth either way.
             loadError = error.localizedDescription
+            workingTree = await tree
         }
         fileTree = await files
     }
@@ -748,7 +813,7 @@ struct DiffDocumentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(OreTheme.Surface.content)
         .task(id: path) { await load() }
         .task(id: workspace.gitStatus.generation) { await load() }
         .onChange(of: model.fileFocus[workspace.id]?[path]) { _, focus in
@@ -1212,7 +1277,10 @@ private struct ShipStatusPanel: View {
     @State private var dragStart: CGFloat?
     @State private var tab: ShipTab = .commits
     @State private var hoveredTab: ShipTab?
+    @State private var hoveredCommit: String?
+    @State private var hoveredCheck: String?
     @State private var commits: [CommitInfo] = []
+    @State private var workingTree: GitStatusSnapshot?
     @State private var pullRequest: GitHubClient.PullRequest?
     /// Signature of the last seen check states. Auto-switching happens only
     /// when this changes, so a user's manual tab choice survives quiet polls.
@@ -1325,7 +1393,7 @@ private struct ShipStatusPanel: View {
 
     private var commitsList: some View {
         Group {
-            if commits.isEmpty {
+            if commits.isEmpty, (workingTree?.files.isEmpty ?? true) {
                 shipEmpty(
                     icon: "checkmark.circle",
                     text: workspace.gitStatus.hasUncommittedChanges
@@ -1334,34 +1402,173 @@ private struct ShipStatusPanel: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(commits) { commit in
-                            commitRow(commit)
+                        if let workingTree {
+                            if workingTree.unstagedFileCount > 0 {
+                                wipRow(
+                                    title: "Unstaged",
+                                    subtitle: fileCountLabel(workingTree.unstagedFileCount),
+                                    insertions: workingTree.unstagedInsertions,
+                                    deletions: workingTree.unstagedDeletions,
+                                    icon: "pencil.circle",
+                                    isFirst: true,
+                                    isLast: workingTree.stagedFileCount == 0 && commits.isEmpty
+                                )
+                            }
+                            if workingTree.stagedFileCount > 0 {
+                                wipRow(
+                                    title: "Staged",
+                                    subtitle: fileCountLabel(workingTree.stagedFileCount),
+                                    insertions: workingTree.stagedInsertions,
+                                    deletions: workingTree.stagedDeletions,
+                                    icon: "checkmark.circle",
+                                    isFirst: workingTree.unstagedFileCount == 0,
+                                    isLast: commits.isEmpty
+                                )
+                            }
+                        }
+                        ForEach(Array(commits.enumerated()), id: \.element.id) { index, commit in
+                            commitRow(
+                                commit,
+                                isFirst: index == 0 && !hasWorkingTreeWIP,
+                                isLast: index == commits.count - 1
+                            )
                         }
                     }
-                    .padding(.vertical, 3)
+                    .padding(.vertical, 6)
                 }
             }
         }
     }
 
-    private func commitRow(_ commit: CommitInfo) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: OreTheme.Space.sm) {
-            Text(commit.shortSHA)
-                .font(.system(size: OreTheme.Font.caption, design: .monospaced))
-                .foregroundStyle(.tertiary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(commit.subject)
-                    .font(.system(size: OreTheme.Font.body))
-                    .lineLimit(1)
-                Text("\(commit.author) · \(commit.date.formatted(.relative(presentation: .named)))")
+    private var hasWorkingTreeWIP: Bool {
+        (workingTree?.unstagedFileCount ?? 0) > 0 || (workingTree?.stagedFileCount ?? 0) > 0
+    }
+
+    private func fileCountLabel(_ count: Int) -> String {
+        "\(count) file\(count == 1 ? "" : "s")"
+    }
+
+    private func wipRow(
+        title: String,
+        subtitle: String,
+        insertions: Int,
+        deletions: Int,
+        icon: String,
+        isFirst: Bool,
+        isLast: Bool
+    ) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            timelineDot(isFirst: isFirst, isLast: isLast, filled: false)
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 22, height: 22)
+                .background(Color.accentColor.opacity(0.14), in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                Text(subtitle)
                     .font(.system(size: OreTheme.Font.caption))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            if insertions > 0 || deletions > 0 {
+                HStack(spacing: 4) {
+                    if insertions > 0 {
+                        Text("+\(insertions)")
+                            .foregroundStyle(OreTheme.added)
+                    }
+                    if deletions > 0 {
+                        Text("−\(deletions)")
+                            .foregroundStyle(OreTheme.removed)
+                    }
+                }
+                .font(.system(size: OreTheme.Font.caption, design: .monospaced).weight(.medium))
+            }
         }
         .padding(.horizontal, OreTheme.Space.sm)
-        .padding(.vertical, 4)
+        .padding(.vertical, 7)
+    }
+
+    private func commitRow(_ commit: CommitInfo, isFirst: Bool, isLast: Bool) -> some View {
+        let hovering = hoveredCommit == commit.sha
+        return HStack(alignment: .center, spacing: 10) {
+            timelineDot(isFirst: isFirst, isLast: isLast, filled: true)
+            OreMonogram(name: commit.author, size: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(commit.subject)
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    .lineLimit(2)
+                Text("\(commit.author) · \(commit.date.formatted(.relative(presentation: .named)))")
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if commit.insertions > 0 || commit.deletions > 0 {
+                HStack(spacing: 4) {
+                    if commit.insertions > 0 {
+                        Text("+\(commit.insertions)")
+                            .foregroundStyle(OreTheme.added)
+                    }
+                    if commit.deletions > 0 {
+                        Text("−\(commit.deletions)")
+                            .foregroundStyle(OreTheme.removed)
+                    }
+                }
+                .font(.system(size: OreTheme.Font.caption, design: .monospaced).weight(.medium))
+            }
+            Button(action: { copySHA(commit.sha) }) {
+                Text(commit.shortSHA)
+                    .font(.system(size: OreTheme.Font.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(OreTheme.subduedFill, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Copy commit SHA")
+        }
+        .padding(.horizontal, OreTheme.Space.sm)
+        .padding(.vertical, 7)
+        .background(hovering ? OreTheme.subduedFill : .clear)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            hoveredCommit = hovering ? commit.sha : (hoveredCommit == commit.sha ? nil : hoveredCommit)
+        }
+    }
+
+    private func timelineDot(isFirst: Bool, isLast: Bool, filled: Bool) -> some View {
+        ZStack {
+            VStack(spacing: 0) {
+                Rectangle()
+                    .fill(isFirst ? Color.clear : Color.primary.opacity(0.12))
+                    .frame(width: 1)
+                Rectangle()
+                    .fill(isLast ? Color.clear : Color.primary.opacity(0.12))
+                    .frame(width: 1)
+            }
+            Circle()
+                .fill(filled ? Color.accentColor.opacity(0.22) : Color.clear)
+                .overlay {
+                    Circle()
+                        .stroke(Color.accentColor, lineWidth: filled ? 0 : 1.5)
+                }
+                .frame(width: 11, height: 11)
+                .overlay {
+                    if filled {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 5, height: 5)
+                    }
+                }
+        }
+        .frame(width: 14)
+    }
+
+    private func copySHA(_ sha: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sha, forType: .string)
     }
 
     private var checksList: some View {
@@ -1384,7 +1591,8 @@ private struct ShipStatusPanel: View {
     }
 
     private func checkRow(_ check: GitHubClient.CheckRun) -> some View {
-        HStack(spacing: OreTheme.Space.sm) {
+        let hovering = hoveredCheck == check.name
+        return HStack(spacing: OreTheme.Space.sm) {
             Group {
                 if !check.isComplete {
                     ProgressView().controlSize(.mini)
@@ -1397,12 +1605,12 @@ private struct ShipStatusPanel: View {
             .frame(width: 16)
             VStack(alignment: .leading, spacing: 1) {
                 Text(check.name)
-                    .font(.system(size: OreTheme.Font.body))
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
                     .lineLimit(1)
                 if let workflow = check.workflow, !workflow.isEmpty {
                     Text(workflow)
                         .font(.system(size: OreTheme.Font.caption))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
@@ -1422,7 +1630,12 @@ private struct ShipStatusPanel: View {
             }
         }
         .padding(.horizontal, OreTheme.Space.sm)
-        .padding(.vertical, 4)
+        .padding(.vertical, 7)
+        .background(hovering ? OreTheme.subduedFill : .clear)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            hoveredCheck = hovering ? check.name : (hoveredCheck == check.name ? nil : hoveredCheck)
+        }
     }
 
     private func shipEmpty(icon: String, text: String) -> some View {
@@ -1444,7 +1657,9 @@ private struct ShipStatusPanel: View {
     private func load() async {
         async let loadedCommits = model.loadUnpushedCommits(for: workspace.id)
         async let loadedPR = model.loadPullRequestStatus(for: workspace.id)
+        async let loadedTree = model.loadWorkingTreeStatus(for: workspace.id)
         commits = await loadedCommits
+        workingTree = await loadedTree
         let pr = await loadedPR
         pullRequest = pr
 
@@ -1474,20 +1689,21 @@ private struct ShipStatusPanel: View {
     }
 }
 
-/// The single most prominent control in the app: the next step to ship this
-/// work, whatever that currently is.
-private struct GitActionBar: View {
+/// The next git step, shown in the window toolbar so shipping isn't buried
+/// under the review pane. Hidden when there is nothing to do — a clean tree
+/// with no commits ahead of base must not offer "Create pull request".
+struct GitActionToolbar: View {
     @Environment(AppModel.self) private var model
-    let action: SuggestedGitAction
     let workspace: WorkspaceSummary
-    let onRefresh: () async -> Void
 
     @State private var chosenBase: String?
     @State private var branches: [String] = []
     @State private var prURL: String?
 
-    /// True for states that only exist once a PR has been opened, so we only
-    /// spend a `gh` call to fetch its URL when there's actually one to show.
+    private var action: SuggestedGitAction {
+        model.cachedDiff(for: workspace.id)?.gitAction ?? .none
+    }
+
     private var actionImpliesPR: Bool {
         switch action {
         case .waitForChecks, .fixFailingChecks, .waitForReview, .merge,
@@ -1500,10 +1716,45 @@ private struct GitActionBar: View {
     }
 
     var body: some View {
-        bar
-        .padding(.horizontal, OreTheme.Space.md)
-        .frame(height: 42)
-        .background(.bar)
+        HStack(spacing: 8) {
+            if case .createPullRequest(let defaultBase, _) = action {
+                baseMenu(defaultBase: defaultBase)
+            }
+
+            switch presentation {
+            case .hidden:
+                EmptyView()
+            case .status(let title):
+                Label(title, systemImage: icon)
+                    .labelStyle(.titleAndIcon)
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .help(title)
+            case .action(let title):
+                Button {
+                    perform()
+                } label: {
+                    Label(title, systemImage: icon)
+                }
+                .buttonStyle(OreGitActionButtonStyle(tone: tone))
+                .help(actionHelp)
+            }
+
+            if case .merged = action {
+                Button("Archive") { model.requestArchive(workspace.id) }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    .help("Archive this workspace — frees the worktree's disk space")
+            }
+
+            if let prURL, let url = URL(string: prURL) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Image(systemName: "arrow.up.right.square")
+                }
+                .help("Open this pull request on GitHub")
+            }
+        }
         .task(id: "\(workspace.id.rawValue)-\(action.title)-\(workspace.gitStatus.generation)") {
             if case .createPullRequest = action {
                 branches = await model.remoteBranches(for: workspace.id)
@@ -1512,83 +1763,73 @@ private struct GitActionBar: View {
         }
     }
 
-    private var bar: some View {
-        Group {
-            if case .merged = action {
-                // Merged is an end state with an obvious next step, not a
-                // passive banner: continue on a fresh branch, or park the
-                // workspace now that its work has landed.
-                HStack(spacing: OreTheme.Space.sm) {
-                    Image(systemName: icon).foregroundStyle(.green)
-                    Text(action.title)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                    Button("Continue from merged PR") {
-                        model.continueAfterMerge(workspace.id)
-                        Task {
-                            try? await Task.sleep(for: .milliseconds(500))
-                            await onRefresh()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .help("Pull the updated base and continue on a fresh branch")
-                    Button("Archive") { model.requestArchive(workspace.id) }
-                        .controlSize(.small)
-                        .help("Archive this workspace — frees the worktree's disk space")
-                    refreshButton
-                }
-            } else if action.isActionable {
-                HStack(spacing: OreTheme.Space.sm) {
-                    refreshButton
-                    Spacer(minLength: 0)
-                }
-            } else {
-                // Keep controls in the leading cluster. HSplitView may retain
-                // a wider child than the clipped on-screen slice while the
-                // window is compact; trailing alignment would hide the actions.
-                HStack(spacing: OreTheme.Space.sm) {
-                    Image(systemName: icon).foregroundStyle(.secondary)
-                    Text(action.title)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                    refreshButton
-                }
-            }
+    private enum Presentation {
+        case hidden
+        case status(String)
+        case action(String)
+    }
+
+    /// Create PR / Continue / Merge only appear when that step is actually
+    /// possible. Waiting states are a label, not a dummy button.
+    private var presentation: Presentation {
+        switch action {
+        case .none:
+            return .hidden
+        case .committedNoRemote, .waitForChecks, .waitForReview, .waitForParentToMerge:
+            // `committedNoRemote` is a real state with a diff to see — report it
+            // rather than hiding it the way a clean, changeless tree is hidden.
+            return .status(action.title)
+        case .merged:
+            return .action("Continue")
+        default:
+            return action.isActionable ? .action(action.title) : .status(action.title)
         }
     }
 
-    private var refreshButton: some View {
-        HStack(spacing: OreTheme.Space.sm) {
-            if case .createPullRequest(let defaultBase, _) = action {
-                baseMenu(defaultBase: defaultBase)
-            }
-            if action.isActionable {
-                Button(action.title) { perform() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-            }
-            if let prURL, let url = URL(string: prURL) {
-                Button { NSWorkspace.shared.open(url) } label: {
-                    Label("View on GitHub", systemImage: "arrow.up.right.square")
-                }
-                .controlSize(.small)
-                .help("Open this pull request on GitHub")
-            }
-            Button { Task { await onRefresh() } } label: {
-                Image(systemName: "arrow.clockwise")
-                    .frame(width: 26, height: 26)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Refresh repository status")
+    private var tone: OreGitActionTone {
+        switch action {
+        case .commit: return .commit
+        case .push, .createGitHubRepo: return .publish
+        case .createPullRequest: return .pullRequest
+        case .merge, .retargetAfterParentMerged: return .merge
+        case .fixFailingChecks, .resolveConflicts: return .danger
+        case .merged: return .success
+        case .setUpGitHub: return .quiet
+        default: return .pullRequest
         }
     }
 
-    /// The PR base-branch chooser, shown only while about to open a PR. Defaults
-    /// to the workspace's base and lists the repo's remote branches.
+    private var icon: String {
+        switch action {
+        case .none: return "checkmark.circle"
+        case .committedNoRemote: return "checkmark.circle.badge.questionmark"
+        case .createGitHubRepo: return "plus.rectangle.on.folder"
+        case .commit: return "square.and.arrow.down"
+        case .push: return "arrow.up.circle.fill"
+        case .createPullRequest: return "arrow.triangle.pull"
+        case .waitForChecks: return "clock"
+        case .fixFailingChecks: return "xmark.octagon.fill"
+        case .resolveConflicts: return "arrow.triangle.branch"
+        case .waitForReview: return "person.2"
+        case .merge: return "arrow.triangle.merge"
+        case .waitForParentToMerge: return "square.stack.3d.up"
+        case .retargetAfterParentMerged: return "arrow.uturn.right"
+        case .merged: return "arrow.uturn.forward.circle.fill"
+        case .setUpGitHub: return "gear"
+        }
+    }
+
+    private var actionHelp: String {
+        switch action {
+        case .commit:
+            return "Draft a commit prompt in chat so the agent can write the message from the diff"
+        case .createPullRequest:
+            return "Draft a pull-request prompt in chat so the agent can write the title and body"
+        default:
+            return action.title
+        }
+    }
+
     private func baseMenu(defaultBase: String) -> some View {
         let base = chosenBase ?? defaultBase
         return Menu {
@@ -1610,37 +1851,21 @@ private struct GitActionBar: View {
         .help("Choose the branch to merge into")
     }
 
-    private var icon: String {
-        switch action {
-        case .none: return "checkmark.circle"
-        case .committedNoRemote: return "checkmark.circle.badge.questionmark"
-        case .createGitHubRepo: return "plus.rectangle.on.folder"
-        case .commit: return "square.and.arrow.down"
-        case .push: return "arrow.up.circle"
-        case .createPullRequest: return "arrow.triangle.pull"
-        case .waitForChecks: return "clock"
-        case .fixFailingChecks: return "xmark.octagon"
-        case .resolveConflicts: return "arrow.triangle.branch"
-        case .waitForReview: return "person.2"
-        case .merge: return "arrow.triangle.merge"
-        case .waitForParentToMerge: return "square.stack.3d.up"
-        case .retargetAfterParentMerged: return "arrow.uturn.right"
-        case .merged: return "checkmark.seal.fill"
-        case .setUpGitHub: return "gear"
-        }
-    }
-
     private func perform() {
-        // Honour a chosen base branch when opening a PR; otherwise the action's
-        // own default applies.
-        if case .createPullRequest(let defaultBase, _) = action {
-            model.createPullRequest(base: chosenBase ?? defaultBase, for: workspace)
+        if case .merged = action {
+            model.continueAfterMerge(workspace.id)
+        } else if case .createPullRequest(let defaultBase, let isStacked) = action {
+            model.createPullRequest(
+                base: chosenBase ?? defaultBase,
+                isStacked: isStacked,
+                for: workspace
+            )
         } else {
             model.performGitAction(action, for: workspace)
         }
         Task {
             try? await Task.sleep(for: .milliseconds(500))
-            await onRefresh()
+            _ = try? await model.refreshDiff(for: workspace)
         }
     }
 }

@@ -787,6 +787,10 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).unpushedCommits()
     }
 
+    public func workingTreeStatus(workspaceID: WorkspaceID) async -> GitStatusSnapshot? {
+        try? await engine(for: workspaceID).workingTreeStatus()
+    }
+
     /// The branch's PR with live check runs; nil when gh is missing,
     /// unauthenticated, or no PR exists.
     public func pullRequestStatus(workspaceID: WorkspaceID) async throws -> GitHubClient.PullRequest? {

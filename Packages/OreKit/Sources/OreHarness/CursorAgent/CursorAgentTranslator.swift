@@ -102,14 +102,14 @@ struct CursorAgentTranslator {
     /// without this every tool a Cursor turn runs was silently dropped and a
     /// coding task looked like it did nothing.
     private mutating func applyToolCall(_ message: JSONValue, to output: inout Output) {
-        let turnID = ensureTurn(&output)
         guard let rawID = message["call_id"]?.stringValue,
               let call = message["tool_call"]?.objectValue,
-              let (rawKey, payload) = call.first
+              let (rawKey, payload) = Self.cursorToolEntry(in: call)
         else { return }
+        let turnID = ensureTurn(&output)
         let toolCallID = ToolCallID(rawValue: rawID)
         let name = Self.cursorToolName(rawKey)
-        let input = Self.cursorToolInput(from: payload["args"])
+        let input = Self.cursorToolInput(from: payload)
 
         func emitCall() {
             guard reportedToolCallIDs.insert(toolCallID).inserted else { return }
@@ -139,29 +139,95 @@ struct CursorAgentTranslator {
         }
     }
 
+    /// Cursor's `tool_call` object mixes the real payload (`readToolCall`,
+    /// `editToolCall`, …) with metadata (`toolCallId`, `startedAtMs`,
+    /// `hookAdditionalContexts`). Taking `.first` on that dictionary produced
+    /// transcript rows named `Toolcallid` / `Startedatms`. Prefer the `*ToolCall`
+    /// entry; skip hook-only records entirely.
+    private static func cursorToolEntry(
+        in call: [String: JSONValue]
+    ) -> (key: String, payload: JSONValue)? {
+        let tools = call.filter { key, value in
+            value.objectValue != nil
+                && (key.hasSuffix("ToolCall") || key.hasSuffix("toolCall"))
+        }
+        if let match = tools.sorted(by: { $0.key < $1.key }).first {
+            return (match.key, match.value)
+        }
+        let remaining = call.filter { key, value in
+            value.objectValue != nil && !isCursorMetadataKey(key)
+        }
+        if remaining.count == 1, let match = remaining.first {
+            return (match.key, match.value)
+        }
+        return nil
+    }
+
+    private static func isCursorMetadataKey(_ key: String) -> Bool {
+        switch key {
+        case "toolCallId", "tool_call_id", "callId", "call_id",
+             "startedAtMs", "started_at_ms", "completedAtMs", "completed_at_ms",
+             "timestampMs", "timestamp_ms",
+             "hookAdditionalContexts", "hook_additional_contexts":
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func cursorToolName(_ rawKey: String) -> String {
-        let base = rawKey.replacingOccurrences(of: "ToolCall", with: "").lowercased()
-        switch base {
-        case "edit": return "Edit"
+        var base = rawKey
+        if base.hasSuffix("ToolCall") {
+            base = String(base.dropLast("ToolCall".count))
+        } else if base.hasSuffix("toolCall") {
+            base = String(base.dropLast("toolCall".count))
+        }
+        switch base.lowercased() {
+        case "edit", "applypatch", "apply_patch": return "Edit"
         case "write", "create": return "Write"
         case "read": return "Read"
         case "glob": return "Glob"
         case "grep", "search": return "Grep"
+        case "semsearch", "semanticsearch", "codesearch": return "Grep"
         case "shell", "bash", "terminal", "run", "command": return "Bash"
-        case "ls", "list": return "LS"
-        case "delete": return "Delete"
+        case "ls", "list", "listdir": return "LS"
+        case "delete", "remove": return "Delete"
         case "webfetch", "fetch", "web": return "WebFetch"
+        case "websearch": return "WebSearch"
+        case "readlints", "lints", "read_lints": return "ReadLints"
         case "task", "agent": return "Task"
-        default: return base.isEmpty ? "Tool" : base.prefix(1).uppercased() + base.dropFirst()
+        case "todowrite", "todoread", "todo": return "TodoWrite"
+        default:
+            return base.isEmpty ? "Tool" : base.prefix(1).uppercased() + base.dropFirst()
         }
     }
 
     /// Maps Cursor's per-tool arg names onto the keys the UI's presentation
     /// layer already understands (`file_path`, `command`, `pattern`, …).
-    private static func cursorToolInput(from args: JSONValue?) -> JSONValue {
-        guard var dict = args?.objectValue else { return args ?? .object([:]) }
+    private static func cursorToolInput(from payload: JSONValue) -> JSONValue {
+        let args = payload["args"] ?? payload["arguments"]
+        var dict = args?.objectValue ?? {
+            guard var object = payload.objectValue else { return [:] as [String: JSONValue] }
+            object.removeValue(forKey: "result")
+            object.removeValue(forKey: "error")
+            return object
+        }()
         if let path = dict["path"]?.stringValue { dict["file_path"] = .string(path) }
-        if let glob = dict["globPattern"]?.stringValue { dict["pattern"] = .string(glob) }
+        if let target = dict["targetDirectory"]?.stringValue ?? dict["target_directory"]?.stringValue {
+            dict["path"] = .string(target)
+            dict["file_path"] = .string(target)
+        }
+        if dict["file_path"] == nil,
+           let paths = dict["paths"]?.arrayValue,
+           let first = paths.first?.stringValue {
+            dict["file_path"] = .string(first)
+        }
+        if let glob = dict["globPattern"]?.stringValue ?? dict["glob_pattern"]?.stringValue {
+            dict["pattern"] = .string(glob)
+        }
+        if dict["pattern"] == nil, let query = dict["query"]?.stringValue {
+            dict["pattern"] = .string(query)
+        }
         if let content = dict["streamContent"]?.stringValue { dict["new_string"] = .string(content) }
         return .object(dict)
     }

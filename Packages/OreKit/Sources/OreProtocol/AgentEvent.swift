@@ -98,6 +98,15 @@ public enum AgentStatus: String, Sendable, Codable {
     case awaitingInput
     case interrupted
     case failed
+
+    /// True while a turn is running or the agent is waiting on the user.
+    /// Those chats shouldn't have a shipping prompt dropped into the composer.
+    public var occupiesComposer: Bool {
+        switch self {
+        case .thinking, .requesting, .runningTool, .awaitingInput: return true
+        case .idle, .interrupted, .failed: return false
+        }
+    }
 }
 
 public struct SessionEnded: Sendable, Codable, Hashable {

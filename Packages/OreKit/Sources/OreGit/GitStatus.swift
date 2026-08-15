@@ -19,6 +19,9 @@ public struct GitFileChange: Sendable, Hashable, Codable {
     public var originalPath: String?
     public var status: Status
     public var isStaged: Bool
+    /// True when the worktree still differs from the index (including untracked
+    /// files). A file can be both staged and unstaged — `git add -p`.
+    public var isUnstaged: Bool
     /// Nil until a diff is computed — `git status` doesn't count lines.
     public var insertions: Int?
     public var deletions: Int?
@@ -29,6 +32,7 @@ public struct GitFileChange: Sendable, Hashable, Codable {
         originalPath: String? = nil,
         status: Status,
         isStaged: Bool = false,
+        isUnstaged: Bool = false,
         insertions: Int? = nil,
         deletions: Int? = nil,
         isBinary: Bool = false
@@ -37,6 +41,7 @@ public struct GitFileChange: Sendable, Hashable, Codable {
         self.originalPath = originalPath
         self.status = status
         self.isStaged = isStaged
+        self.isUnstaged = isUnstaged
         self.insertions = insertions
         self.deletions = deletions
         self.isBinary = isBinary
@@ -54,6 +59,12 @@ public struct GitStatusSnapshot: Sendable, Hashable, Codable {
     /// load, so a consumer applies a snapshot only if its generation is newer
     /// than the one it already has.
     public var generation: UInt64
+    public var stagedFileCount: Int = 0
+    public var unstagedFileCount: Int = 0
+    public var stagedInsertions: Int = 0
+    public var stagedDeletions: Int = 0
+    public var unstagedInsertions: Int = 0
+    public var unstagedDeletions: Int = 0
 
     public init(
         branch: String? = nil,
@@ -69,9 +80,22 @@ public struct GitStatusSnapshot: Sendable, Hashable, Codable {
         self.behindUpstream = behindUpstream
         self.files = files
         self.generation = generation
+        refreshWorkingTreeTotals()
     }
 
     public var hasUncommittedChanges: Bool { !files.isEmpty }
+
+    public var stagedFiles: [GitFileChange] { files.filter(\.isStaged) }
+    public var unstagedFiles: [GitFileChange] { files.filter(\.isUnstaged) }
+
+    mutating func refreshWorkingTreeTotals() {
+        stagedFileCount = files.filter(\.isStaged).count
+        unstagedFileCount = files.filter(\.isUnstaged).count
+        stagedInsertions = files.filter(\.isStaged).compactMap(\.insertions).reduce(0, +)
+        stagedDeletions = files.filter(\.isStaged).compactMap(\.deletions).reduce(0, +)
+        unstagedInsertions = files.filter(\.isUnstaged).compactMap(\.insertions).reduce(0, +)
+        unstagedDeletions = files.filter(\.isUnstaged).compactMap(\.deletions).reduce(0, +)
+    }
 
     public func summary(aheadOfBase: Int = 0, behindBase: Int = 0) -> GitStatusSummary {
         GitStatusSummary(
@@ -124,19 +148,20 @@ public enum GitStatusParser {
 
             case "u":
                 if let path = record.split(separator: " ", maxSplits: 10).last.map(String.init) {
-                    snapshot.files.append(GitFileChange(path: path, status: .conflicted))
+                    snapshot.files.append(GitFileChange(path: path, status: .conflicted, isUnstaged: true))
                 }
 
             case "?":
                 let path = String(record.dropFirst(2))
                 if !path.isEmpty {
-                    snapshot.files.append(GitFileChange(path: path, status: .untracked))
+                    snapshot.files.append(GitFileChange(path: path, status: .untracked, isUnstaged: true))
                 }
 
             default:
                 break
             }
         }
+        snapshot.refreshWorkingTreeTotals()
         return snapshot
     }
 
@@ -167,7 +192,8 @@ public enum GitStatusParser {
         return GitFileChange(
             path: parts[8],
             status: status(for: xy),
-            isStaged: xy.first != "."
+            isStaged: Self.hasStagedChange(xy),
+            isUnstaged: Self.hasUnstagedChange(xy)
         )
     }
 
@@ -180,7 +206,8 @@ public enum GitStatusParser {
             path: parts[9],
             originalPath: originalPath,
             status: parts[8].hasPrefix("C") ? .copied : .renamed,
-            isStaged: xy.first != "."
+            isStaged: Self.hasStagedChange(xy),
+            isUnstaged: Self.hasUnstagedChange(xy)
         )
     }
 
@@ -200,5 +227,15 @@ public enum GitStatusParser {
         case "U": return .conflicted
         default: return .modified
         }
+    }
+
+    private static func hasStagedChange(_ xy: String) -> Bool {
+        xy.first.map { $0 != "." } ?? false
+    }
+
+    private static func hasUnstagedChange(_ xy: String) -> Bool {
+        let characters = Array(xy)
+        guard characters.count >= 2 else { return false }
+        return characters[1] != "."
     }
 }

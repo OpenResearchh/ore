@@ -62,6 +62,19 @@ final class AppModel {
     private var coalescers: [ChatID: TextDeltaCoalescer] = [:]
     private var chatOwners: [ChatID: WorkspaceID] = [:]
     private var pendingNewChatMessages: [WorkspaceID: [String]] = [:]
+    /// Draft text to drop into a chat that hasn't been published yet, so Commit
+    /// / Create PR can open a tab without sending until the user hits return.
+    private var pendingNewChatDrafts: [WorkspaceID: [String]] = [:]
+    /// Signals the visible composer to pick up a draft written from outside
+    /// (toolbar Commit / Create PR) without waiting for a tab switch.
+    private(set) var composerInjection: ComposerInjection?
+
+    struct ComposerInjection: Equatable {
+        let chatID: ChatID
+        let text: String
+        let generation: UInt64
+    }
+    private var composerInjectionGeneration: UInt64 = 0
     private var identityRenamesInFlight: Set<WorkspaceID> = []
     private var chatRenamesInFlight: Set<ChatID> = []
     private(set) var chatCreationsInFlight: Set<WorkspaceID> = []
@@ -426,16 +439,24 @@ final class AppModel {
         Task { await client.send(.revertChatToCheckpoint(id, chatID, turnID)) }
     }
 
-    func createChat(in workspaceID: WorkspaceID, initialMessage: String? = nil) {
+    func createChat(
+        in workspaceID: WorkspaceID,
+        initialMessage: String? = nil,
+        draft: String? = nil
+    ) {
+        if let initialMessage {
+            pendingNewChatMessages[workspaceID, default: []].append(initialMessage)
+        }
+        if let draft {
+            // Latest click wins if a tab is already spinning up.
+            pendingNewChatDrafts[workspaceID] = [draft]
+        }
         guard chatCreationsInFlight.insert(workspaceID).inserted else { return }
         // A new conversation is a chat destination even when it was invoked
         // while reading a source tab. Keep the existing chat visible until the
         // core publishes the new one, then switch in one atomic event.
         showChatInCenter(workspaceID)
         let workspace = workspaces.first { $0.id == workspaceID }
-        if let initialMessage {
-            pendingNewChatMessages[workspaceID, default: []].append(initialMessage)
-        }
         let usedTitles = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
         let title = ResearchIdentity.nextResearchTitle(
             excluding: usedTitles,
@@ -801,22 +822,18 @@ final class AppModel {
     }
 
     func performGitAction(_ action: SuggestedGitAction, for workspace: WorkspaceSummary) {
+        if let prompt = action.agentDraftPrompt {
+            placePromptInComposer(prompt, in: workspace.id)
+            return
+        }
         Task {
             switch action {
-            case .commit:
-                await client.send(.commit(workspace.id, message: workspace.name))
+            case .commit, .createPullRequest:
+                break
             case .createGitHubRepo:
                 await client.send(.createGitHubRepo(workspace.id))
             case .push:
                 await client.send(.push(workspace.id))
-            case .createPullRequest(let base, _):
-                await client.send(.createPullRequest(
-                    workspace.id,
-                    title: workspace.name,
-                    body: "Created and reviewed with ORE.",
-                    base: base,
-                    draft: false
-                ))
             case .retargetAfterParentMerged(let number, let base):
                 guard let number else { return }
                 await client.send(.retargetPullRequest(workspace.id, number: number, base: base))
@@ -834,16 +851,46 @@ final class AppModel {
 
     /// Open a PR against a user-chosen base branch (the review pane's picker),
     /// rather than the workspace's default base.
-    func createPullRequest(base: String, for workspace: WorkspaceSummary) {
-        Task {
-            await client.send(.createPullRequest(
-                workspace.id,
-                title: workspace.name,
-                body: "Created and reviewed with ORE.",
-                base: base,
-                draft: false
-            ))
+    func createPullRequest(base: String, isStacked: Bool = false, for workspace: WorkspaceSummary) {
+        placePromptInComposer(
+            GitShipPrompt.pullRequest(base: base, isStacked: isStacked),
+            in: workspace.id
+        )
+    }
+
+    /// Drops a shipping prompt into an idle composer so the user can edit and send.
+    ///
+    /// Tab choice: the selected chat if it's idle and empty; otherwise any idle
+    /// empty tab (newest first); otherwise a new tab. Never interrupts a running
+    /// turn or overwrites a draft the user is still writing.
+    func placePromptInComposer(_ text: String, in workspaceID: WorkspaceID) {
+        showChatInCenter(workspaceID)
+        if let chat = ComposerPlacement.target(
+            active: activeChat(for: workspaceID),
+            open: chats(for: workspaceID),
+            isOccupied: composerIsOccupied
+        ) {
+            selectChat(chat.id, in: workspaceID)
+            injectComposerText(text, into: chat)
+            return
         }
+        createChat(in: workspaceID, draft: text)
+    }
+
+    private func composerIsOccupied(_ chat: ChatSummary) -> Bool {
+        chat.status.occupiesComposer
+            || chat.queuedMessageCount > 0
+            || self.chat(for: chat.id).isBusy
+    }
+
+    private func injectComposerText(_ text: String, into chat: ChatSummary) {
+        setDraft(text, for: chat)
+        composerInjectionGeneration += 1
+        composerInjection = ComposerInjection(
+            chatID: chat.id,
+            text: text,
+            generation: composerInjectionGeneration
+        )
     }
 
     func remoteBranches(for id: WorkspaceID) async -> [String] {
@@ -876,6 +923,10 @@ final class AppModel {
 
     func loadUnpushedCommits(for id: WorkspaceID) async -> [CommitInfo] {
         (try? await client.unpushedCommits(workspaceID: id)) ?? []
+    }
+
+    func loadWorkingTreeStatus(for id: WorkspaceID) async -> GitStatusSnapshot? {
+        await client.workingTreeStatus(workspaceID: id)
     }
 
     func loadPullRequestStatus(for id: WorkspaceID) async -> GitHubClient.PullRequest? {
@@ -1226,6 +1277,7 @@ final class AppModel {
             filePresentationModes.removeValue(forKey: id)
             fileFocus.removeValue(forKey: id)
             pendingNewChatMessages.removeValue(forKey: id)
+            pendingNewChatDrafts.removeValue(forKey: id)
             identityRenamesInFlight.remove(id)
             chatCreationsInFlight.remove(id)
             // The workspace's terminals keep their PTYs and scrollback alive
@@ -1257,6 +1309,10 @@ final class AppModel {
                 let message = pending.removeFirst()
                 pendingNewChatMessages[chat.workspaceID] = pending.isEmpty ? nil : pending
                 send(message, to: chat.workspaceID, chatID: chat.id)
+            } else if var drafts = pendingNewChatDrafts[chat.workspaceID], !drafts.isEmpty {
+                let text = drafts.removeFirst()
+                pendingNewChatDrafts[chat.workspaceID] = drafts.isEmpty ? nil : drafts
+                injectComposerText(text, into: chat)
             }
 
         case .chatUpdated(let chat):

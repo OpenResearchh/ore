@@ -28,12 +28,29 @@ struct GitStatusParserTests {
         let modified = try #require(snapshot.files.first { $0.path == "Sources/App.swift" })
         #expect(modified.status == .modified)
         #expect(modified.isStaged == false)
+        #expect(modified.isUnstaged == true)
 
         let added = try #require(snapshot.files.first { $0.path == "Sources/New.swift" })
         #expect(added.status == .added)
         #expect(added.isStaged == true)
+        #expect(added.isUnstaged == false)
 
         #expect(snapshot.files.first { $0.path == "untracked.txt" }?.status == .untracked)
+        #expect(snapshot.files.first { $0.path == "untracked.txt" }?.isUnstaged == true)
+        #expect(snapshot.unstagedFileCount == 2)
+        #expect(snapshot.stagedFileCount == 1)
+    }
+
+    @Test func partiallyStagedFilesAreBothStagedAndUnstaged() {
+        let output = [
+            "# branch.head main",
+            "1 MM N... 100644 100644 100644 aaa bbb Sources/App.swift",
+        ].joined(separator: "\0") + "\0"
+        let snapshot = GitStatusParser.parse(output, generation: 1)
+        #expect(snapshot.files[0].isStaged == true)
+        #expect(snapshot.files[0].isUnstaged == true)
+        #expect(snapshot.stagedFileCount == 1)
+        #expect(snapshot.unstagedFileCount == 1)
     }
 
     @Test func renamesCarryTheirOriginalPath() {

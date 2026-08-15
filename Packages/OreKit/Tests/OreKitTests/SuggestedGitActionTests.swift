@@ -50,6 +50,9 @@ struct SuggestedGitActionTests {
         ))
         #expect(action == .commit(fileCount: 3, insertions: 42, deletions: 8))
         #expect(action.title == "Commit 3 files")
+        #expect(action.delegatesToAgent)
+        #expect(action.agentDraftPrompt?.contains("3 files") == true)
+        #expect(action.agentDraftPrompt?.contains("Do not push") == true)
     }
 
     @Test func anUnpublishedBranchGoesStraightToCreatePR() {
@@ -266,5 +269,38 @@ struct SuggestedGitActionTests {
             hasUncommittedChanges: true, hasUpstream: true, pullRequest: merged
         ))
         #expect(action == .merged(prNumber: 7))
+    }
+
+    @Test func createPullRequestRequiresCommitsAheadOfBase() {
+        // A clean tree with nothing unique vs the base must not offer a PR —
+        // there is nothing to open one from.
+        let clean = SuggestedGitActionResolver.resolve(GitActionContext(
+            hasUncommittedChanges: false,
+            unpushedCommitCount: 0,
+            commitsAheadOfBase: 0,
+            hasUpstream: true
+        ))
+        #expect(clean == .none)
+        #expect(!clean.isActionable)
+
+        let ready = SuggestedGitActionResolver.resolve(GitActionContext(
+            commitsAheadOfBase: 2, hasUpstream: true, baseBranch: "main"
+        ))
+        #expect(ready == .createPullRequest(base: "main", isStacked: false))
+        #expect(ready.delegatesToAgent)
+        #expect(ready.agentDraftPrompt?.contains("`main`") == true)
+        #expect(ready.agentDraftPrompt?.contains("Do not merge") == true)
+    }
+
+    @Test func aStackedPullRequestNamesTheParentBase() {
+        let prompt = GitShipPrompt.pullRequest(base: "ore/parent", isStacked: true)
+        #expect(prompt.contains("`ore/parent`"))
+        #expect(prompt.contains("stacked"))
+    }
+
+    @Test func pushStillRunsDirectlyRatherThanThroughTheAgent() {
+        let action = SuggestedGitAction.push(commitCount: 1, isFirstPush: false)
+        #expect(!action.delegatesToAgent)
+        #expect(action.agentDraftPrompt == nil)
     }
 }

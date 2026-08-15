@@ -1,3 +1,4 @@
+import OreGit
 import OrePersistence
 import OreProtocol
 import AppKit
@@ -19,7 +20,7 @@ struct ChatPane: View {
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
     /// Attachment relative paths that live as inline chips in the draft (pasted
-    /// images) rather than in the attachment shelf above the composer.
+    /// images and long text) rather than in the attachment shelf above the composer.
     @State private var inlinePastedPaths: Set<String> = []
     @State private var showModelChooser = false
     @State private var showEffortChooser = false
@@ -63,7 +64,7 @@ struct ChatPane: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(OreTheme.Surface.content)
         // Workspace identity lives in the window's title bar now, not a 58pt
         // header that repeated the tab title. The toolbar band was empty anyway.
         .navigationTitle(workspace.name)
@@ -238,7 +239,19 @@ struct ChatPane: View {
         .layoutPriority(1)
         .task(id: chatSummary?.id) {
             draftOwnerID = chatSummary?.id
-            draft = chatSummary?.draftText ?? ""
+            if let injection = model.composerInjection, injection.chatID == chatSummary?.id {
+                draft = injection.text
+                composerFocused = true
+            } else {
+                draft = chatSummary?.draftText ?? ""
+            }
+        }
+        .onChange(of: model.composerInjection?.generation) { _, _ in
+            guard let injection = model.composerInjection,
+                  injection.chatID == chatSummary?.id else { return }
+            draftOwnerID = injection.chatID
+            draft = injection.text
+            composerFocused = true
         }
         .task(id: "\(chatSummary?.id.rawValue ?? "")-\(chatSummary?.queuedMessageCount ?? 0)") {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
@@ -248,8 +261,8 @@ struct ChatPane: View {
             // The guard keeps a tab switch from writing the previous tab's text
             // into the newly selected chat before its draft has loaded.
             guard let chatSummary, draftOwnerID == chatSummary.id else { return }
-            // Mentions and inline pasted images live as `@name` tokens in the
-            // draft; drop the attachment once its token is gone. Shelf files
+            // Mentions and inline pasted images/text live as `@name` tokens in
+            // the draft; drop the attachment once its token is gone. Shelf files
             // (attached, not inline) persist regardless of the text.
             var next = chat.draftAttachments
             next.removeAll { attachment in
@@ -601,12 +614,9 @@ struct ChatPane: View {
                     }
 
                 }
-                // Symmetric clearance on both edges keeps a single tab centred on
-                // the window's true midline; the trailing controls sit inside the
-                // right reservation via the overlay below. When the tabs outgrow
-                // the strip, the HStack simply scrolls.
-                .padding(.horizontal, tabControlAllowance)
-                .frame(minWidth: availableWidth, alignment: .center)
+                .padding(.leading, OreTheme.Space.sm)
+                .padding(.trailing, tabControlAllowance)
+                .frame(minWidth: availableWidth, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .onChange(of: activeTabKey) { _, key in
@@ -631,7 +641,7 @@ struct ChatPane: View {
     /// the stop button while busy). Mirrored as leading padding so the tabs stay
     /// optically centred rather than shifted by the controls' width.
     private var tabControlAllowance: CGFloat {
-        chat.isBusy ? 142 : 112
+        88
     }
 
     private var activeTabKey: String {
@@ -662,7 +672,7 @@ struct ChatPane: View {
             isSelected: isSelected,
             isHovered: hoveredTabKey == "file:\(path)"
         )
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: OreTheme.tabRadius))
         .onHover { hovering in
             let key = "file:\(path)"
             if hovering { hoveredTabKey = key }
@@ -710,23 +720,15 @@ struct ChatPane: View {
         // The active tab is at full strength; every other tab recedes — even a
         // working one — so which tab you're actually in is never in doubt. A
         // busy background tab still keeps enough presence to notice its dot.
-        .opacity(isSelected ? 1 : (isWorking ? 0.85 : 0.55))
+        .opacity(isSelected ? 1 : (isWorking ? 0.9 : 0.72))
         .oreNavigationSelection(
             isSelected: isSelected,
             isHovered: hoveredTabKey == "chat:\(tab.id.rawValue)"
         )
-        .overlay {
-            // The sheen signals "working" only on background tabs; the active
-            // tab already owns the accent underline and doesn't need it too.
-            if isWorking && !isSelected {
-                BusyTabSheen(reduceMotion: reduceMotion)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .allowsHitTesting(false)
-            }
-        }
         .overlay(alignment: .bottom) {
             // A solid accent underline is the single unambiguous "you are here"
-            // marker, independent of how many other tabs are busy.
+            // marker: with several dim tabs, opacity alone is too subtle to pick
+            // the active one out at a glance.
             if isSelected {
                 RoundedRectangle(cornerRadius: 1.5)
                     .fill(Color.accentColor)
@@ -736,7 +738,7 @@ struct ChatPane: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: isSelected)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: OreTheme.tabRadius))
         .onHover { hovering in
             let key = "chat:\(tab.id.rawValue)"
             if hovering { hoveredTabKey = key }
@@ -802,17 +804,6 @@ struct ChatPane: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("Chat and checkpoint history")
-
-            if chat.isBusy {
-                Button { model.interrupt(workspace.id) } label: {
-                    Image(systemName: "stop.fill")
-                        .foregroundStyle(.red)
-                        .frame(width: 26, height: 26)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(".", modifiers: .command)
-                .help("Stop the running turn (⌘.)")
-            }
         }
     }
 
@@ -935,7 +926,7 @@ struct ChatPane: View {
                 .overlay(alignment: .topLeading) {
                     if draft.isEmpty {
                         Text(placeholder)
-                            .font(.system(size: OreTheme.Font.title))
+                            .font(.system(size: OreTheme.Font.prose))
                             .foregroundStyle(.tertiary)
                             // Match the editor's textContainerInset (5×6) so the
                             // placeholder sits exactly where the caret and typed
@@ -950,7 +941,7 @@ struct ChatPane: View {
                     // grows the composer with its content — one line by default,
                     // up to a scroll cap — instead of a fixed 72pt box.
                     Text(draft.isEmpty ? " " : draft)
-                        .font(.system(size: OreTheme.Font.title))
+                        .font(.system(size: OreTheme.Font.prose))
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(GeometryReader { geo in
@@ -1079,7 +1070,6 @@ struct ChatPane: View {
         .padding(.horizontal, 9)
         .frame(height: 26)
         .background(OreTheme.subduedFill, in: Capsule())
-        .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
         .contentShape(Capsule())
     }
 
@@ -1088,7 +1078,6 @@ struct ChatPane: View {
             .font(.system(size: 12))
             .frame(width: 26, height: 26)
             .background(OreTheme.subduedFill, in: Capsule())
-            .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
             .contentShape(Capsule())
     }
 
@@ -1436,12 +1425,11 @@ struct ChatPane: View {
     }
 
     /// A file URL to preview when the pointer rests on an inline `@name` token —
-    /// only image attachments have something worth showing.
+    /// pasted images and long text dumps, not every workspace file mention.
     private func previewURL(for name: String) -> URL? {
         guard let attachment = attachments.first(where: { $0.displayName == name }),
-              attachment.mimeType?.hasPrefix("image/") == true else { return nil }
-        return URL(fileURLWithPath: workspace.worktreePath)
-            .appendingPathComponent(attachment.relativePath)
+              attachment.isHoverPreviewable else { return nil }
+        return attachment.fileURL(worktreePath: workspace.worktreePath)
     }
 
     private func addFiles(_ urls: [URL]) {
@@ -1465,8 +1453,8 @@ struct ChatPane: View {
     }
 
     /// Attaches whatever was pasted: a copied file lands as a shelf attachment; a
-    /// copied/screenshot image is written out as a PNG and dropped in as an inline
-    /// chip at the caret, so it reads where it was pasted rather than in a shelf.
+    /// screenshot is written out as a PNG chip; a long text dump becomes
+    /// `@pasted-text.txt` at the caret. Short text still types in as usual.
     private func handlePasteboard(_ pasteboard: NSPasteboard) -> PasteOutcome {
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
@@ -1486,6 +1474,9 @@ struct ChatPane: View {
                 return addPastedImages([image])
             }
         }
+        if let text = pasteboard.string(forType: .string), Attachment.shouldAttachPastedText(text) {
+            return addPastedText(text)
+        }
         return .ignored
     }
 
@@ -1500,7 +1491,7 @@ struct ChatPane: View {
             guard let tiff = image.tiffRepresentation,
                   let rep = NSBitmapImageRep(data: tiff),
                   let png = rep.representation(using: .png, properties: [:]) else { continue }
-            let display = uniquePastedImageName()
+            let display = uniquePastedName(prefix: "pasted-image", ext: "png")
             let name = "\(UUID().uuidString.prefix(8))-\(display)"
             let destination = folder.appendingPathComponent(name)
             do {
@@ -1521,15 +1512,39 @@ struct ChatPane: View {
         return .insert(tokens.joined(separator: " ") + " ")
     }
 
-    /// A draft-unique display name so each inline `@pasted-image.png` token maps to
-    /// exactly one attachment (two pastes would otherwise collide on the token).
-    private func uniquePastedImageName() -> String {
+    /// Writes a long paste out as a text file and returns the `@name` token to
+    /// insert at the caret — the same chip treatment as a pasted screenshot.
+    private func addPastedText(_ text: String) -> PasteOutcome {
+        let folder = URL(fileURLWithPath: workspace.worktreePath)
+            .appendingPathComponent(".context/attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let display = uniquePastedName(prefix: "pasted-text", ext: "txt")
+        let name = "\(UUID().uuidString.prefix(8))-\(display)"
+        let destination = folder.appendingPathComponent(name)
+        do {
+            try text.write(to: destination, atomically: true, encoding: .utf8)
+        } catch {
+            return .ignored
+        }
+        let relativePath = ".context/attachments/\(name)"
+        attachments.append(Attachment(
+            relativePath: relativePath,
+            displayName: display,
+            mimeType: "text/plain"
+        ))
+        inlinePastedPaths.insert(relativePath)
+        return .insert("@\(display) ")
+    }
+
+    /// A draft-unique display name so each inline `@pasted-image.png` /
+    /// `@pasted-text.txt` token maps to exactly one attachment.
+    private func uniquePastedName(prefix: String, ext: String) -> String {
         let existing = Set(attachments.map(\.displayName))
-        var candidate = "pasted-image.png"
+        var candidate = "\(prefix).\(ext)"
         var index = 1
         while existing.contains(candidate) {
             index += 1
-            candidate = "pasted-image-\(index).png"
+            candidate = "\(prefix)-\(index).\(ext)"
         }
         return candidate
     }
@@ -1670,6 +1685,11 @@ struct ChatPane: View {
             model.setPermissionMode(.plan, for: workspace.id)
             draft = "Create a detailed implementation plan for "
         case "/review": draft = "Review the current workspace diff. Focus on correctness, regressions, and missing tests."
+        case "/commit": draft = GitShipPrompt.commit()
+        case "/pr": draft = GitShipPrompt.pullRequest(
+            base: workspace.baseBranch,
+            isStacked: workspace.stackedOn != nil
+        )
         case "/test": draft = "Run the relevant test suite, diagnose any failures, and fix them."
         case "/fix": draft = "Diagnose and fix the issue: "
         case "/explain": draft = "Explain this code clearly: "
@@ -1692,6 +1712,8 @@ private struct ComposerCommand: Identifiable {
     static let all = [
         ComposerCommand(name: "/plan", detail: "Plan before editing", icon: "list.bullet.clipboard"),
         ComposerCommand(name: "/review", detail: "Review the workspace diff", icon: "eye"),
+        ComposerCommand(name: "/commit", detail: "Commit with a message from the diff", icon: "square.and.arrow.down"),
+        ComposerCommand(name: "/pr", detail: "Open a pull request from the diff", icon: "arrow.triangle.pull"),
         ComposerCommand(name: "/test", detail: "Run and fix tests", icon: "checkmark.circle"),
         ComposerCommand(name: "/fix", detail: "Diagnose an issue", icon: "wrench.and.screwdriver"),
         ComposerCommand(name: "/explain", detail: "Explain code", icon: "text.bubble"),
@@ -1740,6 +1762,7 @@ private struct ComposerBusyStatus: View {
                 .foregroundStyle(.red)
             }
             .buttonStyle(OrePressableButtonStyle())
+            .keyboardShortcut(".", modifiers: .command)
             .help("Stop the running turn (⌘.)")
         }
         .padding(.horizontal, 2)
@@ -1848,7 +1871,7 @@ private struct ResearchEmptyState: View {
                 .foregroundStyle(.secondary)
 
                 Text("What are we working on?")
-                    .font(.system(size: compact ? 22 : 27, weight: .semibold, design: .rounded))
+                    .font(.system(size: compact ? 20 : 22, weight: .semibold, design: .rounded))
                 Text("Pick a starting point, or describe the outcome in your own words.")
                     .font(.system(size: compact ? 13 : 14))
                     .foregroundStyle(.secondary)
@@ -1910,8 +1933,8 @@ private struct ResearchEmptyState: View {
                         .background(Color.accentColor.opacity(0.12))
                 }
             }
-            .frame(width: compact ? 52 : 72, height: compact ? 52 : 72)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .frame(width: compact ? 44 : 56, height: compact ? 44 : 56)
+            .clipShape(RoundedRectangle(cornerRadius: OreTheme.controlRadius))
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(identity.name)
@@ -1933,12 +1956,9 @@ private struct ResearchEmptyState: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(compact ? 10 : 14)
+        .padding(compact ? 8 : 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 13))
-        .overlay {
-            RoundedRectangle(cornerRadius: 13).stroke(OreTheme.hairline, lineWidth: 1)
-        }
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
     }
 
     private func starterChip(_ starter: Starter, compact: Bool) -> some View {
@@ -1955,7 +1975,6 @@ private struct ResearchEmptyState: View {
             .padding(.horizontal, 10)
             .frame(height: compact ? 24 : 28)
             .background(OreTheme.subduedFill, in: Capsule())
-            .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
             .contentShape(Capsule())
         }
         .buttonStyle(OrePressableButtonStyle())
@@ -2524,32 +2543,6 @@ private struct BusyTabDot: View {
                     pulse = true
                 }
             }
-    }
-}
-
-private struct BusyTabSheen: View {
-    let reduceMotion: Bool
-    @State private var isAnimating = false
-
-    var body: some View {
-        GeometryReader { geometry in
-            if reduceMotion {
-                Color.accentColor.opacity(0.07)
-            } else {
-                LinearGradient(
-                    colors: [.clear, Color.accentColor.opacity(0.04), Color.accentColor.opacity(0.20), Color.accentColor.opacity(0.04), .clear],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-                .frame(width: max(80, geometry.size.width * 0.72))
-                .offset(x: isAnimating ? geometry.size.width : -geometry.size.width)
-                .onAppear {
-                    withAnimation(.linear(duration: 1.35).repeatForever(autoreverses: false)) {
-                        isAnimating = true
-                    }
-                }
-            }
-        }
     }
 }
 

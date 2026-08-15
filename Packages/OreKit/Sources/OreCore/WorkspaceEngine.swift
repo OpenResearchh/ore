@@ -1160,6 +1160,11 @@ public actor WorkspaceEngine {
         return (try? await git.commits(range: range, in: worktreeURL, limit: limit)) ?? []
     }
 
+    /// Live staged / unstaged files for the ship panel and the Changes list.
+    public func workingTreeStatus() async -> GitStatusSnapshot? {
+        await statusWatcher?.currentSnapshot()
+    }
+
     public func currentPullRequest() async -> GitHubClient.PullRequest? {
         guard await gitHub.status().isAuthenticated else { return nil }
         return await gitHub.pullRequest(forBranch: record.branch)

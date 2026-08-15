@@ -569,7 +569,7 @@ enum ClaudeToolSemantics {
         switch tool {
         case "Bash":
             return input["description"]?.stringValue ?? input["command"]?.stringValue
-        case "Read", "Write", "Edit", "NotebookEdit":
+        case "Read", "Write", "Edit", "NotebookEdit", "LS", "Delete", "ReadLints":
             return input["file_path"]?.stringValue.map {
                 URL(fileURLWithPath: $0).lastPathComponent
             }

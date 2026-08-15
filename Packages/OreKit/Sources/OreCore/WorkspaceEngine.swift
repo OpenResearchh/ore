@@ -871,6 +871,12 @@ public actor WorkspaceEngine {
     /// history nobody is going back to.
     private static let checkpointDepth = 250
 
+    /// How many checkpoints may be captured before the next sweep. Sweeping on
+    /// every turn put a transcript read on the path a queued message drains
+    /// through, for a condition that can only become true once in fifty turns.
+    private static let checkpointPruneInterval = 50
+    private var checkpointsSincePrune = 0
+
     /// Drops checkpoint refs for turns far enough back that no one will revert
     /// to them, so a long-lived workspace stops accumulating one pinned tree
     /// per turn it has ever run.
@@ -879,6 +885,10 @@ public actor WorkspaceEngine {
     /// losing old snapshots is a cost worth paying, failing to take a new one
     /// is not.
     private func pruneCheckpoints() async {
+        checkpointsSincePrune += 1
+        guard checkpointsSincePrune >= Self.checkpointPruneInterval else { return }
+        checkpointsSincePrune = 0
+
         var turns: [TurnRecord] = []
         for chatID in chats.keys {
             turns += (try? await store.turns(chatID: chatID)) ?? []

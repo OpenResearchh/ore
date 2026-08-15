@@ -7,6 +7,24 @@ import Testing
 @testable import OrePersistence
 @testable import OreProtocol
 
+/// Waits for a condition instead of guessing how long it takes.
+///
+/// A fixed `Task.sleep` has to be long enough for the slowest machine that will
+/// ever run it, which makes it both slow everywhere and still flaky on a loaded
+/// CI runner. Polling returns as soon as the work lands and only spends the
+/// full timeout when something is genuinely wrong.
+func waitUntil(
+    timeout: Duration = .seconds(5),
+    _ condition: () async throws -> Bool
+) async rethrows -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if try await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return try await condition()
+}
+
 /// The engine's job is wiring: checkpoints around turns, the message queue,
 /// unread derivation, revert. A scripted harness makes the agent's behaviour an
 /// input, so these test the wiring rather than a model's output.
@@ -194,7 +212,7 @@ struct WorkspaceEngineTests {
         session.emit(.turnCompleted(TurnResult(
             turnID: TurnID(rawValue: "t1"), outcome: .completed
         )))
-        try await Task.sleep(for: .milliseconds(500))
+        _ = await waitUntil { await session.messageTexts().count == 2 }
 
         #expect(await session.messageTexts() == ["first", "second"])
         #expect(try await harness.store.queuedMessages(

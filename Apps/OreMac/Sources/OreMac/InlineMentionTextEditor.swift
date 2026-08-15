@@ -1,4 +1,5 @@
 import AppKit
+import OreProtocol
 import SwiftUI
 
 /// The prompt editor needs one capability SwiftUI's `TextEditor` does not
@@ -14,6 +15,50 @@ enum PasteOutcome {
     /// Handled, and this token should be typed in at the caret (e.g. an inline
     /// chip pointing at a pasted image).
     case insert(String)
+}
+
+/// Attachments that belong with composer text, so ⌘C / ⌘V across tabs keeps
+/// `@` chips and the shelf instead of leaving bare filenames.
+enum ComposerPasteboard {
+    static let type = NSPasteboard.PasteboardType("app.ore.composer-draft")
+
+    struct Payload: Codable, Equatable {
+        var attachments: [Attachment]
+        var inlinePaths: [String]
+    }
+
+    static func write(_ payload: Payload, to pasteboard: NSPasteboard) {
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        pasteboard.setData(data, forType: type)
+    }
+
+    static func read(from pasteboard: NSPasteboard) -> Payload? {
+        guard let data = pasteboard.data(forType: type) else { return nil }
+        return try? JSONDecoder().decode(Payload.self, from: data)
+    }
+
+    static func payload(
+        forCopiedText text: String,
+        fullDraft: String,
+        attachments: [Attachment],
+        inlinePaths: Set<String>
+    ) -> Payload {
+        let mentioned = attachments.filter { text.contains("@\($0.displayName)") }
+        let shelf = attachments.filter {
+            $0.relativePath.hasPrefix(".context/attachments/")
+                && !inlinePaths.contains($0.relativePath)
+        }
+        let copyingWholeDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            == fullDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        var items = mentioned
+        if copyingWholeDraft {
+            for item in shelf where !items.contains(item) { items.append(item) }
+        }
+        let inlines = items
+            .map(\.relativePath)
+            .filter { inlinePaths.contains($0) }
+        return Payload(attachments: items, inlinePaths: inlines)
+    }
 }
 
 extension NSAttributedString.Key {
@@ -140,6 +185,9 @@ struct InlineMentionTextEditor: NSViewRepresentable {
     /// handled, `.insert` to drop a token at the caret, or `.ignored` to let the
     /// editor paste as usual.
     var onPaste: (NSPasteboard) -> PasteOutcome = { _ in .ignored }
+    /// Called after the system writes the selected text so the composer can
+    /// attach chip metadata to the same pasteboard.
+    var onCopy: (NSPasteboard, String) -> Void = { _, _ in }
     /// Given an inline token's name (without the `@`), a file URL to preview when
     /// the pointer rests on it. Return nil for tokens with nothing to show.
     var previewURL: (String) -> URL? = { _ in nil }
@@ -162,6 +210,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
 
         let editor = PromptTextView()
         editor.onPaste = onPaste
+        editor.onCopy = onCopy
         editor.previewURL = previewURL
         editor.mentionNames = mentionNames
         editor.delegate = context.coordinator
@@ -188,6 +237,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         context.coordinator.onTab = onTab
         if let editor = scrollView.documentView as? PromptTextView {
             editor.onPaste = onPaste
+            editor.onCopy = onCopy
             editor.previewURL = previewURL
             editor.mentionNames = mentionNames
         }
@@ -330,6 +380,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
 /// a chip previews the file.
 final class PromptTextView: NSTextView {
     var onPaste: ((NSPasteboard) -> PasteOutcome)?
+    var onCopy: ((NSPasteboard, String) -> Void)?
     var previewURL: ((String) -> URL?)?
     var mentionNames: [String] = []
 
@@ -348,6 +399,26 @@ final class PromptTextView: NSTextView {
             insertText(token, replacementRange: selectedRange())
             return true
         }
+    }
+
+    override func copy(_ sender: Any?) {
+        let text = copiedText
+        super.copy(sender)
+        onCopy?(NSPasteboard.general, text)
+    }
+
+    override func cut(_ sender: Any?) {
+        let text = copiedText
+        super.cut(sender)
+        onCopy?(NSPasteboard.general, text)
+    }
+
+    private var copiedText: String {
+        let range = selectedRange()
+        if range.length > 0 {
+            return (string as NSString).substring(with: range)
+        }
+        return string
     }
 
     override func paste(_ sender: Any?) {
@@ -376,7 +447,7 @@ final class PromptTextView: NSTextView {
     // A plain-text view advertises only text types, so AppKit never offers it
     // images or file URLs. Advertise them too, so paste reaches `readSelection`.
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
-        [.png, .tiff, .fileURL] + super.readablePasteboardTypes
+        [ComposerPasteboard.type, .png, .tiff, .fileURL] + super.readablePasteboardTypes
     }
 
     // MARK: - Hover preview

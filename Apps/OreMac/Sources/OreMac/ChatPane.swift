@@ -35,6 +35,20 @@ struct ChatPane: View {
     @State private var renameChatText = ""
     @State private var workspaceFileIndex: [WorkspaceFileNode] = []
     @FocusState private var composerFocused: Bool
+    @State private var voice = VoiceInputController()
+    @State private var voicePrefix = ""
+    @State private var voiceAttachedClipboard = false
+    /// What dictation has recognized so far, shown as a fading trail so the user
+    /// can see which words were taken out of the prompt and what they changed.
+    @State private var voiceChanges: [VoiceChange] = []
+    /// Recognized live but not committed until the mic stops: switching harness
+    /// tears down the agent session, which is far too costly to do on a partial
+    /// transcript the recognizer may still revise.
+    @State private var voicePendingModel: VoiceModelCandidate?
+    /// The exact draft text dictation last wrote, so the composer's
+    /// user-edited-the-text check can tell our own writes apart.
+    @State private var voiceAppliedDraft: String?
+    private var hotkey: VoiceHotkeyMonitor { .shared }
 
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
@@ -277,6 +291,40 @@ struct ChatPane: View {
                 next.contains { $0.relativePath == path }
             }
             model.setDraft(value, for: chatSummary)
+            // Dictation rewrites the draft itself to strip settings clauses, and
+            // that write must not look like the user typing — otherwise it would
+            // discard the words the recognizer has already given us.
+            if voice.isActive, value != voiceAppliedDraft {
+                let raw = VoiceDraft.combined(prefix: voicePrefix, transcript: voice.transcript)
+                if value != raw {
+                    voicePrefix = value
+                    voice.discardRecognizedSoFar()
+                }
+            }
+        }
+        .onChange(of: voice.transcript) { _, text in
+            guard voice.isActive else { return }
+            applyLiveVoiceIntents(spoken: text)
+        }
+        .onChange(of: chatSummary?.id) { _, _ in
+            finishVoiceIfNeeded()
+            voiceAttachedClipboard = false
+        }
+        .onChange(of: hotkey.command) { _, command in
+            // Panes exist for background workspaces too; only the one on screen
+            // should answer the global chord.
+            guard let command, model.selectedWorkspaceID == workspace.id else { return }
+            switch command.kind {
+            case .toggle: toggleVoice()
+            case .start: if !voice.isActive { startVoice() }
+            case .stop: finishVoiceIfNeeded()
+            }
+        }
+        .onDisappear {
+            finishVoiceIfNeeded()
+        }
+        .onExitCommand {
+            finishVoiceIfNeeded()
         }
         .task(id: chatSummary?.id) {
             let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
@@ -837,6 +885,18 @@ struct ChatPane: View {
                 .transition(.opacity)
             }
 
+            if !voiceChanges.isEmpty {
+                VoiceChangeTrail(changes: voiceChanges)
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .asymmetric(
+                                insertion: .opacity.combined(with: .offset(y: 6)),
+                                removal: .opacity
+                            )
+                    )
+            }
+
             if !externalAttachments.isEmpty {
                 AttachmentChipStrip(
                     attachments: externalAttachments.map {
@@ -919,6 +979,7 @@ struct ChatPane: View {
                     .map(\.displayName),
                 onTab: acceptFirstMentionSuggestion,
                 onPaste: handlePasteboard,
+                onCopy: handleComposerCopy,
                 previewURL: previewURL(for:)
             )
                 .frame(height: min(max(composerTextHeight + 16, 38), 200))
@@ -988,8 +1049,8 @@ struct ChatPane: View {
                     ContextMeter(used: usage.totalContextTokens, window: window)
                 }
 
-                Spacer(minLength: OreTheme.Space.xs)
-                sendButton
+                Spacer(minLength: OreTheme.Space.md)
+                composerSendCluster
             }
 
             HStack(spacing: OreTheme.Space.xs) {
@@ -997,8 +1058,8 @@ struct ChatPane: View {
                 modelChooserButton(for: tab)
                 permissionChip
                 modeControls(for: tab)
-                Spacer(minLength: OreTheme.Space.xs)
-                sendButton
+                Spacer(minLength: OreTheme.Space.md)
+                composerSendCluster
             }
         }
         .frame(minHeight: 34)
@@ -1131,8 +1192,8 @@ struct ChatPane: View {
 
     private func modelChipLabel(for tab: ChatSummary) -> some View {
         HStack(spacing: 6) {
-            HarnessMark(harness: tab.harness, size: 17)
-            Text(modelDisplayName(for: tab))
+            HarnessMark(harness: voicePendingModel?.harness ?? tab.harness, size: 17)
+            Text(voicePendingModel?.displayName ?? modelDisplayName(for: tab))
                 .font(.system(size: OreTheme.Font.body))
                 .lineLimit(1)
                 .contentTransition(.numericText())
@@ -1140,13 +1201,19 @@ struct ChatPane: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 26)
-        .background(OreTheme.subduedFill, in: Capsule())
+        .background(
+            voicePendingModel == nil ? AnyShapeStyle(OreTheme.subduedFill)
+                : AnyShapeStyle(Color.accentColor.opacity(0.16)),
+            in: Capsule()
+        )
         .overlay {
             Capsule().stroke(
-                modelScrollProgress == 0
-                    ? OreTheme.hairline
-                    : Color.accentColor.opacity(0.25 + 0.45 * abs(modelScrollProgress)),
-                lineWidth: 1
+                voicePendingModel != nil
+                    ? Color.accentColor.opacity(0.75)
+                    : modelScrollProgress == 0
+                        ? OreTheme.hairline
+                        : Color.accentColor.opacity(0.25 + 0.45 * abs(modelScrollProgress)),
+                lineWidth: voicePendingModel != nil ? 1.5 : 1
             )
         }
         .overlay(alignment: .trailing) {
@@ -1304,6 +1371,227 @@ struct ChatPane: View {
         }
     }
 
+    /// Mic and send are one trailing pair: same 30pt circle, 8pt between them,
+    /// and a wider gap from the chips so the accent action isn't crowded.
+    private var composerSendCluster: some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            micButton
+            sendButton
+        }
+    }
+
+    private var micButton: some View {
+        Button(action: toggleVoice) {
+            Group {
+                if case .downloadingModel = voice.status {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: voice.isListening ? "mic.fill" : "mic")
+                        .font(.system(size: 13, weight: .semibold))
+                        .symbolEffect(.pulse, isActive: voice.isListening && !reduceMotion)
+                }
+            }
+            .foregroundStyle(voice.isListening ? Color.red : .primary)
+            .frame(width: 30, height: 30)
+            .background(
+                voice.isListening ? Color.red.opacity(0.14) : OreTheme.subduedFill,
+                in: Circle()
+            )
+            .overlay(
+                Circle().stroke(
+                    voice.isListening ? Color.red.opacity(0.45) : OreTheme.hairline,
+                    lineWidth: 1
+                )
+            )
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("m", modifiers: [.option, .command])
+        .help(micHelp)
+    }
+
+    private var micHelp: String {
+        switch voice.status {
+        case .listening: return "Stop dictation (Esc)"
+        case .downloadingModel: return "Downloading on-device speech model…"
+        case .requestingPermission: return "Waiting for microphone permission…"
+        case .error(let message): return message
+        case .idle: return "Dictate prompt (⌥⌘M)"
+        }
+    }
+
+    private func toggleVoice() {
+        if voice.isActive {
+            finishVoiceIfNeeded()
+        } else {
+            startVoice()
+        }
+    }
+
+    private func startVoice() {
+        guard !voice.isActive else { return }
+        voiceAttachedClipboard = false
+        voicePendingModel = nil
+        voiceChanges = []
+        voiceAppliedDraft = nil
+        voicePrefix = draft
+        composerFocused = true
+        voice.start()
+    }
+
+    private func finishVoiceIfNeeded() {
+        guard voice.isActive else { return }
+        let spoken = voice.transcript
+        voice.stop()
+        guard !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            clearVoiceTrail()
+            return
+        }
+        applyVoiceIntents(spoken: spoken)
+    }
+
+    /// Runs on every partial transcript. Extraction costs well under a
+    /// millisecond now that it is plain alias matching, so the chips can track
+    /// speech instead of waiting for the mic to stop.
+    ///
+    /// Effort and mode are applied immediately — they are local state. The model
+    /// is only *shown*; committing it is deferred to `applyVoiceIntents`.
+    private func applyLiveVoiceIntents(spoken: String) {
+        let intents = voiceIntents(from: spoken)
+
+        if let effort = intents.effort, let tab = chatSummary,
+           availableEfforts(for: tab).contains(effort), effort != reasoningEffort {
+            reasoningEffort = effort
+        }
+        if let mode = intents.permissionMode, mode != workspace.permissionMode {
+            model.setPermissionMode(mode, for: workspace.id)
+        }
+
+        // Recognized settings are sticky for the rest of the dictation. A later
+        // partial no longer mentions the model — and if the user edits the
+        // composer mid-dictation the spoken words are dropped entirely — so
+        // reading them off the newest transcript alone would make the chip
+        // flicker back and lose the change before it is committed.
+        let animation: Animation? = reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.72)
+        withAnimation(animation) {
+            if let chosen = intents.model { voicePendingModel = chosen }
+            mergeVoiceChanges(intents.changes)
+        }
+
+        let combined = VoiceDraft.combined(prefix: voicePrefix, transcript: intents.rewritten)
+        voiceAppliedDraft = combined
+        draft = combined
+    }
+
+    /// Latest value per kind, first-spoken order.
+    private func mergeVoiceChanges(_ incoming: [VoiceChange]) {
+        guard !incoming.isEmpty else { return }
+        var merged = voiceChanges
+        for change in incoming {
+            if let index = merged.firstIndex(where: { $0.kind == change.kind }) {
+                merged[index] = change
+            } else {
+                merged.append(change)
+            }
+        }
+        voiceChanges = merged
+    }
+
+    private func clearVoiceTrail() {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.45)) {
+            voiceChanges = []
+            voicePendingModel = nil
+        }
+    }
+
+    private func voiceIntents(from spoken: String) -> VoiceIntents {
+        VoiceIntentExtractor.extract(
+            from: spoken,
+            catalog: voiceSettingsCatalog()
+        )
+    }
+
+    private func voiceSettingsCatalog() -> VoiceSettingsCatalog {
+        VoiceSettingsCatalog(
+            models: HarnessKind.allCases.flatMap { harness -> [VoiceModelCandidate] in
+                // Naming only the harness ("switch to Codex") should land on the
+                // model the user actually defaults to, not the catalog's first row.
+                let fallback = model.defaultModelID(for: harness)
+                return model.knownModels(for: harness).map {
+                    VoiceModelCandidate(
+                        harness: harness,
+                        id: $0.id,
+                        displayName: $0.displayName,
+                        isDefault: $0.id == fallback
+                    )
+                }
+            },
+            efforts: chatSummary.map { availableEfforts(for: $0) } ?? Array(ReasoningEffort.allCases),
+            modes: Array(PermissionMode.allCases)
+        )
+    }
+
+    /// Clipboard and mode/model/effort — applied when dictation ends, not on
+    /// every partial transcript. Spoken filenames are left for the agent.
+    private func applyVoiceIntents(spoken: String) {
+        let intents = voiceIntents(from: spoken)
+        var rewritten = intents.rewritten
+
+        if intents.attachClipboard, !voiceAttachedClipboard {
+            switch handlePasteboard(NSPasteboard.general, allowComposerDraft: false) {
+            case .insert(let token):
+                voiceAttachedClipboard = true
+                rewritten = VoiceIntentExtractor.incorporateClipboardToken(token, into: rewritten)
+            case .consumed:
+                voiceAttachedClipboard = true
+                rewritten = VoiceIntentExtractor.incorporateClipboardToken("", into: rewritten)
+            case .ignored:
+                break
+            }
+        }
+
+        if let mode = intents.permissionMode {
+            model.setPermissionMode(mode, for: workspace.id)
+        }
+        // The one change held back from the live pass — this is where the
+        // session actually switches, once the transcript is final. Prefer the
+        // value recognized at any point during dictation over whatever is still
+        // present in the closing transcript.
+        if let chosen = voicePendingModel ?? intents.model, let tab = chatSummary {
+            applyVoiceModel(chosen, to: tab)
+        }
+        if let effort = intents.effort, let tab = chatSummary {
+            let allowed = availableEfforts(for: tab)
+            if allowed.contains(effort) { reasoningEffort = effort }
+        }
+
+        let combined = VoiceDraft.combined(prefix: voicePrefix, transcript: rewritten)
+        voiceAppliedDraft = combined
+        draft = combined
+        voicePendingModel = nil
+
+        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+            mergeVoiceChanges(intents.changes)
+        }
+
+        // Let the trail sit long enough to read, then fade it out.
+        guard !voiceChanges.isEmpty else { return }
+        let generation = voiceChanges
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            guard voiceChanges == generation else { return }
+            clearVoiceTrail()
+        }
+    }
+
+    private func applyVoiceModel(_ chosen: VoiceModelCandidate, to tab: ChatSummary) {
+        if chosen.harness == tab.harness {
+            model.setModel(chosen.id, for: tab)
+        } else {
+            model.switchHarness(chosen.harness, model: chosen.id, for: tab)
+        }
+    }
+
     @ViewBuilder
     private var sendButton: some View {
         if #available(macOS 26.0, *) {
@@ -1335,7 +1623,10 @@ struct ChatPane: View {
     }
 
     private var placeholder: String {
-        chat.draftComments.isEmpty
+        if voice.isListening { return "Listening…" }
+        if case .downloadingModel = voice.status { return "Downloading speech model…" }
+        if case .error(let message) = voice.status { return message }
+        return chat.draftComments.isEmpty
             ? "Ask the agent to do something…"
             : "\(chat.draftComments.count) review comment"
                 + (chat.draftComments.count == 1 ? "" : "s")
@@ -1343,6 +1634,7 @@ struct ChatPane: View {
     }
 
     private func send() {
+        finishVoiceIfNeeded()
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let outgoing = attachments
         guard !text.isEmpty || !outgoing.isEmpty else { return }
@@ -1456,6 +1748,16 @@ struct ChatPane: View {
     /// screenshot is written out as a PNG chip; a long text dump becomes
     /// `@pasted-text.txt` at the caret. Short text still types in as usual.
     private func handlePasteboard(_ pasteboard: NSPasteboard) -> PasteOutcome {
+        handlePasteboard(pasteboard, allowComposerDraft: true)
+    }
+
+    private func handlePasteboard(
+        _ pasteboard: NSPasteboard,
+        allowComposerDraft: Bool
+    ) -> PasteOutcome {
+        if allowComposerDraft, restoreComposerDraft(from: pasteboard) {
+            return .ignored
+        }
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
@@ -1478,6 +1780,33 @@ struct ChatPane: View {
             return addPastedText(text)
         }
         return .ignored
+    }
+
+    private func handleComposerCopy(_ pasteboard: NSPasteboard, selectedText: String) {
+        let payload = ComposerPasteboard.payload(
+            forCopiedText: selectedText,
+            fullDraft: draft,
+            attachments: attachments,
+            inlinePaths: inlinePastedPaths
+        )
+        guard !payload.attachments.isEmpty else { return }
+        ComposerPasteboard.write(payload, to: pasteboard)
+    }
+
+    /// Rehydrates `@` chips and the shelf when composer text is pasted into
+    /// another tab. Files already live in this worktree; we only restore the
+    /// attachment records so the tokens style again.
+    @discardableResult
+    private func restoreComposerDraft(from pasteboard: NSPasteboard) -> Bool {
+        guard let payload = ComposerPasteboard.read(from: pasteboard),
+              !payload.attachments.isEmpty else { return false }
+        var next = attachments
+        for item in payload.attachments where !next.contains(where: { $0.relativePath == item.relativePath }) {
+            next.append(item)
+        }
+        persistAttachments(next)
+        inlinePastedPaths.formUnion(payload.inlinePaths)
+        return true
     }
 
     /// Writes each pasted image out and returns the `@name` tokens to insert at
@@ -2018,6 +2347,64 @@ private struct ShortcutHint: View {
                 .background(Color.primary.opacity(0.065), in: RoundedRectangle(cornerRadius: 5))
                 .overlay { RoundedRectangle(cornerRadius: 5).stroke(OreTheme.hairline) }
             Text(label).font(.system(size: 11.5)).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The words dictation took out of the prompt, and what they set.
+///
+/// Voice silently deletes part of what you said — "switch this chat to Opus 5"
+/// never reaches the agent. Showing the struck-through phrase next to the new
+/// value is what makes that legible rather than alarming.
+private struct VoiceChangeTrail: View {
+    let changes: [VoiceChange]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Image(systemName: "waveform")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .symbolEffect(.pulse, isActive: !reduceMotion)
+
+            ForEach(changes) { change in
+                HStack(spacing: 5) {
+                    if !change.consumed.isEmpty {
+                        Text(change.consumed)
+                            .strikethrough(true, color: .secondary.opacity(0.7))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 190, alignment: .leading)
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Label(change.label, systemImage: change.symbol)
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                }
+                .font(.system(size: 11))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.accentColor.opacity(0.10), in: Capsule())
+                .transition(reduceMotion ? .opacity : .scale(scale: 0.9).combined(with: .opacity))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 2)
+        .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75), value: changes)
+    }
+}
+
+private extension VoiceChange {
+    var symbol: String {
+        switch kind {
+        case .model: "cpu"
+        case .effort: "gauge.with.dots.needle.67percent"
+        case .mode: "lock.shield"
+        case .clipboard: "doc.on.clipboard"
         }
     }
 }

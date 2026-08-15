@@ -394,10 +394,8 @@ struct ReviewPane: View {
     private var fileList: some View {
         VStack(spacing: 0) {
             HStack(spacing: OreTheme.Space.sm) {
-                Text("\(diffs.count) file\(diffs.count == 1 ? "" : "s")")
-                    .foregroundStyle(.secondary)
-                Spacer()
                 changesLayoutToggle
+                Spacer()
                 Text("\(viewedPaths.count)/\(diffs.count) viewed")
                     .foregroundStyle(.secondary)
                 Text("+\(diffs.reduce(0) { $0 + $1.insertions })")
@@ -559,8 +557,11 @@ struct ReviewPane: View {
         Set((workingTree?.files ?? []).filter(\.isStaged).map(\.path))
     }
 
+    /// Staging already has a home on the Commits tab. Changes only splits into
+    /// Unstaged / Staged / Committed when more than one of those is present —
+    /// a lone "UNSTAGED" header just repeats the tab count and +/- totals.
     private var showsChangeBuckets: Bool {
-        !unstagedPaths.isEmpty || !stagedPaths.isEmpty
+        ChangeBucket.allCases.filter { !diffs(in: $0).isEmpty }.count > 1
     }
 
     private func bucket(for path: String) -> ChangeBucket {
@@ -1263,11 +1264,11 @@ private struct CommentSheet: View {
     }
 }
 
-/// The GitLens-style strip above the action bar: what's committed but not
-/// shipped, and what CI thinks of what was. Two tabs — Commits (unpushed
-/// work) and Checks (the PR's live check runs) — with the panel switching
-/// itself to Checks when runs start or change state, since that's the moment
-/// the user is actually waiting on.
+/// The GitLens-style strip above the action bar: uncommitted work, commits
+/// not yet on any remote, and what CI thinks of what was pushed. Two tabs —
+/// Commits (unpushed work) and Checks — with the panel switching itself to
+/// Checks when runs start or change state, since that's the moment the user
+/// is actually waiting on.
 private struct ShipStatusPanel: View {
     @Environment(AppModel.self) private var model
     let workspace: WorkspaceSummary
@@ -1297,11 +1298,24 @@ private struct ShipStatusPanel: View {
         }
         .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)") {
             await load()
-            // While checks run, poll — CI progress has no local filesystem
-            // event to ride on. The task dies with the view, so a hidden
-            // panel costs no gh calls.
-            while !Task.isCancelled, pullRequest?.hasRunningChecks == true {
-                try? await Task.sleep(for: .seconds(20))
+            // CI has no local filesystem event to ride on. GitHub often posts
+            // the first check runs several seconds after a push, so poll fast
+            // briefly even before any runs appear — but only inside a short
+            // window measured from this task's start (the task restarts on
+            // every git-status change, i.e. after each push). Without that
+            // bound, a repo with no CI has permanently empty `checks` and would
+            // pin us at a 4s `gh` poll forever.
+            let started = ContinuousClock.now
+            while !Task.isCancelled {
+                guard let pr = pullRequest else { return }
+                let withinFirstRunWindow = started.duration(to: .now) < .seconds(90)
+                // Nothing running and no runs will appear now → let the task end;
+                // the next git-status change restarts it.
+                if pr.checks.isEmpty, !pr.hasRunningChecks, !withinFirstRunWindow {
+                    return
+                }
+                let fast = pr.hasRunningChecks || (pr.checks.isEmpty && withinFirstRunWindow)
+                try? await Task.sleep(for: .seconds(fast ? 4 : 12))
                 guard !Task.isCancelled else { return }
                 await load()
             }
@@ -1729,15 +1743,19 @@ struct GitActionToolbar: View {
                     .labelStyle(.titleAndIcon)
                     .font(.system(size: OreTheme.Font.body, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .help(title)
+                    .help("\(title). \(shortcutHint)")
             case .action(let title):
                 Button {
                     perform()
                 } label: {
                     Label(title, systemImage: icon)
+                        .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(OreGitActionButtonStyle(tone: tone))
                 .help(actionHelp)
+                .fixedSize()
+                .accessibilityLabel(title)
+                .accessibilityHint(actionHelp)
             }
 
             if case .merged = action {
@@ -1819,14 +1837,34 @@ struct GitActionToolbar: View {
         }
     }
 
+    private var shortcutHint: String { "⌥⌘G" }
+
     private var actionHelp: String {
         switch action {
         case .commit:
-            return "Draft a commit prompt in chat so the agent can write the message from the diff"
+            return "Commit these changes. The agent writes the message from the diff. (\(shortcutHint))"
+        case .push(let count, let isFirst):
+            return isFirst
+                ? "Publish this branch to origin. (\(shortcutHint))"
+                : "Push \(count) unpushed commit\(count == 1 ? "" : "s") to origin. (\(shortcutHint))"
         case .createPullRequest:
-            return "Draft a pull-request prompt in chat so the agent can write the title and body"
+            return "Draft a pull-request prompt in chat so the agent can write the title and body. (\(shortcutHint))"
+        case .createGitHubRepo:
+            return "Create a GitHub repository for this project and publish the branch. (\(shortcutHint))"
+        case .fixFailingChecks:
+            return "Hand the failing CI logs to the agent. (\(shortcutHint))"
+        case .resolveConflicts:
+            return "Ask the agent to rebase and resolve conflicts. (\(shortcutHint))"
+        case .merge:
+            return "Merge this pull request. (\(shortcutHint))"
+        case .retargetAfterParentMerged:
+            return "Point this pull request at the new base. (\(shortcutHint))"
+        case .merged:
+            return "Start a fresh branch from the merged base. (\(shortcutHint))"
+        case .setUpGitHub:
+            return "Sign in to GitHub with gh so this workspace can push and open PRs."
         default:
-            return action.title
+            return "\(action.title). (\(shortcutHint))"
         }
     }
 
@@ -1852,20 +1890,10 @@ struct GitActionToolbar: View {
     }
 
     private func perform() {
-        if case .merged = action {
-            model.continueAfterMerge(workspace.id)
-        } else if case .createPullRequest(let defaultBase, let isStacked) = action {
-            model.createPullRequest(
-                base: chosenBase ?? defaultBase,
-                isStacked: isStacked,
-                for: workspace
-            )
+        if case .createPullRequest(let defaultBase, _) = action {
+            model.performSuggestedGitAction(for: workspace, baseOverride: chosenBase ?? defaultBase)
         } else {
-            model.performGitAction(action, for: workspace)
-        }
-        Task {
-            try? await Task.sleep(for: .milliseconds(500))
-            _ = try? await model.refreshDiff(for: workspace)
+            model.performSuggestedGitAction(for: workspace)
         }
     }
 }

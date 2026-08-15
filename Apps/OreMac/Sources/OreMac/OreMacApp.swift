@@ -66,6 +66,9 @@ struct OreMacApp: App {
             .frame(minWidth: 1_080, minHeight: 650)
             .task {
                 model.start()
+                // Tap ⌥⌘ anywhere to dictate. Without Accessibility this still
+                // works while ORE is frontmost, so it is never dead.
+                VoiceHotkeyMonitor.shared.start()
                 await requestNotificationPermission()
                 // Sparkle owns updates for a signed, appcast-wired build; only
                 // fall back to the GitHub-releases check when it isn't configured
@@ -100,6 +103,12 @@ struct OreMacApp: App {
                 }
                 .keyboardShortcut("a", modifiers: [.control, .command])
                 .disabled(model.selectedWorkspace == nil)
+
+                Button("Next Git Step") {
+                    model.performSuggestedGitAction()
+                }
+                .keyboardShortcut("g", modifiers: [.command, .option])
+                .disabled(!model.canPerformSuggestedGitAction)
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand().environment(updater)
@@ -267,7 +276,7 @@ struct RootView: View {
             )
         }
         .confirmationDialog(
-            "Permanently delete \u{201C}\(model.pendingArchivedDelete?.workspace.name ?? "workspace")\u{201D}?",
+            "Delete \u{201C}\(model.pendingArchivedDelete?.workspace.name ?? "workspace")\u{201D}?",
             isPresented: Binding(
                 get: { model.pendingArchivedDelete != nil },
                 set: { if !$0 { model.pendingArchivedDelete = nil } }
@@ -289,8 +298,9 @@ struct RootView: View {
             Button("Cancel", role: .cancel) { model.pendingArchivedDelete = nil }
         } message: {
             Text(
-                "This permanently removes the workspace, its chats, and its "
-                + "preserved uncommitted work. This cannot be undone."
+                "This stops the agent and removes the worktree from disk. The "
+                + "workspace, its chats, and its preserved uncommitted work are "
+                + "deleted permanently. This cannot be undone."
             )
         }
         .onChange(of: model.attentionCount) { _, count in
@@ -608,7 +618,11 @@ private struct KeyboardShortcutsView: View {
         ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
         ("New tab", "⌘T"), ("Close tab", "⌘W"),
         ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
-        ("Send / queue", "⌘↩"), ("Toggle terminal", "⌥⌘T"),
+        ("Send / queue", "⌘↩"),
+        ("Dictate prompt", "⌥⌘M"), ("Dictate — tap to start/stop", "⇧⌥"),
+        ("Dictate from another app", "hold ⇧⌥"),
+        ("Next git step", "⌥⌘G"),
+        ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),
     ]
 

@@ -217,6 +217,23 @@ struct Sidebar: View {
 
     @ViewBuilder
     private func menu(for workspace: WorkspaceSummary) -> some View {
+        WorkspaceActionsMenu(
+            workspace: workspace,
+            onRename: {
+                renameText = workspace.name
+                renameWorkspace = workspace
+            }
+        )
+    }
+}
+
+/// Actions shared by the row's ⋯ menu and the right-click context menu.
+private struct WorkspaceActionsMenu: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+    let onRename: () -> Void
+
+    var body: some View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.selectFile(
                 nil, inFileViewerRootedAtPath: workspace.worktreePath
@@ -226,10 +243,7 @@ struct Sidebar: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(workspace.branch, forType: .string)
         }
-        Button("Rename…") {
-            renameText = workspace.name
-            renameWorkspace = workspace
-        }
+        Button("Rename…") { onRename() }
         Button(workspace.isPinned ? "Unpin" : "Pin") {
             model.setPinned(!workspace.isPinned, for: workspace.id)
         }
@@ -244,8 +258,8 @@ struct Sidebar: View {
         }
         Divider()
         Button("Archive…") { model.requestArchive(workspace.id) }
-        Button("Delete…", role: .destructive) {
-            model.delete(workspace.id, deleteBranch: false)
+        Button("Delete Worktree…", role: .destructive) {
+            model.requestPermanentDelete(workspace)
         }
     }
 }
@@ -383,14 +397,18 @@ private struct WorkspaceRow: View {
             .font(.caption2.monospacedDigit())
 
             if isHovering || isSelected {
-                Button(action: onRename) {
+                Menu {
+                    WorkspaceActionsMenu(workspace: workspace, onRename: onRename)
+                } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 11, weight: .semibold))
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
                 .buttonStyle(.plain)
-                .help("Rename workspace")
+                .help("Workspace actions")
             } else if let shortcutIndex {
                 Text("⌘\(shortcutIndex)")
                     .font(.system(size: 10, weight: .medium, design: .rounded))

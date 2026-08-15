@@ -38,3 +38,50 @@ struct CommitInfoTests {
         #expect(minusOnly?.insertions == 0)
     }
 }
+
+struct UnpushedCommitsTests {
+    @Test func unpushedCommitsFallBackToRangeWhenThereIsNoRemote() async throws {
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("next.md", "n\n")
+        try await fixture.run(["add", "next.md"])
+        try await fixture.commit("second")
+        let commits = try await fixture.git.unpushedCommits(fallbackRange: "HEAD~1..HEAD")
+        #expect(commits.map(\.subject) == ["second"])
+    }
+
+    @Test func unpushedCommitsIgnoreHistoryAlreadyOnAnotherRemoteBranch() async throws {
+        let fixture = try await GitFixture.initialized()
+        let origin = fixture.root.appendingPathComponent("origin.git")
+        try await fixture.run(["init", "-q", "--bare", origin.path])
+        try await fixture.run(["remote", "add", "origin", origin.path])
+        try await fixture.run(["push", "-u", "origin", "main"])
+
+        try await fixture.run(["checkout", "-q", "-b", "feature"])
+        try await fixture.run(["push", "-u", "origin", "feature"])
+
+        try await fixture.run(["checkout", "-q", "main"])
+        try fixture.write("later.md", "later\n")
+        try await fixture.run(["add", "later.md"])
+        try await fixture.commit("later on main")
+        try await fixture.run(["push", "origin", "main"])
+
+        // Fast-forward the feature branch onto main the way a developer catching
+        // up does. @{upstream} is still origin/feature, so a naive
+        // `@{u}..HEAD` would list "later on main" as unpushed.
+        try await fixture.run(["checkout", "-q", "feature"])
+        try await fixture.run(["merge", "-q", "--ff-only", "main"])
+
+        let afterFastForward = try await fixture.git.unpushedCommits(
+            fallbackRange: "main..HEAD"
+        )
+        #expect(afterFastForward.isEmpty)
+        #expect(await fixture.git.unpushedCommitCount() == 0)
+
+        try fixture.write("wip.md", "wip\n")
+        try await fixture.run(["add", "wip.md"])
+        try await fixture.commit("local only")
+        let afterLocal = try await fixture.git.unpushedCommits(fallbackRange: "main..HEAD")
+        #expect(afterLocal.map(\.subject) == ["local only"])
+        #expect(await fixture.git.unpushedCommitCount() == 1)
+    }
+}

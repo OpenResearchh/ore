@@ -1042,7 +1042,7 @@ final class TranscriptCell: NSTableCellView {
             ).render(row.text)
 
         case .toolCall, .thinking, .error:
-            rendered = processText(for: row)
+            rendered = processText(for: row, worktreePath: worktreePath)
 
         case .activityGroup:
             rendered = activityGroupText(for: row)
@@ -1479,7 +1479,7 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
-    private static func processText(for row: TranscriptRow) -> NSAttributedString {
+    private static func processText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let item = processPresentation(for: row)
         let result = NSMutableAttributedString()
         let processImage = NSImage(systemSymbolName: item.icon, accessibilityDescription: nil)?
@@ -1521,13 +1521,16 @@ final class TranscriptCell: NSTableCellView {
                 height: pill.size.height
             )
             result.append(NSAttributedString(attachment: attachment))
-            if let path = item.filePath,
-               let url = MarkdownRenderer.fileReferenceURL(path) {
-                result.addAttribute(
-                    .link,
-                    value: url,
-                    range: NSRange(location: subjectStart, length: result.length - subjectStart)
-                )
+            if let path = item.filePath {
+                let chipRange = NSRange(location: subjectStart, length: result.length - subjectStart)
+                if let url = MarkdownRenderer.fileReferenceURL(path) {
+                    result.addAttribute(.link, value: url, range: chipRange)
+                }
+                if let preview = hoverPreviewURL(for: path, worktreePath: worktreePath) {
+                    let lineRange = NSRange(location: 0, length: result.length)
+                    result.addAttribute(.oreAttachmentPreview, value: preview, range: lineRange)
+                    result.addAttribute(.cursor, value: NSCursor.pointingHand, range: lineRange)
+                }
             }
         } else if item.insertions > 0 || item.deletions > 0 {
             if item.insertions > 0 {
@@ -1972,6 +1975,21 @@ final class TranscriptCell: NSTableCellView {
             return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .systemPurple, subject: compact(query))
         }
         return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
+    }
+
+    /// Hover preview for image chips in tool rows (Read image, pasted screenshots).
+    /// Source-file chips stay click-to-open only — previewing a whole Swift file
+    /// on hover would be noise.
+    private static func hoverPreviewURL(for path: String, worktreePath: String) -> URL? {
+        let ext = (path as NSString).pathExtension.lowercased()
+        guard ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp"].contains(ext) else {
+            return nil
+        }
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
+        }
+        guard !worktreePath.isEmpty else { return nil }
+        return URL(fileURLWithPath: worktreePath).appendingPathComponent(path)
     }
 
     /// The agent's task list, as a row that names the task it touched.

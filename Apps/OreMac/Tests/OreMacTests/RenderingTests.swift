@@ -583,6 +583,29 @@ struct UserMessageAttachmentTests {
         #expect(TranscriptCell.attributedText(for: list).string.contains("List"))
     }
 
+    @Test func readImageToolChipsOfferAHoverPreview() {
+        let row = TranscriptRow(
+            id: "tool-image",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "pasted-image.png",
+            toolName: "Read",
+            toolCallID: ToolCallID(rawValue: "c-img"),
+            toolInput: .object([
+                "file_path": .string(".context/attachments/FE9CEC65-pasted-image.png")
+            ])
+        )
+        let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
+        #expect(rendered.string.contains("Read image"))
+        var preview: URL?
+        rendered.enumerateAttributes(
+            in: NSRange(location: 0, length: rendered.length)
+        ) { attributes, _, _ in
+            if let url = attributes[.oreAttachmentPreview] as? URL { preview = url }
+        }
+        #expect(preview?.lastPathComponent == "FE9CEC65-pasted-image.png")
+    }
+
     @Test func appendingAUserMessageStoresAttachmentsOnTheRow() {
         let state = ChatState()
         state.appendUserMessage(

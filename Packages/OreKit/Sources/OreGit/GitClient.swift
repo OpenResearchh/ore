@@ -141,12 +141,54 @@ public actor GitClient {
     public func commits(
         range: String, in directory: URL? = nil, limit: Int = 50
     ) async throws -> [CommitInfo] {
+        try await logCommits(revisionArguments: [range], in: directory, limit: limit)
+    }
+
+    /// Commits on HEAD that aren't on any remote-tracking branch.
+    ///
+    /// That's "what `git push` would actually send", not "what's ahead of a
+    /// possibly stale `@{upstream}`". Fast-forwarding onto `origin/main` used
+    /// to dump that already-published history into the ship panel as if it
+    /// were unpushed work.
+    ///
+    /// With no remotes configured, falls back to `fallbackRange` (typically
+    /// `baseBranch..HEAD`).
+    public func unpushedCommits(
+        fallbackRange: String,
+        in directory: URL? = nil,
+        limit: Int = 50
+    ) async throws -> [CommitInfo] {
+        if await hasRemote() {
+            return try await logCommits(
+                revisionArguments: ["HEAD", "--not", "--remotes"],
+                in: directory,
+                limit: limit
+            )
+        }
+        return try await commits(range: fallbackRange, in: directory, limit: limit)
+    }
+
+    /// How many commits `unpushedCommits` would list. 0 when there is no remote
+    /// — the caller should use `baseBranch..HEAD` in that case.
+    public func unpushedCommitCount(in directory: URL? = nil) async -> Int {
+        guard await hasRemote() else { return 0 }
+        guard let output = try? await run(
+            ["rev-list", "--count", "HEAD", "--not", "--remotes"],
+            in: directory
+        ) else { return 0 }
+        return Int(output.trimmedStandardOutput) ?? 0
+    }
+
+    private func logCommits(
+        revisionArguments: [String],
+        in directory: URL?,
+        limit: Int
+    ) async throws -> [CommitInfo] {
         let output = try await run([
             "log", "--max-count=\(limit)",
             "--format=%H%x1f%h%x1f%s%x1f%an%x1f%aI",
             "--shortstat",
-            range,
-        ], in: directory)
+        ] + revisionArguments, in: directory)
         return CommitInfo.parseLog(output.standardOutput)
     }
 

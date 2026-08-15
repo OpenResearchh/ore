@@ -1151,13 +1151,15 @@ public actor WorkspaceEngine {
         publishChatChange(runtime)
     }
 
-    /// The commits the ship panel lists: not yet pushed to the upstream, or —
-    /// before a first push creates one — everything ahead of the base.
+    /// The commits the ship panel lists: not yet on any remote, or — with no
+    /// remote at all — everything ahead of the base. Comparing only against
+    /// `@{upstream}` treated fast-forwards onto `origin/main` as unpushed work.
     public func unpushedCommits(limit: Int = 50) async -> [CommitInfo] {
-        let range = await hasUpstream()
-            ? "@{upstream}..HEAD"
-            : "\(record.baseBranch)..HEAD"
-        return (try? await git.commits(range: range, in: worktreeURL, limit: limit)) ?? []
+        (try? await git.unpushedCommits(
+            fallbackRange: "\(record.baseBranch)..HEAD",
+            in: worktreeURL,
+            limit: limit
+        )) ?? []
     }
 
     /// Live staged / unstaged files for the ship panel and the Changes list.
@@ -1171,7 +1173,10 @@ public actor WorkspaceEngine {
     }
 
     private func unpushedCommitCount() async -> Int {
-        await commitCount(range: "@{upstream}..HEAD")
+        if await git.hasRemote() {
+            return await git.unpushedCommitCount(in: worktreeURL)
+        }
+        return await commitCount(range: "\(record.baseBranch)..HEAD")
     }
 
     private func commitCount(range: String) async -> Int {

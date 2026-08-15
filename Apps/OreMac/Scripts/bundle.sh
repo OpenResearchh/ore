@@ -66,7 +66,7 @@ fi
 
 # Ad-hoc signature: without one, macOS refuses to grant the app the permissions
 # it needs (notifications, and keeping its own preferences).
-codesign --force --sign - "$APP" >/dev/null 2>&1 || \
+codesign --force --sign - --entitlements "$ROOT/Resources/ORE.entitlements" "$APP" >/dev/null 2>&1 || \
   echo "note: could not sign the bundle; it will still run."
 
 echo "Built $APP"

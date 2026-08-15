@@ -158,6 +158,14 @@ struct SettingsView: View {
         }
     }
 
+    private var hotkey: VoiceHotkeyMonitor { .shared }
+
+    private var hotkeyDetail: String {
+        hotkey.isGlobal
+            ? "In ORE, tap to start and tap again to stop. In any other app, hold ⇧⌥ to talk and release to stop."
+            : "Tap to start and stop while ORE is frontmost. Allow Accessibility to also hold ⇧⌥ to talk from any other app."
+    }
+
     private var general: some View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(title: "Workspace defaults", icon: "square.stack.3d.up") {
@@ -172,6 +180,27 @@ struct SettingsView: View {
                 Toggle("Play completion sounds", isOn: $sound)
                     .disabled(!notifications)
             }
+            SettingsCard(title: "Voice input", icon: "mic") {
+                Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
+                SettingsRow(
+                    "Tap ⇧⌥ to dictate",
+                    detail: hotkeyDetail
+                ) {
+                    if hotkey.isGlobal {
+                        Label("Enabled", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .labelStyle(.titleAndIcon)
+                    } else {
+                        Button("Allow…") {
+                            hotkey.requestAccessibility()
+                        }
+                    }
+                }
+            }
+            .onAppear { hotkey.refreshTrust() }
         }
     }
 

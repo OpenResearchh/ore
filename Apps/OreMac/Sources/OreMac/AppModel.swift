@@ -821,6 +821,48 @@ final class AppModel {
         Task { await client.send(.continueAfterMerge(id)) }
     }
 
+    /// The coloured toolbar button — Commit, Push, Create PR, Merge, and so on.
+    /// `baseOverride` is the review pane's "into …" picker; the ⌥⌘G shortcut
+    /// uses the suggested base.
+    func performSuggestedGitAction(
+        for workspace: WorkspaceSummary? = nil,
+        baseOverride: String? = nil
+    ) {
+        guard let workspace = workspace ?? selectedWorkspace else { return }
+        let action = cachedDiff(for: workspace.id)?.gitAction ?? .none
+        switch action {
+        case .merged:
+            continueAfterMerge(workspace.id)
+        case .createPullRequest(let defaultBase, let isStacked):
+            createPullRequest(
+                base: baseOverride ?? defaultBase,
+                isStacked: isStacked,
+                for: workspace
+            )
+        default:
+            guard action.isActionable else { return }
+            performGitAction(action, for: workspace)
+        }
+        Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            _ = try? await refreshDiff(for: workspace)
+        }
+    }
+
+    var selectedGitAction: SuggestedGitAction {
+        guard let id = selectedWorkspaceID else { return .none }
+        return cachedDiff(for: id)?.gitAction ?? .none
+    }
+
+    /// Whether ⌥⌘G has something to run. The actionable steps, plus the
+    /// post-merge "start a fresh branch" state — `.merged` reports as
+    /// non-actionable (it's a status, not a git command) but still has a
+    /// keyboard path through `performSuggestedGitAction`.
+    var canPerformSuggestedGitAction: Bool {
+        if case .merged = selectedGitAction { return true }
+        return selectedGitAction.isActionable
+    }
+
     func performGitAction(_ action: SuggestedGitAction, for workspace: WorkspaceSummary) {
         if let prompt = action.agentDraftPrompt {
             placePromptInComposer(prompt, in: workspace.id)

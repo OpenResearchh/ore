@@ -61,8 +61,36 @@ private enum HarnessBrandAssets {
     static let codex = load("codex")
     static let cursor = load("cursor")
 
+    /// SwiftPM's generated `Bundle.module` resolves the resource bundle from
+    /// `Bundle.main.bundleURL` (the app *root*) and a build-time absolute path —
+    /// neither of which matches a packaged `.app`, where the bundle lands in
+    /// `Contents/Resources`. On a distributed build both lookups miss and
+    /// `Bundle.module` *traps*, so the first harness icon to render takes the
+    /// whole app down (the update prompt is one thing that triggers that first
+    /// render). Resolve the bundle ourselves across the real locations and fall
+    /// back to `nil` — an SF Symbol — rather than a fatal error.
+    private static let resourceBundle: Bundle = {
+        let name = "OreMac_OreMac.bundle"
+        let candidates: [URL?] = [
+            Bundle.main.resourceURL?.appendingPathComponent(name), // Contents/Resources — packaged app
+            Bundle.main.bundleURL.appendingPathComponent(name),    // app root — SwiftPM's expectation
+            Bundle(for: BundleToken.self).resourceURL?.appendingPathComponent(name),
+            Bundle(for: BundleToken.self).bundleURL.appendingPathComponent(name),
+        ]
+        for case let url? in candidates
+        where FileManager.default.fileExists(atPath: url.path) {
+            if let bundle = Bundle(url: url) { return bundle }
+        }
+        // Last resort: look in the main bundle directly (resources may have been
+        // flattened into Contents/Resources). Its lookups return nil when the
+        // icon is absent, so this still degrades gracefully instead of crashing.
+        return .main
+    }()
+
+    private final class BundleToken {}
+
     private static func load(_ name: String) -> NSImage? {
-        guard let url = Bundle.module.url(
+        guard let url = resourceBundle.url(
             forResource: name,
             withExtension: "svg",
             subdirectory: "HarnessIcons"

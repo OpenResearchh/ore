@@ -62,6 +62,16 @@ if [[ -n "${ORE_APPCAST_URL:-}" ]]; then
   /usr/bin/plutil -replace SUFeedURL -string "$ORE_APPCAST_URL" "$APP/Contents/Info.plist"
 fi
 
+# SwiftPM emits each target's resources in a sibling `.bundle` (the harness
+# brand icons, tree-sitter highlight queries, …). Without them the app finds no
+# resource bundle at runtime and every icon lookup would fall back to a generic
+# symbol — or, before the resolver was hardened, crash outright.
+BIN_DIR="$(dirname "$BINARY")"
+for bundle in "$BIN_DIR"/*.bundle; do
+  [[ -e "$bundle" ]] || continue
+  cp -R "$bundle" "$APP/Contents/Resources/"
+done
+
 # Sparkle ships helper tools and an XPC service that must be inside the bundle
 # and signed as part of it.
 SPARKLE_FRAMEWORK="$(find "$BUILD/release" -maxdepth 4 -name 'Sparkle.framework' -type d | head -1 || true)"

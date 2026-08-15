@@ -257,6 +257,45 @@ struct DiffEngineTests {
         #expect(diffs.map(\.path) == ["mine.txt"])
     }
 
+    @Test func aStaleLocalBaseBranchDoesNotInflateTheDiff() async throws {
+        // The local base branch is only as fresh as the last checkout, and
+        // nothing in ORE updates it. Once the real base moved ahead and the
+        // workspace merged it in, every commit the base itself had gained was
+        // reported as this workspace's work — the review pane showed 53 changed
+        // files where the pull request showed 39.
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "stale", baseRevision: "main", baseBranch: "main"
+        )).path
+
+        // The base moves ahead and `origin/main` follows it, but the local
+        // `main` ref stays put — exactly the state of a machine that hasn't
+        // pulled since.
+        let staleLocalBase = try await fixture.git
+            .run(["rev-parse", "main"]).trimmedStandardOutput
+        try fixture.write("theirs.txt", "landed on the base\n")
+        try await fixture.run(["add", "-A"])
+        try await fixture.commit("someone else's merged work")
+        let movedBase = try await fixture.git
+            .run(["rev-parse", "main"]).trimmedStandardOutput
+        try await fixture.run(["update-ref", "refs/remotes/origin/main", movedBase])
+        try await fixture.run(["update-ref", "refs/heads/main", staleLocalBase])
+
+        // The workspace merges the real base in, then makes its own change.
+        try await fixture.run(["merge", "--no-edit", "origin/main"], in: worktree)
+        try fixture.write("mine.txt", "mine\n", in: worktree)
+        try await fixture.run(["add", "-A"], in: worktree)
+        try await fixture.commit("my work", in: worktree)
+
+        let engine = DiffEngine(git: fixture.git)
+        let diffs = try await engine.diffAgainstBase(worktree: worktree, baseBranch: "main")
+
+        // Only our file: `theirs.txt` belongs to the base, however stale the
+        // local ref pointing at it happens to be.
+        #expect(diffs.map(\.path) == ["mine.txt"])
+    }
+
     @Test func turnDiffsComeFromCheckpointRefs() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

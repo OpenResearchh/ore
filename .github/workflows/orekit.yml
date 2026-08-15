@@ -1,0 +1,70 @@
+name: ORE
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  core:
+    name: OreKit (macOS)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Packages/OreKit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build
+
+      # Golden-transcript tests replay recorded CLI output, so the whole suite
+      # runs offline: no agent CLI installed, no subscription, no model
+      # requests. Git tests use real throwaway repositories.
+      - name: Test
+        run: swift test
+
+  linux:
+    name: OreKit (Linux)
+    runs-on: ubuntu-24.04
+    container: swift:6.3
+    defaults:
+      run:
+        working-directory: Packages/OreKit
+    steps:
+      - uses: actions/checkout@v4
+
+      # The headless core is written to avoid Apple-only API so that a hosted
+      # version of ORE stays possible. That claim is only worth anything if
+      # something checks it — the drivers, git engine and persistence all build
+      # here, and only the FSEvents watcher is compiled out (it falls back to
+      # polling).
+      - name: Build the headless core
+        run: swift build --product OreCore
+
+      - name: Test
+        run: swift test
+
+  app:
+    name: OreMac
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Apps/OreMac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: swift test
+
+      - name: Build the app bundle
+        run: ./Scripts/bundle.sh release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ORE.app
+          path: Apps/OreMac/.build/ORE.app
+          if-no-files-found: error

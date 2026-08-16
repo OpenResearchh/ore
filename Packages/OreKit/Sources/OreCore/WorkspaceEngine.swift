@@ -982,6 +982,77 @@ public actor WorkspaceEngine {
         try await store.pendingDiffComments(workspaceID: workspaceID).map(\.reference)
     }
 
+    public func conflictHunks(path: String) throws -> [ConflictHunk] {
+        let url = worktreeURL.appendingPathComponent(path)
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return ConflictMarkers.hunks(in: text)
+    }
+
+    public func resolveConflict(path: String, side: ConflictSide) async throws {
+        try await git.checkoutConflictSide(side, path: path, in: worktreeURL)
+        await statusWatcher?.refreshNow()
+    }
+
+    public func resolveConflictHunk(
+        path: String,
+        startLine: Int,
+        side: ConflictSide
+    ) async throws {
+        let url = worktreeURL.appendingPathComponent(path)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        guard let next = ConflictMarkers.resolving(
+            text, hunkStartingAt: startLine, side: side
+        ) else {
+            throw OreCoreError.conflictHunkMissing(path, startLine)
+        }
+        try next.write(to: url, atomically: true, encoding: .utf8)
+        if ConflictMarkers.hunks(in: next).isEmpty {
+            try await git.runSerialized(["add", "--", path], in: worktreeURL)
+        }
+        await statusWatcher?.refreshNow()
+    }
+
+    public func turnCheckpoints(chatID: ChatID) async throws -> [TurnCheckpoint] {
+        try await store.turns(chatID: chatID).compactMap { turn in
+            guard let commit = turn.checkpointCommit else { return nil }
+            return TurnCheckpoint(
+                turnID: TurnID(rawValue: turn.id),
+                ordinal: turn.ordinal,
+                commit: commit,
+                summary: turn.summary,
+                prompt: turn.prompt
+            )
+        }
+    }
+
+    public func diffFromCheckpoint(_ commit: String) async throws -> [FileDiff] {
+        try await diffEngine.diffFromCommit(worktree: worktreeURL, commit: commit)
+    }
+
+    public func diffBetweenTurnCheckpoints(from: String, to: String) async throws -> [FileDiff] {
+        try await diffEngine.diffBetweenCheckpoints(
+            worktree: worktreeURL, from: from, to: to
+        )
+    }
+
+    public func rerunFailedChecks() async throws {
+        try await gitHub.rerunFailedChecks(forBranch: record.branch)
+    }
+
+    public func checkLog(named name: String) async -> String? {
+        await gitHub.checkLog(named: name, forBranch: record.branch)
+    }
+
+    public func stackNeighbors() async throws -> (parent: WorkspaceRecord?, children: [WorkspaceRecord]) {
+        let parent: WorkspaceRecord?
+        if let parentID = record.stackedOnWorkspaceID {
+            parent = try await store.workspace(WorkspaceID(rawValue: parentID))
+        } else {
+            parent = nil
+        }
+        return (parent, try await store.children(of: workspaceID))
+    }
+
     // MARK: - Git actions
 
     /// Gathers the state the action resolver needs. Only this part does I/O;
@@ -1400,6 +1471,7 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case noPullRequest(String)
     case pullRequestNotMerged(String)
     case uncommittedChanges
+    case conflictHunkMissing(String, Int)
 
     public var description: String {
         switch self {
@@ -1418,6 +1490,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "The pull request for \(branch) has not been merged."
         case .uncommittedChanges:
             return "There are uncommitted changes. Commit or discard them before continuing."
+        case .conflictHunkMissing(let path, let line):
+            return "No conflict hunk at \(path):\(line)."
         }
     }
 }

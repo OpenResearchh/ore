@@ -25,6 +25,10 @@ struct NewWorkspaceSheet: View {
     @State private var isAuthenticatingGitHub = false
     @State private var isCreating = false
     @State private var operationError: String?
+    @State private var createAnother = false
+    @State private var seedItems: [GitHubClient.IssueListItem] = []
+    @State private var localBranches: [String] = []
+    @State private var isLoadingSeeds = false
 
     private enum RepositorySource: String, CaseIterable, Identifiable {
         case local = "On this Mac"
@@ -118,16 +122,7 @@ struct NewWorkspaceSheet: View {
                 Picker("Start from", selection: $seedKind) {
                     ForEach(SeedKind.allCases) { Text($0.title).tag($0) }
                 }
-                if seedKind == .workspace {
-                    Picker("Workspace", selection: $stackOn) {
-                        Text("Choose a workspace").tag(WorkspaceID?.none)
-                        ForEach(model.sortedWorkspaces) { workspace in
-                            Text(workspace.name).tag(WorkspaceID?.some(workspace.id))
-                        }
-                    }
-                } else if seedKind != .defaultBranch {
-                    TextField(seedKind == .branch ? "Branch name" : "Number", text: $seedValue)
-                }
+                seedPicker
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("First message").font(.caption).foregroundStyle(.secondary)
@@ -145,6 +140,9 @@ struct NewWorkspaceSheet: View {
             .formStyle(.grouped)
 
             HStack {
+                Toggle("Create another", isOn: $createAnother)
+                    .toggleStyle(.checkbox)
+                    .help("Keep this sheet open after creating, so you can dispatch several workspaces quickly.")
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .buttonStyle(OreSecondaryButtonStyle())
@@ -181,6 +179,52 @@ struct NewWorkspaceSheet: View {
         }
         .task(id: repositorySource) {
             if repositorySource == .github { await loadGitHub() }
+        }
+        .task(id: "\(repositoryPath)-\(seedKind.rawValue)") {
+            await loadSeeds()
+        }
+    }
+
+    @ViewBuilder
+    private var seedPicker: some View {
+        switch seedKind {
+        case .defaultBranch:
+            EmptyView()
+        case .workspace:
+            Picker("Workspace", selection: $stackOn) {
+                Text("Choose a workspace").tag(WorkspaceID?.none)
+                ForEach(model.sortedWorkspaces) { workspace in
+                    Text(workspace.name).tag(WorkspaceID?.some(workspace.id))
+                }
+            }
+        case .branch:
+            if localBranches.isEmpty {
+                TextField("Branch name", text: $seedValue)
+            } else {
+                Picker("Branch", selection: $seedValue) {
+                    Text("Choose a branch").tag("")
+                    ForEach(localBranches, id: \.self) { branch in
+                        Text(branch).tag(branch)
+                    }
+                }
+                TextField("Or type a branch name", text: $seedValue)
+                    .font(.caption)
+            }
+        case .issue, .pullRequest:
+            if isLoadingSeeds {
+                ProgressView().controlSize(.small)
+            } else if seedItems.isEmpty {
+                TextField("Number", text: $seedValue)
+            } else {
+                Picker(seedKind == .issue ? "Issue" : "Pull request", selection: $seedValue) {
+                    Text("Choose \(seedKind == .issue ? "an issue" : "a pull request")").tag("")
+                    ForEach(seedItems) { item in
+                        Text("#\(item.number)  \(item.title)").tag(String(item.number))
+                    }
+                }
+                TextField("Or type a number", text: $seedValue)
+                    .font(.caption)
+            }
         }
     }
 
@@ -368,7 +412,32 @@ struct NewWorkspaceSheet: View {
             initialPrompt: prompt.isEmpty ? nil : prompt,
             branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
         ))
-        dismiss()
+        if createAnother {
+            chooseAnotherIdentity()
+            prompt = ""
+            seedValue = ""
+            stackOn = nil
+        } else {
+            dismiss()
+        }
+    }
+
+    private func loadSeeds() async {
+        seedItems = []
+        localBranches = []
+        guard repositorySource == .local, !repositoryPath.isEmpty else { return }
+        isLoadingSeeds = true
+        defer { isLoadingSeeds = false }
+        switch seedKind {
+        case .branch:
+            localBranches = await model.localBranches(repositoryPath: repositoryPath)
+        case .issue:
+            seedItems = await model.githubIssues(repositoryPath: repositoryPath)
+        case .pullRequest:
+            seedItems = await model.githubPullRequests(repositoryPath: repositoryPath)
+        default:
+            break
+        }
     }
 
     private var selectedSeed: CreateWorkspaceRequest.Seed {

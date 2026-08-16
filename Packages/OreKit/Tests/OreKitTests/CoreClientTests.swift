@@ -455,7 +455,8 @@ struct OreConfigurationTests {
             scripts: .init(setup: "pnpm install", run: "pnpm dev"),
             filesToCopy: [".env"],
             defaultHarness: .claudeCode,
-            defaultModel: "opus"
+            defaultModel: "opus",
+            branchPrefix: "feat"
         )
         let parsed = OreConfiguration.parse(original.toTOML())
 
@@ -464,6 +465,7 @@ struct OreConfigurationTests {
         #expect(parsed.filesToCopy == original.filesToCopy)
         #expect(parsed.defaultHarness == original.defaultHarness)
         #expect(parsed.defaultModel == original.defaultModel)
+        #expect(parsed.branchPrefix == "feat")
     }
 
     @Test func escapedCharactersSurviveTheRoundTrip() {

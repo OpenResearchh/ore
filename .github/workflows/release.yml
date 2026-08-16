@@ -1,15 +1,25 @@
 name: Release
 
-# On every merge to master: bump the patch version, build an (ad-hoc signed)
-# DMG, and publish it as a GitHub Release. The in-app GitHub updater
-# (GitHubUpdater.swift) checks these releases and offers the newer build.
+# Emergency CI cut. The normal path is local:
+#   cd Apps/OreMac && ./Scripts/certify-release.sh [patch|minor|major]
+# That runs tests and builds the DMG on a Mac that already has the SDK,
+# then publishes whatever is on master. This workflow exists so a release
+# can still be cut when that machine is not around. Merges to master do
+# not ship a DMG on their own.
 #
 # The version-bump commit is pushed with GITHUB_TOKEN, whose pushes do not
-# retrigger workflows, so this can't loop; the `[skip ci]` marker and the guard
-# below are belt-and-braces.
+# retrigger workflows; the `[skip ci]` marker is belt-and-braces.
 on:
-  push:
-    branches: [master]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which version part to bump
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
 
 permissions:
   contents: write
@@ -20,7 +30,6 @@ concurrency:
 
 jobs:
   release:
-    if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
     name: Bump, build DMG, publish
     # Must match the OreMac CI job: the DMG builds the same target, which needs
     # the macOS 26 SDK for the Liquid Glass symbols behind its availability
@@ -34,9 +43,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Bump patch version
+      - name: Bump version
         id: bump
-        run: echo "version=$(./Scripts/bump-version.sh patch)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(./Scripts/bump-version.sh ${{ inputs.bump }})" >> "$GITHUB_OUTPUT"
 
       - name: Commit the bump
         run: |

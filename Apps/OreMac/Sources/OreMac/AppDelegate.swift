@@ -35,6 +35,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         [.banner, .sound, .badge]
     }
 
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        NotificationCenter.default.post(
+            name: .oreOpenFromNotification,
+            object: nil,
+            userInfo: response.notification.request.content.userInfo
+        )
+    }
+
     /// Closing the last window quits. ORE is a single-window app; leaving a
     /// dockless process behind would mean agents running with nothing to show
     /// for them.
@@ -54,4 +65,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
 extension Notification.Name {
     static let oreApplicationWillTerminate = Notification.Name("ore.applicationWillTerminate")
+    static let oreOpenFromNotification = Notification.Name("ore.openFromNotification")
 }

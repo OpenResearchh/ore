@@ -100,6 +100,31 @@ struct ReviewPane: View {
     @State private var hasLoadedOnce = false
     @State private var workingTree: GitStatusSnapshot?
     @AppStorage("ore.review.changesLayout") private var changesLayoutRaw = "tree"
+    @State private var diffScope: DiffScope = .all
+    @State private var turnCheckpoints: [TurnCheckpoint] = []
+    @State private var stackParent: WorkspaceSummary?
+    @State private var stackChildren: [WorkspaceSummary] = []
+    @State private var reviewSetup: ReviewSetup?
+    @State private var reviewInstructions = ""
+    @State private var reviewModel = ""
+
+    private enum DiffScope: Hashable {
+        case all
+        case sinceLastMessage
+        case turn(String)
+
+        var title: String {
+            switch self {
+            case .all: "All changes"
+            case .sinceLastMessage: "Since last message"
+            case .turn: "This turn"
+            }
+        }
+    }
+
+    private struct ReviewSetup: Identifiable {
+        var id: String { "review-setup" }
+    }
 
     private enum ReviewTab: Hashable { case allFiles, changes }
     private var isTreeLayout: Bool { changesLayoutRaw != "list" }
@@ -110,9 +135,13 @@ struct ReviewPane: View {
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
             content
                 .frame(maxHeight: .infinity)
+            stackStrip
             ShipStatusPanel(workspace: workspace)
         }
         .background(OreTheme.Surface.chrome)
+        .sheet(item: $reviewSetup) { _ in
+            reviewSetupSheet
+        }
         .task(id: workspace.id) {
             knownDiffFolders = []
             expandedDiffFolders = []
@@ -122,7 +151,14 @@ struct ReviewPane: View {
             // back to the loading spinner.
             seedFromCache()
             hasLoadedOnce = model.cachedDiff(for: workspace.id) != nil
+            diffScope = .all
             await refresh()
+            async let checkpoints = model.loadTurnCheckpoints(for: workspace.id)
+            async let neighbors = model.loadStackNeighbors(for: workspace.id)
+            turnCheckpoints = await checkpoints
+            let stack = await neighbors
+            stackParent = stack.parent
+            stackChildren = stack.children
         }
         // Silent catch-up: the agent writing files should grow this list in
         // place, not flash a spinner over it.
@@ -173,6 +209,16 @@ struct ReviewPane: View {
             .buttonStyle(OrePressableButtonStyle())
             .fixedSize(horizontal: true, vertical: false)
             .help("Open a dedicated agent review of the current diff")
+            .contextMenu {
+                ForEach(model.knownModels(for: workspace.harness)) { choice in
+                    Button(choice.displayName) { startAIReview(reviewerModel: choice.id) }
+                }
+                Divider()
+                Button("Custom instructions…") {
+                    reviewModel = workspace.model ?? ""
+                    reviewSetup = ReviewSetup()
+                }
+            }
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: OreTheme.RowHeight.bar)
@@ -349,11 +395,139 @@ struct ReviewPane: View {
         model.chat(for: workspace.id).draftComments
     }
 
-    private func startAIReview() {
-        model.createChat(
-            in: workspace.id,
-            initialMessage: "Review the current workspace diff. Look for correctness, security, tests, and maintainability. Use the ORE diff and review-comment tools, then report findings with file and line references."
-        )
+    private func startAIReview(reviewerModel: String? = nil, instructions: String? = nil) {
+        var prompt = """
+        Review the current workspace diff. Look for correctness, security, tests, and maintainability. \
+        Use GetWorkspaceDiff and GetDiffComments, then post each finding with PostDiffComment \
+        (filePath, startLine, endLine, body) so they land as numbered anchored comments — not as prose. \
+        After posting, list the findings as "1. … 2. …" so the user can say "fix 2 and 4".
+        """
+        if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += "\n\nAdditional instructions:\n\(instructions)"
+        }
+        model.createChat(in: workspace.id, initialMessage: prompt, model: reviewerModel)
+    }
+
+    private var reviewSetupSheet: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.md) {
+            Text("Review with agent")
+                .font(.system(size: 20, weight: .semibold))
+            Picker("Model", selection: $reviewModel) {
+                Text("Workspace default").tag("")
+                ForEach(model.knownModels(for: workspace.harness)) { choice in
+                    Text(choice.displayName).tag(choice.id)
+                }
+            }
+            Text("Custom instructions")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $reviewInstructions)
+                .font(.body)
+                .frame(height: 120)
+            HStack {
+                Spacer()
+                Button("Cancel") { reviewSetup = nil }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                Button("Start review") {
+                    startAIReview(
+                        reviewerModel: reviewModel.isEmpty ? nil : reviewModel,
+                        instructions: reviewInstructions
+                    )
+                    reviewSetup = nil
+                }
+                .buttonStyle(OrePrimaryButtonStyle())
+            }
+        }
+        .padding(OreTheme.Space.lg)
+        .frame(width: 480)
+    }
+
+    private var diffScopeMenu: some View {
+        Menu {
+            Button("All changes") { Task { await applyScope(.all) } }
+            Button("Since last message") { Task { await applyScope(.sinceLastMessage) } }
+            if !turnCheckpoints.isEmpty {
+                Divider()
+                ForEach(Array(turnCheckpoints.suffix(12).reversed())) { checkpoint in
+                    Button("Turn \(checkpoint.ordinal + 1)") {
+                        Task { await applyScope(.turn(checkpoint.commit)) }
+                    }
+                }
+            }
+        } label: {
+            Text(diffScope.title)
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .padding(.horizontal, 8)
+                .frame(height: 22)
+                .background(OreTheme.subduedFill, in: Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Show all changes, since the last message, or one turn")
+    }
+
+    @ViewBuilder
+    private var stackStrip: some View {
+        if stackParent != nil || !stackChildren.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "square.stack.3d.up")
+                    .foregroundStyle(.secondary)
+                if let parent = stackParent {
+                    Button(parent.name) { model.selectedWorkspaceID = parent.id }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "arrow.left")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                Text(workspace.name)
+                    .fontWeight(.semibold)
+                if !stackChildren.isEmpty {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                    ForEach(stackChildren) { child in
+                        Button(child.name) { model.selectedWorkspaceID = child.id }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: OreTheme.Font.caption))
+            .padding(.horizontal, OreTheme.Space.sm)
+            .frame(height: 26)
+            .background(.bar)
+        }
+    }
+
+    private func applyScope(_ scope: DiffScope) async {
+        diffScope = scope
+        do {
+            switch scope {
+            case .all:
+                diffs = try await model.refreshDiff(for: workspace).diffs
+            case .sinceLastMessage:
+                guard let commit = turnCheckpoints.last?.commit else {
+                    diffs = try await model.refreshDiff(for: workspace).diffs
+                    return
+                }
+                diffs = try await model.loadDiffFromCheckpoint(commit, for: workspace.id)
+            case .turn(let commit):
+                if let index = turnCheckpoints.firstIndex(where: { $0.commit == commit }),
+                   index + 1 < turnCheckpoints.count {
+                    let next = turnCheckpoints[index + 1].commit
+                    diffs = try await model.loadDiffBetweenCheckpoints(
+                        from: commit, to: next, for: workspace.id
+                    )
+                } else {
+                    diffs = try await model.loadDiffFromCheckpoint(commit, for: workspace.id)
+                }
+            }
+            loadError = nil
+        } catch {
+            loadError = error.localizedDescription
+        }
     }
 
     private var emptyState: some View {
@@ -395,6 +569,7 @@ struct ReviewPane: View {
         VStack(spacing: 0) {
             HStack(spacing: OreTheme.Space.sm) {
                 changesLayoutToggle
+                diffScopeMenu
                 Spacer()
                 Text("\(viewedPaths.count)/\(diffs.count) viewed")
                     .foregroundStyle(.secondary)
@@ -410,6 +585,15 @@ struct ReviewPane: View {
             Divider()
 
             List {
+                if !conflictedDiffs.isEmpty {
+                    Section {
+                        ForEach(conflictedDiffs, id: \.path) { file in
+                            fileRow(file, showFolder: true)
+                        }
+                    } header: {
+                        changeSectionHeaderLabel("Conflicts", files: conflictedDiffs, tint: .orange)
+                    }
+                }
                 if showsChangeBuckets {
                     ForEach(ChangeBucket.allCases.filter { !diffs(in: $0).isEmpty }) { bucket in
                         Section {
@@ -419,7 +603,7 @@ struct ReviewPane: View {
                         }
                     }
                 } else {
-                    changeRows(for: diffs)
+                    changeRows(for: diffs.filter { !conflictedPaths.contains($0.path) })
                 }
             }
             .listStyle(.inset)
@@ -508,6 +692,19 @@ struct ReviewPane: View {
                     .foregroundStyle(OreTheme.removed)
             }
 
+            if conflictedPaths.contains(file.path) {
+                Button("Ours") {
+                    model.resolveConflict(path: file.path, side: .ours, in: workspace.id)
+                }
+                .buttonStyle(.borderless)
+                .help("Keep this workspace's version")
+                Button("Theirs") {
+                    model.resolveConflict(path: file.path, side: .theirs, in: workspace.id)
+                }
+                .buttonStyle(.borderless)
+                .help("Take the incoming version")
+            }
+
             Button { toggleViewed(file.path) } label: {
                 Image(systemName: viewedPaths.contains(file.path) ? "checkmark.circle.fill" : "circle")
                     .foregroundStyle(viewedPaths.contains(file.path) ? Color.accentColor : Color.secondary.opacity(0.45))
@@ -531,6 +728,14 @@ struct ReviewPane: View {
         }
         .contextMenu {
             Button("Open") { model.openDiffFile(file.path, in: workspace.id) }
+            if conflictedPaths.contains(file.path) {
+                Button("Accept ours") {
+                    model.resolveConflict(path: file.path, side: .ours, in: workspace.id)
+                }
+                Button("Accept theirs") {
+                    model.resolveConflict(path: file.path, side: .theirs, in: workspace.id)
+                }
+            }
             Button(viewedPaths.contains(file.path) ? "Mark as Not Viewed" : "Mark as Viewed") {
                 toggleViewed(file.path)
             }
@@ -570,15 +775,31 @@ struct ReviewPane: View {
         return .committed
     }
 
+    private var conflictedPaths: Set<String> {
+        Set((workingTree?.files ?? []).filter { $0.status == .conflicted }.map(\.path))
+    }
+
+    private var conflictedDiffs: [FileDiff] {
+        diffs.filter { conflictedPaths.contains($0.path) }
+    }
+
     private func diffs(in bucket: ChangeBucket) -> [FileDiff] {
-        diffs.filter { self.bucket(for: $0.path) == bucket }
+        diffs.filter { self.bucket(for: $0.path) == bucket && !conflictedPaths.contains($0.path) }
     }
 
     private func changeSectionHeader(_ bucket: ChangeBucket, files: [FileDiff]) -> some View {
+        changeSectionHeaderLabel(bucket.title, files: files)
+    }
+
+    private func changeSectionHeaderLabel(
+        _ title: String,
+        files: [FileDiff],
+        tint: Color = .secondary
+    ) -> some View {
         HStack(spacing: 8) {
-            Text(bucket.title)
+            Text(title)
                 .font(.system(size: OreTheme.Font.caption, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(tint)
                 .textCase(.uppercase)
             Text("\(files.count)")
                 .font(.system(size: OreTheme.Font.caption).monospacedDigit())
@@ -780,6 +1001,7 @@ struct DiffDocumentView: View {
     @State private var sourceError: String?
     @State private var mode: FilePresentationMode = .diff
     @State private var isSaving = false
+    @State private var conflictHunks: [ConflictHunk] = []
 
     struct LineRef: Equatable { var hunk: Int; var line: Int }
 
@@ -795,6 +1017,9 @@ struct DiffDocumentView: View {
         VStack(spacing: 0) {
             header
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
+            if !conflictHunks.isEmpty {
+                conflictBanner
+            }
 
             if mode == .source {
                 sourceEditor
@@ -1057,6 +1282,51 @@ struct DiffDocumentView: View {
         mode = file == nil ? .source : requested
         let stored = await model.loadViewedFiles(for: workspace.id)
         if let file { isViewed = stored[path] == contentHash(file) }
+        conflictHunks = await model.loadConflictHunks(path: path, for: workspace.id)
+    }
+
+    private var conflictBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("\(conflictHunks.count) conflict\(conflictHunks.count == 1 ? "" : "s")")
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                Spacer()
+                Button("Ours") {
+                    model.resolveConflict(path: path, side: .ours, in: workspace.id)
+                }
+                Button("Theirs") {
+                    model.resolveConflict(path: path, side: .theirs, in: workspace.id)
+                }
+            }
+            ForEach(conflictHunks) { hunk in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("\(hunk.startLine)–\(hunk.endLine)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(hunk.ours.components(separatedBy: "\n").first ?? "")
+                        .lineLimit(1)
+                        .font(.caption)
+                    Spacer()
+                    Button("Ours") {
+                        model.resolveConflictHunk(
+                            path: path, startLine: hunk.startLine, side: .ours, in: workspace.id
+                        )
+                    }
+                    .controlSize(.small)
+                    Button("Theirs") {
+                        model.resolveConflictHunk(
+                            path: path, startLine: hunk.startLine, side: .theirs, in: workspace.id
+                        )
+                    }
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
     }
 
     private func save() async {
@@ -1286,6 +1556,9 @@ private struct ShipStatusPanel: View {
     /// Signature of the last seen check states. Auto-switching happens only
     /// when this changes, so a user's manual tab choice survives quiet polls.
     @State private var checksFingerprint: Int?
+    @State private var expandedCheck: String?
+    @State private var checkLogs: [String: String] = [:]
+    @State private var loadingCheckLog: String?
 
     private enum ShipTab: Hashable { case commits, checks }
 
@@ -1350,6 +1623,16 @@ private struct ShipStatusPanel: View {
             segment("Commits", count: commits.count, target: .commits)
             segment("Checks", count: activeCheckCount, target: .checks)
             Spacer(minLength: 0)
+            if pullRequest?.failingChecks.isEmpty == false {
+                Button {
+                    model.rerunFailedChecks(workspace.id)
+                } label: {
+                    Label("Re-run failed", systemImage: "arrow.clockwise")
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .help("Re-run the failed jobs on GitHub")
+            }
             if pullRequest?.hasRunningChecks == true {
                 ProgressView().controlSize(.mini)
             }
@@ -1606,41 +1889,73 @@ private struct ShipStatusPanel: View {
 
     private func checkRow(_ check: GitHubClient.CheckRun) -> some View {
         let hovering = hoveredCheck == check.name
-        return HStack(spacing: OreTheme.Space.sm) {
-            Group {
-                if !check.isComplete {
-                    ProgressView().controlSize(.mini)
-                } else if check.isSuccess {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                } else {
-                    Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+        let expanded = expandedCheck == check.name
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: OreTheme.Space.sm) {
+                Group {
+                    if !check.isComplete {
+                        ProgressView().controlSize(.mini)
+                    } else if check.isSuccess {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    } else {
+                        Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+                    }
                 }
-            }
-            .frame(width: 16)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(check.name)
-                    .font(.system(size: OreTheme.Font.body, weight: .medium))
-                    .lineLimit(1)
-                if let workflow = check.workflow, !workflow.isEmpty {
-                    Text(workflow)
-                        .font(.system(size: OreTheme.Font.caption))
-                        .foregroundStyle(.secondary)
+                .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(check.name)
+                        .font(.system(size: OreTheme.Font.body, weight: .medium))
                         .lineLimit(1)
+                    if let workflow = check.workflow, !workflow.isEmpty {
+                        Text(workflow)
+                            .font(.system(size: OreTheme.Font.caption))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+                if let duration = check.duration {
+                    Text(Self.format(duration: duration))
+                        .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if !check.isSuccess, check.isComplete {
+                    Button {
+                        toggleCheckLog(check)
+                    } label: {
+                        Image(systemName: expanded ? "chevron.down" : "doc.text")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show failing log")
+                }
+                if let link = check.link, let url = URL(string: link) {
+                    Button { NSWorkspace.shared.open(url) } label: {
+                        Image(systemName: "arrow.up.right.square")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open this check on GitHub")
                 }
             }
-            Spacer(minLength: 0)
-            if let duration = check.duration {
-                Text(Self.format(duration: duration))
-                    .font(.system(size: OreTheme.Font.caption).monospacedDigit())
-                    .foregroundStyle(.tertiary)
-            }
-            if let link = check.link, let url = URL(string: link) {
-                Button { NSWorkspace.shared.open(url) } label: {
-                    Image(systemName: "arrow.up.right.square")
-                        .foregroundStyle(.secondary)
+            if expanded {
+                if loadingCheckLog == check.name {
+                    ProgressView().controlSize(.small)
+                } else if let log = checkLogs[check.name], !log.isEmpty {
+                    ScrollView {
+                        Text(log)
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 160)
+                    .padding(6)
+                    .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Text("No log available yet.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(.plain)
-                .help("Open this check on GitHub")
             }
         }
         .padding(.horizontal, OreTheme.Space.sm)
@@ -1649,6 +1964,24 @@ private struct ShipStatusPanel: View {
         .contentShape(Rectangle())
         .onHover { hovering in
             hoveredCheck = hovering ? check.name : (hoveredCheck == check.name ? nil : hoveredCheck)
+        }
+        .onTapGesture {
+            if !check.isSuccess, check.isComplete { toggleCheckLog(check) }
+        }
+    }
+
+    private func toggleCheckLog(_ check: GitHubClient.CheckRun) {
+        if expandedCheck == check.name {
+            expandedCheck = nil
+            return
+        }
+        expandedCheck = check.name
+        guard checkLogs[check.name] == nil else { return }
+        loadingCheckLog = check.name
+        Task {
+            let log = await model.loadCheckLog(named: check.name, for: workspace.id)
+            checkLogs[check.name] = log ?? ""
+            loadingCheckLog = nil
         }
     }
 
@@ -1713,6 +2046,12 @@ struct GitActionToolbar: View {
     @State private var chosenBase: String?
     @State private var branches: [String] = []
     @State private var prURL: String?
+    @State private var editor: GitEditor?
+
+    private enum GitEditor: String, Identifiable {
+        case commit, pullRequest, merge
+        var id: String { rawValue }
+    }
 
     private var action: SuggestedGitAction {
         model.cachedDiff(for: workspace.id)?.gitAction ?? .none
@@ -1746,7 +2085,7 @@ struct GitActionToolbar: View {
                     .help("\(title). \(shortcutHint)")
             case .action(let title):
                 Button {
-                    perform()
+                    presentOrPerform()
                 } label: {
                     Label(title, systemImage: icon)
                         .labelStyle(.titleAndIcon)
@@ -1756,6 +2095,9 @@ struct GitActionToolbar: View {
                 .fixedSize()
                 .accessibilityLabel(title)
                 .accessibilityHint(actionHelp)
+                .popover(item: $editor) { kind in
+                    gitEditor(kind)
+                }
             }
 
             if case .merged = action {
@@ -1889,12 +2231,158 @@ struct GitActionToolbar: View {
         .help("Choose the branch to merge into")
     }
 
+    private func presentOrPerform() {
+        switch action {
+        case .commit:
+            editor = .commit
+        case .createPullRequest:
+            editor = .pullRequest
+        case .merge:
+            editor = .merge
+        default:
+            perform()
+        }
+    }
+
+    @ViewBuilder
+    private func gitEditor(_ kind: GitEditor) -> some View {
+        switch kind {
+        case .commit:
+            CommitEditor(workspace: workspace) { editor = nil }
+        case .pullRequest:
+            PullRequestEditor(
+                workspace: workspace,
+                base: chosenBase ?? defaultPRBase,
+                isStacked: isStackedPR
+            ) { editor = nil }
+        case .merge:
+            MergeEditor(workspace: workspace) { editor = nil }
+        }
+    }
+
+    private var defaultPRBase: String {
+        if case .createPullRequest(let base, _) = action { return base }
+        return workspace.baseBranch
+    }
+
+    private var isStackedPR: Bool {
+        if case .createPullRequest(_, let stacked) = action { return stacked }
+        return workspace.stackedOn != nil
+    }
+
     private func perform() {
         if case .createPullRequest(let defaultBase, _) = action {
             model.performSuggestedGitAction(for: workspace, baseOverride: chosenBase ?? defaultBase)
         } else {
             model.performSuggestedGitAction(for: workspace)
         }
+    }
+}
+
+private struct CommitEditor: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+    var onDone: () -> Void
+    @State private var message = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Commit").font(.headline)
+            TextEditor(text: $message)
+                .font(.body)
+                .frame(width: 340, height: 110)
+            HStack {
+                Button("Ask agent") {
+                    onDone()
+                    model.placePromptInComposer(GitShipPrompt.commit(), in: workspace.id)
+                }
+                Spacer()
+                Button("Commit") {
+                    model.submitCommit(message: message, for: workspace)
+                    onDone()
+                }
+                .keyboardShortcut(.return)
+                .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(14)
+    }
+}
+
+private struct PullRequestEditor: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+    let base: String
+    let isStacked: Bool
+    var onDone: () -> Void
+    @State private var title = ""
+    @State private var prBody = ""
+    @State private var draft = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Create pull request").font(.headline)
+            TextField("Title", text: $title)
+            Text("onto \(base)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $prBody)
+                .font(.body)
+                .frame(width: 360, height: 120)
+            Toggle("Draft", isOn: $draft)
+            HStack {
+                Button("Ask agent") {
+                    onDone()
+                    model.placePromptInComposer(
+                        GitShipPrompt.pullRequest(base: base, isStacked: isStacked),
+                        in: workspace.id
+                    )
+                }
+                Spacer()
+                Button("Create") {
+                    model.submitPullRequest(
+                        title: title.isEmpty ? workspace.name : title,
+                        body: prBody,
+                        base: base,
+                        draft: draft,
+                        for: workspace
+                    )
+                    onDone()
+                }
+                .keyboardShortcut(.return)
+            }
+        }
+        .padding(14)
+        .onAppear { title = workspace.name }
+    }
+}
+
+private struct MergeEditor: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+    var onDone: () -> Void
+    @AppStorage("ore.mergeMethod") private var method = "squash"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Merge pull request").font(.headline)
+            Picker("Method", selection: $method) {
+                Text("Squash").tag("squash")
+                Text("Merge commit").tag("merge")
+                Text("Rebase").tag("rebase")
+            }
+            .pickerStyle(.radioGroup)
+            HStack {
+                Spacer()
+                Button("Merge") {
+                    model.submitMerge(method: method, for: workspace)
+                    onDone()
+                }
+                .keyboardShortcut(.return)
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
     }
 }
 

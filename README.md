@@ -92,8 +92,18 @@ mentions turned into a button. The terminal is owned by a registry rather than
 by the view hierarchy, so navigating away doesn't kill the process — a dev
 server keeps running while you read the diff.
 
-**Updates.** Sparkle, with a release script that signs, notarizes and staples,
-and produces the signed appcast entry.
+**Updates.** The in-app GitHub updater installs whatever is published as a
+Release. Master is the source of truth; a release is an explicit local cut,
+not a side effect of merging:
+
+```sh
+cd Apps/OreMac && ./Scripts/certify-release.sh        # patch
+cd Apps/OreMac && ./Scripts/certify-release.sh minor
+```
+
+That runs OreKit and OreMac tests, builds the DMG on this Mac, commits the
+version bump, and publishes. Sparkle (`Scripts/release.sh`) is the signed /
+notarized path once a Developer ID is available.
 
 ## Testing
 
@@ -161,10 +171,12 @@ Learned by driving them, and each one cost a real bug:
   *consuming* the package, so consumed from elsewhere the scanner is skipped and
   the link fails. Vendoring generated parsers to work around that costs more than
   it returns.
-- **Releases are unsigned here.** `Scripts/release.sh` does signing,
-  notarization and stapling, but this machine has no Developer ID, so that path
-  is written and syntax-checked rather than executed. `Scripts/bundle.sh`
-  produces an ad-hoc signed bundle that runs locally.
+- **Releases are unsigned here.** `Scripts/certify-release.sh` is the shipping
+  path: local tests + an ad-hoc signed DMG uploaded to GitHub Releases.
+  `Scripts/release.sh` does signing, notarization and stapling, but this
+  machine has no Developer ID, so that path is written and syntax-checked
+  rather than executed. `Scripts/bundle.sh` produces an ad-hoc signed bundle
+  that runs locally.
 - **Linux is audited, not compiled.** Building it needs a second Swift toolchain
   (~1.4 GB, since Xcode's toolchain can't consume the open-source Static Linux
   SDK) and this machine had under a gigabyte free. Instead the core was audited

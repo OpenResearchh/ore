@@ -106,6 +106,17 @@ final class AppModel {
         }
         startFlushTimer()
         restoreScheduledContinuations()
+        NotificationCenter.default.addObserver(
+            forName: .oreOpenFromNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let workspace = notification.userInfo?["workspaceID"] as? String
+            let chat = notification.userInfo?["chatID"] as? String
+            Task { @MainActor in
+                self?.openFromNotification(workspaceID: workspace, chatID: chat)
+            }
+        }
     }
 
     /// Flushes coalesced deltas at ~40Hz.
@@ -442,7 +453,8 @@ final class AppModel {
     func createChat(
         in workspaceID: WorkspaceID,
         initialMessage: String? = nil,
-        draft: String? = nil
+        draft: String? = nil,
+        model: String? = nil
     ) {
         if let initialMessage {
             pendingNewChatMessages[workspaceID, default: []].append(initialMessage)
@@ -466,7 +478,7 @@ final class AppModel {
             workspaceID: workspaceID,
             title: title,
             harness: workspace?.harness,
-            model: workspace?.model,
+            model: model ?? workspace?.model,
             permissionMode: workspace?.permissionMode ?? .default
         ))) }
     }
@@ -735,7 +747,9 @@ final class AppModel {
         send(item.prompt, to: item.workspaceID, chatID: item.chatID)
         postNotification(
             title: "Continuing \(workspaceName(item.workspaceID))",
-            body: "Session limit reset. Picking up where you left off."
+            body: "Session limit reset. Picking up where you left off.",
+            workspaceID: item.workspaceID,
+            chatID: item.chatID
         )
     }
 
@@ -889,7 +903,8 @@ final class AppModel {
                 guard let number else { return }
                 await client.send(.retargetPullRequest(workspace.id, number: number, base: base))
             case .merge:
-                await client.send(.mergePullRequest(workspace.id, method: "squash"))
+                let method = UserDefaults.standard.string(forKey: "ore.mergeMethod") ?? "squash"
+                await client.send(.mergePullRequest(workspace.id, method: method))
             case .fixFailingChecks:
                 forwardFailingChecks(workspace.id)
             case .resolveConflicts(_, let base):
@@ -898,6 +913,80 @@ final class AppModel {
                 break
             }
         }
+    }
+
+    func submitCommit(message: String, for workspace: WorkspaceSummary) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task { await client.send(.commit(workspace.id, message: trimmed)) }
+    }
+
+    func submitPullRequest(
+        title: String,
+        body: String,
+        base: String,
+        draft: Bool,
+        for workspace: WorkspaceSummary
+    ) {
+        Task {
+            await client.send(.createPullRequest(
+                workspace.id,
+                title: title,
+                body: body,
+                base: base,
+                draft: draft
+            ))
+        }
+    }
+
+    func submitMerge(method: String, for workspace: WorkspaceSummary) {
+        UserDefaults.standard.set(method, forKey: "ore.mergeMethod")
+        Task { await client.send(.mergePullRequest(workspace.id, method: method)) }
+    }
+
+    func resolveConflict(path: String, side: ConflictSide, in workspaceID: WorkspaceID) {
+        Task { await client.send(.resolveConflict(workspaceID, path: path, side: side.rawValue)) }
+    }
+
+    func resolveConflictHunk(
+        path: String,
+        startLine: Int,
+        side: ConflictSide,
+        in workspaceID: WorkspaceID
+    ) {
+        Task {
+            await client.send(.resolveConflictHunk(
+                workspaceID, path: path, startLine: startLine, side: side.rawValue
+            ))
+        }
+    }
+
+    func rerunFailedChecks(_ id: WorkspaceID) {
+        Task { await client.send(.rerunFailedChecks(id)) }
+    }
+
+    func retryLastTurn(in workspaceID: WorkspaceID) {
+        guard let chatID = activeChat(for: workspaceID)?.id else { return }
+        let state = chat(for: chatID)
+        guard let row = state.rows.last(where: { $0.kind == .userMessage }) else { return }
+        state.dismissProminentError()
+        send(row.text, attachments: row.attachments, to: workspaceID, chatID: chatID)
+    }
+
+    func openFromNotification(workspaceID: String?, chatID: String?) {
+        if let workspaceID {
+            selectedWorkspaceID = WorkspaceID(rawValue: workspaceID)
+            showChatInCenter(WorkspaceID(rawValue: workspaceID))
+        }
+        if let workspaceID, let chatID {
+            selectChat(ChatID(rawValue: chatID), in: WorkspaceID(rawValue: workspaceID))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func markAllNotificationsRead() {
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        UNUserNotificationCenter.current().setBadgeCount(0)
     }
 
     /// Open a PR against a user-chosen base branch (the review pane's picker),
@@ -982,6 +1071,51 @@ final class AppModel {
 
     func loadPullRequestStatus(for id: WorkspaceID) async -> GitHubClient.PullRequest? {
         try? await client.pullRequestStatus(workspaceID: id)
+    }
+
+    func loadConflictHunks(path: String, for id: WorkspaceID) async -> [ConflictHunk] {
+        (try? await client.conflictHunks(workspaceID: id, path: path)) ?? []
+    }
+
+    func loadTurnCheckpoints(for id: WorkspaceID) async -> [TurnCheckpoint] {
+        guard let chatID = activeChat(for: id)?.id else { return [] }
+        return (try? await client.turnCheckpoints(workspaceID: id, chatID: chatID)) ?? []
+    }
+
+    func loadDiffFromCheckpoint(_ commit: String, for id: WorkspaceID) async throws -> [FileDiff] {
+        try await client.diffFromCheckpoint(workspaceID: id, commit: commit)
+    }
+
+    func loadDiffBetweenCheckpoints(
+        from: String,
+        to: String,
+        for id: WorkspaceID
+    ) async throws -> [FileDiff] {
+        try await client.diffBetweenCheckpoints(workspaceID: id, from: from, to: to)
+    }
+
+    func loadCheckLog(named name: String, for id: WorkspaceID) async -> String? {
+        await client.checkLog(workspaceID: id, named: name)
+    }
+
+    func loadStackNeighbors(for id: WorkspaceID) async -> (parent: WorkspaceSummary?, children: [WorkspaceSummary]) {
+        (try? await client.stackNeighbors(workspaceID: id)) ?? (nil, [])
+    }
+
+    func localBranches(for id: WorkspaceID) async -> [String] {
+        await client.localBranches(workspaceID: id)
+    }
+
+    func localBranches(repositoryPath: String) async -> [String] {
+        await client.localBranches(repositoryPath: repositoryPath)
+    }
+
+    func githubIssues(repositoryPath: String) async -> [GitHubClient.IssueListItem] {
+        (try? await client.githubIssues(repositoryPath: repositoryPath)) ?? []
+    }
+
+    func githubPullRequests(repositoryPath: String) async -> [GitHubClient.IssueListItem] {
+        (try? await client.githubPullRequests(repositoryPath: repositoryPath)) ?? []
     }
 
     /// The last cached diff for a workspace, if any — used to paint the review
@@ -1478,11 +1612,26 @@ final class AppModel {
         guard isBackground else { return }
         switch event {
         case .permissionRequest:
-            postNotification(title: "ORE needs you", body: workspaceName(workspaceID) + " is waiting for permission.")
+            postNotification(
+                title: "ORE needs you",
+                body: workspaceName(workspaceID) + " is waiting for permission.",
+                workspaceID: workspaceID,
+                chatID: chatID
+            )
         case .question:
-            postNotification(title: "ORE needs you", body: workspaceName(workspaceID) + " has a question.")
+            postNotification(
+                title: "ORE needs you",
+                body: workspaceName(workspaceID) + " has a question.",
+                workspaceID: workspaceID,
+                chatID: chatID
+            )
         case .turnCompleted where UserDefaults.standard.object(forKey: "ore.notifications.turnComplete") as? Bool ?? true:
-            postNotification(title: "Agent finished", body: workspaceName(workspaceID) + " completed a turn.")
+            postNotification(
+                title: "Agent finished",
+                body: workspaceName(workspaceID) + " completed a turn.",
+                workspaceID: workspaceID,
+                chatID: chatID
+            )
         default:
             break
         }
@@ -1516,7 +1665,12 @@ final class AppModel {
         workspaces.first { $0.id == id }?.name ?? "A workspace"
     }
 
-    private func postNotification(title: String, body: String) {
+    private func postNotification(
+        title: String,
+        body: String,
+        workspaceID: WorkspaceID? = nil,
+        chatID: ChatID? = nil
+    ) {
         guard UserDefaults.standard.object(forKey: "ore.notifications.enabled") as? Bool ?? true else { return }
         let content = UNMutableNotificationContent()
         content.title = title
@@ -1524,6 +1678,10 @@ final class AppModel {
         if UserDefaults.standard.object(forKey: "ore.notifications.sound") as? Bool ?? true {
             content.sound = .default
         }
+        var userInfo: [String: String] = [:]
+        if let workspaceID { userInfo["workspaceID"] = workspaceID.rawValue }
+        if let chatID { userInfo["chatID"] = chatID.rawValue }
+        content.userInfo = userInfo
         UNUserNotificationCenter.current().add(UNNotificationRequest(
             identifier: UUID().uuidString, content: content, trigger: nil
         ))

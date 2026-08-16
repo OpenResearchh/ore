@@ -46,7 +46,7 @@ struct SettingsView: View {
             case .general: "Workspace behavior, notifications, and everyday defaults."
             case .appearance: "ORE follows the visual and accessibility choices of this Mac."
             case .models: "Choose how new conversations begin and inspect every available model."
-            case .projects: "Per-project setup, including gitignored files copied into every worktree."
+            case .projects: "Per-project ore.toml: scripts, files to copy, branch prefix, and default agent."
             case .agents: "See the coding harnesses ORE can reach, their authentication, and models."
             case .environment: "Understand where work lives and what every terminal and agent inherits."
             }
@@ -500,12 +500,11 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-/// Per-project setup, currently the list of gitignored files (`.env` and
-/// friends) copied into every new worktree. Reads and writes the checked-in
-/// `ore.toml` directly, so the setting travels with the repository.
+/// Per-project setup stored in the checked-in `ore.toml`.
 private struct ProjectsSettings: View {
+    @Environment(AppModel.self) private var appModel
     let repositories: [String]
-    @State private var filesByRepo: [String: [String]] = [:]
+    @State private var configs: [String: OreConfiguration] = [:]
     @State private var newEntry: [String: String] = [:]
     @State private var loaded = false
 
@@ -516,39 +515,17 @@ private struct ProjectsSettings: View {
                     .foregroundStyle(.secondary)
             }
             ForEach(repositories, id: \.self) { repo in
+                let config = Binding(
+                    get: { configs[repo] ?? OreConfiguration() },
+                    set: { configs[repo] = $0; persist(repo, $0) }
+                )
                 SettingsCard(title: (repo as NSString).lastPathComponent, icon: "folder") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Gitignored files copied into every new worktree of this project — e.g. .env, so a fresh worktree can build without extra setup.")
-                            .font(.caption).foregroundStyle(.secondary)
-
-                        let files = filesByRepo[repo] ?? []
-                        if files.isEmpty {
-                            Text("No files configured.")
-                                .font(.caption).foregroundStyle(.tertiary)
-                        }
-                        ForEach(files, id: \.self) { file in
-                            HStack(spacing: 8) {
-                                Image(systemName: "doc").foregroundStyle(.secondary)
-                                Text(file).font(.system(.body, design: .monospaced))
-                                Spacer()
-                                Button { remove(file, from: repo) } label: {
-                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Remove")
-                            }
-                        }
-
-                        HStack {
-                            TextField(".env", text: Binding(
-                                get: { newEntry[repo] ?? "" },
-                                set: { newEntry[repo] = $0 }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { add(to: repo) }
-                            Button("Add") { add(to: repo) }
-                                .disabled((newEntry[repo] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
-                        }
+                    VStack(alignment: .leading, spacing: 14) {
+                        filesSection(repo: repo, config: config)
+                        Divider()
+                        scriptsSection(config: config)
+                        Divider()
+                        defaultsSection(config: config)
                     }
                 }
             }
@@ -556,40 +533,164 @@ private struct ProjectsSettings: View {
         .task {
             guard !loaded else { return }
             for repo in repositories {
-                filesByRepo[repo] = OreConfiguration
-                    .load(repositoryPath: URL(fileURLWithPath: repo)).filesToCopy
+                configs[repo] = OreConfiguration.load(repositoryPath: URL(fileURLWithPath: repo))
             }
             loaded = true
         }
     }
 
-    private func add(to repo: String) {
+    @ViewBuilder
+    private func filesSection(repo: String, config: Binding<OreConfiguration>) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Gitignored files copied into every new worktree — e.g. .env.")
+                .font(.caption).foregroundStyle(.secondary)
+            let files = config.wrappedValue.filesToCopy
+            if files.isEmpty {
+                Text("No files configured.")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+            ForEach(files, id: \.self) { file in
+                HStack(spacing: 8) {
+                    Image(systemName: "doc").foregroundStyle(.secondary)
+                    Text(file).font(.system(.body, design: .monospaced))
+                    Spacer()
+                    Button {
+                        var next = config.wrappedValue
+                        next.filesToCopy.removeAll { $0 == file }
+                        config.wrappedValue = next
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove")
+                }
+            }
+            HStack {
+                TextField(".env", text: Binding(
+                    get: { newEntry[repo] ?? "" },
+                    set: { newEntry[repo] = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { addFile(to: repo, config: config) }
+                Button("Add") { addFile(to: repo, config: config) }
+                    .disabled((newEntry[repo] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func scriptsSection(config: Binding<OreConfiguration>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Scripts")
+                .font(.system(size: 13, weight: .semibold))
+            scriptRow("Setup", detail: "Runs once after a worktree is created", text: Binding(
+                get: { config.wrappedValue.scripts.setup ?? "" },
+                set: {
+                    var next = config.wrappedValue
+                    next.scripts.setup = $0.nilIfEmpty
+                    config.wrappedValue = next
+                }
+            ))
+            scriptRow("Run", detail: "Dev server or watcher, started with ⌘R", text: Binding(
+                get: { config.wrappedValue.scripts.run ?? "" },
+                set: {
+                    var next = config.wrappedValue
+                    next.scripts.run = $0.nilIfEmpty
+                    config.wrappedValue = next
+                }
+            ))
+            scriptRow("Archive", detail: "Runs before archiving: stop containers, free ports", text: Binding(
+                get: { config.wrappedValue.scripts.archive ?? "" },
+                set: {
+                    var next = config.wrappedValue
+                    next.scripts.archive = $0.nilIfEmpty
+                    config.wrappedValue = next
+                }
+            ))
+        }
+    }
+
+    private func scriptRow(_ title: String, detail: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+            TextField(title.lowercased(), text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+        }
+    }
+
+    @ViewBuilder
+    private func defaultsSection(config: Binding<OreConfiguration>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Workspace defaults")
+                .font(.system(size: 13, weight: .semibold))
+            SettingsRow("Branch prefix", detail: "Used for new worktree branches of this project") {
+                TextField("ore", text: Binding(
+                    get: { config.wrappedValue.branchPrefix },
+                    set: {
+                        var next = config.wrappedValue
+                        next.branchPrefix = $0.isEmpty ? "ore" : $0
+                        config.wrappedValue = next
+                    }
+                ))
+                .frame(width: 140)
+            }
+            SettingsRow("Default agent", detail: "Overrides the app default for this repository") {
+                Picker("Agent", selection: Binding(
+                    get: { config.wrappedValue.defaultHarness?.rawValue ?? "" },
+                    set: {
+                        var next = config.wrappedValue
+                        next.defaultHarness = HarnessKind(rawValue: $0)
+                        config.wrappedValue = next
+                    }
+                )) {
+                    Text("App default").tag("")
+                    ForEach(appModel.readyHarnesses, id: \.self) { kind in
+                        Text(kind.displayName).tag(kind.rawValue)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 160)
+            }
+            SettingsRow("Default model", detail: "Used when a new workspace doesn't pick one") {
+                TextField("Model id", text: Binding(
+                    get: { config.wrappedValue.defaultModel ?? "" },
+                    set: {
+                        var next = config.wrappedValue
+                        next.defaultModel = $0.nilIfEmpty
+                        config.wrappedValue = next
+                    }
+                ))
+                .frame(width: 180)
+            }
+        }
+    }
+
+    private func addFile(to repo: String, config: Binding<OreConfiguration>) {
         let value = (newEntry[repo] ?? "").trimmingCharacters(in: .whitespaces)
         guard !value.isEmpty else { return }
-        var files = filesByRepo[repo] ?? []
         newEntry[repo] = ""
-        guard !files.contains(value) else { return }
-        files.append(value)
-        filesByRepo[repo] = files
-        persist(repo, files: files)
+        var next = config.wrappedValue
+        guard !next.filesToCopy.contains(value) else { return }
+        next.filesToCopy.append(value)
+        config.wrappedValue = next
     }
 
-    private func remove(_ file: String, from repo: String) {
-        var files = filesByRepo[repo] ?? []
-        files.removeAll { $0 == file }
-        filesByRepo[repo] = files
-        persist(repo, files: files)
-    }
-
-    private func persist(_ repo: String, files: [String]) {
+    private func persist(_ repo: String, _ config: OreConfiguration) {
         let url = URL(fileURLWithPath: repo)
-        var config = OreConfiguration.load(repositoryPath: url)
-        config.filesToCopy = files
         try? config.toTOML().write(
             to: url.appendingPathComponent(OreConfiguration.fileName),
             atomically: true,
             encoding: .utf8
         )
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

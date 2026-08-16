@@ -177,6 +177,61 @@ final class AttachmentPreviewController {
     }
 }
 
+/// Hit-testing for attachment hover previews.
+///
+/// `NSLayoutManager.glyphIndex(for:in:)` returns the *nearest* glyph, so a
+/// pointer resting in the composer's padding, on another word of the same
+/// line, or in the empty trailing width of a process row still mapped onto
+/// a chip. Previews must only appear when the pointer is actually over the
+/// chip's used glyphs.
+enum AttachmentHoverHitTesting {
+    static func characterIndex(at point: NSPoint, in textView: NSTextView) -> Int? {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
+              let textStorage = textView.textStorage,
+              textStorage.length > 0 else { return nil }
+        let containerPoint = containerPoint(at: point, in: textView)
+        var fraction: CGFloat = 0
+        let glyphIndex = layoutManager.glyphIndex(
+            for: containerPoint,
+            in: textContainer,
+            fractionOfDistanceThroughGlyph: &fraction
+        )
+        let used = layoutManager.lineFragmentUsedRect(
+            forGlyphAt: glyphIndex, effectiveRange: nil
+        )
+        guard used.contains(containerPoint) else { return nil }
+        let character = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        guard character < textStorage.length else { return nil }
+        return character
+    }
+
+    static func anchor(
+        for range: NSRange,
+        at point: NSPoint,
+        in textView: NSTextView
+    ) -> NSRect? {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else { return nil }
+        let origin = textView.textContainerOrigin
+        let containerPoint = containerPoint(at: point, in: textView)
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: range, actualCharacterRange: nil
+        )
+        var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        // A couple of points of slop so the chip's visual padding still counts.
+        guard rect.insetBy(dx: -3, dy: -3).contains(containerPoint) else { return nil }
+        rect.origin.x += origin.x
+        rect.origin.y += origin.y
+        return rect
+    }
+
+    private static func containerPoint(at point: NSPoint, in textView: NSTextView) -> NSPoint {
+        let origin = textView.textContainerOrigin
+        return NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+    }
+}
+
 struct InlineMentionTextEditor: NSViewRepresentable {
     @Binding var text: String
     var mentionNames: [String]
@@ -477,18 +532,12 @@ final class PromptTextView: NSTextView {
 
     private func updatePreview(at point: NSPoint) {
         guard let previewURL,
-              let layoutManager,
-              let textContainer else { dismissPreview(); return }
+              let charIndex = AttachmentHoverHitTesting.characterIndex(at: point, in: self)
+        else { dismissPreview(); return }
         let named = mentionNames.filter { previewURL($0) != nil }
         guard !named.isEmpty else { dismissPreview(); return }
 
-        let origin = textContainerOrigin
-        let containerPoint = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
-        let glyph = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
-        let charIndex = layoutManager.characterIndexForGlyph(at: glyph)
         let source = string as NSString
-        guard charIndex < source.length else { dismissPreview(); return }
-
         for name in named {
             let token = "@\(name)"
             var search = NSRange(location: 0, length: source.length)
@@ -496,13 +545,10 @@ final class PromptTextView: NSTextView {
                 let found = source.range(of: token, options: [], range: search)
                 guard found.location != NSNotFound else { break }
                 if charIndex >= found.location, charIndex < NSMaxRange(found),
-                   let url = previewURL(name) {
-                    let glyphRange = layoutManager.glyphRange(
-                        forCharacterRange: found, actualCharacterRange: nil
-                    )
-                    var anchor = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-                    anchor.origin.x += origin.x
-                    anchor.origin.y += origin.y
+                   let url = previewURL(name),
+                   let anchor = AttachmentHoverHitTesting.anchor(
+                    for: found, at: point, in: self
+                   ) {
                     attachmentPreview.show(url: url, from: self, anchor: anchor)
                     return
                 }

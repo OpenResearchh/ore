@@ -119,6 +119,21 @@ public actor InProcessCoreClient: CoreClient {
             try await engine(for: id).continueAfterMerge()
             try await resync(id)
 
+        case .resolveConflict(let id, let path, let side):
+            guard let conflictSide = ConflictSide(rawValue: side) else { return }
+            try await engine(for: id).resolveConflict(path: path, side: conflictSide)
+            try await resync(id)
+
+        case .resolveConflictHunk(let id, let path, let startLine, let side):
+            guard let conflictSide = ConflictSide(rawValue: side) else { return }
+            try await engine(for: id).resolveConflictHunk(
+                path: path, startLine: startLine, side: conflictSide
+            )
+            try await resync(id)
+
+        case .rerunFailedChecks(let id):
+            try await engine(for: id).rerunFailedChecks()
+
         case .createChat(let request):
             let chat = try await engine(for: request.workspaceID).createChat(request)
             continuation.yield(.chatAdded(chat))
@@ -797,6 +812,60 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).currentPullRequest()
     }
 
+    public func conflictHunks(workspaceID: WorkspaceID, path: String) async throws -> [ConflictHunk] {
+        try await engine(for: workspaceID).conflictHunks(path: path)
+    }
+
+    public func turnCheckpoints(workspaceID: WorkspaceID, chatID: ChatID) async throws -> [TurnCheckpoint] {
+        try await engine(for: workspaceID).turnCheckpoints(chatID: chatID)
+    }
+
+    public func diffFromCheckpoint(
+        workspaceID: WorkspaceID,
+        commit: String
+    ) async throws -> [FileDiff] {
+        try await engine(for: workspaceID).diffFromCheckpoint(commit)
+    }
+
+    public func diffBetweenCheckpoints(
+        workspaceID: WorkspaceID,
+        from: String,
+        to: String
+    ) async throws -> [FileDiff] {
+        try await engine(for: workspaceID).diffBetweenTurnCheckpoints(from: from, to: to)
+    }
+
+    public func checkLog(workspaceID: WorkspaceID, named name: String) async -> String? {
+        try? await engine(for: workspaceID).checkLog(named: name)
+    }
+
+    public func stackNeighbors(
+        workspaceID: WorkspaceID
+    ) async throws -> (parent: WorkspaceSummary?, children: [WorkspaceSummary]) {
+        let (parent, children) = try await engine(for: workspaceID).stackNeighbors()
+        return (parent?.summary(), children.map { $0.summary() })
+    }
+
+    public func localBranches(workspaceID id: WorkspaceID) async -> [String] {
+        guard let (_, git, _) = try? await workspaceAndGit(id) else { return [] }
+        return await git.localBranches()
+    }
+
+    public func localBranches(repositoryPath: String) async -> [String] {
+        guard let git = try? GitClient(repositoryURL: URL(fileURLWithPath: repositoryPath)) else {
+            return []
+        }
+        return await git.localBranches()
+    }
+
+    public func githubIssues(repositoryPath: String) async throws -> [GitHubClient.IssueListItem] {
+        try await GitHubClient(repositoryURL: URL(fileURLWithPath: repositoryPath)).issues()
+    }
+
+    public func githubPullRequests(repositoryPath: String) async throws -> [GitHubClient.IssueListItem] {
+        try await GitHubClient(repositoryURL: URL(fileURLWithPath: repositoryPath)).pullRequests()
+    }
+
     public func addDiffComment(
         workspaceID: WorkspaceID,
         _ reference: DiffCommentReference
@@ -915,7 +984,9 @@ private extension CoreCommand {
              .commit(let id, _), .createGitHubRepo(let id), .push(let id),
              .createPullRequest(let id, _, _, _, _),
              .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _),
-             .continueAfterMerge(let id):
+             .continueAfterMerge(let id), .rerunFailedChecks(let id):
+            return id
+        case .resolveConflict(let id, _, _), .resolveConflictHunk(let id, _, _, _):
             return id
         case .resolvePermission(let id, _, _), .answerQuestion(let id, _, _),
              .revertToCheckpoint(let id, _):

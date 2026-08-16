@@ -272,6 +272,28 @@ public actor GitClient {
             .map { String($0).replacingOccurrences(of: "origin/", with: "") }
             .filter { !$0.isEmpty && $0 != "HEAD" }
     }
+
+    /// Local branch names, for seeding a workspace from an existing branch.
+    public func localBranches() async -> [String] {
+        guard let output = try? await run([
+            "for-each-ref", "--format=%(refname:short)", "refs/heads",
+        ]) else { return [] }
+        return output.trimmedStandardOutput
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    /// Takes `--ours` or `--theirs` for a conflicted path and stages the result.
+    public func checkoutConflictSide(
+        _ side: ConflictSide,
+        path: String,
+        in worktree: URL
+    ) async throws {
+        let flag = side == .ours ? "--ours" : "--theirs"
+        try await runSerialized(["checkout", flag, "--", path], in: worktree)
+        try await runSerialized(["add", "--", path], in: worktree)
+    }
 }
 
 /// One commit as the ship panel shows it: enough to recognize the work, not

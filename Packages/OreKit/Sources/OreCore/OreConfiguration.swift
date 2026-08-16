@@ -192,6 +192,11 @@ public struct OreConfiguration: Sendable, Hashable, Codable {
             "",
         ]
 
+        if branchPrefix != "ore" {
+            lines.append("branch_prefix = \(quote(branchPrefix))")
+            lines.append("")
+        }
+
         if scripts.setup != nil || scripts.run != nil || scripts.archive != nil {
             lines.append("[scripts]")
             if let setup = scripts.setup { lines.append("setup = \(quote(setup))") }

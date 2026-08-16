@@ -129,6 +129,9 @@ struct ProtocolBoundaryTests {
             .setChatDraft(workspaceID, chatID, text: "draft"),
             .resolveChatPermission(workspaceID, chatID, "permission", .allow),
             .revertChatToCheckpoint(workspaceID, chatID, "turn"),
+            .resolveConflict(workspaceID, path: "Sources/App.swift", side: "ours"),
+            .resolveConflictHunk(workspaceID, path: "Sources/App.swift", startLine: 12, side: "theirs"),
+            .rerunFailedChecks(workspaceID),
         ]
         for command in commands {
             let data = try JSONEncoder().encode(command)

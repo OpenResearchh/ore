@@ -1527,9 +1527,8 @@ final class TranscriptCell: NSTableCellView {
                     result.addAttribute(.link, value: url, range: chipRange)
                 }
                 if let preview = hoverPreviewURL(for: path, worktreePath: worktreePath) {
-                    let lineRange = NSRange(location: 0, length: result.length)
-                    result.addAttribute(.oreAttachmentPreview, value: preview, range: lineRange)
-                    result.addAttribute(.cursor, value: NSCursor.pointingHand, range: lineRange)
+                    result.addAttribute(.oreAttachmentPreview, value: preview, range: chipRange)
+                    result.addAttribute(.cursor, value: NSCursor.pointingHand, range: chipRange)
                 }
             }
         } else if item.insertions > 0 || item.deletions > 0 {
@@ -1977,14 +1976,17 @@ final class TranscriptCell: NSTableCellView {
         return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
     }
 
-    /// Hover preview for image chips in tool rows (Read image, pasted screenshots).
-    /// Source-file chips stay click-to-open only — previewing a whole Swift file
-    /// on hover would be noise.
+    /// Hover preview for image chips and pasted-text dumps in tool rows.
+    /// Workspace source-file chips stay click-to-open only — previewing a
+    /// whole Swift file on hover would be noise.
     private static func hoverPreviewURL(for path: String, worktreePath: String) -> URL? {
         let ext = (path as NSString).pathExtension.lowercased()
-        guard ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp"].contains(ext) else {
-            return nil
-        }
+        let isImage = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp"]
+            .contains(ext)
+        let isPastedText = path.hasPrefix(".context/attachments/")
+            && ["txt", "md", "markdown", "json", "csv", "log", "xml", "yml", "yaml",
+                "html", "css", "toml", "ini", "env", "sh"].contains(ext)
+        guard isImage || isPastedText else { return nil }
         if path.hasPrefix("/") {
             return URL(fileURLWithPath: path)
         }
@@ -2219,20 +2221,9 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
     }
 
     private func updateAttachmentPreview(at point: NSPoint) {
-        guard let layoutManager, let textContainer, let textStorage,
-              textStorage.length > 0 else {
-            dismissAttachmentPreview()
-            return
-        }
-        let origin = textContainerOrigin
-        let containerPoint = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
-        guard layoutManager.usedRect(for: textContainer).contains(containerPoint) else {
-            dismissAttachmentPreview()
-            return
-        }
-        let glyph = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
-        let character = layoutManager.characterIndexForGlyph(at: glyph)
-        guard character < textStorage.length else {
+        guard let textStorage,
+              let character = AttachmentHoverHitTesting.characterIndex(at: point, in: self)
+        else {
             dismissAttachmentPreview()
             return
         }
@@ -2241,16 +2232,13 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
             .oreAttachmentPreview,
             at: character,
             effectiveRange: &range
-        ) as? URL else {
+        ) as? URL,
+              let anchor = AttachmentHoverHitTesting.anchor(
+                for: range, at: point, in: self
+              ) else {
             dismissAttachmentPreview()
             return
         }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: range, actualCharacterRange: nil
-        )
-        var anchor = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-        anchor.origin.x += origin.x
-        anchor.origin.y += origin.y
         attachmentPreview.show(url: url, from: self, anchor: anchor)
     }
 

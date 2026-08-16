@@ -104,6 +104,10 @@ struct OreMacApp: App {
                 .keyboardShortcut("a", modifiers: [.control, .command])
                 .disabled(model.selectedWorkspace == nil)
 
+                Button("Mark All Notifications Read") {
+                    model.markAllNotificationsRead()
+                }
+
                 Button("Next Git Step") {
                     model.performSuggestedGitAction()
                 }

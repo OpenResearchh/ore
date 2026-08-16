@@ -375,6 +375,76 @@ public actor GitHubClient {
         )
     }
 
+    public struct IssueListItem: Sendable, Hashable, Codable, Identifiable {
+        public var id: Int { number }
+        public var number: Int
+        public var title: String
+        public var updatedAt: String?
+        public var headRefName: String?
+
+        public init(number: Int, title: String, updatedAt: String? = nil, headRefName: String? = nil) {
+            self.number = number
+            self.title = title
+            self.updatedAt = updatedAt
+            self.headRefName = headRefName
+        }
+    }
+
+    /// Open issues, newest activity first — the New Workspace sheet's picker.
+    public func issues(limit: Int = 40) async throws -> [IssueListItem] {
+        let output = try await run([
+            "issue", "list", "--limit", String(limit),
+            "--json", "number,title,updatedAt",
+        ])
+        return (try? JSONDecoder().decode([IssueListItem].self, from: Data(output.standardOutput.utf8))) ?? []
+    }
+
+    /// Open pull requests, newest activity first.
+    public func pullRequests(limit: Int = 40) async throws -> [IssueListItem] {
+        let output = try await run([
+            "pr", "list", "--limit", String(limit),
+            "--json", "number,title,updatedAt,headRefName",
+        ])
+        return (try? JSONDecoder().decode([IssueListItem].self, from: Data(output.standardOutput.utf8))) ?? []
+    }
+
+    /// Re-runs the failed jobs of the latest workflow run on this branch.
+    public func rerunFailedChecks(forBranch branch: String) async throws {
+        guard let runs = try? await run([
+            "run", "list", "--branch", branch, "--limit", "5",
+            "--json", "databaseId,conclusion,status",
+        ]) else { return }
+
+        struct Run: Decodable {
+            var databaseId: Int
+            var conclusion: String?
+            var status: String
+        }
+        guard let decoded = try? JSONDecoder().decode(
+            [Run].self, from: Data(runs.standardOutput.utf8)
+        ) else { return }
+
+        let failed = decoded.filter {
+            $0.conclusion == "failure" || ($0.status == "completed" && $0.conclusion != "success")
+        }
+        guard let target = failed.first ?? decoded.first else { return }
+        try await run(["run", "rerun", String(target.databaseId), "--failed"])
+    }
+
+    /// The failing log tail for one check, when `gh` can map it to a run.
+    public func checkLog(named name: String, forBranch branch: String) async -> String? {
+        guard let logs = await failedCheckLogs(forBranch: branch, limit: 8) else { return nil }
+        let needle = "### \(name)"
+        if let range = logs.range(of: needle) {
+            let rest = logs[range.lowerBound...]
+            if let next = rest.range(of: "\n### ", range: rest.index(after: rest.startIndex)..<rest.endIndex) {
+                return String(rest[..<next.lowerBound])
+            }
+            return String(rest)
+        }
+        return logs
+    }
+
     public func pullRequestSeed(number: Int) async throws -> IssueSeed {
         let output = try await run([
             "pr", "view", String(number), "--json", "number,title,body,url,headRefName",

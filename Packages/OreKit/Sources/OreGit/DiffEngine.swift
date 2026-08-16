@@ -37,6 +37,31 @@ public struct FileDiff: Sendable, Hashable, Codable {
     }
 }
 
+/// A turn that captured a worktree snapshot, so the review pane can show
+/// "what this turn changed" without the user tracking refs themselves.
+public struct TurnCheckpoint: Sendable, Hashable, Codable, Identifiable {
+    public var id: String { turnID.rawValue }
+    public var turnID: TurnID
+    public var ordinal: Int
+    public var commit: String
+    public var summary: String?
+    public var prompt: String?
+
+    public init(
+        turnID: TurnID,
+        ordinal: Int,
+        commit: String,
+        summary: String? = nil,
+        prompt: String? = nil
+    ) {
+        self.turnID = turnID
+        self.ordinal = ordinal
+        self.commit = commit
+        self.summary = summary
+        self.prompt = prompt
+    }
+}
+
 public struct DiffHunk: Sendable, Hashable, Codable {
     public var oldStart: Int
     public var oldCount: Int
@@ -127,6 +152,23 @@ public actor DiffEngine {
     ) async throws -> [FileDiff] {
         var diffs = try await diff(
             arguments: ["diff", "--no-color", "--no-ext-diff", "-M", "HEAD", "--"],
+            worktree: worktree
+        )
+        if includeUntracked {
+            diffs += try await untrackedDiffs(worktree: worktree)
+        }
+        return diffs.sorted { $0.path < $1.path }
+    }
+
+    /// Working tree plus untracked files, relative to an arbitrary commit —
+    /// used for "what changed since this turn's checkpoint".
+    public func diffFromCommit(
+        worktree: URL,
+        commit: String,
+        includeUntracked: Bool = true
+    ) async throws -> [FileDiff] {
+        var diffs = try await diff(
+            arguments: ["diff", "--no-color", "--no-ext-diff", "-M", commit, "--"],
             worktree: worktree
         )
         if includeUntracked {

@@ -598,12 +598,23 @@ struct UserMessageAttachmentTests {
         let rendered = TranscriptCell.attributedText(for: row, worktreePath: "/tmp/work")
         #expect(rendered.string.contains("Read image"))
         var preview: URL?
+        var previewRange: NSRange?
         rendered.enumerateAttributes(
             in: NSRange(location: 0, length: rendered.length)
-        ) { attributes, _, _ in
-            if let url = attributes[.oreAttachmentPreview] as? URL { preview = url }
+        ) { attributes, range, _ in
+            if let url = attributes[.oreAttachmentPreview] as? URL {
+                preview = url
+                previewRange = range
+            }
         }
         #expect(preview?.lastPathComponent == "FE9CEC65-pasted-image.png")
+        // The preview is the chip, not the whole "Read image …" row — hovering
+        // the title or empty trailing width must not pop the image.
+        let titleRange = (rendered.string as NSString).range(of: "Read image")
+        #expect(previewRange != nil)
+        if let previewRange, titleRange.location != NSNotFound {
+            #expect(NSIntersectionRange(titleRange, previewRange).length == 0)
+        }
     }
 
     @Test func appendingAUserMessageStoresAttachmentsOnTheRow() {

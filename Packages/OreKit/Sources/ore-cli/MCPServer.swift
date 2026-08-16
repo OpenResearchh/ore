@@ -48,6 +48,21 @@ private func toolDefinitions() -> [[String: Any]] { [
         "inputSchema": ["type": "object", "properties": [:]],
     ],
     [
+        "name": "PostDiffComment",
+        "description": "Anchor a numbered review finding to a file and line range in the current diff. Use this instead of describing findings in prose so the user can say 'fix 2 and 4'.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "filePath": ["type": "string", "description": "Path relative to the worktree."],
+                "startLine": ["type": "integer"],
+                "endLine": ["type": "integer"],
+                "body": ["type": "string", "description": "The finding, as the user should read it."],
+                "context": ["type": "string", "description": "Optional surrounding code for the comment."],
+            ],
+            "required": ["filePath", "startLine", "body"],
+        ],
+    ],
+    [
         "name": "AskUserQuestion",
         "description": "Ask the ORE user a blocking question. The question appears in the workspace context inbox.",
         "inputSchema": [
@@ -68,6 +83,8 @@ private func callORETool(
     case "GetDiffComments":
         let url = directory.appendingPathComponent(".context/ore-diff-comments.json")
         text = (try? String(contentsOf: url, encoding: .utf8)) ?? "[]"
+    case "PostDiffComment":
+        text = postDiffComment(arguments: arguments, directory: directory)
     case "AskUserQuestion":
         let question = arguments["question"] as? String ?? "The agent has a question."
         let inbox = directory.appendingPathComponent(".context/ore-questions.txt")
@@ -87,6 +104,44 @@ private func callORETool(
         return ["content": [["type": "text", "text": "Unknown ORE tool: \(name)"]], "isError": true]
     }
     return ["content": [["type": "text", "text": text]]]
+}
+
+private func postDiffComment(arguments: [String: Any], directory: URL) -> String {
+    let filePath = arguments["filePath"] as? String ?? ""
+    let startLine = (arguments["startLine"] as? Int)
+        ?? (arguments["startLine"] as? Double).map(Int.init)
+        ?? 0
+    let endLine = (arguments["endLine"] as? Int)
+        ?? (arguments["endLine"] as? Double).map(Int.init)
+        ?? startLine
+    let body = arguments["body"] as? String ?? ""
+    let context = arguments["context"] as? String
+    guard !filePath.isEmpty, !body.isEmpty, startLine > 0 else {
+        return "PostDiffComment needs filePath, startLine, and body."
+    }
+
+    let contextDirectory = directory.appendingPathComponent(".context", isDirectory: true)
+    try? FileManager.default.createDirectory(
+        at: contextDirectory, withIntermediateDirectories: true
+    )
+    let url = contextDirectory.appendingPathComponent("ore-diff-comments.json")
+    var comments: [[String: Any]] = []
+    if let data = try? Data(contentsOf: url),
+       let existing = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+        comments = existing
+    }
+    var entry: [String: Any] = [
+        "filePath": filePath,
+        "startLine": startLine,
+        "endLine": endLine,
+        "body": body,
+    ]
+    if let context, !context.isEmpty { entry["context"] = context }
+    comments.append(entry)
+    if let data = try? JSONSerialization.data(withJSONObject: comments, options: [.prettyPrinted]) {
+        try? data.write(to: url, options: .atomic)
+    }
+    return "Recorded finding #\(comments.count) on \(filePath):\(startLine)-\(endLine)."
 }
 
 private func runGitDiff(in directory: URL) -> String {

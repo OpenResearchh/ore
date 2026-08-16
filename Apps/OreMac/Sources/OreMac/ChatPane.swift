@@ -201,6 +201,7 @@ struct ChatPane: View {
                     scheduled: model.scheduledContinuation(for: chatSummary?.id),
                     onContinueWhenAvailable: scheduleContinuation,
                     onCancelSchedule: cancelScheduledContinuation,
+                    onRetry: { model.retryLastTurn(in: workspace.id) },
                     onDismiss: { chat.dismissProminentError() }
                 )
                     .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -210,6 +211,13 @@ struct ChatPane: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
                 ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, OreTheme.Space.md)
+                    .padding(.top, OreTheme.Space.sm)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if let limit = chat.rateLimit, limit.status == .warning || limit.status == .exhausted {
+                RateLimitBanner(report: limit, onRetry: { model.retryLastTurn(in: workspace.id) })
                     .frame(maxWidth: OreTheme.contentMaxWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, OreTheme.Space.md)
@@ -1085,7 +1093,12 @@ struct ChatPane: View {
 
                 if let usage = chat.usage ?? tab.contextUsage,
                    let window = usage.contextWindow, window > 0 {
-                    ContextMeter(used: usage.totalContextTokens, window: window)
+                    ContextMeter(
+                        used: usage.totalContextTokens,
+                        window: window,
+                        usage: usage,
+                        modelName: tab.model
+                    )
                 }
 
                 Spacer(minLength: OreTheme.Space.md)
@@ -2576,24 +2589,12 @@ private struct VoiceComposerTranscript: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
-                content
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                padded(content)
                     .contentTransition(reduceMotion ? .identity : .interpolate)
-                    // Match the editor's textContainerInset so the words sit
-                    // exactly where the caret and typed text would.
-                    .padding(.leading, 5)
-                    .padding(.top, 6)
-                    .padding(.bottom, 6)
-                    .background(GeometryReader { geo in
-                        Color.clear
-                            .onAppear { contentHeight = geo.size.height }
-                            .onChange(of: geo.size.height) { _, height in
-                                contentHeight = height
-                            }
-                    })
                 Color.clear.frame(height: 1).id("voice-transcript-bottom")
             }
             .frame(height: min(max(contentHeight, 38), 200))
+            .background(measurer)
             .onChange(of: spoken) { _, _ in
                 // Keep the newest words on screen once the transcript
                 // outgrows the editor's scroll cap.
@@ -2601,6 +2602,39 @@ private struct VoiceComposerTranscript: View {
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: transcript)
+    }
+
+    /// A hidden, unscrolled copy of the same words at the composer's width.
+    ///
+    /// Measuring *inside* the ScrollView made the reported height depend on the
+    /// frame it was driving, so every wrap onto a new line landed one partial
+    /// late: the box only grew when the *next* partial arrived, and the words
+    /// spilled over the toolbar until it did. The last line of a dictation has
+    /// no next partial, so it stayed clipped until something else — a window
+    /// resize — forced another layout pass. `fixedSize` here takes the wrapped
+    /// ideal height straight from the text, the way the typed composer measures
+    /// itself, so the height is right on the pass that adds the words.
+    private var measurer: some View {
+        padded(content)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(GeometryReader { geo in
+                Color.clear
+                    .onAppear { contentHeight = geo.size.height }
+                    .onChange(of: geo.size.height) { _, height in
+                        contentHeight = height
+                    }
+            })
+            .hidden()
+    }
+
+    /// Match the editor's textContainerInset so the words sit exactly where the
+    /// caret and typed text would.
+    private func padded(_ view: some View) -> some View {
+        view
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 5)
+            .padding(.top, 6)
+            .padding(.bottom, 6)
     }
 
     @ViewBuilder
@@ -2849,6 +2883,10 @@ private extension Comparable {
 private struct ContextMeter: View {
     let used: Int
     let window: Int
+    var usage: UsageReport?
+    var modelName: String?
+
+    @State private var hovering = false
 
     private var fraction: Double {
         min(1, Double(used) / Double(window))
@@ -2868,6 +2906,46 @@ private struct ContextMeter: View {
                 .foregroundStyle(.secondary)
         }
         .help("\(used.formatted()) of \(window.formatted()) tokens in the current model context")
+        .onHover { hovering = $0 }
+        .popover(isPresented: $hovering) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let modelName, !modelName.isEmpty {
+                    Text(modelName)
+                        .font(.headline)
+                }
+                tokenRow("Input", usage?.inputTokens ?? used)
+                tokenRow("Output", usage?.outputTokens ?? 0)
+                if let cache = usage?.cacheReadTokens, cache > 0 {
+                    tokenRow("Cache read", cache)
+                }
+                if let created = usage?.cacheCreationTokens, created > 0 {
+                    tokenRow("Cache write", created)
+                }
+                Divider()
+                tokenRow("Context", used)
+                Text("of \(window.formatted()) window")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let cost = usage?.costUSD {
+                    Text(cost, format: .currency(code: "USD"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+            .frame(width: 220)
+        }
+    }
+
+    private func tokenRow(_ title: String, _ value: Int) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value.formatted())
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption)
     }
 }
 
@@ -2878,6 +2956,7 @@ private struct ProminentErrorBanner: View {
     var scheduled: ScheduledContinuation?
     var onContinueWhenAvailable: () -> Void
     var onCancelSchedule: () -> Void
+    var onRetry: () -> Void
     let onDismiss: () -> Void
 
     private var tint: Color { error.isUsageLimit ? OreTheme.warning : .red }
@@ -2912,6 +2991,16 @@ private struct ProminentErrorBanner: View {
                     } else {
                         continueButton
                     }
+                } else {
+                    Button(action: onRetry) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(tint.opacity(0.18), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Send the last prompt again")
                 }
             }
 
@@ -2990,6 +3079,46 @@ private struct ScheduledContinuationBanner: View {
             Button("Cancel", action: onCancel)
                 .font(.system(size: OreTheme.Font.caption, weight: .semibold))
                 .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(OreTheme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(OreTheme.warning.opacity(0.35), lineWidth: 1)
+        }
+    }
+}
+
+/// A standalone rate-limit warning when the turn itself didn't fail, so the
+/// composer still shows when the window resets and offers Retry.
+private struct RateLimitBanner: View {
+    let report: RateLimitReport
+    var onRetry: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: OreTheme.Space.sm) {
+            Image(systemName: report.status == .exhausted
+                ? "hourglass.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(OreTheme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(report.status == .exhausted ? "Rate limit reached" : "Approaching rate limit")
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                if let reset = report.resetsAt {
+                    Text(UsageLimitReset.format(reset))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let window = report.window {
+                    Text(window)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+            Button(action: onRetry) {
+                Label("Retry", systemImage: "arrow.clockwise")
+                    .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            }
+            .buttonStyle(.plain)
         }
         .padding(12)
         .background(OreTheme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))

@@ -34,6 +34,12 @@ public enum CoreCommand: Sendable, Codable {
     /// After the PR merges: fetch the base, restart the workspace on a fresh
     /// branch cut from it, and leave a memo in the chat so the agent knows.
     case continueAfterMerge(WorkspaceID)
+    /// Take `--ours` or `--theirs` for a conflicted path (and stage it).
+    case resolveConflict(WorkspaceID, path: String, side: String)
+    /// Replace one `<<<<<<<` hunk with ours or theirs.
+    case resolveConflictHunk(WorkspaceID, path: String, startLine: Int, side: String)
+    /// `gh run rerun --failed` for the branch's latest failing workflow.
+    case rerunFailedChecks(WorkspaceID)
 
     // Chat
     case createChat(CreateChatRequest)

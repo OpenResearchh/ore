@@ -50,14 +50,45 @@ struct VoiceTranscriptAssembler: Equatable, Sendable {
         ignoredPrefix = ""
     }
 
+    /// Words already discarded stay discarded. A later hypothesis is compared
+    /// word-by-word (case and punctuation ignored) so "Hello world extra."
+    /// cannot paste back "hello world extra" the user just deleted, and a
+    /// revision like "add a test now" only contributes the new "now".
     private func remainder(afterIgnoring prefix: String, in full: String) -> String {
         guard !prefix.isEmpty else { return full }
-        if full.hasPrefix(prefix) {
-            return String(full.dropFirst(prefix.count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixWords = words(in: prefix)
+        let fullWords = words(in: full)
+        guard !prefixWords.isEmpty else { return full }
+
+        var shared = 0
+        while shared < prefixWords.count, shared < fullWords.count,
+              prefixWords[shared] == fullWords[shared] {
+            shared += 1
         }
-        if prefix.hasPrefix(full) { return "" }
-        return full
+
+        if shared == fullWords.count { return "" }
+        if shared == 0 { return full }
+        return substring(of: full, afterWordCount: shared)
+    }
+
+    private func words(in text: String) -> [String] {
+        text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+    }
+
+    private func substring(of full: String, afterWordCount count: Int) -> String {
+        var seen = 0
+        var index = full.startIndex
+        while index < full.endIndex, seen < count {
+            if full[index].isLetter || full[index].isNumber {
+                while index < full.endIndex, full[index].isLetter || full[index].isNumber {
+                    index = full.index(after: index)
+                }
+                seen += 1
+            } else {
+                index = full.index(after: index)
+            }
+        }
+        return String(full[index...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -67,7 +98,124 @@ enum VoiceDraft {
         if spoken.isEmpty { return prefix }
         if prefix.isEmpty { return spoken }
         if prefix.hasSuffix(" ") || prefix.hasSuffix("\n") { return prefix + spoken }
+        if spoken.hasPrefix("\n") { return prefix + spoken }
+        if spoken.hasPrefix("- ") { return prefix + "\n" + spoken }
         return prefix + " " + spoken
+    }
+}
+
+/// Decides what happens to the dictated text when a voice session ends.
+/// Ending the chord sends the turn; Esc cancels; passive teardown (switching
+/// tabs, the pane disappearing) parks the words in the draft instead of firing
+/// a turn the user never asked for.
+enum VoiceTurnCommit {
+    enum Disposition {
+        case send
+        case commitToDraft
+        case cancel
+    }
+
+    enum Outcome: Equatable {
+        case send(String)
+        case updateDraft(String)
+        case none
+    }
+
+    static func resolve(_ disposition: Disposition, prefix: String, spokenFormatted: String) -> Outcome {
+        if case .cancel = disposition { return .none }
+        // Nothing was actually said: leave the draft alone and never send.
+        guard !spokenFormatted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .none
+        }
+        let combined = VoiceDraft.combined(prefix: prefix, transcript: spokenFormatted)
+        switch disposition {
+        case .send: return .send(combined)
+        case .commitToDraft: return .updateDraft(combined)
+        case .cancel: return .none
+        }
+    }
+}
+
+/// Turns a dictated paragraph into something closer to a typed prompt: spoken
+/// "new line" / "new paragraph" become real breaks, and a run of "first… second…"
+/// becomes a markdown list. Intent extraction still sees the raw transcript;
+/// this runs on the rewritten draft so model-switch clauses are already gone.
+enum VoiceDictationFormatter {
+    static func format(_ text: String) -> String {
+        let withBreaks = applySpokenBreaks(text)
+        return applySpokenLists(withBreaks)
+    }
+
+    private static let breakPhrases: [(phrase: String, replacement: String)] = [
+        ("new paragraph", "\n\n"),
+        ("new line", "\n"),
+        ("newline", "\n"),
+        ("bullet point", "\n- "),
+        ("next bullet", "\n- "),
+    ]
+
+    private static func applySpokenBreaks(_ text: String) -> String {
+        var result = text
+        for (phrase, replacement) in breakPhrases {
+            let pattern = #"\b"# + NSRegularExpression.escapedPattern(for: phrase) + #"\b"#
+            result = result.replacingOccurrences(
+                of: pattern,
+                with: replacement,
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+        result = result.replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"\n[ \t]+"#, with: "\n", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static let ordinalPattern = try! NSRegularExpression(
+        pattern: #"\b(firstly|first|secondly|second|thirdly|third|fourth|fifth|finally|lastly)\b"#,
+        options: .caseInsensitive
+    )
+
+    private static func applySpokenLists(_ text: String) -> String {
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        let matches = ordinalPattern.matches(in: text, range: full).filter { match in
+            isClauseStart(in: text, before: match.range.location)
+        }
+        guard matches.count >= 2 else { return text }
+
+        let intro = String(text[text.startIndex..<range(matches[0].range, in: text).lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var items: [String] = []
+        for (index, match) in matches.enumerated() {
+            let start = range(match.range, in: text).upperBound
+            let end = index + 1 < matches.count
+                ? range(matches[index + 1].range, in: text).lowerBound
+                : text.endIndex
+            var item = String(text[start..<end])
+            item = item.replacingOccurrences(
+                of: #"^[\s,;:\-–—]+"#, with: "", options: .regularExpression
+            )
+            item = item.trimmingCharacters(in: CharacterSet(charactersIn: " \t,;."))
+            if !item.isEmpty { items.append(item) }
+        }
+        guard items.count >= 2 else { return text }
+
+        let list = items.map { "- \($0)" }.joined(separator: "\n")
+        if intro.isEmpty { return list }
+        return intro + "\n" + list
+    }
+
+    private static func isClauseStart(in text: String, before location: Int) -> Bool {
+        guard location > 0 else { return true }
+        let prefix = (text as NSString).substring(to: location)
+        guard let last = prefix.trimmingCharacters(in: .whitespacesAndNewlines).last else {
+            return true
+        }
+        return ".!?;:\n".contains(last)
+    }
+
+    private static func range(_ nsRange: NSRange, in text: String) -> Range<String.Index> {
+        Range(nsRange, in: text) ?? text.startIndex..<text.startIndex
     }
 }
 
@@ -79,6 +227,9 @@ final class VoiceInputController {
     enum Status: Equatable {
         case idle
         case requestingPermission
+        /// Loading an already-installed on-device model into the analyzer.
+        case preparing
+        /// The English dictation asset is not on disk yet and is being fetched.
         case downloadingModel
         case listening
         case error(String)
@@ -86,10 +237,13 @@ final class VoiceInputController {
 
     private(set) var status: Status = .idle
     private(set) var transcript: String = ""
+    /// Smoothed microphone loudness, 0…1 — fast attack, slow release, so the
+    /// composer's smoke breathes with the voice instead of flickering with it.
+    private(set) var audioLevel: Double = 0
 
     var isActive: Bool {
         switch status {
-        case .requestingPermission, .downloadingModel, .listening: true
+        case .requestingPermission, .preparing, .downloadingModel, .listening: true
         case .idle, .error: false
         }
     }
@@ -105,10 +259,6 @@ final class VoiceInputController {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var analyzerStop: (@Sendable () async -> Void)?
-    /// A reserved on-device dictation locale that still needs releasing. Set once
-    /// the reservation is taken so teardown frees it on every exit — throw or
-    /// cancel included, not just the clean finish.
-    private var reservedDictationLocale: Locale?
 
     func toggle() {
         if isActive { stop() } else { start() }
@@ -118,6 +268,7 @@ final class VoiceInputController {
         guard !isActive else { return }
         assembler.reset()
         transcript = ""
+        audioLevel = 0
         status = .requestingPermission
         runTask = Task { await run() }
     }
@@ -126,16 +277,21 @@ final class VoiceInputController {
         runTask?.cancel()
         runTask = nil
         Task { await tearDownCapture() }
+        audioLevel = 0
         if case .error = status { return }
         status = .idle
     }
 
-    /// The composer changed under us (the user deleted or edited while the mic
-    /// was live). Drop already-recognized words so the next hypothesis does not
-    /// paste them back.
-    func discardRecognizedSoFar() {
-        assembler.discardCommitted()
-        transcript = assembler.text
+    /// Called from the audio tap (via the main actor) roughly 12×/second.
+    private func absorb(level: Float) {
+        audioLevel = max(Double(level), audioLevel * 0.82)
+    }
+
+    /// The tap's level callback: hops to the main actor and feeds `absorb`.
+    private nonisolated func levelHandler() -> @Sendable (Float) -> Void {
+        { [weak self] level in
+            Task { @MainActor in self?.absorb(level: level) }
+        }
     }
 
     private func run() async {
@@ -184,20 +340,19 @@ final class VoiceInputController {
             ?? preferred
         let transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
 
-        status = .downloadingModel
-        _ = try? await AssetInventory.reserve(locale: locale)
-        reservedDictationLocale = locale
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            try await request.downloadAndInstall()
+        status = .preparing
+        try await SpeechAssetKeeper.ensureInstalled(transcriber: transcriber, locale: locale) {
+            status = .downloadingModel
         }
         guard !Task.isCancelled else { throw CancellationError() }
+        if status == .downloadingModel { status = .preparing }
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         try await analyzer.prepareToAnalyze(in: bestFormat)
 
         let capture = MicrophoneCapture()
-        let buffers = try capture.start(targetFormat: bestFormat)
+        let buffers = try capture.start(targetFormat: bestFormat, onLevel: levelHandler())
         self.capture = capture
 
         let input = AsyncStream<AnalyzerInput> { continuation in
@@ -237,13 +392,6 @@ final class VoiceInputController {
         try await analyzer.start(inputSequence: input)
         try? await analyzer.finalizeAndFinishThroughEndOfInput()
         resultsTask.cancel()
-        await releaseReservedDictationLocale()
-    }
-
-    private func releaseReservedDictationLocale() async {
-        guard #available(macOS 26.0, *), let locale = reservedDictationLocale else { return }
-        reservedDictationLocale = nil
-        await AssetInventory.release(reservedLocale: locale)
     }
 
     private func runSpeechRecognizer() async throws {
@@ -273,7 +421,7 @@ final class VoiceInputController {
         recognitionRequest = request
 
         let capture = MicrophoneCapture()
-        let buffers = try capture.start(targetFormat: nil)
+        let buffers = try capture.start(targetFormat: nil, onLevel: levelHandler())
         self.capture = capture
 
         let pump = Task { [weak self] in
@@ -328,7 +476,6 @@ final class VoiceInputController {
             await analyzerStop()
             self.analyzerStop = nil
         }
-        await releaseReservedDictationLocale()
     }
 
     private static func userFacingMessage(for error: Error) -> String {
@@ -337,6 +484,39 @@ final class VoiceInputController {
             return "Speech recognition is busy. Try again in a moment."
         }
         return error.localizedDescription
+    }
+}
+
+/// Holds the on-device English dictation locale for the process lifetime.
+///
+/// Releasing it at the end of every mic session made the next tab look like a
+/// fresh download: `AssetInventory` had to reserve (and sometimes reinstall)
+/// the same asset again, and the UI labeled that wait as "Downloading…".
+@available(macOS 26.0, *)
+@MainActor
+enum SpeechAssetKeeper {
+    private static var reservedLocale: Locale?
+    private static var assetsReady = false
+
+    static func ensureInstalled(
+        transcriber: DictationTranscriber,
+        locale: Locale,
+        downloading: () -> Void
+    ) async throws {
+        if reservedLocale == nil {
+            do {
+                try await AssetInventory.reserve(locale: locale)
+            } catch {
+                // Already reserved in this process, or the system is holding it.
+            }
+            reservedLocale = locale
+        }
+        guard !assetsReady else { return }
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            downloading()
+            try await request.downloadAndInstall()
+        }
+        assetsReady = true
     }
 }
 
@@ -397,7 +577,10 @@ private final class MicrophoneCapture: @unchecked Sendable {
     private var tapInstalled = false
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
 
-    func start(targetFormat: AVAudioFormat?) throws -> AsyncStream<AVAudioPCMBuffer> {
+    func start(
+        targetFormat: AVAudioFormat?,
+        onLevel: (@Sendable (Float) -> Void)? = nil
+    ) throws -> AsyncStream<AVAudioPCMBuffer> {
         let input = engine.inputNode
         engine.prepare()
         try engine.start()
@@ -421,6 +604,9 @@ private final class MicrophoneCapture: @unchecked Sendable {
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.continuation = continuation
         input.installTap(onBus: 0, bufferSize: 4096, format: hardwareFormat) { buffer, _ in
+            if let onLevel, let loudness = bufferLoudness(buffer) {
+                onLevel(loudness)
+            }
             if let converter, let converted = converter.convert(buffer) {
                 continuation.yield(converted)
             } else if let copy = copyPCMBuffer(buffer) {
@@ -442,6 +628,21 @@ private final class MicrophoneCapture: @unchecked Sendable {
             engine.stop()
         }
     }
+}
+
+/// Perceptual loudness of a buffer in 0…1, mapping roughly -50 dB (room tone)
+/// to -8 dB (speaking directly into the mic).
+private func bufferLoudness(_ buffer: AVAudioPCMBuffer) -> Float? {
+    guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return nil }
+    let frames = Int(buffer.frameLength)
+    let samples = data[0]
+    var sum: Float = 0
+    for i in 0..<frames {
+        sum += samples[i] * samples[i]
+    }
+    let rms = sqrt(sum / Float(frames))
+    let db = 20 * log10(max(rms, 1e-6))
+    return min(max((db + 50) / 42, 0), 1)
 }
 
 private func copyPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {

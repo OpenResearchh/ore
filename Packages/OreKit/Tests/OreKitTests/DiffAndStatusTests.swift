@@ -313,6 +313,38 @@ struct DiffEngineTests {
         #expect(diffs.map(\.path) == ["mine.txt"])
     }
 
+    @Test func aStaleLocalBaseBranchDoesNotInventCommitsToOpenAPullRequestFrom() async throws {
+        // Same stale-ref trap, on the count that gates the toolbar: a fresh
+        // workspace that has committed nothing was reported as 24 commits ahead
+        // — the whole distance the local `main` ref had fallen behind — so
+        // "Create pull request" sat there permanently with nothing to ship.
+        let fixture = try await GitFixture.initialized()
+        let staleLocalBase = try await fixture.git
+            .run(["rev-parse", "main"]).trimmedStandardOutput
+        try fixture.write("theirs.txt", "landed on the base\n")
+        try await fixture.run(["add", "-A"])
+        try await fixture.commit("someone else's merged work")
+        let movedBase = try await fixture.git
+            .run(["rev-parse", "main"]).trimmedStandardOutput
+        try await fixture.run(["update-ref", "refs/remotes/origin/main", movedBase])
+        try await fixture.run(["update-ref", "refs/heads/main", staleLocalBase])
+
+        // Branched from where the base *actually* is, with no work of its own.
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "fresh", baseRevision: "origin/main", baseBranch: "main"
+        )).path
+
+        #expect(await fixture.git.commitsAheadOfBase("main", in: worktree) == 0)
+
+        // And it still counts real work once there is some.
+        try fixture.write("mine.txt", "mine\n", in: worktree)
+        try await fixture.run(["add", "-A"], in: worktree)
+        try await fixture.commit("my work", in: worktree)
+
+        #expect(await fixture.git.commitsAheadOfBase("main", in: worktree) == 1)
+    }
+
     @Test func turnDiffsComeFromCheckpointRefs() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

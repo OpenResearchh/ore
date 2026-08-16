@@ -99,10 +99,15 @@ final class TerminalRegistry {
     }
 
     func closeTab(_ tabID: UUID, for workspaceID: WorkspaceID) {
+        let next = TabCloseSelection.replacement(
+            closing: tabID,
+            active: activeTabIDs[workspaceID],
+            open: (tabs[workspaceID] ?? []).map(\.id)
+        )
         views[workspaceID]?.removeValue(forKey: tabID)?.terminate()
         tabs[workspaceID]?.removeAll { $0.id == tabID }
         if activeTabIDs[workspaceID] == tabID {
-            activeTabIDs[workspaceID] = tabs[workspaceID]?.first?.id
+            activeTabIDs[workspaceID] = next
         }
     }
 

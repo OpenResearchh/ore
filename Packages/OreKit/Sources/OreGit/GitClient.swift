@@ -133,6 +133,54 @@ public actor GitClient {
         (try? await run(["show-ref", "--verify", "--quiet", "refs/heads/\(name)"])) != nil
     }
 
+    /// Where a worktree actually diverged from its base branch.
+    ///
+    /// `...` semantics — compare against the merge base — mean commits landing
+    /// on the base while the agent works aren't counted as this workspace's
+    /// work. The subtlety is *which* base ref to ask about: the local branch is
+    /// only as fresh as the last time the user checked it out, and nothing in
+    /// ORE updates it. Once the real base moves ahead, every workspace starts
+    /// reporting the base's own commits as its own — the review pane showed 53
+    /// changed files where the pull request showed 39, and a workspace that had
+    /// committed nothing at all still offered "Create pull request".
+    ///
+    /// So both the local branch and its remote-tracking ref are considered, and
+    /// the one that diverged *later* wins. Taking the later of the two is what
+    /// makes this safe in both directions: a stale local ref is ignored, and so
+    /// is a stale `origin/` ref when the user is working offline or ahead.
+    /// Repositories with no remote are unaffected — the `origin/` lookup simply
+    /// fails and the local ref stands.
+    public func mergeBase(with baseBranch: String, in directory: URL? = nil) async -> String? {
+        var best: String?
+        for ref in ["origin/\(baseBranch)", baseBranch] {
+            guard let candidate = try? await run(
+                ["merge-base", "HEAD", ref], in: directory
+            ).trimmedStandardOutput, !candidate.isEmpty else { continue }
+
+            guard let current = best else { best = candidate; continue }
+            // `--is-ancestor` exits 0 when the first commit precedes the second,
+            // which is exactly "the candidate is the later divergence point".
+            let isNewer = (try? await run(
+                ["merge-base", "--is-ancestor", current, candidate],
+                in: directory,
+                allowedExitCodes: [0, 1]
+            ).exitCode) == 0
+            if isNewer { best = candidate }
+        }
+        return best
+    }
+
+    /// How many commits this worktree has that its base doesn't — measured from
+    /// the real divergence point, so a stale local base ref can't credit the
+    /// base's own history to the workspace.
+    public func commitsAheadOfBase(_ baseBranch: String, in directory: URL? = nil) async -> Int {
+        let base = await mergeBase(with: baseBranch, in: directory) ?? baseBranch
+        guard let output = try? await run(
+            ["rev-list", "--count", "\(base)..HEAD"], in: directory
+        ) else { return 0 }
+        return Int(output.trimmedStandardOutput) ?? 0
+    }
+
     /// Commits in a revision range, newest first.
     ///
     /// Fields are separated by unit-separator so subjects containing any

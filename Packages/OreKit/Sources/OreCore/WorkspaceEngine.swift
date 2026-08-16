@@ -1014,8 +1014,8 @@ public actor WorkspaceEngine {
             insertions: liveStatus.insertions,
             deletions: liveStatus.deletions,
             unpushedCommitCount: await unpushedCommitCount(),
-            commitsAheadOfBase: await commitCount(
-                range: "\(record.baseBranch)..HEAD"
+            commitsAheadOfBase: await git.commitsAheadOfBase(
+                record.baseBranch, in: worktreeURL
             ),
             hasUpstream: await hasUpstream(),
             hasRemote: await git.hasRemote(),
@@ -1176,14 +1176,7 @@ public actor WorkspaceEngine {
         if await git.hasRemote() {
             return await git.unpushedCommitCount(in: worktreeURL)
         }
-        return await commitCount(range: "\(record.baseBranch)..HEAD")
-    }
-
-    private func commitCount(range: String) async -> Int {
-        guard let output = try? await git.run(
-            ["rev-list", "--count", range], in: worktreeURL
-        ) else { return 0 }
-        return Int(output.trimmedStandardOutput) ?? 0
+        return await git.commitsAheadOfBase(record.baseBranch, in: worktreeURL)
     }
 
     private func hasUpstream() async -> Bool {

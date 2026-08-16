@@ -1877,12 +1877,12 @@ struct GitActionToolbar: View {
                 Button(branch) { chosenBase = branch }
             }
         } label: {
-            HStack(spacing: 4) {
-                Text("into").foregroundStyle(.secondary)
-                Text(base).fontWeight(.medium)
-                Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
-            }
-            .font(.system(size: OreTheme.Font.body))
+            // One `Text`, not a styled `HStack`: a borderless menu on macOS
+            // renders its label the way AppKit renders a menu item — image
+            // first, and only the first string survives — which is why the
+            // picker read "into ⌄" with the branch name missing entirely.
+            Text("into \(base)")
+                .font(.system(size: OreTheme.Font.body))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()

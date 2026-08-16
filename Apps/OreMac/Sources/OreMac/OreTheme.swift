@@ -92,6 +92,12 @@ struct OreComposerSurface: ViewModifier {
     /// composer itself is the progress indicator.
     var isBusy: Bool = false
     var reduceMotion: Bool = false
+    /// While dictation is live, blue "clouds" drift along the bottom and sides
+    /// of the surface. Takes precedence over the busy border so two animated
+    /// edges never stack.
+    var voiceGlow: OreVoiceGlowLevel = .off
+    /// Smoothed microphone loudness, 0…1 — the clouds billow with the voice.
+    var voiceEnergy: Double = 0
 
     private static let glassRadius: CGFloat = OreTheme.cardRadius
 
@@ -100,20 +106,129 @@ struct OreComposerSurface: ViewModifier {
         if #available(macOS 26.0, *) {
             content
                 .padding(padding)
+                .background { glow(cornerRadius: Self.glassRadius) }
                 .glassEffect(.regular, in: .rect(cornerRadius: Self.glassRadius))
                 .overlay { busyBorder(cornerRadius: Self.glassRadius) }
+                .overlay { glowStroke(cornerRadius: Self.glassRadius) }
         } else {
             content
                 .modifier(OreCard(padding: padding, radius: OreTheme.cardRadius))
+                .background { glow(cornerRadius: OreTheme.cardRadius) }
                 .overlay { busyBorder(cornerRadius: OreTheme.cardRadius) }
+                .overlay { glowStroke(cornerRadius: OreTheme.cardRadius) }
         }
     }
 
     @ViewBuilder
     private func busyBorder(cornerRadius: CGFloat) -> some View {
-        if isBusy {
+        if isBusy, voiceGlow == .off {
             OreComposerBusyBorder(cornerRadius: cornerRadius, reduceMotion: reduceMotion)
                 .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private func glow(cornerRadius: CGFloat) -> some View {
+        if voiceGlow != .off, !reduceMotion {
+            OreVoiceGlow(cornerRadius: cornerRadius, level: voiceGlow, energy: voiceEnergy)
+                .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private func glowStroke(cornerRadius: CGFloat) -> some View {
+        if voiceGlow != .off {
+            OreVoiceGlowStroke(
+                cornerRadius: cornerRadius,
+                level: voiceGlow,
+                reduceMotion: reduceMotion
+            )
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+/// How strongly the composer's voice glow renders: `subdued` while the mic is
+/// still spinning up (permission, model download), `full` once listening.
+enum OreVoiceGlowLevel {
+    case off, subdued, full
+
+    var intensity: Double {
+        switch self {
+        case .off: 0
+        case .subdued: 0.5
+        case .full: 1
+        }
+    }
+}
+
+/// A quiet blue glow pooled along the composer's bottom edge while dictation
+/// is live, breathing with the speaker's voice: louder speech lifts and
+/// brightens it, silence lets it settle. Deliberately simple — one gradient,
+/// no texture — so it reads as state, not weather.
+struct OreVoiceGlow: View {
+    let cornerRadius: CGFloat
+    let level: OreVoiceGlowLevel
+    /// Smoothed microphone loudness, 0…1.
+    var energy: Double = 0
+
+    var body: some View {
+        let strength = level.intensity * (0.55 + 0.45 * energy)
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: Color.blue.opacity(0.12 * strength), location: 0.45),
+                    .init(color: Color.cyan.opacity(0.3 * strength), location: 1.0),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 44 + 44 * energy)
+            .blur(radius: 10)
+        }
+        // Strictly inside the composer: clip to the exact glass shape, inset a
+        // hair so no fringe peeks past the border stroke.
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).inset(by: 0.5))
+        .animation(.easeOut(duration: 0.25), value: energy)
+        .animation(.easeOut(duration: 0.25), value: level.intensity)
+        .allowsHitTesting(false)
+    }
+}
+
+/// The crisp edge of the voice glow: a blue-to-cyan outline that fades toward
+/// the top of the composer. Under Reduce Motion this is the entire effect.
+struct OreVoiceGlowStroke: View {
+    let cornerRadius: CGFloat
+    let level: OreVoiceGlowLevel
+    let reduceMotion: Bool
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if reduceMotion {
+            shape.strokeBorder(Color.blue.opacity(0.6 * level.intensity), lineWidth: 1.5)
+        } else {
+            shape
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.cyan, Color.blue],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 1.5
+                )
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white.opacity(0.25), location: 0.0),
+                            .init(color: .white, location: 1.0),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .opacity(0.85 * level.intensity)
         }
     }
 }
@@ -344,9 +459,17 @@ extension View {
     func oreComposerSurface(
         padding: CGFloat = 10,
         isBusy: Bool = false,
-        reduceMotion: Bool = false
+        reduceMotion: Bool = false,
+        voiceGlow: OreVoiceGlowLevel = .off,
+        voiceEnergy: Double = 0
     ) -> some View {
-        modifier(OreComposerSurface(padding: padding, isBusy: isBusy, reduceMotion: reduceMotion))
+        modifier(OreComposerSurface(
+            padding: padding,
+            isBusy: isBusy,
+            reduceMotion: reduceMotion,
+            voiceGlow: voiceGlow,
+            voiceEnergy: voiceEnergy
+        ))
     }
 
     func oreNavigationSurface() -> some View {

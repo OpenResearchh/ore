@@ -36,7 +36,6 @@ struct ChatPane: View {
     @State private var workspaceFileIndex: [WorkspaceFileNode] = []
     @FocusState private var composerFocused: Bool
     @State private var voice = VoiceInputController()
-    @State private var voicePrefix = ""
     @State private var voiceAttachedClipboard = false
     /// What dictation has recognized so far, shown as a fading trail so the user
     /// can see which words were taken out of the prompt and what they changed.
@@ -45,9 +44,10 @@ struct ChatPane: View {
     /// tears down the agent session, which is far too costly to do on a partial
     /// transcript the recognizer may still revise.
     @State private var voicePendingModel: VoiceModelCandidate?
-    /// The exact draft text dictation last wrote, so the composer's
-    /// user-edited-the-text check can tell our own writes apart.
-    @State private var voiceAppliedDraft: String?
+    /// The live, intent-stripped transcript shown in the quote panel while the
+    /// mic is hot. Dictation never touches `draft`; the words only land there
+    /// (or go straight out as a turn) when the session ends.
+    @State private var voiceQuote = ""
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
     private var chat: ChatState { model.chat(for: workspace.id) }
@@ -130,13 +130,13 @@ struct ChatPane: View {
             .clipped()
 
             // Anything blocking the agent sits directly above the composer,
-            // where the user is already looking. AskUserQuestion is both a
-            // permission gate and a question; showing the generic Allow/Deny
-            // card alongside the question card is the confusing "two prompts at
-            // once" — the QuestionCard below owns it, and answering there also
-            // allows this permission.
+            // where the user is already looking. AskUserQuestion and
+            // ExitPlanMode are both a permission gate *and* a dedicated card;
+            // showing the generic Allow/Deny alongside that card is two
+            // prompts for the same decision. The dedicated card owns it, and
+            // answering there also allows (or denies) this permission.
             if let permission = chat.pendingPermission,
-               permission.toolName != "AskUserQuestion" {
+               !hidesGenericPermission(permission) {
                 PermissionCard(request: permission) { decision in
                     model.resolvePermission(permission.id, decision: decision, for: workspace.id)
                 }
@@ -291,24 +291,22 @@ struct ChatPane: View {
                 next.contains { $0.relativePath == path }
             }
             model.setDraft(value, for: chatSummary)
-            // Dictation rewrites the draft itself to strip settings clauses, and
-            // that write must not look like the user typing — otherwise it would
-            // discard the words the recognizer has already given us.
-            if voice.isActive, value != voiceAppliedDraft {
-                let raw = VoiceDraft.combined(prefix: voicePrefix, transcript: voice.transcript)
-                if value != raw {
-                    voicePrefix = value
-                    voice.discardRecognizedSoFar()
-                }
-            }
         }
         .onChange(of: voice.transcript) { _, text in
             guard voice.isActive else { return }
             applyLiveVoiceIntents(spoken: text)
         }
+        .onChange(of: voice.status) { _, status in
+            handleVoiceStatusChange(status)
+        }
         .onChange(of: chatSummary?.id) { _, _ in
-            finishVoiceIfNeeded()
+            finishVoice(.commitToDraft)
             voiceAttachedClipboard = false
+        }
+        .onChange(of: chat.pendingQuestion != nil) { _, hasQuestion in
+            // The QuestionCard replaces the composer entirely; keep the words
+            // rather than leaving a hot mic pointed at a vanished quote panel.
+            if hasQuestion { finishVoice(.commitToDraft) }
         }
         .onChange(of: hotkey.command) { _, command in
             // Panes exist for background workspaces too; only the one on screen
@@ -317,14 +315,14 @@ struct ChatPane: View {
             switch command.kind {
             case .toggle: toggleVoice()
             case .start: if !voice.isActive { startVoice() }
-            case .stop: finishVoiceIfNeeded()
+            case .stop: finishVoice(.send)
             }
         }
         .onDisappear {
-            finishVoiceIfNeeded()
+            finishVoice(.commitToDraft)
         }
         .onExitCommand {
-            finishVoiceIfNeeded()
+            finishVoice(.cancel)
         }
         .task(id: chatSummary?.id) {
             let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
@@ -346,10 +344,7 @@ struct ChatPane: View {
         }
         .confirmationDialog(
             "Revert chat and workspace?",
-            isPresented: Binding(
-                get: { revertTarget != nil },
-                set: { if !$0 { revertTarget = nil } }
-            ),
+            isPresented: revertDialogPresented,
             titleVisibility: .visible
         ) {
             Button("Revert", role: .destructive) {
@@ -362,10 +357,7 @@ struct ChatPane: View {
         }
         .confirmationDialog(
             "Close this tab while the agent is working?",
-            isPresented: Binding(
-                get: { model.pendingChatClose != nil },
-                set: { if !$0 { model.pendingChatClose = nil } }
-            ),
+            isPresented: pendingChatClosePresented,
             titleVisibility: .visible
         ) {
             Button("Close Tab", role: .destructive) {
@@ -380,10 +372,7 @@ struct ChatPane: View {
                 Text("“\(pending.title)” still has a running turn. Closing the tab will stop the agent.")
             }
         }
-        .alert("Rename Chat", isPresented: Binding(
-            get: { renameChatTarget != nil },
-            set: { if !$0 { renameChatTarget = nil } }
-        )) {
+        .alert("Rename Chat", isPresented: renameChatPresented) {
             TextField("Name", text: $renameChatText)
             Button("Rename") {
                 guard let target = renameChatTarget else { return }
@@ -393,6 +382,29 @@ struct ChatPane: View {
             }
             Button("Cancel", role: .cancel) { renameChatTarget = nil }
         }
+    }
+
+    // Extracted from the body's modifier chain: inline `Binding` closures there
+    // push the type-checker past its expression limit.
+    private var revertDialogPresented: Binding<Bool> {
+        Binding(
+            get: { revertTarget != nil },
+            set: { if !$0 { revertTarget = nil } }
+        )
+    }
+
+    private var pendingChatClosePresented: Binding<Bool> {
+        Binding(
+            get: { model.pendingChatClose != nil },
+            set: { if !$0 { model.pendingChatClose = nil } }
+        )
+    }
+
+    private var renameChatPresented: Binding<Bool> {
+        Binding(
+            get: { renameChatTarget != nil },
+            set: { if !$0 { renameChatTarget = nil } }
+        )
     }
 
     private var displayRows: [TranscriptRow] {
@@ -662,11 +674,15 @@ struct ChatPane: View {
                     }
 
                 }
-                .padding(.leading, OreTheme.Space.sm)
-                .padding(.trailing, tabControlAllowance)
-                .frame(minWidth: availableWidth, alignment: .leading)
+                // Mirrored, not lopsided: padding only the trailing edge for the
+                // controls pushes the whole strip left of centre by half their
+                // width. With both edges reserved the tabs sit on the window's
+                // centre line — the same line the transcript and composer use —
+                // and the last tab still can't slide under the + button.
+                .padding(.horizontal, tabControlAllowance)
+                .frame(minWidth: availableWidth)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity)
             .onChange(of: activeTabKey) { _, key in
                 withAnimation(.easeOut(duration: 0.18)) {
                     proxy.scrollTo(key, anchor: .center)
@@ -685,9 +701,10 @@ struct ChatPane: View {
         .background(.bar)
     }
 
-    /// The trailing edge reserved for the fixed controls (new-tab, history, and
-    /// the stop button while busy). Mirrored as leading padding so the tabs stay
-    /// optically centred rather than shifted by the controls' width.
+    /// Width reserved at *each* edge of the strip: the trailing side holds the
+    /// fixed controls (new-tab, history, and the stop button while busy), and
+    /// the leading side matches it so the tabs stay optically centred rather
+    /// than shifted by the controls' width.
     private var tabControlAllowance: CGFloat {
         88
     }
@@ -886,7 +903,7 @@ struct ChatPane: View {
             }
 
             if !voiceChanges.isEmpty {
-                VoiceChangeTrail(changes: voiceChanges)
+                VoiceChangeTrail(changes: voiceChanges, onActivate: confirmVoiceChange)
                     .transition(
                         reduceMotion
                             ? .opacity
@@ -969,49 +986,63 @@ struct ChatPane: View {
                 .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
             }
 
-            InlineMentionTextEditor(
-                text: $draft,
-                mentionNames: attachments
-                    .filter {
-                        !$0.relativePath.hasPrefix(".context/attachments/")
-                            || inlinePastedPaths.contains($0.relativePath)
-                    }
-                    .map(\.displayName),
-                onTab: acceptFirstMentionSuggestion,
-                onPaste: handlePasteboard,
-                onCopy: handleComposerCopy,
-                previewURL: previewURL(for:)
-            )
-                .frame(height: min(max(composerTextHeight + 16, 38), 200))
-                .focused($composerFocused)
-                .overlay(alignment: .topLeading) {
-                    if draft.isEmpty {
-                        Text(placeholder)
-                            .font(.system(size: OreTheme.Font.prose))
-                            .foregroundStyle(.tertiary)
-                            // Match the editor's textContainerInset (5×6) so the
-                            // placeholder sits exactly where the caret and typed
-                            // text do, instead of 6pt above them.
-                            .padding(.leading, 5)
-                            .padding(.top, 6)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .background(
-                    // A hidden copy of the text, measured at the editor's width,
-                    // grows the composer with its content — one line by default,
-                    // up to a scroll cap — instead of a fixed 72pt box.
-                    Text(draft.isEmpty ? " " : draft)
-                        .font(.system(size: OreTheme.Font.prose))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(GeometryReader { geo in
-                            Color.clear
-                                .onAppear { composerTextHeight = geo.size.height }
-                                .onChange(of: draft) { _, _ in composerTextHeight = geo.size.height }
-                        })
-                        .hidden()
+            if voice.isActive {
+                // In voice mode the input area itself becomes the transcript:
+                // the words land where they will be sent from, set in serif
+                // quotes so they read as speech-in-progress rather than typed
+                // text.
+                VoiceComposerTranscript(
+                    prefix: draft,
+                    transcript: voiceQuote,
+                    isListening: voice.isListening
                 )
+                .frame(minHeight: 38, alignment: .topLeading)
+                .transition(.opacity)
+            } else {
+                InlineMentionTextEditor(
+                    text: $draft,
+                    mentionNames: attachments
+                        .filter {
+                            !$0.relativePath.hasPrefix(".context/attachments/")
+                                || inlinePastedPaths.contains($0.relativePath)
+                        }
+                        .map(\.displayName),
+                    onTab: acceptFirstMentionSuggestion,
+                    onPaste: handlePasteboard,
+                    onCopy: handleComposerCopy,
+                    previewURL: previewURL(for:)
+                )
+                    .frame(height: min(max(composerTextHeight + 16, 38), 200))
+                    .focused($composerFocused)
+                    .overlay(alignment: .topLeading) {
+                        if draft.isEmpty {
+                            Text(placeholder)
+                                .font(.system(size: OreTheme.Font.prose))
+                                .foregroundStyle(.tertiary)
+                                // Match the editor's textContainerInset (5×6) so the
+                                // placeholder sits exactly where the caret and typed
+                                // text do, instead of 6pt above them.
+                                .padding(.leading, 5)
+                                .padding(.top, 6)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .background(
+                        // A hidden copy of the text, measured at the editor's width,
+                        // grows the composer with its content — one line by default,
+                        // up to a scroll cap — instead of a fixed 72pt box.
+                        Text(draft.isEmpty ? " " : draft)
+                            .font(.system(size: OreTheme.Font.prose))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { composerTextHeight = geo.size.height }
+                                    .onChange(of: draft) { _, _ in composerTextHeight = geo.size.height }
+                            })
+                            .hidden()
+                    )
+            }
 
             if let tab = chatSummary {
                 composerToolbar(for: tab)
@@ -1019,8 +1050,16 @@ struct ChatPane: View {
         }
         // While the agent runs, the composer's own border animates — the input
         // box *is* the progress indicator, not a chip floating beside it.
-        .oreComposerSurface(padding: 10, isBusy: chat.isBusy, reduceMotion: reduceMotion)
+        .oreComposerSurface(
+            padding: 10,
+            isBusy: chat.isBusy,
+            reduceMotion: reduceMotion,
+            voiceGlow: voice.isListening ? .full : voice.isActive ? .subdued : .off,
+            voiceEnergy: voice.audioLevel
+        )
         .animation(.easeOut(duration: 0.2), value: chat.isBusy)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: voice.isActive)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: voice.isListening)
         // Left-aligned to sit in the same column as the transcript, rather than
         // centring while the prose above it starts at the leading edge.
         .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -1081,11 +1120,18 @@ struct ChatPane: View {
         .help("Permission mode")
     }
 
+    /// Generic Allow/Deny is the wrong surface when a dedicated card already
+    /// answers the same permission request.
+    private func hidesGenericPermission(_ permission: PermissionRequest) -> Bool {
+        if permission.toolName == "AskUserQuestion" { return true }
+        if permission.toolName == "ExitPlanMode", case .proposal = chat.plan {
+            return true
+        }
+        return false
+    }
+
     @ViewBuilder
     private func modeControls(for tab: ChatSummary) -> some View {
-        if (chatSummary?.permissionMode ?? workspace.permissionMode) == .plan {
-            ComposerModeTag(title: "Plan", systemImage: "list.bullet.clipboard", tint: .purple)
-        }
         if supportsFastMode(tab) {
             Menu {
                 Button {
@@ -1157,7 +1203,7 @@ struct ChatPane: View {
     }
 
     private func modelChooserButton(for tab: ChatSummary) -> some View {
-        Button { showModelChooser.toggle() } label: {
+        Button { handleModelChipTap(for: tab) } label: {
             modelChipLabel(for: tab)
         }
         .buttonStyle(OrePressableButtonStyle())
@@ -1187,7 +1233,26 @@ struct ChatPane: View {
                 showModelChooser = false
             }
         }
-        .help("Model: \(modelDisplayName(for: tab)). Scroll to switch agent.")
+        .help(modelChipHelp(for: tab))
+    }
+
+    private func modelChipHelp(for tab: ChatSummary) -> String {
+        if let pending = voicePendingModel {
+            return "Click to switch to \(pending.displayName) now"
+        }
+        return "Model: \(modelDisplayName(for: tab)). Scroll to switch agent."
+    }
+
+    /// A highlighted pending model is a confirmation, not a prompt to pick
+    /// something else. Opening the chooser stole focus into its search field
+    /// and ate both clicks and the rest of the dictation.
+    private func handleModelChipTap(for tab: ChatSummary) {
+        if let pending = voicePendingModel {
+            applyVoiceModel(pending, to: tab)
+            voicePendingModel = nil
+            return
+        }
+        showModelChooser.toggle()
     }
 
     private func modelChipLabel(for tab: ChatSummary) -> some View {
@@ -1383,7 +1448,7 @@ struct ChatPane: View {
     private var micButton: some View {
         Button(action: toggleVoice) {
             Group {
-                if case .downloadingModel = voice.status {
+                if voice.status == .downloadingModel || voice.status == .preparing {
                     ProgressView().controlSize(.small)
                 } else {
                     Image(systemName: voice.isListening ? "mic.fill" : "mic")
@@ -1412,7 +1477,8 @@ struct ChatPane: View {
 
     private var micHelp: String {
         switch voice.status {
-        case .listening: return "Stop dictation (Esc)"
+        case .listening: return "Finish and send (Esc cancels)"
+        case .preparing: return "Starting dictation…"
         case .downloadingModel: return "Downloading on-device speech model…"
         case .requestingPermission: return "Waiting for microphone permission…"
         case .error(let message): return message
@@ -1422,7 +1488,7 @@ struct ChatPane: View {
 
     private func toggleVoice() {
         if voice.isActive {
-            finishVoiceIfNeeded()
+            finishVoice(.send)
         } else {
             startVoice()
         }
@@ -1433,21 +1499,119 @@ struct ChatPane: View {
         voiceAttachedClipboard = false
         voicePendingModel = nil
         voiceChanges = []
-        voiceAppliedDraft = nil
-        voicePrefix = draft
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            voiceQuote = ""
+        }
         composerFocused = true
+        // Load the on-device model while the user talks, so the commit-time
+        // refinement doesn't pay the cold start.
+        VoiceIntentRefiner.shared.prewarm()
         voice.start()
     }
 
-    private func finishVoiceIfNeeded() {
+    /// The recognizer failing flips `isActive` off before `finishVoice` can
+    /// run, which would silently drop everything already spoken. Park the words
+    /// in the draft and let the placeholder surface the error.
+    private func handleVoiceStatusChange(_ status: VoiceInputController.Status) {
+        guard case .error = status else { return }
+        let spoken = voice.transcript
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            voiceQuote = ""
+        }
+        clearVoiceTrail()
+        let outcome = VoiceTurnCommit.resolve(
+            .commitToDraft,
+            prefix: draft,
+            spokenFormatted: formattedVoiceText(spoken: spoken)
+        )
+        if case .updateDraft(let text) = outcome {
+            draft = text
+        }
+    }
+
+    /// Ends the voice session. Ending the chord (or the mic button, or ⌘↩)
+    /// sends the dictated words as a turn; Esc throws them away; passive
+    /// teardown — switching tabs, the pane disappearing — parks them in the
+    /// draft so nothing fires that the user didn't ask for.
+    private func finishVoice(_ disposition: VoiceTurnCommit.Disposition) {
         guard voice.isActive else { return }
         let spoken = voice.transcript
         voice.stop()
-        guard !spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            voiceQuote = ""
+        }
+        if case .cancel = disposition {
             clearVoiceTrail()
+            voiceAttachedClipboard = false
             return
         }
-        applyVoiceIntents(spoken: spoken)
+        let finalText = finalizeVoiceIntents(spoken: spoken)
+        switch VoiceTurnCommit.resolve(disposition, prefix: draft, spokenFormatted: finalText) {
+        case .send(let text):
+            sendVoiceTurn(regexCombined: text, spoken: spoken)
+        case .updateDraft(let text):
+            draft = text
+        case .none:
+            break
+        }
+    }
+
+    /// The auto-send path: before the turn goes out, one on-device language
+    /// model call arbitrates what the regex pass may have missed — fuzzy file
+    /// references, indirect settings requests — and produces the final
+    /// cleaned prompt. Regex output is the floor: unavailable model, timeout,
+    /// or an empty parse all fall back to it, so send never blocks on the
+    /// refiner for more than its watchdog.
+    private func sendVoiceTurn(regexCombined: String, spoken: String) {
+        let prefix = draft
+        // The words land in the draft before anything async happens: whatever
+        // the refiner does — improve, time out, or fail — the user's speech is
+        // already visible and sendable, never held hostage.
+        draft = regexCombined
+        guard VoiceIntentRefiner.shared.isAvailable else {
+            performSend()
+            return
+        }
+        let catalog = voiceSettingsCatalog()
+        let candidates = VoiceFileCandidates.rank(
+            transcript: spoken,
+            files: workspaceFileIndex
+                .filter { !$0.isDirectory }
+                .map { VoiceFileCandidates.Candidate(name: $0.name, path: $0.path) }
+        )
+        Task {
+            let refinement = await VoiceIntentRefiner.shared.refine(
+                spoken: spoken,
+                catalog: catalog,
+                fileCandidates: candidates
+            )
+            if let refinement {
+                if let id = refinement.modelID, let tab = chatSummary,
+                   let chosen = catalog.models.first(where: { $0.id == id }) {
+                    applyVoiceModel(chosen, to: tab)
+                }
+                if let effort = refinement.effort, let tab = chatSummary,
+                   availableEfforts(for: tab).contains(effort) {
+                    reasoningEffort = effort
+                }
+                if let mode = refinement.mode, mode != workspace.permissionMode {
+                    model.setPermissionMode(mode, for: workspace.id)
+                }
+                // Prefer the model's cleaned prompt, but never let it drop
+                // words: an empty parse means the model over-stripped, and
+                // the regex floor wins.
+                if let cleaned = refinement.cleanedPrompt {
+                    draft = VoiceDraft.combined(
+                        prefix: prefix,
+                        transcript: VoiceDictationFormatter.format(cleaned)
+                    )
+                }
+                for file in refinement.files {
+                    insertWorkspaceReference(path: file.path, displayName: file.name)
+                }
+            }
+            performSend()
+        }
     }
 
     /// Runs on every partial transcript. Extraction costs well under a
@@ -1455,7 +1619,7 @@ struct ChatPane: View {
     /// speech instead of waiting for the mic to stop.
     ///
     /// Effort and mode are applied immediately — they are local state. The model
-    /// is only *shown*; committing it is deferred to `applyVoiceIntents`.
+    /// is only *shown*; committing it is deferred to `finalizeVoiceIntents`.
     private func applyLiveVoiceIntents(spoken: String) {
         let intents = voiceIntents(from: spoken)
 
@@ -1478,9 +1642,15 @@ struct ChatPane: View {
             mergeVoiceChanges(intents.changes)
         }
 
-        let combined = VoiceDraft.combined(prefix: voicePrefix, transcript: intents.rewritten)
-        voiceAppliedDraft = combined
-        draft = combined
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+            voiceQuote = VoiceDictationFormatter.format(intents.rewritten)
+        }
+    }
+
+    /// The transcript with settings clauses stripped and spoken breaks applied,
+    /// without any of the end-of-session side effects.
+    private func formattedVoiceText(spoken: String) -> String {
+        VoiceDictationFormatter.format(voiceIntents(from: spoken).rewritten)
     }
 
     /// Latest value per kind, first-spoken order.
@@ -1502,6 +1672,14 @@ struct ChatPane: View {
             voiceChanges = []
             voicePendingModel = nil
         }
+    }
+
+    private func confirmVoiceChange(_ change: VoiceChange) {
+        guard change.kind == .model, let chosen = voicePendingModel, let tab = chatSummary else {
+            return
+        }
+        applyVoiceModel(chosen, to: tab)
+        voicePendingModel = nil
     }
 
     private func voiceIntents(from spoken: String) -> VoiceIntents {
@@ -1533,7 +1711,9 @@ struct ChatPane: View {
 
     /// Clipboard and mode/model/effort — applied when dictation ends, not on
     /// every partial transcript. Spoken filenames are left for the agent.
-    private func applyVoiceIntents(spoken: String) {
+    /// Returns the formatted, intent-stripped text ready to send or park in
+    /// the draft; settings commit even when nothing sendable was said.
+    private func finalizeVoiceIntents(spoken: String) -> String {
         let intents = voiceIntents(from: spoken)
         var rewritten = intents.rewritten
 
@@ -1565,9 +1745,6 @@ struct ChatPane: View {
             if allowed.contains(effort) { reasoningEffort = effort }
         }
 
-        let combined = VoiceDraft.combined(prefix: voicePrefix, transcript: rewritten)
-        voiceAppliedDraft = combined
-        draft = combined
         voicePendingModel = nil
 
         withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
@@ -1575,13 +1752,16 @@ struct ChatPane: View {
         }
 
         // Let the trail sit long enough to read, then fade it out.
-        guard !voiceChanges.isEmpty else { return }
-        let generation = voiceChanges
-        Task {
-            try? await Task.sleep(for: .seconds(3))
-            guard voiceChanges == generation else { return }
-            clearVoiceTrail()
+        if !voiceChanges.isEmpty {
+            let generation = voiceChanges
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                guard voiceChanges == generation else { return }
+                clearVoiceTrail()
+            }
         }
+
+        return VoiceDictationFormatter.format(rewritten)
     }
 
     private func applyVoiceModel(_ chosen: VoiceModelCandidate, to tab: ChatSummary) {
@@ -1623,7 +1803,7 @@ struct ChatPane: View {
     }
 
     private var placeholder: String {
-        if voice.isListening { return "Listening…" }
+        if case .preparing = voice.status { return "Starting dictation…" }
         if case .downloadingModel = voice.status { return "Downloading speech model…" }
         if case .error(let message) = voice.status { return message }
         return chat.draftComments.isEmpty
@@ -1634,7 +1814,16 @@ struct ChatPane: View {
     }
 
     private func send() {
-        finishVoiceIfNeeded()
+        // ⌘↩ mid-dictation ends the session, which sends exactly once through
+        // `finishVoice` rather than racing it.
+        if voice.isActive {
+            finishVoice(.send)
+            return
+        }
+        performSend()
+    }
+
+    private func performSend() {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let outgoing = attachments
         guard !text.isEmpty || !outgoing.isEmpty else { return }
@@ -2206,13 +2395,9 @@ private struct ResearchEmptyState: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let identity {
-                spotlightCard(identity: identity, compact: compact)
-            }
-
             // The starters earn one compact row of chips, not four cards —
-            // the scientist is the centerpiece, and the real call to action
-            // is the composer below.
+            // they are the visible answer to the headline's question, and the
+            // real call to action is the composer below.
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: compact ? 6 : 8) {
                     ForEach(starters) { starter in starterChip(starter, compact: compact) }
@@ -2240,15 +2425,26 @@ private struct ResearchEmptyState: View {
                 }
             }
 
+            if let identity {
+                inspirationLine(identity: identity, compact: compact)
+                    .padding(.top, compact ? 2 : 10)
+            }
         }
         .padding(.vertical, compact ? 6 : 44)
     }
 
-    /// The scientist this workspace is named for, given real presence:
-    /// portrait, a few sentences of biography from the corpus, and a link out.
-    /// Falls back to a monogram and the catalog's one-line fact offline.
-    private func spotlightCard(identity: ResearchIdentity, compact: Bool) -> some View {
-        HStack(alignment: .top, spacing: compact ? 10 : 14) {
+    /// The scientist this workspace is named for — a footnote, not a feature.
+    ///
+    /// This used to be a filled card carrying a portrait, a description line,
+    /// four lines of Wikipedia and a "Learn more" link, sitting directly under
+    /// the headline. At that weight it competed with the question the page is
+    /// actually asking and read like an advertisement for a stranger. The point
+    /// was only ever a quiet nod to someone who built something: one portrait,
+    /// one sentence about what they did, parked below the shortcuts where it
+    /// rewards a glance and costs nothing to ignore.
+    private func inspirationLine(identity: ResearchIdentity, compact: Bool) -> some View {
+        let side: CGFloat = compact ? 20 : 24
+        return HStack(spacing: 8) {
             Group {
                 if let portrait {
                     Image(nsImage: portrait)
@@ -2256,38 +2452,44 @@ private struct ResearchEmptyState: View {
                         .scaledToFill()
                 } else {
                     Text(Self.monogram(for: identity.name))
-                        .font(.system(size: compact ? 18 : 24, weight: .semibold, design: .rounded))
+                        .font(.system(size: side * 0.42, weight: .semibold, design: .rounded))
                         .foregroundStyle(Color.accentColor)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color.accentColor.opacity(0.12))
                 }
             }
-            .frame(width: compact ? 44 : 56, height: compact ? 44 : 56)
-            .clipShape(RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+            .frame(width: side, height: side)
+            .clipShape(Circle())
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(identity.name)
-                    .font(.system(size: compact ? 13.5 : 15, weight: .semibold))
-                Text(profile?.descriptionLine ?? "\(identity.field) · \(identity.region)")
-                    .font(.system(size: compact ? 10.5 : 11.5))
-                    .foregroundStyle(.secondary)
-                Text(profile?.extract ?? identity.fact)
-                    .font(.system(size: compact ? 11 : 12))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(compact ? 2 : 4)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 1)
-                if let page = profile?.pageURL, let url = URL(string: page) {
-                    Link("Learn more on Wikipedia", destination: url)
-                        .font(.system(size: compact ? 10.5 : 11.5))
-                        .padding(.top, 1)
-                }
-            }
-            Spacer(minLength: 0)
+            // The catalog's `fact` is the inspiring sentence — what this person
+            // actually did. Wikipedia's extract is an encyclopedia entry, which
+            // is what made the old card read like a biography stapled to a
+            // to-do list.
+            (
+                Text(identity.name).foregroundStyle(.secondary)
+                    + Text("  ") + Text(identity.fact).foregroundStyle(.tertiary)
+            )
+            .font(.system(size: compact ? 10.5 : 11.5))
+            .lineLimit(compact ? 1 : 2)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(compact ? 8 : 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        // The link survives, but as behaviour rather than furniture: the row
+        // itself opens Wikipedia. Nothing here announces itself.
+        .contentShape(Rectangle())
+        .help(wikipediaURL == nil ? identity.fact : "Read about \(identity.name) on Wikipedia")
+        .onTapGesture {
+            if let url = wikipediaURL { NSWorkspace.shared.open(url) }
+        }
+        .onHover { hovering in
+            guard wikipediaURL != nil else { return }
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    private var wikipediaURL: URL? {
+        guard let page = profile?.pageURL else { return nil }
+        return URL(string: page)
     }
 
     private func starterChip(_ starter: Starter, compact: Bool) -> some View {
@@ -2351,6 +2553,89 @@ private struct ShortcutHint: View {
     }
 }
 
+/// Voice mode's take on the input area: the live transcript rendered exactly
+/// where typed text would be, in serif italic between curly quotes, so speech
+/// reads as speech until the session ends and it becomes the sent prompt. Any
+/// pre-typed draft stays visible in the normal prompt face ahead of the quote.
+private struct VoiceComposerTranscript: View {
+    let prefix: String
+    let transcript: String
+    let isListening: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var spoken: String {
+        transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Measured height of the laid-out (wrapped) transcript. A ScrollView's
+    /// ideal height ignores wrapping — `fixedSize` reports the single-line
+    /// height, so the composer never grew. Measuring the content after layout
+    /// and driving the frame from it mirrors how the text editor grows.
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                content
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentTransition(reduceMotion ? .identity : .interpolate)
+                    // Match the editor's textContainerInset so the words sit
+                    // exactly where the caret and typed text would.
+                    .padding(.leading, 5)
+                    .padding(.top, 6)
+                    .padding(.bottom, 6)
+                    .background(GeometryReader { geo in
+                        Color.clear
+                            .onAppear { contentHeight = geo.size.height }
+                            .onChange(of: geo.size.height) { _, height in
+                                contentHeight = height
+                            }
+                    })
+                Color.clear.frame(height: 1).id("voice-transcript-bottom")
+            }
+            .frame(height: min(max(contentHeight, 38), 200))
+            .onChange(of: spoken) { _, _ in
+                // Keep the newest words on screen once the transcript
+                // outgrows the editor's scroll cap.
+                proxy.scrollTo("voice-transcript-bottom", anchor: .bottom)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: transcript)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if spoken.isEmpty && prefix.isEmpty {
+            HStack(spacing: OreTheme.Space.sm) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.blue)
+                    .symbolEffect(.pulse, isActive: isListening && !reduceMotion)
+                Text(isListening ? "Listening…" : "Starting dictation…")
+                    .font(.system(size: 15, design: .serif))
+                    .italic()
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            quoted
+        }
+    }
+
+    private var quoted: Text {
+        let quote = Text(
+            spoken.isEmpty ? "\u{201C}…\u{201D}" : "\u{201C}\(spoken)\u{201D}"
+        )
+        .font(.system(size: 15, design: .serif))
+        .italic()
+        .foregroundStyle(.primary.opacity(0.85))
+        guard !prefix.isEmpty else { return quote }
+        return Text(prefix)
+            .font(.system(size: OreTheme.Font.prose))
+            .foregroundStyle(.primary)
+            + Text(" ") + quote
+    }
+}
+
 /// The words dictation took out of the prompt, and what they set.
 ///
 /// Voice silently deletes part of what you said — "switch this chat to Opus 5"
@@ -2358,6 +2643,7 @@ private struct ShortcutHint: View {
 /// value is what makes that legible rather than alarming.
 private struct VoiceChangeTrail: View {
     let changes: [VoiceChange]
+    var onActivate: (VoiceChange) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -2368,27 +2654,39 @@ private struct VoiceChangeTrail: View {
                 .symbolEffect(.pulse, isActive: !reduceMotion)
 
             ForEach(changes) { change in
-                HStack(spacing: 5) {
-                    if !change.consumed.isEmpty {
-                        Text(change.consumed)
-                            .strikethrough(true, color: .secondary.opacity(0.7))
-                            .foregroundStyle(.secondary)
+                Button {
+                    onActivate(change)
+                } label: {
+                    HStack(spacing: 5) {
+                        if !change.consumed.isEmpty {
+                            Text(change.consumed)
+                                .strikethrough(true, color: .secondary.opacity(0.7))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: 190, alignment: .leading)
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Label(change.label, systemImage: change.symbol)
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(Color.accentColor)
                             .lineLimit(1)
-                            .truncationMode(.middle)
-                            .frame(maxWidth: 190, alignment: .leading)
-                        Image(systemName: "arrow.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.tertiary)
+                        if change.kind == .model {
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                        }
                     }
-                    Label(change.label, systemImage: change.symbol)
-                        .labelStyle(.titleAndIcon)
-                        .foregroundStyle(Color.accentColor)
-                        .lineLimit(1)
+                    .font(.system(size: 11))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.10), in: Capsule())
+                    .contentShape(Capsule())
                 }
-                .font(.system(size: 11))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.accentColor.opacity(0.10), in: Capsule())
+                .buttonStyle(.plain)
+                .help(change.kind == .model ? "Click to switch to \(change.label) now" : change.label)
                 .transition(reduceMotion ? .opacity : .scale(scale: 0.9).combined(with: .opacity))
             }
             Spacer(minLength: 0)

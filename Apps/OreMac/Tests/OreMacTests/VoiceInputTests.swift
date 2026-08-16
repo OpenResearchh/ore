@@ -44,6 +44,22 @@ struct VoiceTranscriptAssemblerTests {
         assembler.applyUtterance("foo", isFinal: false)
         #expect(assembler.text == "foo")
     }
+
+    @Test func punctuationDriftAfterDiscardDoesNotRestoreDeletedWords() {
+        var assembler = VoiceTranscriptAssembler()
+        assembler.applyUtterance("hello world extra", isFinal: false)
+        assembler.discardCommitted()
+        assembler.applyUtterance("Hello world extra.", isFinal: false)
+        #expect(assembler.text.isEmpty)
+    }
+
+    @Test func aRevisedHypothesisAfterEditOnlyContributesNewWords() {
+        var assembler = VoiceTranscriptAssembler()
+        assembler.applyUtterance("add a test for the parser", isFinal: false)
+        assembler.discardCommitted()
+        assembler.applyUtterance("add a test now", isFinal: false)
+        #expect(assembler.text == "now")
+    }
 }
 
 struct VoiceIntentExtractorTests {
@@ -64,6 +80,12 @@ struct VoiceIntentExtractorTests {
             ),
             VoiceModelCandidate(
                 harness: .cursorAgent, id: "composer-2.5", displayName: "Composer 2.5"
+            ),
+            VoiceModelCandidate(
+                harness: .cursorAgent, id: "cursor-grok-4.6-high", displayName: "Cursor Grok 4.6"
+            ),
+            VoiceModelCandidate(
+                harness: .cursorAgent, id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5"
             ),
         ],
         efforts: Array(ReasoningEffort.allCases),
@@ -231,6 +253,22 @@ struct VoiceIntentExtractorTests {
         #expect(perCall(long, iterations: 50) < .milliseconds(90))
     }
 
+    @Test func cursorVersionIsMatchedEvenWhenDictationInsertsAnArticle() {
+        let spoken = extract("switch this chat to cursor 4.6 and look at ChatPane")
+        #expect(spoken.model?.id == "cursor-grok-4.6-high")
+        #expect(spoken.rewritten.lowercased().contains("chatpane"))
+        #expect(!spoken.rewritten.lowercased().contains("cursor"))
+        #expect(!spoken.rewritten.contains("4.6"))
+
+        let grok = extract("use grok 4.6 model and fix the login bug")
+        #expect(grok.model?.id == "cursor-grok-4.6-high")
+        #expect(grok.rewritten == "fix the login bug")
+
+        let cursed = extract("switch to curse a 4.6 and look at ChatPane")
+        #expect(cursed.model?.id == "cursor-grok-4.6-high")
+        #expect(cursed.rewritten.lowercased().contains("chatpane"))
+    }
+
     @Test func unlistedCatalogNamesStillSwitchWithoutAWordList() {
         let custom = VoiceSettingsCatalog(
             models: [
@@ -301,5 +339,120 @@ struct VoiceDraftTests {
 
     @Test func anEmptyTranscriptLeavesTheDraftUntouched() {
         #expect(VoiceDraft.combined(prefix: "keep me", transcript: "   ") == "keep me")
+    }
+
+    @Test func aSpokenListIsAppendedWithoutAnExtraSpace() {
+        #expect(
+            VoiceDraft.combined(prefix: "Please", transcript: "- look at ChatPane")
+                == "Please\n- look at ChatPane"
+        )
+        #expect(
+            VoiceDraft.combined(prefix: "Please\n", transcript: "- look at ChatPane")
+                == "Please\n- look at ChatPane"
+        )
+    }
+}
+
+struct VoiceFileCandidatesTests {
+    private let files = [
+        VoiceFileCandidates.Candidate(name: "ChatPane.swift", path: "Apps/OreMac/Sources/OreMac/ChatPane.swift"),
+        VoiceFileCandidates.Candidate(name: "VoiceInput.swift", path: "Apps/OreMac/Sources/OreMac/VoiceInput.swift"),
+        VoiceFileCandidates.Candidate(name: "README.md", path: "README.md"),
+        VoiceFileCandidates.Candidate(name: "OreTheme.swift", path: "Apps/OreMac/Sources/OreMac/OreTheme.swift"),
+    ]
+
+    @Test func spokenWordsMatchCamelCaseFileNames() {
+        let ranked = VoiceFileCandidates.rank(
+            transcript: "look at the chat pane file and fix the bug",
+            files: files
+        )
+        #expect(ranked.first?.name == "ChatPane.swift")
+    }
+
+    @Test func theBestOverlapWinsOverPartialMatches() {
+        let ranked = VoiceFileCandidates.rank(
+            transcript: "voice input handling in the voice input file",
+            files: files
+        )
+        #expect(ranked.first?.name == "VoiceInput.swift")
+    }
+
+    @Test func unrelatedSpeechOffersNoCandidates() {
+        let ranked = VoiceFileCandidates.rank(
+            transcript: "please refactor everything to be faster",
+            files: files
+        )
+        #expect(ranked.isEmpty)
+    }
+
+    @Test func shortNoiseWordsDoNotMatch(){
+        // "md" and "at" are too short to count as evidence.
+        let ranked = VoiceFileCandidates.rank(transcript: "at md", files: files)
+        #expect(ranked.isEmpty)
+    }
+
+    @Test func camelCaseSplittingBreaksNamesIntoWords() {
+        #expect(VoiceFileCandidates.words(in: "ChatPane.swift") == ["chat", "pane", "swift"])
+        #expect(VoiceFileCandidates.words(in: "voice_input2 test") == ["voice", "input2", "test"])
+    }
+}
+
+struct VoiceTurnCommitTests {
+    @Test func endingTheChordSendsThePrefixAndSpokenTextCombined() {
+        #expect(
+            VoiceTurnCommit.resolve(.send, prefix: "Please", spokenFormatted: "add a test")
+                == .send("Please add a test")
+        )
+        #expect(
+            VoiceTurnCommit.resolve(.send, prefix: "", spokenFormatted: "open the diff")
+                == .send("open the diff")
+        )
+    }
+
+    @Test func silenceNeverSendsAndLeavesTheDraftAlone() {
+        #expect(VoiceTurnCommit.resolve(.send, prefix: "", spokenFormatted: "  ") == .none)
+        #expect(VoiceTurnCommit.resolve(.send, prefix: "keep me", spokenFormatted: "\n ") == .none)
+        #expect(VoiceTurnCommit.resolve(.commitToDraft, prefix: "keep me", spokenFormatted: "") == .none)
+    }
+
+    @Test func cancellingDiscardsTheSpokenText() {
+        #expect(
+            VoiceTurnCommit.resolve(.cancel, prefix: "Please", spokenFormatted: "add a test")
+                == .none
+        )
+    }
+
+    @Test func passiveTeardownParksTheSpokenTextInTheDraft() {
+        #expect(
+            VoiceTurnCommit.resolve(.commitToDraft, prefix: "Please", spokenFormatted: "add a test")
+                == .updateDraft("Please add a test")
+        )
+    }
+}
+
+struct VoiceDictationFormatterTests {
+    @Test func spokenNewLinesBecomeRealBreaks() {
+        let formatted = VoiceDictationFormatter.format(
+            "Look at ChatPane new line then fix the login bug"
+        )
+        #expect(formatted.contains("\n"))
+        #expect(formatted.lowercased().contains("chatpane"))
+        #expect(formatted.lowercased().contains("login bug"))
+        #expect(!formatted.lowercased().contains("new line"))
+    }
+
+    @Test func firstSecondBecomeAMarkdownList() {
+        let formatted = VoiceDictationFormatter.format(
+            "I need two things. First look at ChatPane. Second fix the login bug."
+        )
+        #expect(formatted.contains("- look at ChatPane"))
+        #expect(formatted.contains("- fix the login bug"))
+        #expect(formatted.lowercased().contains("i need two things"))
+        #expect(!formatted.lowercased().contains("first look"))
+    }
+
+    @Test func aSingleFirstDoesNotBecomeAList() {
+        let formatted = VoiceDictationFormatter.format("First look at ChatPane")
+        #expect(formatted == "First look at ChatPane")
     }
 }

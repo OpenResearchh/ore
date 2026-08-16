@@ -108,8 +108,7 @@ public actor DiffEngine {
         baseBranch: String,
         includeUntracked: Bool = true
     ) async throws -> [FileDiff] {
-        let mergeBase = await mergeBase(worktree: worktree, baseBranch: baseBranch)
-            ?? baseBranch
+        let mergeBase = await git.mergeBase(with: baseBranch, in: worktree) ?? baseBranch
 
         var diffs = try await diff(
             arguments: ["diff", "--no-color", "--no-ext-diff", "-M", mergeBase, "--"],
@@ -119,40 +118,6 @@ public actor DiffEngine {
             diffs += try await untrackedDiffs(worktree: worktree)
         }
         return diffs.sorted { $0.path < $1.path }
-    }
-
-    /// Where this workspace actually diverged from its base.
-    ///
-    /// `...` semantics — compare against the merge base — mean commits landing
-    /// on the base while the agent works aren't counted as this workspace's
-    /// changes. The subtlety is *which* base ref to ask about: the local branch
-    /// is only as fresh as the last time the user checked it out, and nothing in
-    /// ORE updates it. Once the real base moves ahead, every workspace starts
-    /// reporting the base's own merged commits as its own work — the review pane
-    /// showed 53 changed files where the pull request showed 39.
-    ///
-    /// So both the local branch and its remote-tracking ref are considered, and
-    /// the one that diverged *later* wins. Taking the later of the two is what
-    /// makes this safe in both directions: a stale local ref is ignored, and so
-    /// is a stale `origin/` ref when the user is working offline or ahead.
-    private func mergeBase(worktree: URL, baseBranch: String) async -> String? {
-        var best: String?
-        for ref in ["origin/\(baseBranch)", baseBranch] {
-            guard let candidate = try? await git.run(
-                ["merge-base", "HEAD", ref], in: worktree
-            ).trimmedStandardOutput, !candidate.isEmpty else { continue }
-
-            guard let current = best else { best = candidate; continue }
-            // `--is-ancestor` exits 0 when the first commit precedes the second,
-            // which is exactly "the candidate is the later divergence point".
-            let isNewer = (try? await git.run(
-                ["merge-base", "--is-ancestor", current, candidate],
-                in: worktree,
-                allowedExitCodes: [0, 1]
-            ).exitCode) == 0
-            if isNewer { best = candidate }
-        }
-        return best
     }
 
     /// Uncommitted changes only.

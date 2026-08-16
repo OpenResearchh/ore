@@ -505,6 +505,15 @@ final class AppModel {
     }
 
     func closeChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
+        // Pick the neighbor before the close lands, so the UI never flashes
+        // the first remaining tab via `activeChat`'s fallback.
+        if let replacement = TabCloseSelection.replacement(
+            closing: chatID,
+            active: activeChat(for: workspaceID)?.id,
+            open: chats(for: workspaceID).map(\.id)
+        ) {
+            selectChat(replacement, in: workspaceID)
+        }
         Task { await client.send(.closeChat(workspaceID, chatID)) }
     }
 
@@ -1359,11 +1368,21 @@ final class AppModel {
 
         case .chatUpdated(let chat):
             chatOwners[chat.id] = chat.workspaceID
-            upsertChat(chat)
             chatRenamesInFlight.remove(chat.id)
-            if chat.isClosed, activeChatIDs[chat.workspaceID] == chat.id,
-               let replacement = chats(for: chat.workspaceID).first {
-                selectChat(replacement.id, in: chat.workspaceID)
+            // Neighbor is computed while the closed chat is still in the open
+            // list. After `upsertChat` it is filtered out, and `.first` would
+            // jump to the oldest remaining tab.
+            let replacement: ChatID? = {
+                guard chat.isClosed else { return nil }
+                return TabCloseSelection.replacement(
+                    closing: chat.id,
+                    active: activeChat(for: chat.workspaceID)?.id,
+                    open: chats(for: chat.workspaceID).map(\.id)
+                )
+            }()
+            upsertChat(chat)
+            if let replacement {
+                selectChat(replacement, in: chat.workspaceID)
             }
 
         case .chatRemoved(_, let chatID):

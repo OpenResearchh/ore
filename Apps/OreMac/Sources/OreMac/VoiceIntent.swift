@@ -303,7 +303,8 @@ enum VoiceIntentExtractor {
 
     /// Every way a user might say a model out loud: growing prefixes of the
     /// display name ("Sonnet", "Sonnet 5"), the name with version numbers
-    /// dropped ("GPT Sol"), and the raw id.
+    /// dropped ("GPT Sol"), vendor+version skipping the middle ("cursor 4.6"
+    /// for "Cursor Grok 4.6"), and the raw id.
     private static func aliases(for model: VoiceModelCandidate) -> [[String]] {
         let name = VoiceLexer.tokenize(model.displayName).map(\.text)
         let identifier = VoiceLexer.tokenize(model.id).map(\.text)
@@ -313,6 +314,21 @@ enum VoiceIntentExtractor {
         }
         let nameCore = name.filter { !isVersionLike($0) }
         if !nameCore.isEmpty { result.append(nameCore) }
+        if name.count >= 2, let version = name.last, isVersionLike(version) {
+            result.append([name[0], version])
+            if name.count >= 3 {
+                result.append([name[name.count - 2], version])
+            }
+        }
+        // Dictation hears "cursor" as "curse" (two edits, over the usual budget).
+        if name.first == "cursor" {
+            var cursed = name
+            cursed[0] = "curse"
+            for length in 1...cursed.count { result.append(Array(cursed.prefix(length))) }
+            if let version = name.last, isVersionLike(version) {
+                result.append(["curse", version])
+            }
+        }
         if !identifier.isEmpty { result.append(identifier) }
         let identifierCore = identifier.filter { !isVersionLike($0) }
         if !identifierCore.isEmpty { result.append(identifierCore) }
@@ -325,6 +341,10 @@ enum VoiceIntentExtractor {
         let name = VoiceLexer.tokenize(harness.displayName).map(\.text)
         var result: [[String]] = [name]
         if let first = name.first, name.count > 1 { result.append([first]) }
+        if harness == .cursorAgent {
+            result.append(["cursor"])
+            result.append(["curse"])
+        }
         var seen: Set<String> = []
         return result.filter { !$0.isEmpty && seen.insert($0.joined(separator: " ")).inserted }
     }
@@ -425,6 +445,37 @@ enum VoiceIntentExtractor {
                 VoiceLexer.tokensMatch(tokens[start + $0].text, alias[$0])
             }
             if matched { return start..<(start + alias.count) }
+        }
+        return matchAllowingFillers(of: alias, in: tokens)
+    }
+
+    /// "curse a 4.6" for "cursor 4.6": a short filler between alias words is
+    /// almost always dictation inserting an article, not a different name.
+    private static let aliasFillers: Set<String> = [
+        "a", "an", "the", "to", "of", "and",
+    ]
+
+    private static func matchAllowingFillers(of alias: [String], in tokens: [VoiceToken]) -> Range<Int>? {
+        guard alias.count >= 2 else { return nil }
+        for start in 0..<tokens.count {
+            var aliasIndex = 0
+            var position = start
+            var fillers = 0
+            while position < tokens.count, aliasIndex < alias.count {
+                if VoiceLexer.tokensMatch(tokens[position].text, alias[aliasIndex]) {
+                    aliasIndex += 1
+                    position += 1
+                    fillers = 0
+                    continue
+                }
+                if aliasIndex > 0, fillers < 2, aliasFillers.contains(tokens[position].text) {
+                    position += 1
+                    fillers += 1
+                    continue
+                }
+                break
+            }
+            if aliasIndex == alias.count { return start..<position }
         }
         return nil
     }

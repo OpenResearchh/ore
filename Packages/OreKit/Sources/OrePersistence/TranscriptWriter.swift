@@ -120,8 +120,25 @@ public actor TranscriptWriter {
             ))
 
         case .toolCall(let call):
+            let id = "tool-\(call.id.rawValue)"
+            if let existing = try await store.block(id) {
+                try await append(BlockRecord(
+                    id: existing.id,
+                    turnID: call.turnID,
+                    ordinal: existing.ordinal,
+                    kind: .toolCall,
+                    text: call.displayName ?? call.name,
+                    toolName: call.name,
+                    toolCallID: call.id,
+                    displayName: call.displayName,
+                    payload: call.input,
+                    parentToolCallID: call.parentToolCallID,
+                    createdAt: existing.createdAt
+                ))
+                return
+            }
             try await append(BlockRecord(
-                id: "tool-\(call.id.rawValue)",
+                id: id,
                 turnID: call.turnID,
                 ordinal: nextOrdinal(),
                 kind: .toolCall,

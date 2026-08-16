@@ -48,6 +48,12 @@ struct ChatPane: View {
     /// mic is hot. Dictation never touches `draft`; the words only land there
     /// (or go straight out as a turn) when the session ends.
     @State private var voiceQuote = ""
+    /// Spoken file matching runs against this pre-tokenized index.
+    @State private var voiceFileMatcher = VoiceFileMatcher.empty
+    /// File tags the user dismissed mid-dictation by tapping their chip. The
+    /// matcher skips these paths for the rest of the session, which restores
+    /// the spoken words to the quote and keeps the tag from committing.
+    @State private var voiceCanceledFilePaths: Set<String> = []
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
     private var chat: ChatState { model.chat(for: workspace.id) }
@@ -72,7 +78,7 @@ struct ChatPane: View {
                 if let filePath = model.activeFilePath[workspace.id] {
                     DiffDocumentView(workspace: workspace, path: filePath)
                 } else {
-                    chatBody
+                    chatBody(paneHeight: geometry.size.height)
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -86,7 +92,7 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private var chatBody: some View {
+    private func chatBody(paneHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
             ZStack(alignment: .bottomLeading) {
                 if chat.rows.isEmpty && !chat.isBusy {
@@ -254,7 +260,7 @@ struct ChatPane: View {
                 .padding(.vertical, 10)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
-                composer
+                composer(paneHeight: paneHeight)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -349,6 +355,13 @@ struct ChatPane: View {
         }
         .task(id: workspace.id) {
             workspaceFileIndex = Self.flattenFiles(await model.workspaceFiles(for: workspace))
+            // Pre-tokenized once here, not on every partial transcript: spoken
+            // file matching runs 5×/second while dictating.
+            voiceFileMatcher = VoiceFileMatcher(
+                files: workspaceFileIndex
+                    .filter { !$0.isDirectory }
+                    .map { (name: $0.name, path: $0.path) }
+            )
         }
         .confirmationDialog(
             "Revert chat and workspace?",
@@ -415,7 +428,38 @@ struct ChatPane: View {
         )
     }
 
+    /// Memoization for `displayRows`. A class box rather than `@State` value
+    /// storage: the cache is invisible to SwiftUI on purpose — filling it during
+    /// a body evaluation must not schedule another one.
+    private final class DisplayRowsMemo {
+        struct Key: Equatable {
+            var revision: Int
+            var isBusy: Bool
+            var expanded: Set<String>
+        }
+        var key: Key?
+        var rows: [TranscriptRow] = []
+    }
+    @State private var displayRowsMemo = DisplayRowsMemo()
+
     private var displayRows: [TranscriptRow] {
+        // Reading `rowsRevision` (not just `rows`) keeps observation intact:
+        // any transcript mutation still re-evaluates the body, but unrelated
+        // re-evaluations — hover, audio level, focus — reuse the last grouping
+        // instead of re-deriving it from every row.
+        let key = DisplayRowsMemo.Key(
+            revision: chat.rowsRevision,
+            isBusy: chat.isBusy,
+            expanded: expandedActivityGroups
+        )
+        if displayRowsMemo.key == key { return displayRowsMemo.rows }
+        let computed = computeDisplayRows()
+        displayRowsMemo.key = key
+        displayRowsMemo.rows = computed
+        return computed
+    }
+
+    private func computeDisplayRows() -> [TranscriptRow] {
         let visible = chat.rows.compactMap { source -> TranscriptRow? in
             if source.kind == .error, !Self.isMeaningfulError(source.text, result: source.resultText) {
                 return nil
@@ -894,7 +938,7 @@ struct ChatPane: View {
 
     // MARK: - Composer
 
-    private var composer: some View {
+    private func composer(paneHeight: CGFloat) -> some View {
         VStack(spacing: OreTheme.Space.sm) {
             if chat.isBusy {
                 ComposerBusyStatus(
@@ -1002,7 +1046,10 @@ struct ChatPane: View {
                 VoiceComposerTranscript(
                     prefix: draft,
                     transcript: voiceQuote,
-                    isListening: voice.isListening
+                    isListening: voice.isListening,
+                    // Never let the quote squeeze the toolbar out of a short
+                    // window: cap it to a slice of the pane and scroll the rest.
+                    maxHeight: min(200, paneHeight * 0.35)
                 )
                 .frame(minHeight: 38, alignment: .topLeading)
                 .transition(.opacity)
@@ -1512,6 +1559,7 @@ struct ChatPane: View {
         voiceAttachedClipboard = false
         voicePendingModel = nil
         voiceChanges = []
+        voiceCanceledFilePaths = []
         withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
             voiceQuote = ""
         }
@@ -1619,7 +1667,10 @@ struct ChatPane: View {
                         transcript: VoiceDictationFormatter.format(cleaned)
                     )
                 }
-                for file in refinement.files {
+                // The deterministic pass may already have tagged a file inline;
+                // appending its token again would double it up in the prompt.
+                for file in refinement.files
+                where !chat.draftAttachments.contains(where: { $0.relativePath == file.path }) {
                     insertWorkspaceReference(path: file.path, displayName: file.name)
                 }
             }
@@ -1655,9 +1706,11 @@ struct ChatPane: View {
             mergeVoiceChanges(intents.changes)
         }
 
-        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
-            voiceQuote = VoiceDictationFormatter.format(intents.rewritten)
-        }
+        // No animation on the streaming text itself: partials arrive several
+        // times a second, and retargeting a transition on every one is churn
+        // the transcript view no longer opts into. Chip and trail changes —
+        // rare, deliberate — keep theirs above.
+        voiceQuote = VoiceDictationFormatter.format(intents.rewritten)
     }
 
     /// The transcript with settings clauses stripped and spoken breaks applied,
@@ -1666,12 +1719,17 @@ struct ChatPane: View {
         VoiceDictationFormatter.format(voiceIntents(from: spoken).rewritten)
     }
 
-    /// Latest value per kind, first-spoken order.
+    /// Latest value per kind, first-spoken order. Files are the exception:
+    /// several can be referenced in one dictation, so they merge by identity
+    /// rather than replacing each other.
     private func mergeVoiceChanges(_ incoming: [VoiceChange]) {
         guard !incoming.isEmpty else { return }
         var merged = voiceChanges
         for change in incoming {
-            if let index = merged.firstIndex(where: { $0.kind == change.kind }) {
+            let index = change.kind == .file
+                ? merged.firstIndex(where: { $0.id == change.id })
+                : merged.firstIndex(where: { $0.kind == change.kind })
+            if let index {
                 merged[index] = change
             } else {
                 merged.append(change)
@@ -1688,17 +1746,32 @@ struct ChatPane: View {
     }
 
     private func confirmVoiceChange(_ change: VoiceChange) {
-        guard change.kind == .model, let chosen = voicePendingModel, let tab = chatSummary else {
-            return
+        switch change.kind {
+        case .model:
+            guard let chosen = voicePendingModel, let tab = chatSummary else { return }
+            applyVoiceModel(chosen, to: tab)
+            voicePendingModel = nil
+        case .file:
+            // Tapping a file chip cancels that tag: the path is excluded for
+            // the rest of the session, and re-running the live pass puts the
+            // spoken words back into the quote.
+            guard let path = change.detail else { return }
+            voiceCanceledFilePaths.insert(path)
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                voiceChanges.removeAll { $0.id == change.id }
+            }
+            applyLiveVoiceIntents(spoken: voice.transcript)
+        case .effort, .mode, .clipboard:
+            break
         }
-        applyVoiceModel(chosen, to: tab)
-        voicePendingModel = nil
     }
 
     private func voiceIntents(from spoken: String) -> VoiceIntents {
         VoiceIntentExtractor.extract(
             from: spoken,
-            catalog: voiceSettingsCatalog()
+            catalog: voiceSettingsCatalog(),
+            fileMatcher: voiceFileMatcher,
+            excludedFilePaths: voiceCanceledFilePaths
         )
     }
 
@@ -1756,6 +1829,13 @@ struct ChatPane: View {
         if let effort = intents.effort, let tab = chatSummary {
             let allowed = availableEfforts(for: tab)
             if allowed.contains(effort) { reasoningEffort = effort }
+        }
+        // The rewritten text already carries each file's `@Name` token where
+        // the spoken reference was; this attaches the file behind the token,
+        // exactly as a typed mention would. Cancelled chips never get here —
+        // their paths are excluded from extraction.
+        for file in intents.files {
+            insertWorkspaceReference(path: file.path, displayName: file.name, appendToken: false)
         }
 
         voicePendingModel = nil
@@ -2574,34 +2654,52 @@ private struct VoiceComposerTranscript: View {
     let prefix: String
     let transcript: String
     let isListening: Bool
+    /// Scroll cap, already clamped to the pane's height by the caller so a
+    /// short window scrolls the quote instead of pushing the toolbar out.
+    var maxHeight: CGFloat = 200
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var spoken: String {
         transcript.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Measured height of the laid-out (wrapped) transcript. A ScrollView's
-    /// ideal height ignores wrapping — `fixedSize` reports the single-line
-    /// height, so the composer never grew. Measuring the content after layout
-    /// and driving the frame from it mirrors how the text editor grows.
+    /// Height of the transcript, measured on a hidden mirror rendered in the
+    /// scroll view's *background* — the same trick the typed editor uses. An
+    /// earlier version measured the scroll view's own content and fed the
+    /// result back into that scroll view's frame; that layout cycle made
+    /// AttributeGraph sever the composer's update edge, freezing dictation
+    /// (transcript, chips, even intent handling) until a window resize forced
+    /// a full re-layout. The mirror's height depends only on the composer's
+    /// width, never on the frame it drives, so no cycle exists.
     @State private var contentHeight: CGFloat = 0
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
-                padded(content)
-                    .contentTransition(reduceMotion ? .identity : .interpolate)
-                Color.clear.frame(height: 1).id("voice-transcript-bottom")
+                // No `contentTransition` on the streaming words: partials land
+                // several times a second, and retargeting an interpolating
+                // morph on each one both burned the main thread and painted
+                // mid-transition text outside the clip.
+                VStack(spacing: 0) {
+                    padded(content)
+                    Color.clear.frame(height: 0).id("voice-transcript-bottom")
+                }
             }
-            .frame(height: min(max(contentHeight, 38), 200))
-            .background(measurer)
+            .frame(height: min(max(contentHeight, 38), max(38, maxHeight)))
+            // Belt and braces: streaming text must never paint over the
+            // toolbar row below, even mid-transition.
+            .clipped()
+            .background(alignment: .topLeading) { measurer }
             .onChange(of: spoken) { _, _ in
-                // Keep the newest words on screen once the transcript
-                // outgrows the editor's scroll cap.
-                proxy.scrollTo("voice-transcript-bottom", anchor: .bottom)
+                // Keep the newest words on screen once the transcript outgrows
+                // the scroll cap. Deferred a tick: scrolling synchronously here
+                // would mutate scroll state inside the same transaction that is
+                // still laying out the new words.
+                Task { @MainActor in
+                    proxy.scrollTo("voice-transcript-bottom", anchor: .bottom)
+                }
             }
         }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: transcript)
     }
 
     /// A hidden, unscrolled copy of the same words at the composer's width.
@@ -2720,7 +2818,11 @@ private struct VoiceChangeTrail: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .help(change.kind == .model ? "Click to switch to \(change.label) now" : change.label)
+                .help(
+                    change.kind == .model ? "Click to switch to \(change.label) now"
+                        : change.kind == .file ? "Click to remove \(change.label)"
+                        : change.label
+                )
                 .transition(reduceMotion ? .opacity : .scale(scale: 0.9).combined(with: .opacity))
             }
             Spacer(minLength: 0)
@@ -2737,6 +2839,7 @@ private extension VoiceChange {
         case .effort: "gauge.with.dots.needle.67percent"
         case .mode: "lock.shield"
         case .clipboard: "doc.on.clipboard"
+        case .file: "doc.text"
         }
     }
 }

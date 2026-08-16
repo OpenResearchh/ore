@@ -12,7 +12,14 @@ import OreProtocol
 @MainActor
 @Observable
 final class ChatState {
-    private(set) var rows: [TranscriptRow] = []
+    private(set) var rows: [TranscriptRow] = [] {
+        didSet { rowsRevision &+= 1 }
+    }
+    /// Bumped on every `rows` mutation (in-place edits included). Lets the pane
+    /// memoize its derived display rows instead of regrouping the whole
+    /// transcript on every body evaluation — at 40 flushes/second while text
+    /// streams, that regrouping was a large share of the main thread.
+    private(set) var rowsRevision = 0
     private(set) var status: AgentStatus = .idle
     private(set) var usage: UsageReport?
     private(set) var pendingPermission: PermissionRequest?
@@ -102,6 +109,16 @@ final class ChatState {
             complete(block)
 
         case .toolCall(let call):
+            // Cursor (and similar) re-emits the same call as `streamContent`
+            // grows and again on completion with the real diff. Updating the
+            // existing row keeps the chip live without duplicating it.
+            if let index = rows.lastIndex(where: { $0.toolCallID == call.id }) {
+                rows[index].text = call.displayName ?? call.name
+                rows[index].toolName = call.name
+                rows[index].toolInput = call.input
+                rows[index].parentToolCallID = call.parentToolCallID
+                return
+            }
             rows.append(TranscriptRow(
                 id: "tool-\(call.id.rawValue)",
                 turnID: call.turnID,

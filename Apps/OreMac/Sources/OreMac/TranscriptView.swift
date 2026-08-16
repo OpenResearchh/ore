@@ -152,6 +152,15 @@ struct TranscriptView: NSViewRepresentable {
         /// like the table was fighting the gesture.
         private var persistScrollWork: DispatchWorkItem?
         private var prefetchWork: DispatchWorkItem?
+        /// Rows whose text changed but whose reload hasn't been applied yet.
+        /// Streaming deltas land ~40×/second; re-rendering the growing markdown
+        /// block (twice — once to measure, once to draw) at that cadence is what
+        /// made scrolling stutter while an agent worked. Text-only changes are
+        /// coalesced and applied at ~10 Hz instead; anything structural (a block
+        /// completing, a section expanding) still applies immediately.
+        private var pendingTextReload: IndexSet = []
+        private var textFlushScheduled = false
+        private static let textFlushInterval: TimeInterval = 0.1
 
         init(
             persistenceKey: String,
@@ -179,39 +188,38 @@ struct TranscriptView: NSViewRepresentable {
             // responsive while text arrives.
             if previous.count == newRows.count {
                 var changed: IndexSet = []
-                for index in newRows.indices
-                where previous[index].text != newRows[index].text
-                    || previous[index].resultText != newRows[index].resultText
-                    || previous[index].isComplete != newRows[index].isComplete
-                    || previous[index].isExpanded != newRows[index].isExpanded
-                    || previous[index].toolInput != newRows[index].toolInput
-                    || previous[index].resultMetadata != newRows[index].resultMetadata
-                    || previous[index].activitySignature != newRows[index].activitySignature
-                    || previous[index].attachments != newRows[index].attachments {
-                    heightCache.removeValue(forKey: newRows[index].id)
-                    changed.insert(index)
+                var structural = false
+                for index in newRows.indices {
+                    let old = previous[index]
+                    let new = newRows[index]
+                    let textChanged = old.text != new.text || old.resultText != new.resultText
+                    let restChanged = old.isComplete != new.isComplete
+                        || old.isExpanded != new.isExpanded
+                        || old.toolInput != new.toolInput
+                        || old.resultMetadata != new.resultMetadata
+                        || old.activitySignature != new.activitySignature
+                        || old.attachments != new.attachments
+                    if textChanged || restChanged {
+                        heightCache.removeValue(forKey: new.id)
+                        changed.insert(index)
+                        if restChanged { structural = true }
+                    }
                 }
                 guard !changed.isEmpty else { return }
-                // The growing last row must not animate its height change. The
-                // default row-height animation reflows the paragraph the reader
-                // is mid-way through on every streaming delta, which is the
-                // "bouncing" that makes the final response hard to read. A
-                // zero-duration context applies the new height in place instead.
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0
-                    context.allowsImplicitAnimation = false
-                    tableView.noteHeightOfRows(withIndexesChanged: changed)
+                pendingTextReload.formUnion(changed)
+                if structural {
+                    flushPendingReload()
+                } else {
+                    scheduleTextFlush()
                 }
-                tableView.reloadData(
-                    forRowIndexes: changed,
-                    columnIndexes: IndexSet(integer: 0)
-                )
+                return
             } else if newRows.count > previous.count,
                       previous.elementsEqualByID(newRows.prefix(previous.count)) {
                 // Rows appended: insert rather than reload the whole table.
                 let added = IndexSet(previous.count..<newRows.count)
                 tableView.insertRows(at: added, withAnimation: [])
             } else {
+                pendingTextReload.removeAll()
                 heightCache.removeAll()
                 tableView.reloadData()
             }
@@ -247,9 +255,46 @@ struct TranscriptView: NSViewRepresentable {
 
         func appearanceChanged() {
             guard let tableView else { return }
+            pendingTextReload.removeAll()
             heightCache.removeAll()
             prefetchHeights(in: tableView, immediateVisible: true)
             tableView.reloadData()
+        }
+
+        /// Applies the accumulated text-only row reloads in one pass: height
+        /// note + reload + bottom pin, exactly what used to happen per delta,
+        /// now at most every `textFlushInterval`.
+        private func flushPendingReload() {
+            guard let tableView else { return }
+            let indexes = pendingTextReload.filteredIndexSet { rows.indices.contains($0) }
+            pendingTextReload.removeAll()
+            guard !indexes.isEmpty else { return }
+            let wasAtBottom = isScrolledToBottom(tableView)
+            // The growing last row must not animate its height change. The
+            // default row-height animation reflows the paragraph the reader
+            // is mid-way through on every streaming delta, which is the
+            // "bouncing" that makes the final response hard to read. A
+            // zero-duration context applies the new height in place instead.
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                context.allowsImplicitAnimation = false
+                tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            }
+            tableView.reloadData(
+                forRowIndexes: indexes,
+                columnIndexes: IndexSet(integer: 0)
+            )
+            if wasAtBottom { scrollToBottom(tableView) }
+        }
+
+        private func scheduleTextFlush() {
+            guard !textFlushScheduled else { return }
+            textFlushScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.textFlushInterval) { [weak self] in
+                guard let self else { return }
+                self.textFlushScheduled = false
+                self.flushPendingReload()
+            }
         }
 
         /// Applies a deferred scroll restore once the table can honour it — i.e.
@@ -1859,7 +1904,8 @@ final class TranscriptCell: NSTableCellView {
         let resultText = row.resultText ?? ""
 
         if key.contains("edit") || key.contains("write") || key.contains("patch") {
-            let suppliedDiff = patchText ?? input?[0]?["diff"]?.stringValue
+            let resultDiff = ToolChangeStats.looksLikeDiff(resultText) ? resultText : nil
+            let suppliedDiff = patchText ?? input?[0]?["diff"]?.stringValue ?? resultDiff
             let old = input?["old_string"]?.stringValue ?? input?["oldString"]?.stringValue
             let new = input?["new_string"]?.stringValue ?? input?["newString"]?.stringValue
             let content = input?["content"]?.stringValue ?? input?["contents"]?.stringValue
@@ -2123,17 +2169,36 @@ enum ToolChangeStats {
         }
 
         if isWrite || changeKind == "add" {
-            let text = content ?? diff
+            let text = content ?? new ?? diff
             return (max(lineCount(text), text.isEmpty ? 0 : 1), 0)
         }
         if changeKind == "delete" {
-            let text = content ?? diff
+            let text = content ?? old ?? diff
             return (0, max(lineCount(text), text.isEmpty ? 0 : 1))
+        }
+        if let new, !new.isEmpty {
+            return (lineCount(new), 0)
         }
         if let content, !content.isEmpty {
             return (lineCount(content), 0)
         }
         return (0, 0)
+    }
+
+    static func looksLikeDiff(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix("diff --git") { return true }
+        if trimmed.contains("*** Begin Patch") { return true }
+        if trimmed.contains("*** Update File:")
+            || trimmed.contains("*** Add File:")
+            || trimmed.contains("*** Delete File:") {
+            return true
+        }
+        if trimmed.hasPrefix("@@ ") || trimmed.contains("\n@@ ") { return true }
+        let hasMinusHeader = trimmed.hasPrefix("--- ") || trimmed.contains("\n--- ")
+        let hasPlusHeader = trimmed.contains("\n+++ ") || trimmed.hasPrefix("+++ ")
+        return hasMinusHeader && hasPlusHeader
     }
 
     static func lineCount(_ text: String) -> Int {

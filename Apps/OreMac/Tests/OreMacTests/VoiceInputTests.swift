@@ -62,6 +62,125 @@ struct VoiceTranscriptAssemblerTests {
     }
 }
 
+struct VoiceFileMatcherTests {
+    private let matcher = VoiceFileMatcher(files: [
+        (name: "ChatPane.swift", path: "Apps/OreMac/Sources/OreMac/ChatPane.swift"),
+        (name: "VoiceInput.swift", path: "Apps/OreMac/Sources/OreMac/VoiceInput.swift"),
+        (name: "AppModel.swift", path: "Apps/OreMac/Sources/OreMac/AppModel.swift"),
+        (name: "index.ts", path: "web/src/index.ts"),
+        (name: "index.ts", path: "web/src/nested/deeper/index.ts"),
+        (name: "Makefile", path: "Makefile"),
+        (name: "URLSession2Helper.swift", path: "Sources/URLSession2Helper.swift"),
+    ])
+
+    private let catalog = VoiceSettingsCatalog(
+        models: [], efforts: Array(ReasoningEffort.allCases), modes: Array(PermissionMode.allCases)
+    )
+
+    private func extract(_ spoken: String, excluding: Set<String> = []) -> VoiceIntents {
+        VoiceIntentExtractor.extract(
+            from: spoken,
+            catalog: catalog,
+            fileMatcher: matcher,
+            excludedFilePaths: excluding
+        )
+    }
+
+    @Test func subwordsSplitCamelCaseAndDigits() {
+        #expect(VoiceFileMatcher.subwords(of: "ChatPane") == ["chat", "pane"])
+        #expect(VoiceFileMatcher.subwords(of: "URLSession2Helper") == ["url", "session", "2", "helper"])
+        #expect(VoiceFileMatcher.subwords(of: "index") == ["index"])
+    }
+
+    @Test func theFileTriggerTagsTheSpokenName() {
+        let intents = extract("look at the chat pane file and fix the overflow")
+        #expect(intents.files == [
+            VoiceFileTag(name: "ChatPane.swift", path: "Apps/OreMac/Sources/OreMac/ChatPane.swift")
+        ])
+        #expect(intents.rewritten.contains("@ChatPane.swift"))
+        #expect(!intents.rewritten.lowercased().contains("chat pane file"))
+        #expect(intents.changes.contains { $0.kind == .file && $0.label == "@ChatPane.swift" })
+    }
+
+    @Test func aSpokenExtensionTagsWithoutTheWordFile() {
+        let intents = extract("open voice input dot swift please")
+        #expect(intents.files.map(\.name) == ["VoiceInput.swift"])
+        #expect(intents.rewritten.contains("@VoiceInput.swift"))
+    }
+
+    @Test func asrMisrecognitionWithinAnExplicitReferenceStillMatches() {
+        // "pane" heard as "pan" — one edit, within the tolerance the model
+        // matcher already uses for proper nouns.
+        let intents = extract("the chat pan file has a bug")
+        #expect(intents.files.map(\.name) == ["ChatPane.swift"])
+    }
+
+    @Test func anExactMultiWordNameTagsWithoutACue() {
+        let intents = extract("I think app model owns that state")
+        #expect(intents.files.map(\.name) == ["AppModel.swift"])
+        #expect(intents.rewritten.contains("@AppModel.swift"))
+    }
+
+    @Test func aSingleCommonWordNeverTagsWithoutATrigger() {
+        // "index" alone is prose; only "index file" or "index dot ts" refer.
+        let intents = extract("the index needs rebuilding")
+        #expect(intents.files.isEmpty)
+        #expect(!intents.rewritten.contains("@"))
+    }
+
+    @Test func casualProseDoesNotTag() {
+        let loose = extract("we should chat about the pane of glass")
+        #expect(loose.files.isEmpty)
+        let meeting = extract("we have a client meeting about voices")
+        #expect(meeting.files.isEmpty)
+    }
+
+    @Test func ambiguousNamesPreferTheShallowerPath() {
+        let intents = extract("check the index file")
+        #expect(intents.files.map(\.path) == ["web/src/index.ts"])
+    }
+
+    @Test func glueedDictationOfAFullNameMatches() {
+        // Dictation sometimes writes the name verbatim: "ChatPane.swift"
+        // normalizes to a single glued token.
+        let intents = extract("open ChatPane.swift and look around")
+        #expect(intents.files.map(\.name) == ["ChatPane.swift"])
+    }
+
+    @Test func excludedPathsAreNeverTagged() {
+        let intents = extract(
+            "look at the chat pane file",
+            excluding: ["Apps/OreMac/Sources/OreMac/ChatPane.swift"]
+        )
+        #expect(intents.files.isEmpty)
+        #expect(intents.rewritten.lowercased().contains("chat pane file"))
+    }
+
+    @Test func multipleReferencesAllTag() {
+        let intents = extract("compare the chat pane file with voice input dot swift")
+        #expect(Set(intents.files.map(\.name)) == ["ChatPane.swift", "VoiceInput.swift"])
+    }
+
+    @Test func fileReferencesComposeWithSettingsChanges() {
+        let catalog = VoiceSettingsCatalog(
+            models: [VoiceModelCandidate(
+                harness: .claudeCode, id: "claude-opus-5", displayName: "Opus 5", isDefault: true
+            )],
+            efforts: Array(ReasoningEffort.allCases),
+            modes: Array(PermissionMode.allCases)
+        )
+        let intents = VoiceIntentExtractor.extract(
+            from: "switch to Opus 5 with high reasoning effort and fix the chat pane file",
+            catalog: catalog,
+            fileMatcher: matcher
+        )
+        #expect(intents.model?.displayName == "Opus 5")
+        #expect(intents.effort == .high)
+        #expect(intents.files.map(\.name) == ["ChatPane.swift"])
+        #expect(intents.rewritten.contains("@ChatPane.swift"))
+    }
+}
+
 struct VoiceIntentExtractorTests {
     private let catalog = VoiceSettingsCatalog(
         models: [
@@ -251,6 +370,25 @@ struct VoiceIntentExtractorTests {
         let long = String(repeating: "look at the parser and fix the login bug there ", count: 20)
             + "then switch this chat to Opus 5 with high reasoning effort"
         #expect(perCall(long, iterations: 50) < .milliseconds(90))
+
+        // File matching must not change the budget: a real workspace index has
+        // thousands of entries, and the matcher runs on every partial too.
+        let files = (0..<4000).map { index in
+            (name: "SourceFile\(index)Helper.swift", path: "Sources/Deep/Nested/SourceFile\(index)Helper.swift")
+        }
+        let matcher = VoiceFileMatcher(files: files + [
+            (name: "ChatPane.swift", path: "Sources/ChatPane.swift")
+        ])
+        func perCallWithFiles(_ spoken: String, iterations: Int) -> Duration {
+            _ = VoiceIntentExtractor.extract(from: spoken, catalog: catalog, fileMatcher: matcher)
+            let started = ContinuousClock.now
+            for _ in 0..<iterations {
+                _ = VoiceIntentExtractor.extract(from: spoken, catalog: catalog, fileMatcher: matcher)
+            }
+            return (ContinuousClock.now - started) / iterations
+        }
+        let withReference = long + " and fix the chat pane file"
+        #expect(perCallWithFiles(withReference, iterations: 50) < .milliseconds(90))
     }
 
     @Test func cursorVersionIsMatchedEvenWhenDictationInsertsAnArticle() {

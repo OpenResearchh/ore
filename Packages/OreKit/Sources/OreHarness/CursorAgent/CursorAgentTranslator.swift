@@ -23,7 +23,12 @@ struct CursorAgentTranslator {
     private var decoder = JSONDecoder()
     private var streamedText: [BlockID: String] = [:]
     private var reportedToolCallIDs: Set<ToolCallID> = []
+    private var toolInputs: [ToolCallID: JSONValue] = [:]
     private var thinkingSegment = 0
+    private var textSegment = 0
+    /// Concatenation of assistant text already completed this turn, so a final
+    /// snapshot of the whole turn is not rewritten into the first row.
+    private var emittedAssistantText = ""
     private var model: String?
 
     init(sessionID: SessionID) {
@@ -109,10 +114,13 @@ struct CursorAgentTranslator {
         let turnID = ensureTurn(&output)
         let toolCallID = ToolCallID(rawValue: rawID)
         let name = Self.cursorToolName(rawKey)
-        let input = Self.cursorToolInput(from: payload)
 
-        func emitCall() {
-            guard reportedToolCallIDs.insert(toolCallID).inserted else { return }
+        func emitCall(result: JSONValue? = nil) {
+            let input = mergedToolInput(id: toolCallID, from: payload, result: result)
+            let isNew = reportedToolCallIDs.insert(toolCallID).inserted
+            if isNew {
+                closeCurrentTextSegment(turnID: turnID, to: &output)
+            }
             output.events.append(.toolCall(ToolCall(
                 turnID: turnID, id: toolCallID, name: name,
                 displayName: ClaudeToolSemantics.displayName(tool: name, input: input),
@@ -125,8 +133,8 @@ struct CursorAgentTranslator {
             emitCall()
             append(status: .runningTool, to: &output)
         case "completed":
-            emitCall()  // in case "started" was never seen
             let result = payload["result"]
+            emitCall(result: result)
             output.events.append(.toolResult(ToolResult(
                 turnID: turnID,
                 toolCallID: toolCallID,
@@ -204,14 +212,28 @@ struct CursorAgentTranslator {
 
     /// Maps Cursor's per-tool arg names onto the keys the UI's presentation
     /// layer already understands (`file_path`, `command`, `pattern`, …).
-    private static func cursorToolInput(from payload: JSONValue) -> JSONValue {
+    private static func cursorToolInput(
+        from payload: JSONValue,
+        result: JSONValue? = nil
+    ) -> JSONValue {
         let args = payload["args"] ?? payload["arguments"]
-        var dict = args?.objectValue ?? {
-            guard var object = payload.objectValue else { return [:] as [String: JSONValue] }
-            object.removeValue(forKey: "result")
-            object.removeValue(forKey: "error")
-            return object
-        }()
+        var dict = args?.objectValue ?? [:]
+        if let object = payload.objectValue {
+            for (key, value) in object {
+                if key == "result" || key == "error" || key == "args" || key == "arguments" {
+                    continue
+                }
+                if dict[key] == nil { dict[key] = value }
+            }
+        }
+        // Streaming edits put the growing body on the payload, not in `args`.
+        if let stream = payload["streamContent"]?.stringValue
+            ?? payload["stream_content"]?.stringValue,
+           !stream.isEmpty {
+            dict["streamContent"] = .string(stream)
+        }
+        mergeDiffFields(from: result?["success"] ?? result, into: &dict)
+
         if let path = dict["path"]?.stringValue { dict["file_path"] = .string(path) }
         if let target = dict["targetDirectory"]?.stringValue ?? dict["target_directory"]?.stringValue {
             dict["path"] = .string(target)
@@ -228,7 +250,94 @@ struct CursorAgentTranslator {
         if dict["pattern"] == nil, let query = dict["query"]?.stringValue {
             dict["pattern"] = .string(query)
         }
-        if let content = dict["streamContent"]?.stringValue { dict["new_string"] = .string(content) }
+        applyEditContent(to: &dict)
+        return .object(dict)
+    }
+
+    private static func mergeDiffFields(from source: JSONValue?, into dict: inout [String: JSONValue]) {
+        guard let object = source?.objectValue else { return }
+        for key in [
+            "diff", "patch", "before", "after",
+            "old_string", "oldString", "new_string", "newString",
+            "oldContent", "newContent", "content", "contents", "path",
+        ] {
+            if let value = object[key], dict[key] == nil {
+                dict[key] = value
+            }
+        }
+        if let path = object["path"]?.stringValue, dict["file_path"] == nil {
+            dict["file_path"] = .string(path)
+        }
+    }
+
+    /// Turns Cursor's `streamContent` / before-after / diff fields into the
+    /// `patch` / `old_string` / `new_string` keys the transcript already renders.
+    private static func applyEditContent(to dict: inout [String: JSONValue]) {
+        if let stream = dict["streamContent"]?.stringValue ?? dict["stream_content"]?.stringValue,
+           !stream.isEmpty {
+            if looksLikePatch(stream) {
+                dict["patch"] = .string(stream)
+            } else if dict["new_string"] == nil {
+                dict["new_string"] = .string(stream)
+            }
+        }
+        if dict["patch"] == nil, let diff = dict["diff"]?.stringValue, looksLikePatch(diff) {
+            dict["patch"] = .string(diff)
+        }
+        if dict["old_string"] == nil {
+            if let before = dict["before"]?.stringValue ?? dict["oldContent"]?.stringValue {
+                dict["old_string"] = .string(before)
+            }
+        }
+        if dict["new_string"] == nil {
+            if let after = dict["after"]?.stringValue ?? dict["newContent"]?.stringValue {
+                dict["new_string"] = .string(after)
+            }
+        }
+    }
+
+    static func looksLikePatch(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.hasPrefix("diff --git") { return true }
+        if trimmed.contains("*** Begin Patch") { return true }
+        if trimmed.contains("*** Update File:")
+            || trimmed.contains("*** Add File:")
+            || trimmed.contains("*** Delete File:") {
+            return true
+        }
+        if trimmed.hasPrefix("@@ ") || trimmed.contains("\n@@ ") { return true }
+        let hasMinusHeader = trimmed.hasPrefix("--- ") || trimmed.contains("\n--- ")
+        let hasPlusHeader = trimmed.contains("\n+++ ") || trimmed.hasPrefix("+++ ")
+        return hasMinusHeader && hasPlusHeader
+    }
+
+    private mutating func mergedToolInput(
+        id: ToolCallID,
+        from payload: JSONValue,
+        result: JSONValue?
+    ) -> JSONValue {
+        let incoming = Self.cursorToolInput(from: payload, result: result)
+        let merged = Self.mergePreferringNonEmpty(toolInputs[id], incoming)
+        toolInputs[id] = merged
+        return merged
+    }
+
+    /// Keeps the first non-empty string for each key so a `completed` record
+    /// that dropped `streamContent` does not wipe the patch collected on start.
+    private static func mergePreferringNonEmpty(_ old: JSONValue?, _ new: JSONValue) -> JSONValue {
+        guard var dict = new.objectValue else { return new }
+        guard let previous = old?.objectValue else { return new }
+        for (key, value) in previous {
+            if dict[key] == nil {
+                dict[key] = value
+                continue
+            }
+            if let current = dict[key]?.stringValue, current.isEmpty,
+               let kept = value.stringValue, !kept.isEmpty {
+                dict[key] = value
+            }
+        }
         return .object(dict)
     }
 
@@ -252,8 +361,8 @@ struct CursorAgentTranslator {
         }
         if let success = object["success"] {
             if let text = success.stringValue { return text }
-            for key in ["content", "output", "stdout", "text"] {
-                if let value = success[key]?.stringValue { return value }
+            for key in ["content", "output", "stdout", "text", "diff", "patch"] {
+                if let value = success[key]?.stringValue, !value.isEmpty { return value }
             }
             // A shell call reports its streams separately; an exit code with no
             // output at all is still worth showing as the result.
@@ -283,6 +392,7 @@ struct CursorAgentTranslator {
                 turnID: turnID, blockID: blockID, text: text
             )))
         case "completed":
+            closeCurrentTextSegment(turnID: turnID, to: &output)
             defer { thinkingSegment += 1 }
             let text = streamedText.removeValue(forKey: blockID) ?? ""
             guard !text.isEmpty else { return }
@@ -301,34 +411,28 @@ struct CursorAgentTranslator {
         // cursor-agent streams a *full* assistant message per chunk (not a bare
         // delta): each partial carries `content:[{text: "<next fragment>"}]` and
         // a top-level `timestamp_ms`, then the run ends with ONE final message
-        // that has no `timestamp_ms` and the whole concatenated text. So partials
-        // must accumulate as text deltas into a single row, and only the final
-        // message completes that row. Treating every partial as a completed block
-        // (the previous behaviour) appended one row per word — the "each word on
-        // its own line" bug.
+        // that has no `timestamp_ms` and the whole concatenated text. Partials
+        // accumulate as deltas into the *current* text segment; a tool call
+        // closes that segment so later narration is a new row after the tools.
+        // Treating every partial as a completed block (the previous behaviour)
+        // appended one row per word — the "each word on its own line" bug.
         let isPartial = message["timestamp_ms"] != nil
         if isPartial { append(status: .requesting, to: &output) }
-        let textBlockID = BlockID(rawValue: "\(turnID.rawValue)#text")
 
         // A bare `delta` field is an alternate shape; keep handling it.
         if let delta = message["delta"]?.stringValue ?? body["delta"]?.stringValue,
            !delta.isEmpty {
-            streamedText[textBlockID, default: ""] += delta
-            output.events.append(.textDelta(BlockDelta(
-                turnID: turnID, blockID: textBlockID, text: delta
-            )))
+            appendTextDelta(turnID: turnID, text: delta, to: &output)
             return
         }
 
         guard let content = body["content"]?.arrayValue else {
             if let text = body["content"]?.stringValue, !text.isEmpty {
-                streamedText.removeValue(forKey: textBlockID)
-                output.events.append(.blockCompleted(BlockCompleted(
-                    turnID: turnID,
-                    blockID: textBlockID,
-                    kind: .text,
-                    text: text
-                )))
+                if isPartial {
+                    appendTextDelta(turnID: turnID, text: text, to: &output)
+                } else {
+                    completeAssistantText(turnID: turnID, text: text, to: &output)
+                }
             }
             return
         }
@@ -338,15 +442,9 @@ struct CursorAgentTranslator {
             case "text":
                 guard let text = block["text"]?.stringValue, !text.isEmpty else { break }
                 if isPartial {
-                    streamedText[textBlockID, default: ""] += text
-                    output.events.append(.textDelta(BlockDelta(
-                        turnID: turnID, blockID: textBlockID, text: text
-                    )))
+                    appendTextDelta(turnID: turnID, text: text, to: &output)
                 } else {
-                    streamedText.removeValue(forKey: textBlockID)
-                    output.events.append(.blockCompleted(BlockCompleted(
-                        turnID: turnID, blockID: textBlockID, kind: .text, text: text
-                    )))
+                    completeAssistantText(turnID: turnID, text: text, to: &output)
                 }
 
             case "thinking", "reasoning":
@@ -364,9 +462,14 @@ struct CursorAgentTranslator {
                       let name = block["name"]?.stringValue
                 else { break }
                 let toolCallID = ToolCallID(rawValue: rawID)
-                guard !reportedToolCallIDs.contains(toolCallID) else { break }
-                reportedToolCallIDs.insert(toolCallID)
+                let isNew = reportedToolCallIDs.insert(toolCallID).inserted
+                if isNew {
+                    closeCurrentTextSegment(turnID: turnID, to: &output)
+                } else {
+                    break
+                }
                 let input = block["input"] ?? block["arguments"] ?? .object([:])
+                toolInputs[toolCallID] = input
                 output.events.append(.toolCall(ToolCall(
                     turnID: turnID,
                     id: toolCallID,
@@ -431,6 +534,102 @@ struct CursorAgentTranslator {
         currentTurnID = nil
     }
 
+    // MARK: - Assistant text segments
+
+    private func currentTextBlockID(turnID: TurnID) -> BlockID {
+        BlockID(rawValue: "\(turnID.rawValue)#text-\(textSegment)")
+    }
+
+    /// Cursor sometimes sends a fragment (`" there"`) and sometimes a snapshot
+    /// of the block so far (`"Hello there"`). If the new text already has the
+    /// accumulated prefix, emit only the suffix so the row does not duplicate.
+    private mutating func appendTextDelta(
+        turnID: TurnID,
+        text: String,
+        to output: inout Output
+    ) {
+        let blockID = currentTextBlockID(turnID: turnID)
+        let previous = streamedText[blockID] ?? ""
+        let delta: String
+        if !previous.isEmpty, text.hasPrefix(previous), text.count >= previous.count {
+            delta = String(text.dropFirst(previous.count))
+            streamedText[blockID] = text
+        } else {
+            delta = text
+            streamedText[blockID, default: ""] += text
+        }
+        guard !delta.isEmpty else { return }
+        output.events.append(.textDelta(BlockDelta(
+            turnID: turnID, blockID: blockID, text: delta
+        )))
+    }
+
+    private mutating func closeCurrentTextSegment(turnID: TurnID, to output: inout Output) {
+        let blockID = currentTextBlockID(turnID: turnID)
+        let text = streamedText.removeValue(forKey: blockID) ?? ""
+        guard !text.isEmpty else { return }
+        emittedAssistantText += text
+        output.events.append(.blockCompleted(BlockCompleted(
+            turnID: turnID, blockID: blockID, kind: .text, text: text
+        )))
+        textSegment += 1
+    }
+
+    /// Completes the current segment without treating a final whole-turn
+    /// snapshot as a rewrite of the first row.
+    private mutating func completeAssistantText(
+        turnID: TurnID,
+        text: String,
+        to output: inout Output
+    ) {
+        let blockID = currentTextBlockID(turnID: turnID)
+        let accumulated = streamedText[blockID] ?? ""
+        let combinedPrior = emittedAssistantText + accumulated
+
+        if text == accumulated {
+            streamedText.removeValue(forKey: blockID)
+            emittedAssistantText += text
+            output.events.append(.blockCompleted(BlockCompleted(
+                turnID: turnID, blockID: blockID, kind: .text, text: text
+            )))
+            return
+        }
+
+        if text == combinedPrior || text == emittedAssistantText {
+            closeCurrentTextSegment(turnID: turnID, to: &output)
+            return
+        }
+
+        if text.hasPrefix(combinedPrior) {
+            let tail = String(text.dropFirst(combinedPrior.count))
+            closeCurrentTextSegment(turnID: turnID, to: &output)
+            let trimmed = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let answerID = currentTextBlockID(turnID: turnID)
+            emittedAssistantText += tail
+            output.events.append(.blockCompleted(BlockCompleted(
+                turnID: turnID, blockID: answerID, kind: .text, text: tail
+            )))
+            return
+        }
+
+        if !accumulated.isEmpty, text.hasPrefix(accumulated) {
+            streamedText.removeValue(forKey: blockID)
+            emittedAssistantText += text
+            output.events.append(.blockCompleted(BlockCompleted(
+                turnID: turnID, blockID: blockID, kind: .text, text: text
+            )))
+            return
+        }
+
+        closeCurrentTextSegment(turnID: turnID, to: &output)
+        let answerID = currentTextBlockID(turnID: turnID)
+        emittedAssistantText += text
+        output.events.append(.blockCompleted(BlockCompleted(
+            turnID: turnID, blockID: answerID, kind: .text, text: text
+        )))
+    }
+
     /// Turns text that only ever arrived as deltas into completed blocks.
     ///
     /// Without this a session that streams but never sends a final content
@@ -438,8 +637,10 @@ struct CursorAgentTranslator {
     private mutating func flushStreamedBlocks(turnID: TurnID, to output: inout Output) {
         for (blockID, text) in streamedText.sorted(by: { $0.key.rawValue < $1.key.rawValue })
         where !text.isEmpty {
+            let kind: BlockCompleted.Kind =
+                blockID.rawValue.contains("#thinking-") ? .thinking : .text
             output.events.append(.blockCompleted(BlockCompleted(
-                turnID: turnID, blockID: blockID, kind: .text, text: text
+                turnID: turnID, blockID: blockID, kind: kind, text: text
             )))
         }
         streamedText.removeAll()
@@ -451,7 +652,10 @@ struct CursorAgentTranslator {
         let turnID = TurnID.generate()
         currentTurnID = turnID
         reportedToolCallIDs.removeAll()
+        toolInputs.removeAll()
         thinkingSegment = 0
+        textSegment = 0
+        emittedAssistantText = ""
         output.events.append(.turnStarted(TurnStarted(turnID: turnID, model: model)))
         return turnID
     }

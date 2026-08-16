@@ -10,13 +10,24 @@ struct VoiceIntents: Equatable, Sendable {
     var rewritten: String
     /// What was recognized, in spoken order — drives the composer's change trail.
     var changes: [VoiceChange] = []
+    /// Workspace files the dictation explicitly referenced ("the chat pane
+    /// file", "voice input dot swift"). The spoken phrase becomes an `@Name`
+    /// token in `rewritten`; the attachment itself is added when the session
+    /// commits.
+    var files: [VoiceFileTag] = []
+}
+
+/// A file reference recognized in dictation, resolved against the workspace index.
+struct VoiceFileTag: Equatable, Sendable {
+    var name: String
+    var path: String
 }
 
 /// One setting the dictation changed, plus the words that were consumed saying it.
 /// The composer animates these: the chip pulses, the consumed clause strikes out.
 struct VoiceChange: Equatable, Sendable, Identifiable {
     enum Kind: String, Sendable, Equatable {
-        case model, effort, mode, clipboard
+        case model, effort, mode, clipboard, file
     }
 
     var kind: Kind
@@ -24,8 +35,12 @@ struct VoiceChange: Equatable, Sendable, Identifiable {
     var label: String
     /// The literal spoken words that were removed from the draft.
     var consumed: String
+    /// Machine identity of the value where the label alone is ambiguous — for
+    /// a file chip this is the relative path, so tapping it can cancel exactly
+    /// that tag even when two directories hold files with the same name.
+    var detail: String?
 
-    var id: String { "\(kind.rawValue)\u{1e}\(label)" }
+    var id: String { "\(kind.rawValue)\u{1e}\(label)\u{1e}\(detail ?? "")" }
 }
 
 struct VoiceModelCandidate: Equatable, Sendable {
@@ -41,6 +56,110 @@ struct VoiceSettingsCatalog: Equatable, Sendable {
     var models: [VoiceModelCandidate]
     var efforts: [ReasoningEffort]
     var modes: [PermissionMode]
+}
+
+// MARK: - File matching
+
+/// The workspace file index, pre-tokenized for spoken matching.
+///
+/// Deterministic on purpose — the earlier attempt at voice file tagging was
+/// abandoned because fuzzy scoring over the whole index mis-tagged constantly.
+/// This matcher only fires on *explicit* references: a name next to the word
+/// "file", a spoken extension ("dot swift"), or an exact multi-word name. ASR
+/// noise inside those references is absorbed per-token with the same one-edit
+/// tolerance the model matcher uses ("chat pain file" still finds ChatPane),
+/// but nothing is ever tagged from resemblance alone.
+///
+/// Built once per file-index load, not per partial: tokenizing a few thousand
+/// names is cheap but not 5×/second cheap.
+struct VoiceFileMatcher: Sendable {
+    struct Entry: Sendable {
+        var name: String        // "ChatPane.swift"
+        var path: String        // "Apps/OreMac/Sources/OreMac/ChatPane.swift"
+        var baseTokens: [String]  // ["chat", "pane"]
+        var joinedBase: String    // "chatpane" — dictation sometimes glues words
+        var joinedAll: String     // "chatpaneswift" — ".‌" vanishes in normalization
+        var ext: String?          // "swift"
+        var componentCount: Int
+    }
+
+    var entries: [Entry] = []
+    /// Extensions that actually exist in this workspace, so "dot swift" only
+    /// triggers where .swift files do.
+    var extensions: Set<String> = []
+    /// Space-joined base tokens → entry indices, for the triggerless exact pass.
+    var byJoinedSpacedBase: [String: [Int]] = [:]
+    /// Normalized glued full name ("chatpaneswift") → entry indices.
+    var byJoinedAll: [String: [Int]] = [:]
+
+    static let empty = VoiceFileMatcher()
+
+    init() {}
+
+    init(files: [(name: String, path: String)]) {
+        entries = files.map { file in
+            let dot = file.name.lastIndex(of: ".")
+            let base: Substring
+            let ext: String?
+            if let dot, dot != file.name.startIndex, file.name.index(after: dot) != file.name.endIndex {
+                base = file.name[..<dot]
+                ext = String(file.name[file.name.index(after: dot)...]).lowercased()
+            } else {
+                base = file.name[...]
+                ext = nil
+            }
+            let tokens = Self.subwords(of: String(base))
+            return Entry(
+                name: file.name,
+                path: file.path,
+                baseTokens: tokens,
+                joinedBase: tokens.joined(),
+                joinedAll: tokens.joined() + (ext ?? ""),
+                ext: ext,
+                componentCount: file.path.reduce(into: 1) { if $1 == "/" { $0 += 1 } }
+            )
+        }
+        for (index, entry) in entries.enumerated() {
+            if let ext = entry.ext { extensions.insert(ext) }
+            if entry.baseTokens.count >= 2 {
+                byJoinedSpacedBase[entry.baseTokens.joined(separator: " "), default: []].append(index)
+            }
+            byJoinedAll[entry.joinedAll, default: []].append(index)
+        }
+    }
+
+    /// "ChatPane" → ["chat", "pane"], "URLSession2" → ["url", "session", "2"].
+    /// Splits on camel boundaries, separators, and letter→digit transitions so
+    /// file names tokenize the way dictation hears them.
+    static func subwords(of text: String) -> [String] {
+        var words: [String] = []
+        var current = ""
+        var previous: Character?
+        let characters = Array(text)
+        for (index, character) in characters.enumerated() {
+            guard character.isLetter || character.isNumber else {
+                if !current.isEmpty { words.append(current); current = "" }
+                previous = nil
+                continue
+            }
+            if let previous {
+                let camel = previous.isLowercase && character.isUppercase
+                let digitBoundary = previous.isLetter != character.isLetter
+                // "URLSession" — the last capital of an acronym run starts the
+                // next word when a lowercase letter follows it.
+                let acronymEnd = previous.isUppercase && character.isUppercase
+                    && index + 1 < characters.count && characters[index + 1].isLowercase
+                if camel || digitBoundary || acronymEnd {
+                    words.append(current)
+                    current = ""
+                }
+            }
+            current.append(Character(character.lowercased()))
+            previous = character
+        }
+        if !current.isEmpty { words.append(current) }
+        return words
+    }
 }
 
 // MARK: - Lexing
@@ -194,7 +313,12 @@ enum VoiceLexer {
 /// handles the misrecognitions instead, and needs no model load at all, which is
 /// what makes it fast enough to run on every partial transcript.
 enum VoiceIntentExtractor {
-    static func extract(from spoken: String, catalog: VoiceSettingsCatalog) -> VoiceIntents {
+    static func extract(
+        from spoken: String,
+        catalog: VoiceSettingsCatalog,
+        fileMatcher: VoiceFileMatcher = .empty,
+        excludedFilePaths: Set<String> = []
+    ) -> VoiceIntents {
         let tokens = VoiceLexer.tokenize(spoken)
         guard !tokens.isEmpty else {
             return VoiceIntents(
@@ -205,17 +329,28 @@ enum VoiceIntentExtractor {
         }
 
         var spans: [Range<Int>] = []
+        var replacements: [(span: Range<Int>, text: String)] = []
         var changes: [(index: Int, change: VoiceChange)] = []
 
         /// A span already claimed by an earlier setting cannot be spent twice —
         /// "max" inside "GPT-5.6 Max" is part of the model, not an effort.
-        func claim(_ span: Range<Int>, kind: VoiceChange.Kind, label: String) -> Bool {
+        /// Settings are cut out (`replacement` empty); a file reference is
+        /// replaced by its `@Name` token where the words were.
+        func claim(
+            _ span: Range<Int>,
+            kind: VoiceChange.Kind,
+            label: String,
+            detail: String? = nil,
+            replacement: String = ""
+        ) -> Bool {
             guard !spans.contains(where: { $0.overlaps(span) }) else { return false }
             spans.append(span)
+            replacements.append((span, replacement))
             changes.append((span.lowerBound, VoiceChange(
                 kind: kind,
                 label: label,
-                consumed: text(of: span, in: spoken, tokens: tokens)
+                consumed: text(of: span, in: spoken, tokens: tokens),
+                detail: detail
             )))
             return true
         }
@@ -238,13 +373,26 @@ enum VoiceIntentExtractor {
             mode = hit.value
         }
 
+        var files: [VoiceFileTag] = []
+        for hit in matchFiles(tokens: tokens, matcher: fileMatcher, excluded: excludedFilePaths)
+        where claim(
+            hit.span,
+            kind: .file,
+            label: "@\(hit.value.name)",
+            detail: hit.value.path,
+            replacement: "@\(hit.value.name)"
+        ) {
+            files.append(VoiceFileTag(name: hit.value.name, path: hit.value.path))
+        }
+
         return VoiceIntents(
             attachClipboard: wantsClipboard(spoken),
             permissionMode: mode,
             model: model,
             effort: effort,
-            rewritten: remove(spans, from: spoken, tokens: tokens),
-            changes: changes.sorted { $0.index < $1.index }.map(\.change)
+            rewritten: rewrite(replacements, in: spoken, tokens: tokens),
+            changes: changes.sorted { $0.index < $1.index }.map(\.change),
+            files: files
         )
     }
 
@@ -436,6 +584,150 @@ enum VoiceIntentExtractor {
         return Hit(value: best.value, span: span)
     }
 
+    // MARK: Files
+
+    /// Explicit spoken file references, in three shapes, most specific first:
+    ///
+    ///   1. A spoken extension — "voice input dot swift", or dictation writing
+    ///      the name verbatim ("ChatPane.swift" normalizes to one glued token).
+    ///   2. A name next to the word "file" — "the chat pane file".
+    ///   3. An exact multi-word name with no cue — "open app model" when the
+    ///      workspace has AppModel.swift. Exact only: fuzziness without an
+    ///      explicit cue is how the old auto-tagger went wrong.
+    ///
+    /// Within an explicit reference, each word is matched with the usual
+    /// one-edit tolerance, so "chat pain file" still finds ChatPane.
+    private static func matchFiles(
+        tokens: [VoiceToken],
+        matcher: VoiceFileMatcher,
+        excluded: Set<String>
+    ) -> [Hit<VoiceFileMatcher.Entry>] {
+        guard !matcher.entries.isEmpty else { return [] }
+        var hits: [Hit<VoiceFileMatcher.Entry>] = []
+        var taken: [Range<Int>] = []
+
+        func record(_ entry: VoiceFileMatcher.Entry, _ span: Range<Int>) {
+            guard !taken.contains(where: { $0.overlaps(span) }) else { return }
+            taken.append(span)
+            hits.append(Hit(value: entry, span: span))
+        }
+
+        /// The article ahead of a reference belongs to it: cutting "chat pane
+        /// file" out of "the chat pane file" would leave a dangling "the".
+        func extendOverArticle(_ lower: Int) -> Int {
+            guard lower > 0, referenceArticles.contains(tokens[lower - 1].text) else { return lower }
+            return lower - 1
+        }
+
+        func bestEntry(
+            window: ArraySlice<VoiceToken>,
+            requiredExt: String?
+        ) -> VoiceFileMatcher.Entry? {
+            var best: VoiceFileMatcher.Entry?
+            for entry in matcher.entries where !excluded.contains(entry.path) {
+                if let requiredExt, entry.ext != requiredExt { continue }
+                guard baseMatches(window, entry) else { continue }
+                if let current = best {
+                    // More name tokens matched is more specific; then prefer the
+                    // shallower, shorter path so `Sources/App.swift` beats
+                    // `Vendor/Deep/App.swift`; alphabetical keeps ties stable.
+                    let better = (entry.baseTokens.count, current.componentCount, current.path.count, current.path)
+                        > (current.baseTokens.count, entry.componentCount, entry.path.count, entry.path)
+                    if better { best = entry }
+                } else {
+                    best = entry
+                }
+            }
+            return best
+        }
+
+        // Pass 1 — "<name> dot <ext>", plus glued verbatim names.
+        for index in tokens.indices {
+            if tokens[index].text == "dot" || tokens[index].text == "period",
+               index + 1 < tokens.count,
+               let ext = matchedExtension(tokens[index + 1].text, in: matcher.extensions),
+               index > 0 {
+                for length in (1...min(4, index)).reversed() {
+                    let window = tokens[(index - length)..<index]
+                    guard let entry = bestEntry(window: window, requiredExt: ext) else { continue }
+                    record(entry, extendOverArticle(index - length)..<(index + 2))
+                    break
+                }
+            }
+            if let indices = matcher.byJoinedAll[tokens[index].text] {
+                let candidates = indices.map { matcher.entries[$0] }
+                    .filter { !excluded.contains($0.path) }
+                if let entry = candidates.min(by: {
+                    ($0.componentCount, $0.path.count, $0.path) < ($1.componentCount, $1.path.count, $1.path)
+                }) {
+                    record(entry, extendOverArticle(index)..<(index + 1))
+                }
+            }
+        }
+
+        // Pass 2 — "<name> file".
+        for index in tokens.indices
+        where (tokens[index].text == "file" || tokens[index].text == "files") && index > 0 {
+            for length in (1...min(4, index)).reversed() {
+                let window = tokens[(index - length)..<index]
+                guard !window.contains(where: { referenceArticles.contains($0.text) }) else { continue }
+                guard let entry = bestEntry(window: window, requiredExt: nil) else { continue }
+                record(entry, extendOverArticle(index - length)..<(index + 1))
+                break
+            }
+        }
+
+        // Pass 3 — an exact multi-word name, no cue. Exact join only.
+        for length in stride(from: 4, through: 2, by: -1) {
+            guard tokens.count >= length else { continue }
+            for start in 0...(tokens.count - length) {
+                let span = start..<(start + length)
+                guard !taken.contains(where: { $0.overlaps(span) }) else { continue }
+                let joined = tokens[span].map(\.text).joined(separator: " ")
+                guard let indices = matcher.byJoinedSpacedBase[joined] else { continue }
+                let candidates = indices.map { matcher.entries[$0] }
+                    .filter { !excluded.contains($0.path) }
+                if let entry = candidates.min(by: {
+                    ($0.componentCount, $0.path.count, $0.path) < ($1.componentCount, $1.path.count, $1.path)
+                }) {
+                    record(entry, span)
+                }
+            }
+        }
+
+        return hits.sorted { $0.span.lowerBound < $1.span.lowerBound }
+    }
+
+    /// Matching a spoken window against a file's name tokens: word for word
+    /// with edit tolerance, or the whole window glued ("chatpane file").
+    private static func baseMatches(
+        _ window: ArraySlice<VoiceToken>,
+        _ entry: VoiceFileMatcher.Entry
+    ) -> Bool {
+        if window.count == entry.baseTokens.count {
+            return zip(window, entry.baseTokens).allSatisfy {
+                VoiceLexer.tokensMatch($0.text, $1)
+            }
+        }
+        if window.count == 1, let only = window.first {
+            return VoiceLexer.tokensMatch(only.text, entry.joinedBase)
+        }
+        return false
+    }
+
+    /// Short extensions ("ts", "py") must match exactly — one edit could turn
+    /// them into each other. Longer ones get the usual tolerance so a misheard
+    /// "swist" still reads as swift.
+    private static func matchedExtension(_ spoken: String, in extensions: Set<String>) -> String? {
+        if extensions.contains(spoken) { return spoken }
+        guard spoken.utf8.count >= 4 else { return nil }
+        return extensions.first { $0.utf8.count >= 4 && VoiceLexer.tokensMatch(spoken, $0) }
+    }
+
+    private static let referenceArticles: Set<String> = [
+        "the", "that", "this", "a", "an", "my", "our",
+    ]
+
     // MARK: Span helpers
 
     private static func firstMatch(of alias: [String], in tokens: [VoiceToken]) -> Range<Int>? {
@@ -554,18 +846,24 @@ enum VoiceIntentExtractor {
         return lower..<upper
     }
 
-    private static func remove(
-        _ spans: [Range<Int>],
-        from spoken: String,
+    /// Applies the claimed spans back to the spoken text: settings clauses are
+    /// cut, file references become their `@Name` token in place.
+    private static func rewrite(
+        _ replacements: [(span: Range<Int>, text: String)],
+        in spoken: String,
         tokens: [VoiceToken]
     ) -> String {
-        let ranges = spans.compactMap { characterRange(of: $0, in: tokens) }
-            .sorted { $0.lowerBound > $1.lowerBound }
+        let ranges = replacements
+            .compactMap { item -> (Range<String.Index>, String)? in
+                guard let range = characterRange(of: item.span, in: tokens) else { return nil }
+                return (range, item.text)
+            }
+            .sorted { $0.0.lowerBound > $1.0.lowerBound }
         var result = spoken
         var cut: [Range<String.Index>] = []
-        for range in ranges {
+        for (range, text) in ranges {
             if cut.contains(where: { $0.overlaps(range) }) { continue }
-            result.replaceSubrange(range, with: " ")
+            result.replaceSubrange(range, with: text.isEmpty ? " " : " \(text) ")
             cut.append(range)
         }
         return tidy(result)

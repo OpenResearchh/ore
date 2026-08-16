@@ -518,4 +518,24 @@ struct TranscriptWriterTests {
         #expect(await writer.persistenceFailures == 1)
         #expect(await writer.lastPersistenceError != nil)
     }
+
+    @Test func aRepeatedToolCallUpdatesPayloadInsteadOfDuplicating() async throws {
+        let (store, writer, _) = try await makeWriter()
+        let turnID = TurnID(rawValue: "t1")
+        await writer.handle(.turnStarted(TurnStarted(turnID: turnID)))
+        await writer.handle(.toolCall(ToolCall(
+            turnID: turnID, id: "c1", name: "Edit",
+            displayName: "x.txt", input: ["file_path": "x.txt"]
+        )))
+        await writer.handle(.toolCall(ToolCall(
+            turnID: turnID, id: "c1", name: "Edit",
+            displayName: "x.txt",
+            input: ["file_path": "x.txt", "patch": "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n"]
+        )))
+
+        let blocks = try await store.blocks(turnID: turnID)
+        #expect(blocks.count == 1)
+        #expect(blocks[0].ordinal == 0)
+        #expect(blocks[0].decodedPayload?["patch"]?.stringValue?.contains("+new") == true)
+    }
 }

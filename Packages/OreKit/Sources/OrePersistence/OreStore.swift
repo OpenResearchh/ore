@@ -385,6 +385,10 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
+    public func block(_ id: String) throws -> BlockRecord? {
+        try writer.read { db in try BlockRecord.fetchOne(db, key: id) }
+    }
+
     public func appendBlocks(_ records: [BlockRecord]) throws {
         guard !records.isEmpty else { return }
         try writer.write { db in

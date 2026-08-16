@@ -395,8 +395,12 @@ final class VoiceInputController {
     }
 
     private func runSpeechRecognizer() async throws {
+        // `@Sendable` is load-bearing: without it the closure inherits this
+        // class's MainActor isolation, and TCC delivers it on a background
+        // queue — the runtime isolation check then kills the app (SIGTRAP in
+        // dispatch_assert_queue) the first time permission is requested.
         let authorized = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
+            SFSpeechRecognizer.requestAuthorization { @Sendable status in
                 continuation.resume(returning: status == .authorized)
             }
         }
@@ -434,11 +438,16 @@ final class VoiceInputController {
         status = .listening
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                var finished = false
-                recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-                    guard let self else { return }
+                // Same trap as the authorization callback above: the handler
+                // runs on the recognizer's own queue, so it must be @Sendable
+                // rather than silently MainActor-isolated. `finished` lives in
+                // a Flag because a @Sendable closure cannot mutate a captured
+                // var; the recognizer delivers callbacks serially.
+                let finished = Flag()
+                recognitionTask = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, error in
                     if let result {
                         Task { @MainActor in
+                            guard let self else { return }
                             self.assembler.applyUtterance(
                                 result.bestTranscription.formattedString,
                                 isFinal: result.isFinal
@@ -447,14 +456,14 @@ final class VoiceInputController {
                         }
                     }
                     if let error {
-                        if !finished {
-                            finished = true
+                        if !finished.value {
+                            finished.value = true
                             continuation.resume(throwing: error)
                         }
                         return
                     }
-                    if result?.isFinal == true, !finished {
-                        finished = true
+                    if result?.isFinal == true, !finished.value {
+                        finished.value = true
                         continuation.resume()
                     }
                 }

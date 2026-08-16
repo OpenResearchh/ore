@@ -967,6 +967,31 @@ struct ToolChangeStatsTests {
         #expect(counts.insertions == 1)
         #expect(counts.deletions == 0)
     }
+
+    @Test func editWithOnlyNewStringCountsInsertions() {
+        let counts = ToolChangeStats.lineCounts(
+            diff: "",
+            old: nil,
+            new: "hello\nworld\n",
+            content: nil,
+            changeKind: nil,
+            isWrite: false
+        )
+        #expect(counts.insertions == 2)
+        #expect(counts.deletions == 0)
+    }
+
+    @Test func unifiedDiffInResultTextIsRecognised() {
+        let diff = """
+        --- a/App.swift
+        +++ b/App.swift
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+        #expect(ToolChangeStats.looksLikeDiff(diff))
+        #expect(!ToolChangeStats.looksLikeDiff("wrote App.swift"))
+    }
 }
 
 @MainActor

@@ -457,6 +457,58 @@ struct ComposerPasteboardTests {
         #expect(partial.attachments.map(\.displayName) == ["GitClient.swift"])
         #expect(partial.inlinePaths.isEmpty)
     }
+
+    /// Switching chat tabs tears the composer down, so the set of inline
+    /// attachments has to be rebuilt from the restored draft — otherwise every
+    /// `@pasted-image.png` pill comes back as a chip above the composer.
+    @Test func inlinePathsAreRebuiltFromTheRestoredDraft() {
+        let image = Attachment(
+            relativePath: ".context/attachments/aa-pasted-image.png",
+            displayName: "pasted-image.png",
+            mimeType: "image/png"
+        )
+        let shelf = Attachment(
+            relativePath: ".context/attachments/bb-notes.txt",
+            displayName: "notes.txt"
+        )
+        let file = Attachment(relativePath: "Sources/GitClient.swift", displayName: "GitClient.swift")
+
+        let restored = ComposerPasteboard.inlinePaths(
+            inDraft: "Look at @GitClient.swift and @pasted-image.png",
+            attachments: [image, shelf, file]
+        )
+        // The pasted image was typed into the draft, so it stays a pill.
+        #expect(restored == [image.relativePath])
+        // A shelf attachment carries no token and must remain a chip; a
+        // workspace file is never a "pasted" path at all.
+        #expect(!restored.contains(shelf.relativePath))
+        #expect(!restored.contains(file.relativePath))
+    }
+
+    /// `uniquePastedName` numbers collisions, so one token must not match the
+    /// other attachment by prefix.
+    @Test func similarlyNamedPastesDoNotMatchEachOther() {
+        let first = Attachment(
+            relativePath: ".context/attachments/aa-pasted-image.png",
+            displayName: "pasted-image.png"
+        )
+        let second = Attachment(
+            relativePath: ".context/attachments/bb-pasted-image-2.png",
+            displayName: "pasted-image-2.png"
+        )
+        let onlySecond = ComposerPasteboard.inlinePaths(
+            inDraft: "see @pasted-image-2.png", attachments: [first, second]
+        )
+        #expect(onlySecond == [second.relativePath])
+    }
+
+    @Test func anEmptyDraftLeavesEverythingOnTheShelf() {
+        let image = Attachment(
+            relativePath: ".context/attachments/aa-pasted-image.png",
+            displayName: "pasted-image.png"
+        )
+        #expect(ComposerPasteboard.inlinePaths(inDraft: "", attachments: [image]).isEmpty)
+    }
 }
 
 struct VoiceDraftTests {
@@ -565,6 +617,24 @@ struct VoiceTurnCommitTests {
             VoiceTurnCommit.resolve(.commitToDraft, prefix: "Please", spokenFormatted: "add a test")
                 == .updateDraft("Please add a test")
         )
+    }
+}
+
+struct VoiceLiveQuoteTests {
+    @Test func shortDictationIsShownWhole() {
+        #expect(VoiceLiveQuote.tail(of: "add a test for the parser") == "add a test for the parser")
+        #expect(VoiceLiveQuote.tail(of: "") == "")
+    }
+
+    @Test func onlyTheNewestWordsSurviveALongDictation() {
+        let spoken = (1...60).map(String.init).joined(separator: " ")
+        let tail = VoiceLiveQuote.tail(of: spoken, maxWords: 4)
+        #expect(tail == "57 58 59 60")
+    }
+
+    @Test func dictatedBreaksDoNotWrapTheOneLineQuote() {
+        #expect(VoiceLiveQuote.tail(of: "first thing\n- second thing") == "first thing - second thing")
+        #expect(VoiceLiveQuote.tail(of: "  padded words  ") == "padded words")
     }
 }
 

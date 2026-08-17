@@ -454,6 +454,7 @@ final class AppModel {
         in workspaceID: WorkspaceID,
         initialMessage: String? = nil,
         draft: String? = nil,
+        defaults: ChatDefaults? = nil,
         model: String? = nil
     ) {
         if let initialMessage {
@@ -474,11 +475,12 @@ final class AppModel {
             excluding: usedTitles,
             preferred: workspace.flatMap(researchIdentity(for:))
         )
+        let resolved = defaults ?? newChatDefaults(for: workspaceID)
         Task { await client.send(.createChat(CreateChatRequest(
             workspaceID: workspaceID,
             title: title,
-            harness: workspace?.harness,
-            model: model ?? workspace?.model,
+            harness: resolved.harness,
+            model: model ?? resolved.model,
             permissionMode: workspace?.permissionMode ?? .default
         ))) }
     }
@@ -872,9 +874,14 @@ final class AppModel {
         }
     }
 
+    /// The next step for a workspace, as last computed.
+    func gitAction(for id: WorkspaceID) -> SuggestedGitAction {
+        cachedDiff(for: id)?.gitAction ?? .none
+    }
+
     var selectedGitAction: SuggestedGitAction {
         guard let id = selectedWorkspaceID else { return .none }
-        return cachedDiff(for: id)?.gitAction ?? .none
+        return gitAction(for: id)
     }
 
     /// Whether ⌥⌘G has something to run. The actionable steps, plus the
@@ -1134,8 +1141,38 @@ final class AppModel {
             diffs: try await diffs,
             gitAction: try await action
         )
+        // Reads race: the review pane refreshes on both workspace switch and
+        // every git-status bump, and `prefetchDiff` runs more in the
+        // background. They finish out of order, so an older read landing last
+        // used to overwrite fresh changes with the empty diff from before the
+        // agent wrote anything — the "Changes 0 even though files are
+        // modified" that only showed up sometimes. The newest generation wins,
+        // and a stale caller is handed the newer snapshot rather than its own.
+        if let cached = diffCache[workspace.id], cached.generation > snapshot.generation {
+            return cached
+        }
         diffCache[workspace.id] = snapshot
         return snapshot
+    }
+
+    /// Recomputes just the suggested git action, leaving the cached diff alone.
+    ///
+    /// Everything else here refreshes on the git-status generation, which only
+    /// moves when the *worktree* does. Half of what the action depends on lives
+    /// on GitHub: opening a PR, a review landing, CI going red, someone merging
+    /// in a browser tab — none of which touch a local file, so none of which
+    /// bump the generation. Without a trigger of its own the toolbar kept
+    /// offering "Create pull request" for a PR that was already open, and the
+    /// button did the one thing that could not work.
+    ///
+    /// Cheap enough to call on turn boundaries and workspace switches: it is one
+    /// `gh pr view` and a `git status`, and it never refetches the diff.
+    func refreshGitAction(for workspaceID: WorkspaceID) async {
+        guard let action = try? await loadGitAction(for: workspaceID) else { return }
+        guard var snapshot = diffCache[workspaceID] else { return }
+        guard snapshot.gitAction != action else { return }
+        snapshot.gitAction = action
+        diffCache[workspaceID] = snapshot
     }
 
     /// Best-effort background warm-up of a workspace's diff so a later switch is
@@ -1483,6 +1520,12 @@ final class AppModel {
                 applyToChat(workspaceID: id, chatID: chatID, event: flushed)
             }
             coalescers[chatID] = coalescer
+            // An agent that ends its turn by pushing and opening a PR leaves the
+            // worktree byte-for-byte identical to how it started it, so nothing
+            // else asks whether the next step changed.
+            if case .turnCompleted = agentEvent {
+                Task { [weak self] in await self?.refreshGitAction(for: id) }
+            }
 
         case .chatAdded(let chat):
             chatCreationsInFlight.remove(chat.workspaceID)
@@ -1592,6 +1635,68 @@ final class AppModel {
     /// UserDefaults key for a harness's user-chosen default model.
     static func defaultModelKey(for harness: HarnessKind) -> String {
         "ore.defaultModel.\(harness.rawValue)"
+    }
+
+    /// Settings keys for the agent and model a new tab opens with, and for the
+    /// Review button's own override. An empty stored value means "inherit", so
+    /// nothing is pinned until the user actually picks something.
+    enum DefaultKey {
+        static let newChatHarness = "ore.defaultHarness"
+        static let newChatModel = "ore.defaultModel"
+        static let reviewHarness = "ore.review.harness"
+        static let reviewModel = "ore.review.model"
+    }
+
+    /// The agent and model a chat starts with. Both are optional because either
+    /// can be left to the core's own fallbacks.
+    struct ChatDefaults: Equatable {
+        var harness: HarnessKind?
+        var model: String?
+    }
+
+    private static func pinned(_ key: String) -> String? {
+        guard let value = UserDefaults.standard.string(forKey: key), !value.isEmpty else { return nil }
+        return value
+    }
+
+    /// What the `+` button opens: the Settings pin if the user set one, else
+    /// whatever the workspace is already using.
+    func newChatDefaults(for workspaceID: WorkspaceID) -> ChatDefaults {
+        let workspace = workspaces.first { $0.id == workspaceID }
+        return resolveDefaults(
+            harnessKey: DefaultKey.newChatHarness,
+            modelKey: DefaultKey.newChatModel,
+            inherited: ChatDefaults(harness: workspace?.harness, model: workspace?.model)
+        )
+    }
+
+    /// What the Review button opens. Review pins fall back to the new-chat pins,
+    /// which fall back to the workspace — one chain, so leaving review unset
+    /// keeps it behaving exactly like any other new tab.
+    func reviewDefaults(for workspaceID: WorkspaceID) -> ChatDefaults {
+        resolveDefaults(
+            harnessKey: DefaultKey.reviewHarness,
+            modelKey: DefaultKey.reviewModel,
+            inherited: newChatDefaults(for: workspaceID)
+        )
+    }
+
+    private func resolveDefaults(
+        harnessKey: String,
+        modelKey: String,
+        inherited: ChatDefaults
+    ) -> ChatDefaults {
+        let harness = Self.pinned(harnessKey).flatMap(HarnessKind.init(rawValue:)) ?? inherited.harness
+        if let model = Self.pinned(modelKey) {
+            return ChatDefaults(harness: harness, model: model)
+        }
+        // Switching agent invalidates the inherited model id — it names a model
+        // in the other provider's catalogue, and handing it over is exactly what
+        // produces "the selected model may not exist" once the agent starts.
+        guard harness == inherited.harness else {
+            return ChatDefaults(harness: harness, model: harness.flatMap { defaultModelID(for: $0) })
+        }
+        return ChatDefaults(harness: harness, model: inherited.model)
     }
 
     /// The default model id for a harness: the user's per-harness choice from
@@ -1825,6 +1930,9 @@ final class AppModel {
                 try? await client.setFocused(workspaceID: next, chatID: chatID, focused: true)
             }
         }
+        // Looking at a workspace again is the other moment its remote state may
+        // have moved without us — a PR reviewed or merged in a browser tab.
+        if let next { Task { [weak self] in await self?.refreshGitAction(for: next) } }
     }
 
     func dismissBanner(_ id: UUID) {

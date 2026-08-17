@@ -160,9 +160,16 @@ public actor CursorAgentSession: AgentSession {
     private let allowUnprompted: Bool
 
     private var translator: CursorAgentTranslator
+    /// The mode the *next* turn spawns with. A turn is a whole process, so a
+    /// change made while one is running lands on the one after it rather than
+    /// forcing the user into a new chat.
+    private var permissionMode: PermissionMode
     private var currentProcess: ChildProcess?
     private var turnTask: Task<Void, Never>?
     private var isStopping = false
+    /// Set while the user's own interrupt is tearing the process down, so its
+    /// non-zero exit isn't misread as a failure.
+    private var isInterrupting = false
 
     public private(set) var providerSessionID: String?
 
@@ -176,6 +183,7 @@ public actor CursorAgentSession: AgentSession {
         self.id = id
         self.executablePath = executablePath
         self.configuration = configuration
+        self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
         self.allowUnprompted = allowUnprompted
         self.translator = CursorAgentTranslator(sessionID: id)
@@ -228,11 +236,28 @@ public actor CursorAgentSession: AgentSession {
         process.closeStandardInput()
 
         turnTask = Task { [weak self] in
+            // stderr is drained concurrently and joined before the turn closes:
+            // it is the only channel that says *why* a run failed, and reading
+            // it after the fact would race the classification against EOF.
+            // `async let` keeps it structured, so cancelling the turn cancels it.
+            async let diagnostics = Self.collectStderr(from: process)
             for await line in process.stdoutChunks.lines() {
                 await self?.handle(line: line)
             }
-            await self?.finishTurn(status: await process.waitForExit())
+            let status = await process.waitForExit()
+            await self?.finishTurn(status: status, stderr: await diagnostics)
         }
+    }
+
+    /// The tail of stderr. Bounded because a failing CLI can print without end,
+    /// and only the last lines carry the reason it gave up.
+    private static func collectStderr(from process: ChildProcess) async -> String {
+        var recent: [String] = []
+        for await line in process.stderrChunks.lines() {
+            recent.append(line)
+            if recent.count > 40 { recent.removeFirst(recent.count - 40) }
+        }
+        return recent.joined(separator: "\n")
     }
 
     private func arguments(for prompt: String) -> [String] {
@@ -247,7 +272,7 @@ public actor CursorAgentSession: AgentSession {
         if let model = configuration.model {
             arguments += ["--model", model]
         }
-        if configuration.permissionMode == .plan {
+        if permissionMode == .plan {
             arguments += ["--mode", "plan"]
         }
         if let providerSessionID {
@@ -261,9 +286,9 @@ public actor CursorAgentSession: AgentSession {
         // `--force` runs anything and so stays behind the explicit opt-in;
         // `--auto-review` is the default because refusing on a classifier's
         // judgement is a policy, whereas refusing everything is a defect.
-        if allowUnprompted, configuration.permissionMode == .bypassPermissions {
+        if allowUnprompted, permissionMode == .bypassPermissions {
             arguments.append("--force")
-        } else if configuration.permissionMode != .plan {
+        } else if permissionMode != .plan {
             arguments.append("--auto-review")
         }
         arguments += configuration.extraArguments
@@ -281,22 +306,35 @@ public actor CursorAgentSession: AgentSession {
         }
     }
 
-    private func finishTurn(status: Int32) {
+    private func finishTurn(status: Int32, stderr: String) {
         currentProcess = nil
-        for event in translator.closeTurn(exitCode: status).events {
+        // A process the user killed exits non-zero by definition. Classifying
+        // that would raise an error banner for a deliberate stop, so the turn
+        // is closed as if it had ended cleanly.
+        let wasInterrupted = isInterrupting
+        isInterrupting = false
+        for event in translator.closeTurn(
+            exitCode: wasInterrupted ? 0 : status,
+            stderr: stderr
+        ).events {
             continuation.yield(event)
         }
     }
 
     public func interrupt() async throws {
         guard let process = currentProcess else { return }
+        isInterrupting = true
         await process.terminate(gracePeriod: .seconds(2))
         currentProcess = nil
         continuation.yield(.statusChanged(.interrupted))
     }
 
+    /// Accepted at any point in the chat. There is no live control channel to
+    /// push it down, but every turn is a fresh process, so recording it here is
+    /// all it takes for the next turn to run under the new policy — the user
+    /// does not have to open a new chat to switch to accept-edits.
     public func setPermissionMode(_ mode: PermissionMode) async throws {
-        throw HarnessError.unsupportedCapability("permission mode changes")
+        permissionMode = mode
     }
 
     public func resolvePermission(

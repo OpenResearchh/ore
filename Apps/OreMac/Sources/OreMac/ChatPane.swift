@@ -21,6 +21,11 @@ struct ChatPane: View {
     @State private var expandedActivityGroups: Set<String> = []
     /// Attachment relative paths that live as inline chips in the draft (pasted
     /// images and long text) rather than in the attachment shelf above the composer.
+    ///
+    /// View state, so a tab switch destroys it while `chat.draftAttachments`
+    /// survives on the chat — which is what demoted inline pills to shelf
+    /// chips. It is rebuilt from the restored draft on every chat change; see
+    /// `ComposerPasteboard.inlinePaths(inDraft:attachments:)`.
     @State private var inlinePastedPaths: Set<String> = []
     @State private var showModelChooser = false
     @State private var showEffortChooser = false
@@ -48,6 +53,11 @@ struct ChatPane: View {
     /// mic is hot. Dictation never touches `draft`; the words only land there
     /// (or go straight out as a turn) when the session ends.
     @State private var voiceQuote = ""
+    /// Set between the mic stopping and the turn going out: the composer holds
+    /// the whole dictated prompt on screen for that beat instead of the live
+    /// one-line quote. Non-nil means a send is pending and still cancellable.
+    @State private var voiceSettle: VoiceSettledTurn?
+    @State private var voiceSettleTask: Task<Void, Never>?
     /// Spoken file matching runs against this pre-tokenized index.
     @State private var voiceFileMatcher = VoiceFileMatcher.empty
     /// File tags the user dismissed mid-dictation by tapping their chip. The
@@ -273,6 +283,14 @@ struct ChatPane: View {
             } else {
                 draft = chatSummary?.draftText ?? ""
             }
+            // The attachments survive a tab switch on the chat, but the record
+            // of which ones were *inline* is view state that dies with the
+            // pane — so without this every `@pasted-image.png` pill came back
+            // as a chip above the composer. The tokens left in the restored
+            // draft are what say which were inline.
+            inlinePastedPaths = ComposerPasteboard.inlinePaths(
+                inDraft: draft, attachments: chat.draftAttachments
+            )
         }
         .onChange(of: model.composerInjection?.generation) { _, _ in
             guard let injection = model.composerInjection,
@@ -1038,18 +1056,19 @@ struct ChatPane: View {
                 .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
             }
 
-            if voice.isActive {
+            if voice.isActive || voiceSettle != nil {
                 // In voice mode the input area itself becomes the transcript:
                 // the words land where they will be sent from, set in serif
                 // quotes so they read as speech-in-progress rather than typed
                 // text.
                 VoiceComposerTranscript(
                     prefix: draft,
-                    transcript: voiceQuote,
+                    transcript: voiceSettle?.quote ?? voiceQuote,
                     isListening: voice.isListening,
-                    // Never let the quote squeeze the toolbar out of a short
-                    // window: cap it to a slice of the pane and scroll the rest.
-                    maxHeight: min(200, paneHeight * 0.35)
+                    isSettled: voiceSettle != nil,
+                    // Never let the settled prompt squeeze the toolbar out of a
+                    // short window: cap it to a slice of the pane.
+                    maxLines: min(6, max(2, Int(paneHeight * 0.35 / 22)))
                 )
                 .frame(minHeight: 38, alignment: .topLeading)
                 .transition(.opacity)
@@ -1109,12 +1128,15 @@ struct ChatPane: View {
             padding: 10,
             isBusy: chat.isBusy,
             reduceMotion: reduceMotion,
-            voiceGlow: voice.isListening ? .full : voice.isActive ? .subdued : .off,
+            // The glow keeps burning through the settle beat: the turn has not
+            // gone out yet, so voice mode is not over yet either.
+            voiceGlow: voice.isListening ? .full : (voice.isActive || voiceSettle != nil) ? .subdued : .off,
             voiceEnergy: voice.audioLevel
         )
         .animation(.easeOut(duration: 0.2), value: chat.isBusy)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: voice.isActive)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: voice.isListening)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: voiceSettle)
         // Left-aligned to sit in the same column as the transcript, rather than
         // centring while the prose above it starts at the leading edge.
         .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -1165,19 +1187,36 @@ struct ChatPane: View {
     }
 
     private var permissionChip: some View {
-        Menu {
+        let current = chatSummary?.permissionMode ?? workspace.permissionMode
+        // Switching is always allowed in an open chat. On a harness that binds
+        // its policy per turn the change lands on the next one, and saying so
+        // is the difference between "later" and "ignored".
+        let landsNextTurn = chat.isBusy
+            && !(chatSummary?.capabilities.supportsRuntimePermissionModeChange ?? true)
+        return Menu {
             ForEach(PermissionMode.allCases, id: \.self) { mode in
-                Button(mode.displayName) { model.setPermissionMode(mode, for: workspace.id) }
+                Button {
+                    model.setPermissionMode(mode, for: workspace.id)
+                } label: {
+                    if mode == current {
+                        Label(mode.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(mode.displayName)
+                    }
+                }
+            }
+            if landsNextTurn {
+                Divider()
+                Text("Applies from the next turn")
             }
         } label: {
-            chipLabel(
-                chatSummary?.permissionMode.displayName ?? workspace.permissionMode.displayName,
-                systemImage: "shield.lefthalf.filled"
-            )
+            chipLabel(current.displayName, systemImage: "shield.lefthalf.filled")
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .help("Permission mode")
+        .help(landsNextTurn
+            ? "Permission mode — \(chatSummary?.harness.displayName ?? "this agent") applies it from the next turn"
+            : "Permission mode")
     }
 
     /// Generic Allow/Deny is the wrong surface when a dedicated card already
@@ -1547,7 +1586,9 @@ struct ChatPane: View {
     }
 
     private func toggleVoice() {
-        if voice.isActive {
+        // Pressing again during the hold means "go now": send the pending turn
+        // rather than opening a second dictation on top of it.
+        if voice.isActive || voiceSettle != nil {
             finishVoice(.send)
         } else {
             startVoice()
@@ -1556,6 +1597,9 @@ struct ChatPane: View {
 
     private func startVoice() {
         guard !voice.isActive else { return }
+        // Talking again before the previous turn's hold elapses flushes it, so
+        // two dictations can never share a composer.
+        resolveVoiceSettle(.send)
         voiceAttachedClipboard = false
         voicePendingModel = nil
         voiceChanges = []
@@ -1591,10 +1635,14 @@ struct ChatPane: View {
     }
 
     /// Ends the voice session. Ending the chord (or the mic button, or ⌘↩)
-    /// sends the dictated words as a turn; Esc throws them away; passive
-    /// teardown — switching tabs, the pane disappearing — parks them in the
-    /// draft so nothing fires that the user didn't ask for.
+    /// sends the dictated words as a turn — after a beat holding the finished
+    /// prompt on screen; Esc throws them away; passive teardown — switching
+    /// tabs, the pane disappearing — parks them in the draft so nothing fires
+    /// that the user didn't ask for.
     private func finishVoice(_ disposition: VoiceTurnCommit.Disposition) {
+        // A turn already waiting out its hold is what this disposition is
+        // about: the recognizer is idle, but nothing has been sent yet.
+        if resolveVoiceSettle(disposition) { return }
         guard voice.isActive else { return }
         let spoken = voice.transcript
         voice.stop()
@@ -1609,12 +1657,51 @@ struct ChatPane: View {
         let finalText = finalizeVoiceIntents(spoken: spoken)
         switch VoiceTurnCommit.resolve(disposition, prefix: draft, spokenFormatted: finalText) {
         case .send(let text):
-            sendVoiceTurn(regexCombined: text, spoken: spoken)
+            holdThenSend(VoiceSettledTurn(quote: finalText, combined: text, spoken: spoken))
         case .updateDraft(let text):
             draft = text
         case .none:
             break
         }
+    }
+
+    /// Swaps the live one-line quote for the whole prompt, then sends it. The
+    /// wait is what lets the user read what the recognizer actually heard
+    /// before it reaches the agent.
+    private func holdThenSend(_ turn: VoiceSettledTurn) {
+        voiceSettleTask?.cancel()
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            voiceSettle = turn
+        }
+        voiceSettleTask = Task { @MainActor in
+            try? await Task.sleep(for: VoiceSettledTurn.hold)
+            guard !Task.isCancelled else { return }
+            resolveVoiceSettle(.send)
+        }
+    }
+
+    /// Settles a turn that is waiting out its hold, and reports whether there
+    /// was one. Esc during the beat still cancels it, a second chord or mic
+    /// press sends it early rather than waiting, and passive teardown parks it
+    /// in the draft — the same three outcomes a live session has.
+    @discardableResult
+    private func resolveVoiceSettle(_ disposition: VoiceTurnCommit.Disposition) -> Bool {
+        guard let settled = voiceSettle else { return false }
+        voiceSettleTask?.cancel()
+        voiceSettleTask = nil
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            voiceSettle = nil
+        }
+        switch disposition {
+        case .send:
+            sendVoiceTurn(regexCombined: settled.combined, spoken: settled.spoken)
+        case .commitToDraft:
+            draft = settled.combined
+        case .cancel:
+            clearVoiceTrail()
+            voiceAttachedClipboard = false
+        }
+        return true
     }
 
     /// The auto-send path: before the turn goes out, one on-device language
@@ -1908,8 +1995,9 @@ struct ChatPane: View {
 
     private func send() {
         // ⌘↩ mid-dictation ends the session, which sends exactly once through
-        // `finishVoice` rather than racing it.
-        if voice.isActive {
+        // `finishVoice` rather than racing it — including a turn still waiting
+        // out its hold, whose words are not in the draft yet.
+        if voice.isActive || voiceSettle != nil {
             finishVoice(.send)
             return
         }
@@ -2646,93 +2734,50 @@ private struct ShortcutHint: View {
     }
 }
 
-/// Voice mode's take on the input area: the live transcript rendered exactly
-/// where typed text would be, in serif italic between curly quotes, so speech
-/// reads as speech until the session ends and it becomes the sent prompt. Any
+/// Voice mode's take on the input area: the transcript rendered exactly where
+/// typed text would be, in serif italic between curly quotes, so speech reads
+/// as speech until the session ends and it becomes the sent prompt. Any
 /// pre-typed draft stays visible in the normal prompt face ahead of the quote.
+///
+/// While the mic is hot this is a *single line* ending on the newest words.
+/// Streaming the whole paragraph in restated what the user had only just said
+/// and grew the box under their pointer while they were still talking. The
+/// finished prompt then takes over the box for a beat before it sends, which is
+/// where reading the whole thing actually matters.
 private struct VoiceComposerTranscript: View {
     let prefix: String
     let transcript: String
     let isListening: Bool
-    /// Scroll cap, already clamped to the pane's height by the caller so a
-    /// short window scrolls the quote instead of pushing the toolbar out.
-    var maxHeight: CGFloat = 200
+    /// The mic has stopped and the turn is waiting out its hold: wrap the whole
+    /// prompt instead of clipping to the tail.
+    let isSettled: Bool
+    /// Wrap cap for the settled prompt, already clamped to the pane's height by
+    /// the caller so a short window keeps its toolbar.
+    var maxLines: Int = 6
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Widths behind the live line's roll: the words' own, and the composer's.
+    @State private var lineWidth: CGFloat = 0
+    @State private var visibleWidth: CGFloat = 0
 
     private var spoken: String {
-        transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        isSettled
+            ? transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            : VoiceLiveQuote.tail(of: transcript)
     }
-
-    /// Height of the transcript, measured on a hidden mirror rendered in the
-    /// scroll view's *background* — the same trick the typed editor uses. An
-    /// earlier version measured the scroll view's own content and fed the
-    /// result back into that scroll view's frame; that layout cycle made
-    /// AttributeGraph sever the composer's update edge, freezing dictation
-    /// (transcript, chips, even intent handling) until a window resize forced
-    /// a full re-layout. The mirror's height depends only on the composer's
-    /// width, never on the frame it drives, so no cycle exists.
-    @State private var contentHeight: CGFloat = 0
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical) {
-                // No `contentTransition` on the streaming words: partials land
-                // several times a second, and retargeting an interpolating
-                // morph on each one both burned the main thread and painted
-                // mid-transition text outside the clip.
-                VStack(spacing: 0) {
-                    padded(content)
-                    Color.clear.frame(height: 0).id("voice-transcript-bottom")
-                }
-            }
-            .frame(height: min(max(contentHeight, 38), max(38, maxHeight)))
-            // Belt and braces: streaming text must never paint over the
-            // toolbar row below, even mid-transition.
-            .clipped()
-            .background(alignment: .topLeading) { measurer }
-            .onChange(of: spoken) { _, _ in
-                // Keep the newest words on screen once the transcript outgrows
-                // the scroll cap. Deferred a tick: scrolling synchronously here
-                // would mutate scroll state inside the same transaction that is
-                // still laying out the new words.
-                Task { @MainActor in
-                    proxy.scrollTo("voice-transcript-bottom", anchor: .bottom)
-                }
-            }
-        }
-    }
-
-    /// A hidden, unscrolled copy of the same words at the composer's width.
-    ///
-    /// Measuring *inside* the ScrollView made the reported height depend on the
-    /// frame it was driving, so every wrap onto a new line landed one partial
-    /// late: the box only grew when the *next* partial arrived, and the words
-    /// spilled over the toolbar until it did. The last line of a dictation has
-    /// no next partial, so it stayed clipped until something else — a window
-    /// resize — forced another layout pass. `fixedSize` here takes the wrapped
-    /// ideal height straight from the text, the way the typed composer measures
-    /// itself, so the height is right on the pass that adds the words.
-    private var measurer: some View {
-        padded(content)
-            .fixedSize(horizontal: false, vertical: true)
-            .background(GeometryReader { geo in
-                Color.clear
-                    .onAppear { contentHeight = geo.size.height }
-                    .onChange(of: geo.size.height) { _, height in
-                        contentHeight = height
-                    }
-            })
-            .hidden()
-    }
-
-    /// Match the editor's textContainerInset so the words sit exactly where the
-    /// caret and typed text would.
-    private func padded(_ view: some View) -> some View {
-        view
+        content
+            // Match the editor's textContainerInset so the words sit exactly
+            // where the caret and typed text would.
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.leading, 5)
-            .padding(.top, 6)
-            .padding(.bottom, 6)
+            .padding(.vertical, 6)
+            // The live line has a fixed height and the settled one is
+            // line-capped, so the box takes its height straight from its
+            // content. The old growing transcript needed a hidden measuring
+            // mirror to avoid a layout cycle that froze dictation; bounded
+            // content needs none.
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -2748,10 +2793,99 @@ private struct VoiceComposerTranscript: View {
                     .italic()
                     .foregroundStyle(.secondary)
             }
-        } else {
+            .frame(height: Self.lineHeight)
+        } else if isSettled {
+            // The hold is for reading, so the whole prompt wraps. Past the cap
+            // — six lines, so only a dictation of a minute or so reaches it —
+            // head truncation drops the middle and keeps both the opening and
+            // the real ending, which is what you need to confirm what is about
+            // to be sent. Tail truncation would hide the ending instead.
             quoted
+                .lineLimit(maxLines)
+                .truncationMode(.head)
+        } else {
+            rollingLine
         }
     }
+
+    /// The live line, held against its trailing edge: the quote is laid out at
+    /// its full width and slid left by whatever overflows, so short speech sits
+    /// exactly where typed text would and a long tail rolls past the leading
+    /// edge. Each new word lands off the right edge and the line glides over to
+    /// reveal it, which is what makes dictation read as speech going by rather
+    /// than a label being retyped in place.
+    ///
+    /// An offset rather than a scroll view: partials land several times a
+    /// second, and an offset is an animatable value that retargets mid-flight,
+    /// where a scroll animation restarted that often stutters. It is also inert
+    /// in layout — nothing here feeds a measured size back into the frame that
+    /// produced it, which is what used to freeze the growing transcript.
+    private var rollingLine: some View {
+        // The line rides in an *overlay*, which is sized by what it sits on and
+        // never the reverse. `fixedSize` makes the text rigid — it reports one
+        // width and refuses to compress — so laying it out as a normal child
+        // would push that width all the way up and stretch the composer to the
+        // length of the sentence.
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: Self.lineHeight)
+            .background { width(into: $visibleWidth) }
+            .overlay(alignment: .leading) {
+                quoted
+                    .lineLimit(1)
+                    // Take the line's width from the text, not from whatever
+                    // happens to be visible, so it can roll rather than
+                    // truncate.
+                    .fixedSize()
+                    .background { width(into: $lineWidth) }
+                    .offset(x: rollOffset)
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.28), value: rollOffset)
+            }
+            .mask(rollMask)
+    }
+
+    /// Zero until the line outgrows the composer, then however far left it has
+    /// to sit for its last word to land on the trailing edge — short of it by a
+    /// hair, so the closing quote is never kissed by the clip.
+    ///
+    /// Written against the overflow rather than as `min(0, visible - line - 3)`:
+    /// both widths are zero until the first measurement lands, and that form
+    /// reads as a 3pt overflow on the frame before it, nudging a line that fits
+    /// and switching the fade on over its opening quote.
+    private var rollOffset: CGFloat {
+        let overflow = lineWidth - visibleWidth
+        return overflow > 0 ? -(overflow + 3) : 0
+    }
+
+    /// Words leaving at the leading edge dissolve rather than being guillotined
+    /// by the clip. Only once the line is actually rolling: fading a line that
+    /// still fits would put a gradient across its opening quote for no reason.
+    private var rollMask: LinearGradient {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: rollOffset < 0 ? 0.05 : 0),
+                .init(color: .black, location: 1),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+
+    /// Both widths are read off the geometry the parent already imposed and
+    /// only ever drive an offset, never a frame — so unlike the measuring
+    /// mirror this replaced, there is no size feeding itself.
+    private func width(into binding: Binding<CGFloat>) -> some View {
+        GeometryReader { geo in
+            Color.clear.onChange(of: geo.size.width, initial: true) { _, width in
+                binding.wrappedValue = width
+            }
+        }
+    }
+
+    /// One line of the 15pt quote face. Fixed rather than measured: the live
+    /// line never wraps, so its height is a constant of the type face.
+    private static let lineHeight: CGFloat = 20
 
     private var quoted: Text {
         let quote = Text(

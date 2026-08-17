@@ -220,6 +220,111 @@ struct WorkspaceEngineTests {
         ).isEmpty)
     }
 
+    @Test func aQueuedMessageSurvivesTheSessionDyingMidTurn() async throws {
+        // The agent can die mid-turn — a model id its provider doesn't recognise
+        // is enough. That never produces a `.turnCompleted`, so without an
+        // explicit drain the queued message sits in the card forever and the
+        // user has to retype it.
+        let harness = try await makeEngine()
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        session.emit(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+        try await Task.sleep(for: .milliseconds(150))
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "continue"
+        ))
+        session.emit(.sessionEnded(SessionEnded(
+            sessionID: session.id, exitCode: 1, wasUnexpected: true
+        )))
+
+        #expect(await waitUntil { harness.harness.allSessions.count == 2 })
+        let replacement = try #require(harness.harness.latestSession)
+        #expect(await waitUntil { await replacement.messageTexts() == ["continue"] })
+        #expect(try await harness.store.queuedMessages(
+            workspaceID: harness.workspaceID
+        ).isEmpty)
+    }
+
+    @Test func switchingModelAfterStoppingSendsWhatWasQueued() async throws {
+        // Stopping the agent and picking a different model is the natural way
+        // out of a bad model choice. The message queued behind the stopped turn
+        // is what the user wants that new model to work on.
+        let harness = try await makeEngine()
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        session.emit(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+        try await Task.sleep(for: .milliseconds(150))
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "continue"
+        ))
+        try await harness.engine.interrupt(chatID: defaultChatID)
+        _ = try await harness.engine.setModel(chatID: defaultChatID, model: "opus")
+
+        #expect(await waitUntil { await session.messageTexts() == ["first", "continue"] })
+        #expect(try await harness.store.queuedMessages(
+            workspaceID: harness.workspaceID
+        ).isEmpty)
+    }
+
+    @Test func permissionModeSwitchesInsideTheRunningChat() async throws {
+        // Reaching for Accept Edits happens *because* a turn is underway and
+        // the prompts are in the way. Opening a fresh chat to get it would
+        // throw away the conversation that motivated the change.
+        let harness = try await makeEngine()
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        session.emit(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+        try await Task.sleep(for: .milliseconds(150))
+
+        try await harness.engine.setPermissionMode(.acceptEdits, chatID: defaultChatID)
+
+        #expect(await session.permissionMode == .acceptEdits)
+        #expect(harness.harness.allSessions.count == 1)
+        #expect(try await harness.store.chat(defaultChatID)?.permissionMode
+            == PermissionMode.acceptEdits.rawValue)
+    }
+
+    @Test func aLaunchOnlyHarnessKeepsThePermissionModeItWasGiven() async throws {
+        // The change used to be dropped entirely when the session refused it:
+        // the chip showed Accept Edits, the stored mode stayed Ask, and the
+        // only way to actually get it was a new chat. Now the choice is
+        // recorded and the next session is launched under it.
+        let fake = FakeHarness()
+        fake.rejectsPermissionModeChange = true
+        let harness = try await makeEngine(harnesses: [fake])
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(fake.latestSession)
+        session.runTurn(turnID: TurnID(rawValue: "t1"))
+        try await Task.sleep(for: .milliseconds(150))
+
+        try await harness.engine.setPermissionMode(.acceptEdits, chatID: defaultChatID)
+
+        #expect(try await harness.store.chat(defaultChatID)?.permissionMode
+            == PermissionMode.acceptEdits.rawValue)
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "second"
+        ))
+        let replacement = try #require(fake.latestSession)
+        #expect(replacement.configuration.permissionMode == .acceptEdits)
+    }
+
     @Test func diffCommentsReachTheAgentAnchoredToTheirLines() async throws {
         // A comment is more precise than prose because it carries the file and
         // the line; the agent must not have to guess what "that function" meant.

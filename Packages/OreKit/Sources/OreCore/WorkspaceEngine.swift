@@ -304,7 +304,9 @@ public actor WorkspaceEngine {
             toModel: model
         ))
         publishChatChange(runtime)
-        return try await summary(for: runtime)
+        let result = try await summary(for: runtime)
+        scheduleQueueDrain(runtime: runtime)
+        return result
     }
 
     public func setModel(chatID: ChatID, model: String?) async throws -> ChatSummary {
@@ -335,7 +337,9 @@ public actor WorkspaceEngine {
         ))
         await syncWorkspaceCompatibility(from: runtime)
         publishChatChange(runtime)
-        return try await summary(for: runtime)
+        let result = try await summary(for: runtime)
+        scheduleQueueDrain(runtime: runtime)
+        return result
     }
 
     private func summary(for runtime: ChatRuntime) async throws -> ChatSummary {
@@ -796,6 +800,21 @@ public actor WorkspaceEngine {
         return sections.joined(separator: "\n")
     }
 
+    /// Drains the queue after a turn ended somewhere other than `.turnCompleted`
+    /// — a model or agent switch, or a provider session that died mid-turn.
+    ///
+    /// Without this the queued message is stranded forever: the drain only ran
+    /// on turn completion, and a session that was stopped rather than finished
+    /// never emits one. The user sees "Queued messages (1)" and an idle agent,
+    /// and the only way out is to retype the message.
+    ///
+    /// Detached so the caller — usually a `setModel` the UI is awaiting — isn't
+    /// blocked on the replacement session starting up.
+    private func scheduleQueueDrain(runtime: ChatRuntime) {
+        guard runtime.queuedMessageCount > 0 else { return }
+        Task { [weak self] in await self?.drainQueue(runtime: runtime) }
+    }
+
     private func drainQueue(runtime: ChatRuntime) async {
         guard !runtime.isTurnActive else { return }
         guard let next = try? await store.dequeueMessage(chatID: runtime.record.chatID) else { return }
@@ -810,6 +829,10 @@ public actor WorkspaceEngine {
             queueIfBusy: false,
             serviceTier: next.serviceTier
         ))
+        // `send` doesn't publish on its success path, and the drain can run
+        // after the caller's own publish, so the count the queue card watches
+        // has to be republished here or the card outlives the message.
+        publishChatChange(runtime)
     }
 
     public func interrupt(chatID: ChatID? = nil) async throws {
@@ -818,11 +841,38 @@ public actor WorkspaceEngine {
         runtime.isTurnActive = false
     }
 
+    /// Switches the running chat's permission mode. Never requires a new chat.
+    ///
+    /// The stored mode is written first and unconditionally: it is what any
+    /// later spawn is configured from, so losing it because a live session
+    /// refused the change is what used to leave "Accept Edits" selected in the
+    /// UI and nothing accepting edits.
     public func setPermissionMode(_ mode: PermissionMode, chatID: ChatID? = nil) async throws {
         let runtime = try await runtime(for: chatID)
-        try await runtime.session?.setPermissionMode(mode)
+        guard PermissionMode(rawValue: runtime.record.permissionMode) != mode else { return }
         runtime.record.permissionMode = mode.rawValue
         try await store.saveChat(runtime.record)
+
+        if let session = runtime.session {
+            do {
+                try await session.setPermissionMode(mode)
+            } catch HarnessError.unsupportedCapability {
+                // A harness that can only take the mode at launch. Recycling
+                // the session while idle makes the change real for the next
+                // turn; mid-turn we leave the turn alone and it lands when the
+                // session is next started.
+                if !runtime.isTurnActive {
+                    runtime.handoffContext = try await store.handoffContext(
+                        chatID: runtime.record.chatID
+                    )
+                    await stopSession(chatID: runtime.record.chatID)
+                    // Nothing will complete a turn now to trigger the drain, so
+                    // anything queued behind the stopped session would strand.
+                    scheduleQueueDrain(runtime: runtime)
+                }
+            }
+        }
+
         await syncWorkspaceCompatibility(from: runtime)
         publishChatChange(runtime)
     }
@@ -1330,6 +1380,9 @@ public actor WorkspaceEngine {
             runtime.sessionEffort = nil
             runtime.isTurnActive = false
             setStatus(.idle, runtime: runtime)
+            // A session that dies mid-turn never reports `.turnCompleted`, so
+            // this is the only chance anything queued behind it gets sent.
+            scheduleQueueDrain(runtime: runtime)
 
         default:
             break

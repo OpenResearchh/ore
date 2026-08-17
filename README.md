@@ -177,6 +177,13 @@ Learned by driving them, and each one cost a real bug:
   machine has no Developer ID, so that path is written and syntax-checked
   rather than executed. `Scripts/bundle.sh` produces an ad-hoc signed bundle
   that runs locally.
+- **Local builds sign with a self-signed certificate, if you make one.** An
+  ad-hoc signature has no certificate, so the app's only identity is the hash of
+  its binary — and every rebuild changes it, silently dropping permissions you
+  already granted (Screen Recording, the microphone). Run
+  `Scripts/make-signing-identity.sh` once and debug bundles are signed with a
+  stable certificate instead, so those grants stick. Release bundles stay
+  ad-hoc: a self-signed certificate buys nothing on someone else's Mac.
 - **Linux is audited, not compiled.** Building it needs a second Swift toolchain
   (~1.4 GB, since Xcode's toolchain can't consume the open-source Static Linux
   SDK) and this machine had under a gigabyte free. Instead the core was audited

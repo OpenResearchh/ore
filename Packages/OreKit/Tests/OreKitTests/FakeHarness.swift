@@ -17,6 +17,11 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
     /// Sessions handed out so far, so a test can drive them.
     private let sessions = Lockbox<[FakeSession]>([])
 
+    /// Stands in for a CLI that can only take its permission mode as a launch
+    /// argument: the session rejects the change and the engine has to make it
+    /// real some other way.
+    var rejectsPermissionModeChange = false
+
     init(
         kind: HarnessKind = .claudeCode,
         capabilities: HarnessCapabilities = HarnessCapabilities(
@@ -42,7 +47,8 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
     func makeSession(_ configuration: SessionConfiguration) async throws -> any AgentSession {
         let session = FakeSession(
             id: SessionID.generate(), kind: kind,
-            capabilities: capabilities, configuration: configuration
+            capabilities: capabilities, configuration: configuration,
+            rejectsPermissionModeChange: rejectsPermissionModeChange
         )
         sessions.withLock { $0.append(session) }
         return session
@@ -72,16 +78,20 @@ actor FakeSession: AgentSession {
     private(set) var isStopped = false
     var providerSessionID: String?
 
+    private let rejectsPermissionModeChange: Bool
+
     init(
         id: SessionID,
         kind: HarnessKind,
         capabilities: HarnessCapabilities,
-        configuration: SessionConfiguration
+        configuration: SessionConfiguration,
+        rejectsPermissionModeChange: Bool = false
     ) {
         self.id = id
         self.harness = kind
         self.capabilities = capabilities
         self.configuration = configuration
+        self.rejectsPermissionModeChange = rejectsPermissionModeChange
 
         let (stream, continuation) = AsyncStream<AgentEvent>.makeStream(
             bufferingPolicy: .unbounded
@@ -107,7 +117,12 @@ actor FakeSession: AgentSession {
 
     func interrupt() async throws { interruptCount += 1 }
 
-    func setPermissionMode(_ mode: PermissionMode) async throws { permissionMode = mode }
+    func setPermissionMode(_ mode: PermissionMode) async throws {
+        if rejectsPermissionModeChange {
+            throw HarnessError.unsupportedCapability("permission mode changes")
+        }
+        permissionMode = mode
+    }
 
     func setModel(_ model: String?) async throws { selectedModel = model }
 

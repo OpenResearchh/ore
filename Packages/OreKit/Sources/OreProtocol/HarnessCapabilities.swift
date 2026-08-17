@@ -99,7 +99,9 @@ public struct HarnessCapabilities: Sendable, Codable, Hashable {
     public var supportsSessionFork: Bool
     public var supportsThinkingStream: Bool
     public var supportsPartialMessages: Bool
-    /// Can switch permission mode mid-session without a restart.
+    /// Can switch permission mode *during a running turn*, so the change binds
+    /// the tool call the agent is about to make. Every harness accepts a change
+    /// mid-session; false only means it lands on the next turn instead.
     public var supportsRuntimePermissionModeChange: Bool
     /// ORE can expose its own MCP tools (diff comments, ask-user) to the agent.
     public var supportsCustomTools: Bool

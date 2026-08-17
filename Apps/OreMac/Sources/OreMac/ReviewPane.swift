@@ -150,7 +150,12 @@ struct ReviewPane: View {
             // previously selected workspace's changes. Only a cold cache falls
             // back to the loading spinner.
             seedFromCache()
-            hasLoadedOnce = model.cachedDiff(for: workspace.id) != nil
+            // Only a cache with something in it counts as loaded. An empty
+            // snapshot — every workspace gets one prefetched at launch, before
+            // the agent has written anything — otherwise suppressed the
+            // spinner and let the pane claim "No changes yet" for the whole
+            // time the first real read was still running.
+            hasLoadedOnce = model.cachedDiff(for: workspace.id)?.diffs.isEmpty == false
             diffScope = .all
             await refresh()
             async let checkpoints = model.loadTurnCheckpoints(for: workspace.id)
@@ -210,12 +215,12 @@ struct ReviewPane: View {
             .fixedSize(horizontal: true, vertical: false)
             .help("Open a dedicated agent review of the current diff")
             .contextMenu {
-                ForEach(model.knownModels(for: workspace.harness)) { choice in
+                ForEach(reviewModelChoices) { choice in
                     Button(choice.displayName) { startAIReview(reviewerModel: choice.id) }
                 }
                 Divider()
                 Button("Custom instructions…") {
-                    reviewModel = workspace.model ?? ""
+                    reviewModel = ""
                     reviewSetup = ReviewSetup()
                 }
             }
@@ -405,7 +410,23 @@ struct ReviewPane: View {
         if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             prompt += "\n\nAdditional instructions:\n\(instructions)"
         }
-        model.createChat(in: workspace.id, initialMessage: prompt, model: reviewerModel)
+        model.createChat(
+            in: workspace.id,
+            initialMessage: prompt,
+            defaults: reviewDefaults,
+            model: reviewerModel
+        )
+    }
+
+    /// The agent and model the Review button opens with, from Settings.
+    private var reviewDefaults: AppModel.ChatDefaults {
+        model.reviewDefaults(for: workspace.id)
+    }
+
+    /// Models to offer for a one-off review, drawn from the agent the review
+    /// will actually run on rather than the workspace's.
+    private var reviewModelChoices: [AgentModel] {
+        model.knownModels(for: reviewDefaults.harness ?? workspace.harness)
     }
 
     private var reviewSetupSheet: some View {
@@ -413,8 +434,8 @@ struct ReviewPane: View {
             Text("Review with agent")
                 .font(.system(size: 20, weight: .semibold))
             Picker("Model", selection: $reviewModel) {
-                Text("Workspace default").tag("")
-                ForEach(model.knownModels(for: workspace.harness)) { choice in
+                Text("Review default").tag("")
+                ForEach(reviewModelChoices) { choice in
                     Text(choice.displayName).tag(choice.id)
                 }
             }
@@ -1569,7 +1590,11 @@ private struct ShipStatusPanel: View {
             list
                 .frame(height: max(80, min(height, 400) - 34))
         }
-        .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)") {
+        // The suggested action is in the key because the panel's own poll gives
+        // up the moment it sees no PR (`guard let pr` below), and a PR opened
+        // from the terminal moves no local file to restart it. When the action
+        // notices the PR, the panel reloads with it.
+        .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)-\(model.gitAction(for: workspace.id).title)") {
             await load()
             // CI has no local filesystem event to ride on. GitHub often posts
             // the first check runs several seconds after a push, so poll fast
@@ -2054,7 +2079,7 @@ struct GitActionToolbar: View {
     }
 
     private var action: SuggestedGitAction {
-        model.cachedDiff(for: workspace.id)?.gitAction ?? .none
+        model.gitAction(for: workspace.id)
     }
 
     private var actionImpliesPR: Bool {

@@ -64,10 +64,36 @@ if [[ ${#FRAMEWORKS[@]} -gt 0 ]]; then
     "$APP/Contents/MacOS/OreMac" 2>/dev/null || true
 fi
 
-# Ad-hoc signature: without one, macOS refuses to grant the app the permissions
-# it needs (notifications, and keeping its own preferences).
-codesign --force --sign - --entitlements "$ROOT/Resources/ORE.entitlements" "$APP" >/dev/null 2>&1 || \
+# Signature: without one, macOS refuses to grant the app the permissions it
+# needs (notifications, and keeping its own preferences).
+#
+# An ad-hoc signature carries no certificate, so the app's only identity is the
+# hash of its binary — which changes on every build, taking every permission
+# already granted (Screen Recording, the microphone) with it. A debug build
+# therefore prefers a stable local certificate when one exists;
+# `Scripts/make-signing-identity.sh` creates it.
+#
+# Release builds stay ad-hoc deliberately. A self-signed certificate is no
+# better than ad-hoc on anyone else's Mac — it only makes the Gatekeeper
+# refusal less recognizable — and real signing belongs in a pipeline with
+# Developer ID credentials.
+DEV_IDENTITY="ORE Development"
+IDENTITY="-"
+if [[ -n "${ORE_SIGN_IDENTITY:-}" ]]; then
+  IDENTITY="$ORE_SIGN_IDENTITY"
+elif [[ "$CONFIGURATION" == "debug" ]] &&
+     security find-identity -v -p codesigning 2>/dev/null | grep -qF "$DEV_IDENTITY"; then
+  IDENTITY="$DEV_IDENTITY"
+fi
+
+if codesign --force --sign "$IDENTITY" \
+     --entitlements "$ROOT/Resources/ORE.entitlements" "$APP" >/dev/null 2>&1; then
+  [[ "$IDENTITY" == "-" ]] \
+    && echo "Signed ad-hoc — granted permissions will not survive the next build." \
+    || echo "Signed with '$IDENTITY'."
+else
   echo "note: could not sign the bundle; it will still run."
+fi
 
 echo "Built $APP"
 echo "Run it with: open '$APP'"

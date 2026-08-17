@@ -33,6 +33,14 @@ public actor CodexSession: AgentSession {
     private var hasStarted = false
     private var currentModel: String?
     private var hasModelOverride: Bool
+    /// The posture the next turn starts under. Codex binds sandbox and approval
+    /// policy per turn, so a change made mid-chat is carried here and applied
+    /// on the next `turn/start` rather than needing a new thread.
+    private var permissionMode: PermissionMode
+    /// Whether the user changed the mode after the thread was started. Only
+    /// then does `turn/start` carry the override params — an untouched chat
+    /// keeps running on exactly the policy `thread/start` established.
+    private var hasPermissionOverride = false
 
     public private(set) var providerSessionID: String?
 
@@ -47,6 +55,7 @@ public actor CodexSession: AgentSession {
         self.configuration = configuration
         self.currentModel = configuration.model
         self.hasModelOverride = configuration.model != nil
+        self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
         self.translator = CodexTranslator(sessionID: id)
 
@@ -153,15 +162,26 @@ public actor CodexSession: AgentSession {
     /// Plan mode is read-only, so it maps onto the sandbox rather than onto the
     /// approval policy: the agent can research and propose, and cannot write.
     private func sandboxMode() -> String {
-        switch configuration.permissionMode {
+        switch permissionMode {
         case .plan: return "read-only"
         case .bypassPermissions: return "danger-full-access"
         case .default, .acceptEdits: return "workspace-write"
         }
     }
 
+    /// The same posture as `sandboxMode`, in the tagged shape `turn/start`
+    /// takes. `thread/start` names the sandbox by mode; a per-turn override
+    /// names it by policy object.
+    private func sandboxPolicy() -> JSONValue {
+        switch permissionMode {
+        case .plan: return .object(["type": .string("readOnly")])
+        case .bypassPermissions: return .object(["type": .string("dangerFullAccess")])
+        case .default, .acceptEdits: return .object(["type": .string("workspaceWrite")])
+        }
+    }
+
     private func approvalPolicy() -> String {
-        switch configuration.permissionMode {
+        switch permissionMode {
         case .bypassPermissions, .acceptEdits: return "never"
         case .plan, .default: return "on-request"
         }
@@ -218,6 +238,14 @@ public actor CodexSession: AgentSession {
         if hasModelOverride {
             parameters["model"] = currentModel.map(JSONValue.string) ?? .null
         }
+        // The only place a mid-chat permission change can land: both fields
+        // override "this turn and subsequent turns". Sandbox alone would not be
+        // enough — Accept Edits and Ask share a sandbox and differ only in
+        // whether Codex stops to ask.
+        if hasPermissionOverride {
+            parameters["sandboxPolicy"] = sandboxPolicy()
+            parameters["approvalPolicy"] = .string(approvalPolicy())
+        }
         if let effort = message.reasoningEffort {
             parameters["effort"] = .string(effort.rawValue)
         }
@@ -252,26 +280,17 @@ public actor CodexSession: AgentSession {
         )
     }
 
-    /// Codex sets its permission posture per turn rather than through a live
-    /// control message, so the change lands on the next turn.
+    /// Accepted at any point in the chat, and applied on the next `turn/start`.
+    ///
+    /// There is no live channel for this: `thread/metadata/update` only patches
+    /// git metadata, so the version of this that called it was writing to a
+    /// field the app-server ignores and the mode never actually changed. The
+    /// per-turn override is the real mechanism, and it is enough — a change
+    /// made while a turn runs binds the next one, without a new chat.
     public func setPermissionMode(_ mode: PermissionMode) async throws {
-        guard let connection, let threadID = translator.threadID else {
-            throw HarnessError.sessionEnded
-        }
-        let sandbox: JSONValue
-        switch mode {
-        case .plan: sandbox = .object(["type": .string("readOnly")])
-        case .bypassPermissions: sandbox = .object(["type": .string("dangerFullAccess")])
-        case .default, .acceptEdits: sandbox = .object(["type": .string("workspaceWrite")])
-        }
-        _ = try await connection.send(
-            method: "thread/metadata/update",
-            params: .object([
-                "threadId": .string(threadID),
-                "sandboxPolicy": sandbox,
-            ]),
-            timeout: .seconds(15)
-        )
+        guard mode != permissionMode else { return }
+        permissionMode = mode
+        hasPermissionOverride = true
     }
 
     public func setModel(_ model: String?) async throws {

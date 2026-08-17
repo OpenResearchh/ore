@@ -187,3 +187,139 @@ struct CursorTranslatorTests {
         #expect(completed == ["Hello there"])
     }
 }
+
+/// cursor-agent explains a failure only on stderr, and exits with an empty
+/// stdout when it rejects a model, a login or a quota. The stderr strings here
+/// are copied verbatim from the real CLI (2026.08.11 build).
+struct CursorAgentFailureTests {
+    @Test func unavailableModelIsNamedWithoutDumpingTheCatalog() {
+        let stderr = "Cannot use this model: cursor-grok-4. Available models: auto, "
+            + Array(repeating: "some-model-id", count: 150).joined(separator: ", ")
+        let error = CursorAgentFailure.classify(exitCode: 1, stderr: stderr)
+
+        #expect(error.message.contains("cursor-grok-4"))
+        #expect(error.message.contains("model picker"))
+        // The 150-id catalog belongs in `detail`, not in a banner.
+        #expect(!error.message.contains("some-model-id"))
+        #expect(error.detail?.contains("some-model-id") == true)
+    }
+
+    @Test func invalidAPIKeyReportsHowToAuthenticate() {
+        // The real CLI colours this line even when stdout is not a TTY.
+        let stderr = "\u{1B}[33m⚠ Warning: The provided API key is invalid.\u{1B}[0m\n"
+            + "Please check you have the right key, create a new one, or authenticate without it."
+        let error = CursorAgentFailure.classify(exitCode: 1, stderr: stderr)
+
+        #expect(error.kind == .notAuthenticated)
+        #expect(error.message.contains("API key"))
+        #expect(error.isRecoverable == false)
+        // ANSI escapes must not reach the UI as literal `[33m` garbage.
+        #expect(!error.message.contains("\u{1B}"))
+        #expect(!error.message.contains("[33m"))
+    }
+
+    @Test func quotaExhaustionIsClassifiedAsARateLimit() {
+        for stderr in [
+            "You've hit your usage limit. Upgrade to Pro for more requests.",
+            "Error: 429 Too Many Requests",
+            "Insufficient credits remaining on your plan.",
+            "Rate limit exceeded, please try again later.",
+        ] {
+            let error = CursorAgentFailure.classify(exitCode: 1, stderr: stderr)
+            // The banner switches to its "wait for the reset" variant on this
+            // kind, so misclassifying here costs the user the Continue button.
+            #expect(error.kind == .rateLimited, "not rate limited: \(stderr)")
+        }
+    }
+
+    @Test func unrecognizedStderrIsReportedVerbatimRatherThanSwallowed() {
+        let error = CursorAgentFailure.classify(
+            exitCode: 3, stderr: "Something entirely new went wrong"
+        )
+        #expect(error.message.contains("Something entirely new went wrong"))
+        #expect(error.message.contains("status 3"))
+    }
+
+    @Test func silentFailureStillSaysWhatToDo() {
+        let error = CursorAgentFailure.classify(exitCode: 1, stderr: "")
+        #expect(error.message.contains("status 1"))
+        #expect(error.message.contains("terminal"))
+    }
+
+    @Test func ansiStrippingLeavesOrdinaryTextAlone() {
+        #expect(CursorAgentFailure.stripANSI("plain text") == "plain text")
+        #expect(CursorAgentFailure.stripANSI("\u{1B}[1;31mred\u{1B}[0m") == "red")
+        #expect(CursorAgentFailure.stripANSI("a\u{1B}[Kb") == "ab")
+    }
+
+    /// The bug in the screenshot: a turn that had already started produced only
+    /// "cursor-agent exited with status 1", with the real reason discarded.
+    @Test func failedTurnCarriesTheReasonNotJustTheExitCode() {
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(
+            line: #"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s"}"#
+        )
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"timestamp_ms":1}"#
+        )
+        let events = translator.closeTurn(
+            exitCode: 1, stderr: "You've hit your usage limit."
+        ).events
+
+        let failures = events.compactMap { event -> String? in
+            if case .turnCompleted(let result) = event, result.outcome == .failed {
+                return result.errorMessage
+            }
+            return nil
+        }
+        #expect(failures.count == 1)
+        #expect(failures[0].contains("usage limit"))
+        #expect(!failures[0].contains("exited with status"))
+    }
+
+    /// A bad model kills the CLI before it writes a single stdout record, so
+    /// there is no turn to fail — this used to end in total silence.
+    @Test func failureBeforeAnyTurnStartsBecomesASessionError() {
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        let events = translator.closeTurn(
+            exitCode: 1, stderr: "Cannot use this model: nope. Available models: auto"
+        ).events
+
+        let errors = events.compactMap { event -> SessionError? in
+            if case .sessionError(let error) = event { return error }
+            return nil
+        }
+        #expect(errors.count == 1)
+        #expect(errors[0].message.contains("nope"))
+        #expect(events.contains { if case .statusChanged(.failed) = $0 { return true }; return false })
+    }
+
+    /// A CLI that reports a failure in-band *and* exits non-zero must not raise
+    /// the same problem twice — once as a failed turn, again as a session error.
+    @Test func inBandResultFailureIsNotAlsoReportedOnExit() {
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"timestamp_ms":1}"#
+        )
+        let reported = translator.translate(
+            line: #"{"type":"result","subtype":"error","is_error":true,"result":"usage limit reached"}"#
+        ).events
+        #expect(reported.contains { if case .turnCompleted = $0 { return true }; return false })
+
+        let onExit = translator.closeTurn(exitCode: 1, stderr: "usage limit reached").events
+        #expect(!onExit.contains { if case .sessionError = $0 { return true }; return false })
+    }
+
+    @Test func cleanExitStillCompletesTheTurn() {
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"timestamp_ms":1}"#
+        )
+        let events = translator.closeTurn(exitCode: 0, stderr: "some harmless warning").events
+        let outcomes = events.compactMap { event -> TurnResult.Outcome? in
+            if case .turnCompleted(let result) = event { return result.outcome }
+            return nil
+        }
+        #expect(outcomes == [.completed])
+    }
+}

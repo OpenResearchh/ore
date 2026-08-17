@@ -30,6 +30,9 @@ struct CursorAgentTranslator {
     /// snapshot of the whole turn is not rewritten into the first row.
     private var emittedAssistantText = ""
     private var model: String?
+    /// Whether a `result` record already closed the current turn, so the
+    /// process exit has nothing left to report.
+    private var didReportResult = false
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -69,17 +72,40 @@ struct CursorAgentTranslator {
 
     /// The process exiting is the only reliable end-of-turn signal here: a
     /// one-shot CLI may exit without a final `result` record.
-    mutating func closeTurn(exitCode: Int32) -> Output {
+    ///
+    /// `stderr` carries the *only* explanation of a failure this CLI gives —
+    /// stdout is empty when it rejects a model, a login or a quota — so a
+    /// non-zero exit is classified from it rather than reported as a bare
+    /// status code.
+    mutating func closeTurn(exitCode: Int32, stderr: String = "") -> Output {
         var output = Output()
+        let failure = exitCode == 0
+            ? nil
+            : CursorAgentFailure.classify(exitCode: exitCode, stderr: stderr)
+
         guard let turnID = currentTurnID else {
-            append(status: .idle, to: &output)
+            // Config-level failures (bad model, expired login) kill the process
+            // before it emits a single stdout record, so there is no turn to
+            // fail — and the turn used to end here in silence, leaving the user
+            // with a spinner that simply stopped. Report it as a session error.
+            //
+            // Unless a `result` record already closed the turn: a CLI that
+            // reports an in-band failure *and* exits non-zero would otherwise
+            // raise the same problem twice, as a failed turn and again as a
+            // session error.
+            if let failure, !didReportResult {
+                output.events.append(.sessionError(failure))
+                append(status: .failed, to: &output)
+            } else {
+                append(status: .idle, to: &output)
+            }
             return output
         }
         flushStreamedBlocks(turnID: turnID, to: &output)
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: exitCode == 0 ? .completed : .failed,
-            errorMessage: exitCode == 0 ? nil : "cursor-agent exited with status \(exitCode)"
+            errorMessage: failure?.message
         )))
         append(status: exitCode == 0 ? .idle : .failed, to: &output)
         currentTurnID = nil
@@ -532,6 +558,7 @@ struct CursorAgentTranslator {
         )))
         append(status: isError ? .failed : .idle, to: &output)
         currentTurnID = nil
+        didReportResult = true
     }
 
     // MARK: - Assistant text segments
@@ -656,6 +683,7 @@ struct CursorAgentTranslator {
         thinkingSegment = 0
         textSegment = 0
         emittedAssistantText = ""
+        didReportResult = false
         output.events.append(.turnStarted(TurnStarted(turnID: turnID, model: model)))
         return turnID
     }

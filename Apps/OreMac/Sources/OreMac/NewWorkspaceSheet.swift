@@ -171,11 +171,13 @@ struct NewWorkspaceSheet: View {
             if name.isEmpty { name = model.suggestedResearchIdentity().name }
             if repositoryPath.isEmpty { repositoryPath = model.repositories.first ?? "" }
             if let ready = model.readyHarnesses.first { harness = ready }
-            if let raw = UserDefaults.standard.string(forKey: "ore.defaultHarness"),
+            if let raw = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatHarness),
                let preferred = HarnessKind(rawValue: raw), model.readyHarnesses.contains(preferred) {
                 harness = preferred
+                // The pinned model belongs to the pinned agent's catalogue, so it
+                // only carries over when that agent is the one we ended up with.
+                modelName = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatModel) ?? ""
             }
-            modelName = UserDefaults.standard.string(forKey: "ore.defaultModel") ?? ""
         }
         .task(id: repositorySource) {
             if repositorySource == .github { await loadGitHub() }

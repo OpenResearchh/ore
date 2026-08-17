@@ -19,6 +19,9 @@ public actor ClaudeCodeSession: AgentSession {
     private let executablePath: String
 
     private var translator: ClaudeCodeTranslator
+    /// The current mode, which the control channel keeps in step with the
+    /// running CLI and which a later spawn is launched with.
+    private var permissionMode: PermissionMode
     private var process: ChildProcess?
     private var readerTask: Task<Void, Never>?
     private var stderrTask: Task<Void, Never>?
@@ -47,6 +50,7 @@ public actor ClaudeCodeSession: AgentSession {
         self.id = id
         self.executablePath = executablePath
         self.configuration = configuration
+        self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
         self.translator = ClaudeCodeTranslator(sessionID: id)
 
@@ -155,10 +159,18 @@ public actor ClaudeCodeSession: AgentSession {
         try await sendControlRequest(ClaudeControlPayload.interrupt(), timeout: .seconds(10))
     }
 
+    /// Live: the CLI applies this to the tool call it is about to make, so a
+    /// user who switches to Accept Edits mid-turn stops being asked from the
+    /// very next edit.
     public func setPermissionMode(_ mode: PermissionMode) async throws {
         guard capabilities.supportsRuntimePermissionModeChange else {
             throw HarnessError.unsupportedCapability("permission mode changes")
         }
+        // Also the flag a relaunch spawns with — a session that has not started
+        // yet, or one being resumed after a crash, has no control channel to
+        // carry the change and would otherwise come back on the stale mode.
+        permissionMode = mode
+        guard process != nil, !isStopping else { return }
         try await sendControlRequest(
             ClaudeControlPayload.setPermissionMode(mode),
             timeout: .seconds(10)
@@ -389,7 +401,7 @@ public actor ClaudeCodeSession: AgentSession {
         if let model = configuration.model {
             arguments += ["--model", model]
         }
-        arguments += ["--permission-mode", configuration.permissionMode.rawValue]
+        arguments += ["--permission-mode", permissionMode.rawValue]
 
         switch configuration.resume {
         case .fresh:

@@ -8,8 +8,10 @@ import SwiftUI
 /// the real CLI probe/model data that the running core is using.
 struct SettingsView: View {
     @Environment(AppModel.self) private var appModel
-    @AppStorage("ore.defaultHarness") private var harnessRaw = HarnessKind.claudeCode.rawValue
-    @AppStorage("ore.defaultModel") private var defaultModel = ""
+    @AppStorage(AppModel.DefaultKey.newChatHarness) private var harnessRaw = ""
+    @AppStorage(AppModel.DefaultKey.newChatModel) private var defaultModel = ""
+    @AppStorage(AppModel.DefaultKey.reviewHarness) private var reviewHarnessRaw = ""
+    @AppStorage(AppModel.DefaultKey.reviewModel) private var reviewModel = ""
     @AppStorage("ore.branchPrefix") private var branchPrefix = "ore"
     @AppStorage("ore.cursorExperimental") private var cursorExperimental = false
     @AppStorage("ore.cursorAllowUnprompted") private var cursorAllowUnprompted = false
@@ -226,8 +228,16 @@ struct SettingsView: View {
         )
     }
 
-    private func modelOptions(for harness: HarnessKind) -> [(String, String)] {
-        [("", "Agent default")] + appModel.knownModels(for: harness).map { ($0.id, $0.displayName) }
+    private func modelOptions(
+        for harness: HarnessKind?,
+        placeholder: String = "Agent default"
+    ) -> [(String, String)] {
+        guard let harness else { return [("", placeholder)] }
+        return [("", placeholder)] + appModel.knownModels(for: harness).map { ($0.id, $0.displayName) }
+    }
+
+    private func harnessOptions(placeholder: String) -> [(String, String)] {
+        [("", placeholder)] + HarnessKind.allCases.map { ($0.rawValue, $0.displayName) }
     }
 
     private var models: some View {
@@ -236,13 +246,50 @@ struct SettingsView: View {
                 SettingsRow("Default agent", detail: "Existing chats keep their own agent") {
                     SettingsPicker(
                         selection: $harnessRaw,
-                        options: HarnessKind.allCases.map { ($0.rawValue, $0.displayName) }
+                        options: harnessOptions(placeholder: "Same as workspace")
                     )
                 }
-                SettingsRow("Default model", detail: "The agent default is used when none is selected") {
-                    SettingsPicker(selection: $defaultModel, options: modelOptions(for: defaultHarness))
+                SettingsRow(
+                    "Default model",
+                    detail: pinnedHarness == nil
+                        ? "Pin an agent above to pin its model too"
+                        : "The agent default is used when none is selected"
+                ) {
+                    SettingsPicker(
+                        selection: $defaultModel,
+                        options: modelOptions(for: pinnedHarness, placeholder: "Same as workspace")
+                    )
+                    .disabled(pinnedHarness == nil)
                 }
             }
+            // A model id belongs to exactly one agent, so a pin left over from
+            // the previous agent would name a model the new one cannot run.
+            .onChange(of: harnessRaw) { defaultModel = "" }
+
+            SettingsCard(title: "Review button", icon: "sparkles") {
+                SettingsRow("Agent", detail: "Used by Review in the Changes tab") {
+                    SettingsPicker(
+                        selection: $reviewHarnessRaw,
+                        options: harnessOptions(placeholder: "Same as new chats")
+                    )
+                }
+                SettingsRow(
+                    "Model",
+                    detail: pinnedReviewHarness == nil
+                        ? "Pin an agent above or under New chats to pin its model too"
+                        : "Right-clicking Review still offers a one-off model"
+                ) {
+                    SettingsPicker(
+                        selection: $reviewModel,
+                        options: modelOptions(
+                            for: pinnedReviewHarness,
+                            placeholder: "Same as new chats"
+                        )
+                    )
+                    .disabled(pinnedReviewHarness == nil)
+                }
+            }
+            .onChange(of: reviewHarnessRaw) { reviewModel = "" }
 
             SettingsCard(title: "Default model per agent", icon: "cpu") {
                 ForEach(appModel.readyHarnesses, id: \.self) { harness in
@@ -418,7 +465,14 @@ struct SettingsView: View {
         }
     }
 
-    private var defaultHarness: HarnessKind { HarnessKind(rawValue: harnessRaw) ?? .claudeCode }
+    /// The agent pinned for new chats, or nil while they still follow the workspace.
+    private var pinnedHarness: HarnessKind? { HarnessKind(rawValue: harnessRaw) }
+    /// The agent pinned for the Review button, falling back to the new-chat pin.
+    private var pinnedReviewHarness: HarnessKind? {
+        HarnessKind(rawValue: reviewHarnessRaw) ?? pinnedHarness
+    }
+    /// Whose model catalogue the "Available models" list should show.
+    private var defaultHarness: HarnessKind { pinnedHarness ?? .claudeCode }
     private func probe(for kind: HarnessKind) -> HarnessProbeResult? { appModel.harnesses.first { $0.kind == kind } }
     private func statusColor(_ probe: HarnessProbeResult?) -> Color {
         guard let probe else { return .secondary }

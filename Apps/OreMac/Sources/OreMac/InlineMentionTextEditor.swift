@@ -37,6 +37,23 @@ enum ComposerPasteboard {
         return try? JSONDecoder().decode(Payload.self, from: data)
     }
 
+    /// Which pasted attachments a draft still mentions by token.
+    ///
+    /// Reconstructs the inline set from the text alone, for when the view state
+    /// that tracked it is gone: switching chat tabs tears the composer down
+    /// while the attachments live on for the chat, and without rebuilding this
+    /// every inline pill came back as a shelf chip. Pasted display names are
+    /// draft-unique, so a token maps to exactly one attachment; shelf items
+    /// carry no token and correctly stay out.
+    static func inlinePaths(inDraft text: String, attachments: [Attachment]) -> Set<String> {
+        Set(
+            attachments.lazy
+                .filter { $0.relativePath.hasPrefix(".context/attachments/") }
+                .filter { text.contains("@\($0.displayName)") }
+                .map(\.relativePath)
+        )
+    }
+
     static func payload(
         forCopiedText text: String,
         fullDraft: String,

@@ -104,6 +104,46 @@ enum VoiceDraft {
     }
 }
 
+/// What the composer shows while the mic is live: one line, ending on the words
+/// just spoken.
+///
+/// Streaming the whole paragraph into the composer restated what the user had
+/// only just said and grew the box while they were still talking. The tail is
+/// the part still in their head — enough to confirm the recognizer is keeping
+/// up — and the full prompt gets its own moment once the session ends.
+enum VoiceLiveQuote {
+    /// Far more words than fit on any composer line, so the tail the user reads
+    /// is never cut short — but bounded, because the live line lays itself out
+    /// at full width several times a second and a whole dictation would make
+    /// that measurement grow without limit.
+    static let tailWords = 40
+
+    static func tail(of text: String, maxWords: Int = tailWords) -> String {
+        // Dictated breaks ("new line", "bullet point") would wrap a line that
+        // must not wrap; flatten them for the live view only.
+        let words = text.split(whereSeparator: \.isWhitespace)
+        return words.suffix(maxWords).joined(separator: " ")
+    }
+}
+
+/// A finished dictation, held on screen for a beat before it sends.
+///
+/// Firing the turn the instant the mic stops gives the user no chance to read
+/// what was actually heard. The whole prompt replaces the live one-line quote,
+/// then goes out on its own — and the beat stays interruptible, so Esc still
+/// cancels and a second chord still sends early.
+struct VoiceSettledTurn: Equatable {
+    /// The dictated words, shown in the quote.
+    let quote: String
+    /// What actually sends: any typed draft plus `quote`.
+    let combined: String
+    /// The raw transcript, for the commit-time refiner.
+    let spoken: String
+
+    /// Long enough to read a sentence, short enough not to feel like a stall.
+    static let hold: Duration = .milliseconds(900)
+}
+
 /// Decides what happens to the dictated text when a voice session ends.
 /// Ending the chord sends the turn; Esc cancels; passive teardown (switching
 /// tabs, the pane disappearing) parks the words in the draft instead of firing

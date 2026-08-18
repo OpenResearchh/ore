@@ -136,6 +136,17 @@ struct SuggestedGitActionTests {
         #expect(action == .merge(prNumber: 7, isStacked: false))
     }
 
+    @Test func aLocalConflictWithMasterSurfacesEvenWhenGitHubIsStillUnknown() {
+        // GitHub's mergeable stays UNKNOWN while origin/master has already
+        // moved; the local merge-tree is what lets ORE prompt without a browser.
+        let action = SuggestedGitActionResolver.resolve(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(mergeable: "UNKNOWN", checks: [check("build", "SUCCESS")]),
+            wouldConflictWithOriginDefault: true
+        ))
+        #expect(action == .resolveConflicts(prNumber: 7, base: "main"))
+    }
+
     @Test func changesRequestedBlocksTheMergeButton() {
         let action = SuggestedGitActionResolver.resolve(GitActionContext(
             hasUpstream: true,

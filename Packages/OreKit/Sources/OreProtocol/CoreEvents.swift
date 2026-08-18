@@ -122,6 +122,9 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
     public var gitStatus: GitStatusSummary
     public var contextUsage: UsageReport?
     public var lastActivity: Date?
+    /// Origin default vs local default vs this branch. Nil until the first
+    /// fetch lands; missing from older snapshots.
+    public var baseSync: BaseSyncStatus?
 
     public init(
         id: WorkspaceID,
@@ -142,7 +145,8 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         archivedDiskBytes: Int64? = nil,
         gitStatus: GitStatusSummary = GitStatusSummary(),
         contextUsage: UsageReport? = nil,
-        lastActivity: Date? = nil
+        lastActivity: Date? = nil,
+        baseSync: BaseSyncStatus? = nil
     ) {
         self.id = id
         self.name = name
@@ -163,6 +167,7 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         self.gitStatus = gitStatus
         self.contextUsage = contextUsage
         self.lastActivity = lastActivity
+        self.baseSync = baseSync
     }
 }
 
@@ -194,6 +199,35 @@ public struct GitStatusSummary: Sendable, Codable, Hashable {
         self.aheadOfBase = aheadOfBase
         self.behindBase = behindBase
         self.generation = generation
+    }
+}
+
+/// Origin's default branch compared to the local default ref and to this
+/// worktree's HEAD. The UI uses it to prompt for a pull or a rebase without
+/// sending the user to GitHub.
+public struct BaseSyncStatus: Sendable, Codable, Hashable {
+    public var defaultBranch: String
+    /// Commits on `origin/<default>` that local `<default>` does not have.
+    public var localDefaultBehindOrigin: Int
+    /// Commits on `origin/<default>` that this workspace's HEAD does not have.
+    public var workspaceBehindOrigin: Int
+    /// Merging `origin/<default>` into this branch would conflict.
+    public var wouldConflict: Bool
+
+    public init(
+        defaultBranch: String,
+        localDefaultBehindOrigin: Int = 0,
+        workspaceBehindOrigin: Int = 0,
+        wouldConflict: Bool = false
+    ) {
+        self.defaultBranch = defaultBranch
+        self.localDefaultBehindOrigin = localDefaultBehindOrigin
+        self.workspaceBehindOrigin = workspaceBehindOrigin
+        self.wouldConflict = wouldConflict
+    }
+
+    public var needsAttention: Bool {
+        localDefaultBehindOrigin > 0 || workspaceBehindOrigin > 0 || wouldConflict
     }
 }
 

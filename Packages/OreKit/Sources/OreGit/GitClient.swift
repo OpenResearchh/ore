@@ -17,6 +17,9 @@ public actor GitClient {
     /// add racing a status read produces nonsense. Writes queue behind this.
     private var writeLocked = false
     private var writeWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Last successful `fetch origin <branch>`, so sibling worktrees share a
+    /// cooldown instead of each hitting the network on every poll.
+    private var lastRemoteFetch: [String: ContinuousClock.Instant] = [:]
 
     public init(repositoryURL: URL, executablePath: String? = nil) throws {
         self.repositoryURL = repositoryURL
@@ -284,6 +287,78 @@ public actor GitClient {
             .filter { !$0.isEmpty }
     }
 
+    /// How many commits `tip` has that `base` does not (`base..tip`).
+    public func commitCount(from base: String, to tip: String, in directory: URL? = nil) async -> Int {
+        guard let output = try? await run(
+            ["rev-list", "--count", "\(base)..\(tip)"], in: directory
+        ) else { return 0 }
+        return Int(output.trimmedStandardOutput) ?? 0
+    }
+
+    /// Fetch one remote branch. Coalesced so N worktrees of the same repo don't
+    /// hammer origin every poll.
+    public func fetchRemoteBranch(_ name: String, force: Bool = false) async throws {
+        guard await hasRemote() else { return }
+        let key = "origin/\(name)"
+        if !force, let last = lastRemoteFetch[key], last.duration(to: .now) < .seconds(30) {
+            return
+        }
+        try await runSerialized(["fetch", "--quiet", "origin", name])
+        lastRemoteFetch[key] = .now
+    }
+
+    /// Fast-forward a local branch that is not checked out — typical for
+    /// worktrees, where `main` lives in the repo but never in this checkout.
+    ///
+    /// Refuses to move the branch if it isn't an ancestor of `to`, so a
+    /// diverged local default isn't silently overwritten.
+    public func fastForwardLocalBranch(_ name: String, to remote: String) async throws {
+        let remoteSHA = try await resolve(remote)
+        if await branchExists(name) {
+            let isAncestor = (try? await run(
+                ["merge-base", "--is-ancestor", name, remote],
+                allowedExitCodes: [0, 1]
+            ).exitCode) == 0
+            guard isAncestor else {
+                throw GitError.notFastForward(branch: name, onto: remote)
+            }
+            try await runSerialized(["update-ref", "refs/heads/\(name)", remoteSHA])
+        } else {
+            try await runSerialized(["branch", name, remoteSHA])
+        }
+    }
+
+    /// Whether merging `other` into HEAD would conflict, without touching the
+    /// index or worktree.
+    public func mergeWouldConflict(with other: String, in directory: URL? = nil) async -> Bool {
+        if let output = try? await run(
+            ["merge-tree", "--write-tree", "HEAD", other],
+            in: directory,
+            allowedExitCodes: [0, 1]
+        ) {
+            return output.exitCode == 1
+        }
+        guard let base = try? await run(
+            ["merge-base", "HEAD", other], in: directory
+        ).trimmedStandardOutput, !base.isEmpty,
+        let tree = try? await run(
+            ["merge-tree", base, "HEAD", other], in: directory
+        ) else { return false }
+        return tree.standardOutput.contains("changed in both")
+    }
+
+    /// `stem`, then `stem-2`, `stem-3`, … until the name is free.
+    public func unusedBranchName(stem: String) async throws -> String {
+        if await !branchExists(stem) { return stem }
+        var suffix = 2
+        while suffix <= 999 {
+            let candidate = "\(stem)-\(suffix)"
+            if await !branchExists(candidate) { return candidate }
+            suffix += 1
+        }
+        throw GitError.branchExists(name: stem)
+    }
+
     /// Takes `--ours` or `--theirs` for a conflicted path and stages the result.
     public func checkoutConflictSide(
         _ side: ConflictSide,
@@ -493,6 +568,7 @@ public enum GitError: Error, Sendable, CustomStringConvertible {
     case branchExists(name: String)
     case dirtyWorktree(path: String)
     case invalidOutput(String)
+    case notFastForward(branch: String, onto: String)
 
     public var description: String {
         switch self {
@@ -513,6 +589,8 @@ public enum GitError: Error, Sendable, CustomStringConvertible {
             return "The worktree at \(path) has uncommitted changes."
         case .invalidOutput(let detail):
             return "Could not parse git output: \(detail)"
+        case .notFastForward(let branch, let onto):
+            return "Local `\(branch)` has diverged from `\(onto)` and cannot be fast-forwarded. Rebase or reset it before pulling."
         }
     }
 }

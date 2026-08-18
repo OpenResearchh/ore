@@ -129,10 +129,11 @@ struct ReviewPane: View {
     private enum ReviewTab: Hashable { case allFiles, changes }
     private var isTreeLayout: Bool { changesLayoutRaw != "list" }
 
-    var body: some View {
+        var body: some View {
         VStack(spacing: 0) {
             tabRow
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
+            BaseSyncBanner(workspace: workspace)
             content
                 .frame(maxHeight: .infinity)
             stackStrip
@@ -198,7 +199,11 @@ struct ReviewPane: View {
 
             Button { startAIReview() } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: "sparkles")
+                    if model.chatCreationsInFlight.contains(workspace.id) {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "sparkles")
+                    }
                     Text("Review")
                     if !draftComments.isEmpty {
                         Text("\(draftComments.count)")
@@ -212,6 +217,7 @@ struct ReviewPane: View {
                 .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
             }
             .buttonStyle(OrePressableButtonStyle())
+            .disabled(model.chatCreationsInFlight.contains(workspace.id))
             .fixedSize(horizontal: true, vertical: false)
             .help("Open a dedicated agent review of the current diff")
             .contextMenu {
@@ -2112,10 +2118,14 @@ struct GitActionToolbar: View {
                 Button {
                     presentOrPerform()
                 } label: {
-                    Label(title, systemImage: icon)
-                        .labelStyle(.titleAndIcon)
+                    GitBusyLabel(
+                        title: title,
+                        systemImage: icon,
+                        isBusy: isThisActionBusy
+                    )
                 }
                 .buttonStyle(OreGitActionButtonStyle(tone: tone))
+                .disabled(model.isGitOpInFlight(workspace.id))
                 .help(actionHelp)
                 .fixedSize()
                 .accessibilityLabel(title)
@@ -2227,7 +2237,7 @@ struct GitActionToolbar: View {
         case .retargetAfterParentMerged:
             return "Point this pull request at the new base. (\(shortcutHint))"
         case .merged:
-            return "Start a fresh branch from the merged base. (\(shortcutHint))"
+            return "Pull the default branch locally and start a fresh branch in this worktree. (\(shortcutHint))"
         case .setUpGitHub:
             return "Sign in to GitHub with gh so this workspace can push and open PRs."
         default:
@@ -2257,6 +2267,7 @@ struct GitActionToolbar: View {
     }
 
     private func presentOrPerform() {
+        guard !model.isGitOpInFlight(workspace.id) else { return }
         switch action {
         case .commit:
             editor = .commit
@@ -2266,6 +2277,17 @@ struct GitActionToolbar: View {
             editor = .merge
         default:
             perform()
+        }
+    }
+
+    private var isThisActionBusy: Bool {
+        switch (action, model.gitOp(for: workspace.id)) {
+        case (.merged, .continueAfterMerge),
+             (.createPullRequest, .createPullRequest),
+             (.merge, .merge):
+            return true
+        default:
+            return false
         }
     }
 
@@ -2375,6 +2397,7 @@ private struct PullRequestEditor: View {
                     onDone()
                 }
                 .keyboardShortcut(.return)
+                .disabled(model.isGitOpInFlight(workspace.id))
             }
         }
         .padding(14)
@@ -2404,10 +2427,140 @@ private struct MergeEditor: View {
                     onDone()
                 }
                 .keyboardShortcut(.return)
+                .disabled(model.isGitOpInFlight(workspace.id))
             }
         }
         .padding(14)
         .frame(width: 260)
+    }
+}
+
+private struct GitBusyLabel: View {
+    let title: String
+    let systemImage: String
+    var isBusy: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(.white)
+            } else {
+                Image(systemName: systemImage)
+            }
+            Text(title)
+        }
+    }
+}
+
+/// Origin's default branch moved: pull the local ref, or rebase this branch,
+/// without sending the user to GitHub.
+private struct BaseSyncBanner: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+
+    var body: some View {
+        if let prompt {
+            HStack(alignment: .center, spacing: OreTheme.Space.sm) {
+                Image(systemName: prompt.icon)
+                    .foregroundStyle(prompt.tone)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(prompt.title)
+                        .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                    Text(prompt.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                if prompt.showPull {
+                    Button {
+                        model.pullDefaultBranch(workspace.id)
+                    } label: {
+                        if model.gitOp(for: workspace.id) == .pullDefaultBranch {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Text("Pull \(prompt.defaultBranch)")
+                        }
+                    }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    .disabled(model.isGitOpInFlight(workspace.id))
+                }
+                if prompt.showRebase {
+                    Button("Ask agent to rebase") {
+                        model.placePromptInComposer(
+                            GitShipPrompt.rebaseOnto(prompt.defaultBranch),
+                            in: workspace.id
+                        )
+                    }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                }
+            }
+            .padding(12)
+            .background(
+                prompt.tone.opacity(0.10),
+                in: RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                    .stroke(prompt.tone.opacity(0.35), lineWidth: 1)
+            }
+            .padding(.horizontal, OreTheme.Space.sm)
+            .padding(.vertical, OreTheme.Space.xs)
+        }
+    }
+
+    private var prompt: Prompt? {
+        guard let sync = workspace.baseSync, sync.needsAttention else { return nil }
+        if case .merged = model.gitAction(for: workspace.id) { return nil }
+        return Prompt(sync: sync)
+    }
+
+    private struct Prompt {
+        var defaultBranch: String
+        var title: String
+        var detail: String
+        var icon: String
+        var tone: Color
+        var showPull: Bool
+        var showRebase: Bool
+
+        init(sync: BaseSyncStatus) {
+            defaultBranch = sync.defaultBranch
+            showPull = sync.localDefaultBehindOrigin > 0
+            showRebase = sync.workspaceBehindOrigin > 0
+            if sync.wouldConflict {
+                icon = "exclamationmark.triangle.fill"
+                tone = OreTheme.warning
+                title = "This branch conflicts with origin/\(sync.defaultBranch)"
+                detail = Self.conflictDetail(sync)
+            } else if sync.workspaceBehindOrigin > 0 {
+                icon = "arrow.down.circle"
+                tone = Color.accentColor
+                title = "origin/\(sync.defaultBranch) moved"
+                detail = "This branch is \(sync.workspaceBehindOrigin) commit\(sync.workspaceBehindOrigin == 1 ? "" : "s") behind. Rebase here rather than on GitHub."
+            } else {
+                icon = "arrow.down.circle"
+                tone = Color.accentColor
+                title = "Local \(sync.defaultBranch) is behind origin"
+                detail = "\(sync.localDefaultBehindOrigin) commit\(sync.localDefaultBehindOrigin == 1 ? "" : "s") to pull so Continue and new workspaces start from current \(sync.defaultBranch)."
+            }
+        }
+
+        private static func conflictDetail(_ sync: BaseSyncStatus) -> String {
+            var parts: [String] = []
+            if sync.workspaceBehindOrigin > 0 {
+                parts.append(
+                    "\(sync.workspaceBehindOrigin) commit\(sync.workspaceBehindOrigin == 1 ? "" : "s") on origin/\(sync.defaultBranch) are not in this branch."
+                )
+            }
+            if sync.localDefaultBehindOrigin > 0 {
+                parts.append("Local \(sync.defaultBranch) is also behind; pull it first.")
+            }
+            parts.append("Ask the agent to rebase so you don't have to leave ORE.")
+            return parts.joined(separator: " ")
+        }
     }
 }
 

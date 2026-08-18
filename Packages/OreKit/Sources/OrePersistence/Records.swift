@@ -103,7 +103,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     public func summary(
         status: AgentStatus = .idle,
         gitStatus: GitStatusSummary = GitStatusSummary(),
-        contextUsage: UsageReport? = nil
+        contextUsage: UsageReport? = nil,
+        baseSync: BaseSyncStatus? = nil
     ) -> WorkspaceSummary {
         WorkspaceSummary(
             id: workspaceID,
@@ -124,7 +125,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
             archivedDiskBytes: archivedDiskBytes,
             gitStatus: gitStatus,
             contextUsage: contextUsage,
-            lastActivity: lastActivityAt
+            lastActivity: lastActivityAt,
+            baseSync: baseSync
         )
     }
 }

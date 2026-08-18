@@ -391,25 +391,34 @@ final class VoiceInputController {
         let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
         try await analyzer.prepareToAnalyze(in: bestFormat)
 
+        // Starting AVAudioEngine is synchronous and slow the first time; on the
+        // main actor it froze the window at the start of a dictation.
         let capture = MicrophoneCapture()
-        let buffers = try capture.start(targetFormat: bestFormat, onLevel: levelHandler())
+        let onLevel = levelHandler()
+        let buffers = try await Task.detached {
+            try capture.start(targetFormat: bestFormat, onLevel: onLevel)
+        }.value
         self.capture = capture
 
-        let input = AsyncStream<AnalyzerInput> { continuation in
-            let bufferTask = Task {
-                for await buffer in buffers {
-                    continuation.yield(AnalyzerInput(buffer: buffer))
-                }
-                continuation.finish()
+        // Detached deliberately: a bare `Task {}` inherits this class's
+        // @MainActor isolation and would pump every microphone buffer through
+        // the main thread, starving SwiftUI of the render that shows the words.
+        let (input, inputContinuation) = AsyncStream<AnalyzerInput>.makeStream()
+        let bufferTask = Task.detached {
+            for await buffer in buffers {
+                inputContinuation.yield(AnalyzerInput(buffer: buffer))
             }
-            continuation.onTermination = { _ in bufferTask.cancel() }
+            inputContinuation.finish()
         }
+        inputContinuation.onTermination = { _ in bufferTask.cancel() }
 
         analyzerStop = {
             await analyzer.cancelAndFinishNow()
         }
 
-        let resultsTask = Task { [weak self] in
+        // Detached for the same reason: only the state mutation below belongs
+        // on the main actor, not the transcription loop that feeds it.
+        let resultsTask = Task.detached { [weak self] in
             do {
                 for try await result in transcriber.results {
                     let segment = String(result.text.characters)
@@ -432,6 +441,7 @@ final class VoiceInputController {
         try await analyzer.start(inputSequence: input)
         try? await analyzer.finalizeAndFinishThroughEndOfInput()
         resultsTask.cancel()
+        bufferTask.cancel()
     }
 
     private func runSpeechRecognizer() async throws {
@@ -465,14 +475,20 @@ final class VoiceInputController {
         recognitionRequest = request
 
         let capture = MicrophoneCapture()
-        let buffers = try capture.start(targetFormat: nil, onLevel: levelHandler())
+        let onLevel = levelHandler()
+        let buffers = try await Task.detached {
+            try capture.start(targetFormat: nil, onLevel: onLevel)
+        }.value
         self.capture = capture
 
-        let pump = Task { [weak self] in
+        // Detached, holding the request directly rather than reaching back
+        // through `self`: appending every buffer on the main actor made the
+        // transcript stall behind the audio it was transcribing.
+        let pump = Task.detached {
             for await buffer in buffers {
-                self?.recognitionRequest?.append(buffer)
+                request.append(buffer)
             }
-            self?.recognitionRequest?.endAudio()
+            request.endAudio()
         }
 
         status = .listening

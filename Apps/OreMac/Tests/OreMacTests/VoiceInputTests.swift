@@ -424,6 +424,47 @@ struct VoiceIntentExtractorTests {
         #expect(!intents.rewritten.lowercased().contains("zephyr"))
         #expect(intents.rewritten.lowercased().contains("chatpane"))
     }
+
+    /// The live quote renders the raw transcript, not the rewritten one. These
+    /// are real partials from the on-device recognizer hearing "switch to Opus
+    /// five": it revises "switch to opus" into "switched to Op. 5", which the
+    /// alias matcher no longer recognizes. Rewriting each partial therefore cut
+    /// the clause out on one frame and put it back on the next, and the words
+    /// visibly shrank and regrew mid-sentence. Formatting the raw text cannot
+    /// do that — every partial is a prefix of the one after it.
+    @Test func theLiveQuoteOnlyGrowsEvenWhenRecognitionRevisesACommand() {
+        let partials = [
+            "Hey, I am working on a new feature for the composer right now switch to op",
+            "Hey, I am working on a new feature for the composer right now switch to opus",
+            "Hey, I am working on a new feature for the composer right now switch to Op. five",
+            "Hey, I am working on a new feature for the composer right now switched to Op. 5",
+            "Hey, I am working on a new feature for the composer right now switched to Op. five and",
+            "Hey, I am working on a new feature for the composer right now switched to Op. five and then",
+        ]
+        // Recognition genuinely is unstable here — that is the premise.
+        let recognized = partials.filter { extract($0).model != nil }
+        #expect(recognized.count < partials.count)
+
+        func worstDrop(_ texts: [String]) -> Int {
+            zip(texts, texts.dropFirst()).map { max(0, $0.count - $1.count) }.max() ?? 0
+        }
+
+        // Rewriting each partial loses a whole clause the moment recognition
+        // stops matching; formatting the raw text can only jitter by however
+        // much the recognizer itself revised a word.
+        let rewritten = partials.map { extract($0).rewritten }
+        let quotes = partials.map { VoiceDictationFormatter.format($0) }
+        #expect(worstDrop(rewritten) > 10)
+        #expect(worstDrop(quotes) <= 2)
+        #expect(quotes.last?.hasSuffix("and then") == true)
+    }
+
+    /// The command clause still comes out of the text that actually gets sent.
+    @Test func theCommittedTextStillDropsTheCommandAndItsDanglingConnective() {
+        let intents = extract("review the layout switch to Opus 5 and")
+        #expect(intents.model?.displayName == "Opus 5")
+        #expect(intents.rewritten == "review the layout")
+    }
 }
 
 struct ComposerPasteboardTests {

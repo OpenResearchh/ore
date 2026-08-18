@@ -29,7 +29,9 @@ public actor WorkspaceEngine {
     private var record: WorkspaceRecord
     private var statusWatcher: StatusWatcher?
     private var statusTask: Task<Void, Never>?
+    private var baseSyncTask: Task<Void, Never>?
     private var gitStatus: GitStatusSummary = GitStatusSummary()
+    private var baseSync: BaseSyncStatus?
     private var chats: [ChatID: ChatRuntime] = [:]
 
     private final class ChatRuntime: @unchecked Sendable {
@@ -89,7 +91,9 @@ public actor WorkspaceEngine {
         let usage = active
             .sorted { ($0.record.lastActivityAt ?? .distantPast) > ($1.record.lastActivityAt ?? .distantPast) }
             .first?.latestUsage
-        return record.summary(status: status, gitStatus: gitStatus, contextUsage: usage)
+        return record.summary(
+            status: status, gitStatus: gitStatus, contextUsage: usage, baseSync: baseSync
+        )
     }
 
     public func currentRecord() -> WorkspaceRecord { record }
@@ -103,6 +107,7 @@ public actor WorkspaceEngine {
     public func start() async {
         _ = try? await loadChats()
         await startStatusWatching()
+        await startBaseSyncWatching()
     }
 
     /// Marks the workspace read. Notification hygiene is capped at one unread
@@ -124,6 +129,7 @@ public actor WorkspaceEngine {
 
     public func stop() async {
         statusTask?.cancel()
+        baseSyncTask?.cancel()
         await statusWatcher?.stop()
         for runtime in chats.values {
             runtime.sessionTask?.cancel()
@@ -1144,7 +1150,8 @@ public actor WorkspaceEngine {
             pullRequest: pullRequest,
             gitHubStatus: gitHubStatus,
             parentBranch: parentBranch,
-            parentPullRequest: parentPullRequest
+            parentPullRequest: parentPullRequest,
+            wouldConflictWithOriginDefault: baseSync?.wouldConflict ?? false
         )
     }
 
@@ -1169,13 +1176,14 @@ public actor WorkspaceEngine {
         ))
     }
 
-    /// Rolls the workspace forward after its PR merged: fetch the base, cut a
-    /// fresh branch from `origin/<base>`, and leave a memo in the chat so the
-    /// next agent turn knows the ground moved under it.
+    /// Rolls the workspace forward after its PR merged: pull the repository's
+    /// default branch (`main`/`master`) into the local ref, then cut a fresh
+    /// branch from that local default in this same worktree.
     ///
     /// A fresh branch rather than a rebase: the merged branch's work now lives
-    /// in the base, and continuing on top of it would show already-merged
-    /// commits in every diff and PR that follows.
+    /// in the default branch, and continuing on top of it would show
+    /// already-merged commits in every diff and PR that follows. Archive is
+    /// never implied — the worktree stays until the user archives it.
     public func continueAfterMerge() async throws {
         guard let pullRequest = await gitHub.pullRequest(forBranch: record.branch),
               pullRequest.isMerged
@@ -1188,24 +1196,12 @@ public actor WorkspaceEngine {
             throw OreCoreError.uncommittedChanges
         }
 
-        let base = pullRequest.baseRefName.isEmpty ? record.baseBranch : pullRequest.baseRefName
-        try await git.runSerialized(["fetch", "origin", base], in: worktreeURL)
-
-        // ore/foo → ore/foo-2 → ore/foo-3…, reusing the numbering idiom from
-        // WorktreeManager.uniqueBranch.
-        let stem = record.branch.replacingOccurrences(
-            of: #"-\d+$"#, with: "", options: .regularExpression
-        )
-        var newBranch = "\(stem)-2"
-        var suffix = 2
-        while await git.branchExists(newBranch) {
-            suffix += 1
-            newBranch = "\(stem)-\(suffix)"
-            if suffix > 999 { throw GitError.branchExists(name: stem) }
-        }
+        let defaultBranch = await git.defaultBranch()
+        try await pullDefaultBranch(forceFetch: true)
+        let newBranch = try await git.unusedBranchName(stem: nextContinueStem())
 
         try await git.runSerialized(
-            ["switch", "-c", newBranch, "origin/\(base)"], in: worktreeURL
+            ["switch", "-c", newBranch, defaultBranch], in: worktreeURL
         )
         let baseSHA = (try? await git.run(
             ["rev-parse", "--short", "HEAD"], in: worktreeURL
@@ -1213,17 +1209,36 @@ public actor WorkspaceEngine {
 
         let oldBranch = record.branch
         record.branch = newBranch
-        record.baseBranch = base
+        record.baseBranch = defaultBranch
         try await persistRecord()
         publishSummaryChange()
         await statusWatcher?.refreshNow()
+        await refreshBaseSync(forceFetch: false)
 
         let memo = """
-        PR #\(pullRequest.number) (\(pullRequest.title)) was merged into \(base). \
+        PR #\(pullRequest.number) (\(pullRequest.title)) was merged into \(defaultBranch). \
         The old branch `\(oldBranch)` is done; this workspace continues on the fresh \
-        branch `\(newBranch)`, cut from updated `origin/\(base)` at \(baseSHA).
+        branch `\(newBranch)`, cut from local `\(defaultBranch)` at \(baseSHA).
         """
         try await recordWorkspaceMemo(memo)
+    }
+
+    /// Fast-forward the local default branch from origin without checking it
+    /// out in this worktree.
+    public func pullDefaultBranch(forceFetch: Bool = true) async throws {
+        guard await git.hasRemote() else { return }
+        let defaultBranch = await git.defaultBranch()
+        try await git.fetchRemoteBranch(defaultBranch, force: forceFetch)
+        try await git.fastForwardLocalBranch(defaultBranch, to: "origin/\(defaultBranch)")
+        await refreshBaseSync(forceFetch: false)
+    }
+
+    /// `ore/foo` → `ore/foo-2` → `ore/foo-3`…, reusing the numbering idiom from
+    /// WorktreeManager.uniqueBranch.
+    private func nextContinueStem() -> String {
+        record.branch.replacingOccurrences(
+            of: #"-\d+$"#, with: "", options: .regularExpression
+        )
     }
 
     /// Persists a memo as a synthetic completed turn (so it renders in the
@@ -1324,7 +1339,60 @@ public actor WorkspaceEngine {
     private func applyStatus(_ snapshot: GitStatusSnapshot) {
         // Out-of-order FSEvents batches are discarded rather than applied.
         guard snapshot.generation >= gitStatus.generation else { return }
-        gitStatus = snapshot.summary()
+        gitStatus = snapshot.summary(
+            aheadOfBase: gitStatus.aheadOfBase,
+            behindBase: baseSync?.workspaceBehindOrigin ?? gitStatus.behindBase
+        )
+        publishSummaryChange()
+    }
+
+    private func startBaseSyncWatching() async {
+        guard baseSyncTask == nil else { return }
+        await refreshBaseSync(forceFetch: true)
+        baseSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(45))
+                guard !Task.isCancelled else { return }
+                await self?.refreshBaseSync(forceFetch: false)
+            }
+        }
+    }
+
+    /// Fetch origin's default branch and compare it to the local default ref
+    /// and to this worktree. Cheap when the fetch is coalesced; the comparison
+    /// is local rev-list / merge-tree.
+    private func refreshBaseSync(forceFetch: Bool) async {
+        guard await git.hasRemote() else {
+            if baseSync != nil {
+                baseSync = nil
+                publishSummaryChange()
+            }
+            return
+        }
+        let defaultBranch = await git.defaultBranch()
+        try? await git.fetchRemoteBranch(defaultBranch, force: forceFetch)
+        let origin = "origin/\(defaultBranch)"
+        let localBehind = await git.branchExists(defaultBranch)
+            ? await git.commitCount(from: defaultBranch, to: origin)
+            : await git.commitCount(from: "HEAD", to: origin)
+        let workspaceBehind = await git.commitCount(
+            from: "HEAD", to: origin, in: worktreeURL
+        )
+        let wouldConflict: Bool
+        if workspaceBehind > 0 {
+            wouldConflict = await git.mergeWouldConflict(with: origin, in: worktreeURL)
+        } else {
+            wouldConflict = false
+        }
+        let next = BaseSyncStatus(
+            defaultBranch: defaultBranch,
+            localDefaultBehindOrigin: localBehind,
+            workspaceBehindOrigin: workspaceBehind,
+            wouldConflict: wouldConflict
+        )
+        guard next != baseSync else { return }
+        baseSync = next
+        gitStatus.behindBase = workspaceBehind
         publishSummaryChange()
     }
 

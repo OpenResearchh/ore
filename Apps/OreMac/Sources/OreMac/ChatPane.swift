@@ -1797,7 +1797,18 @@ struct ChatPane: View {
         // times a second, and retargeting a transition on every one is churn
         // the transcript view no longer opts into. Chip and trail changes —
         // rare, deliberate — keep theirs above.
-        voiceQuote = VoiceDictationFormatter.format(intents.rewritten)
+        //
+        // The quote shows what was said, verbatim, and only ever grows.
+        //
+        // It used to show the *rewritten* text, with recognized command clauses
+        // cut out. But recognition is unstable across partials — the recognizer
+        // revises "switch to opus" into "switched to Op. 5", which no longer
+        // matches — so the clause was removed on one partial and came back on
+        // the next, and the words visibly shrank and regrew while being spoken.
+        // The chip and the struck-through trail already report what was heard;
+        // the command phrases come out at commit, where the on-device refiner
+        // arbitrates instead of a per-partial alias match.
+        voiceQuote = VoiceDictationFormatter.format(spoken)
     }
 
     /// The transcript with settings clauses stripped and spoken breaks applied,

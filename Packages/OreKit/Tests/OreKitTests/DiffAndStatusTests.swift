@@ -428,4 +428,55 @@ struct StatusWatcherTests {
 
         await watcher.stop()
     }
+
+    @Test func fastForwardMovesALocalBranchThatIsNotCheckedOut() async throws {
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "ff", baseRevision: "main", baseBranch: "main"
+        )).path
+
+        let stale = try await fixture.git.run(["rev-parse", "main"]).trimmedStandardOutput
+        try fixture.write("landed.txt", "on default\n")
+        try await fixture.run(["add", "-A"])
+        try await fixture.commit("landed on default")
+        let moved = try await fixture.git.run(["rev-parse", "main"]).trimmedStandardOutput
+        try await fixture.run(["update-ref", "refs/remotes/origin/main", moved])
+        try await fixture.run(["update-ref", "refs/heads/main", stale])
+
+        #expect(await fixture.git.commitCount(from: "main", to: "origin/main") == 1)
+
+        try await fixture.git.fastForwardLocalBranch("main", to: "origin/main")
+        let now = try await fixture.git.run(["rev-parse", "main"]).trimmedStandardOutput
+        #expect(now == moved)
+        // The worktree stayed on its own branch.
+        #expect(try await fixture.git.currentBranch(in: worktree) != "main")
+    }
+
+    @Test func mergeWouldConflictDetectsDivergentEditsToTheSameFile() async throws {
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "conflict", baseRevision: "main", baseBranch: "main"
+        )).path
+
+        try fixture.write("README.md", "# theirs\n")
+        try await fixture.run(["add", "-A"])
+        try await fixture.commit("theirs")
+        try await fixture.run(["update-ref", "refs/remotes/origin/main", "HEAD"])
+
+        try fixture.write("README.md", "# ours\n", in: worktree)
+        try await fixture.run(["add", "-A"], in: worktree)
+        try await fixture.commit("ours", in: worktree)
+
+        #expect(await fixture.git.mergeWouldConflict(with: "origin/main", in: worktree))
+        #expect(await fixture.git.commitCount(from: "HEAD", to: "origin/main", in: worktree) == 1)
+    }
+
+    @Test func unusedBranchNameSkipsNamesThatAlreadyExist() async throws {
+        let fixture = try await GitFixture.initialized()
+        try await fixture.run(["branch", "ore/topic"])
+        try await fixture.run(["branch", "ore/topic-2"])
+        #expect(try await fixture.git.unusedBranchName(stem: "ore/topic") == "ore/topic-3")
+    }
 }

@@ -31,9 +31,12 @@ public enum CoreCommand: Sendable, Codable {
     case createPullRequest(WorkspaceID, title: String, body: String, base: String, draft: Bool)
     case retargetPullRequest(WorkspaceID, number: Int, base: String)
     case mergePullRequest(WorkspaceID, method: String)
-    /// After the PR merges: fetch the base, restart the workspace on a fresh
-    /// branch cut from it, and leave a memo in the chat so the agent knows.
+    /// After the PR merges: pull the default branch into the local ref and
+    /// restart this worktree on a fresh branch cut from that local default.
     case continueAfterMerge(WorkspaceID)
+    /// Fast-forward the repository's local default branch (`main`/`master`)
+    /// from `origin/<default>` without switching this worktree onto it.
+    case pullDefaultBranch(WorkspaceID)
     /// Take `--ours` or `--theirs` for a conflicted path (and stage it).
     case resolveConflict(WorkspaceID, path: String, side: String)
     /// Replace one `<<<<<<<` hunk with ours or theirs.

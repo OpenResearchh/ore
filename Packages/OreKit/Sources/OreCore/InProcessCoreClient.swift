@@ -119,6 +119,10 @@ public actor InProcessCoreClient: CoreClient {
             try await engine(for: id).continueAfterMerge()
             try await resync(id)
 
+        case .pullDefaultBranch(let id):
+            try await engine(for: id).pullDefaultBranch()
+            try await resync(id)
+
         case .resolveConflict(let id, let path, let side):
             guard let conflictSide = ConflictSide(rawValue: side) else { return }
             try await engine(for: id).resolveConflict(path: path, side: conflictSide)
@@ -658,10 +662,10 @@ public actor InProcessCoreClient: CoreClient {
             throw OreCoreError.noPullRequest(record.branch)
         }
         let mergeMethod = GitHubClient.MergeMethod(rawValue: method) ?? .squash
-        // Archive owns worktree cleanup; keep the branch until its checkpointed
-        // state has been preserved and the worktree has been removed safely.
+        // Keep the branch: archive is a separate, explicit action so the
+        // worktree stays until the user presses Archive.
         try await github.merge(number: pr.number, method: mergeMethod, deleteBranch: false)
-        try await archiveWorkspace(id)
+        try await resync(id)
     }
 
     // MARK: - Engines
@@ -984,7 +988,8 @@ private extension CoreCommand {
              .commit(let id, _), .createGitHubRepo(let id), .push(let id),
              .createPullRequest(let id, _, _, _, _),
              .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _),
-             .continueAfterMerge(let id), .rerunFailedChecks(let id):
+             .continueAfterMerge(let id), .pullDefaultBranch(let id),
+             .rerunFailedChecks(let id):
             return id
         case .resolveConflict(let id, _, _), .resolveConflictHunk(let id, _, _, _):
             return id

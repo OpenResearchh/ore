@@ -78,6 +78,15 @@ final class AppModel {
     private var identityRenamesInFlight: Set<WorkspaceID> = []
     private var chatRenamesInFlight: Set<ChatID> = []
     private(set) var chatCreationsInFlight: Set<WorkspaceID> = []
+    /// Continue / Create PR / Merge while a git command is in flight, so the
+    /// toolbar can show a spinner instead of looking idle.
+    enum GitOperation: Hashable {
+        case continueAfterMerge
+        case createPullRequest
+        case merge
+        case pullDefaultBranch
+    }
+    private(set) var gitOpsInFlight: [WorkspaceID: GitOperation] = [:]
     private var flushTask: Task<Void, Never>?
 
     struct Banner: Identifiable, Sendable {
@@ -840,10 +849,35 @@ final class AppModel {
         Task { await client.send(.setWorkspacePinned(id, pinned: pinned)) }
     }
 
-    /// After the PR merged: pull the base and restart the workspace on a fresh
-    /// branch, leaving a memo in the chat so the agent knows what happened.
+    /// After the PR merged: pull the default branch locally and restart this
+    /// worktree on a fresh branch cut from it.
     func continueAfterMerge(_ id: WorkspaceID) {
-        Task { await client.send(.continueAfterMerge(id)) }
+        runGitOp(.continueAfterMerge, for: id) {
+            await self.client.send(.continueAfterMerge(id))
+        }
+    }
+
+    func pullDefaultBranch(_ id: WorkspaceID) {
+        runGitOp(.pullDefaultBranch, for: id) {
+            await self.client.send(.pullDefaultBranch(id))
+        }
+    }
+
+    func gitOp(for id: WorkspaceID) -> GitOperation? {
+        gitOpsInFlight[id]
+    }
+
+    func isGitOpInFlight(_ id: WorkspaceID) -> Bool {
+        gitOpsInFlight[id] != nil
+    }
+
+    private func runGitOp(_ op: GitOperation, for id: WorkspaceID, _ work: @escaping () async -> Void) {
+        guard gitOpsInFlight[id] == nil else { return }
+        gitOpsInFlight[id] = op
+        Task {
+            await work()
+            gitOpsInFlight[id] = nil
+        }
     }
 
     /// The coloured toolbar button — Commit, Push, Create PR, Merge, and so on.
@@ -889,6 +923,7 @@ final class AppModel {
     /// non-actionable (it's a status, not a git command) but still has a
     /// keyboard path through `performSuggestedGitAction`.
     var canPerformSuggestedGitAction: Bool {
+        if let id = selectedWorkspaceID, gitOpsInFlight[id] != nil { return false }
         if case .merged = selectedGitAction { return true }
         return selectedGitAction.isActionable
     }
@@ -911,7 +946,9 @@ final class AppModel {
                 await client.send(.retargetPullRequest(workspace.id, number: number, base: base))
             case .merge:
                 let method = UserDefaults.standard.string(forKey: "ore.mergeMethod") ?? "squash"
-                await client.send(.mergePullRequest(workspace.id, method: method))
+                runGitOp(.merge, for: workspace.id) {
+                    await self.client.send(.mergePullRequest(workspace.id, method: method))
+                }
             case .fixFailingChecks:
                 forwardFailingChecks(workspace.id)
             case .resolveConflicts(_, let base):
@@ -935,8 +972,8 @@ final class AppModel {
         draft: Bool,
         for workspace: WorkspaceSummary
     ) {
-        Task {
-            await client.send(.createPullRequest(
+        runGitOp(.createPullRequest, for: workspace.id) {
+            await self.client.send(.createPullRequest(
                 workspace.id,
                 title: title,
                 body: body,
@@ -948,7 +985,9 @@ final class AppModel {
 
     func submitMerge(method: String, for workspace: WorkspaceSummary) {
         UserDefaults.standard.set(method, forKey: "ore.mergeMethod")
-        Task { await client.send(.mergePullRequest(workspace.id, method: method)) }
+        runGitOp(.merge, for: workspace.id) {
+            await self.client.send(.mergePullRequest(workspace.id, method: method))
+        }
     }
 
     func resolveConflict(path: String, side: ConflictSide, in workspaceID: WorkspaceID) {
@@ -1502,6 +1541,7 @@ final class AppModel {
             pendingNewChatDrafts.removeValue(forKey: id)
             identityRenamesInFlight.remove(id)
             chatCreationsInFlight.remove(id)
+            gitOpsInFlight[id] = nil
             // The workspace's terminals keep their PTYs and scrollback alive
             // for as long as the registry holds them, which outlived the
             // worktree they were running in.
@@ -1589,6 +1629,7 @@ final class AppModel {
         case .commandFailed(let failure):
             if let workspaceID = failure.workspaceID {
                 chatCreationsInFlight.remove(workspaceID)
+                gitOpsInFlight[workspaceID] = nil
             }
             banners.append(Banner(message: failure.message, detail: failure.detail))
         }
@@ -1793,10 +1834,17 @@ final class AppModel {
     }
 
     private func upsert(_ summary: WorkspaceSummary) {
+        let previousSync = workspaces.first { $0.id == summary.id }?.baseSync
         if let index = workspaces.firstIndex(where: { $0.id == summary.id }) {
             workspaces[index] = summary
         } else {
             workspaces.append(summary)
+        }
+        // Origin movement does not touch the worktree, so the git-action
+        // cache would otherwise keep offering Merge while this branch now
+        // conflicts with master.
+        if previousSync != summary.baseSync {
+            Task { await refreshGitAction(for: summary.id) }
         }
     }
 

@@ -130,6 +130,14 @@ public enum GitShipPrompt: Sendable {
         }
         return lines.joined(separator: "\n\n")
     }
+
+    public static func rebaseOnto(_ base: String) -> String {
+        """
+        Rebase this branch onto `\(base)` (the repository default). Resolve any \
+        conflicts, keep our work, and explain the resolution. Do not force-push \
+        unless this branch has no open pull request.
+        """
+    }
 }
 
 /// Everything the state machine needs to decide. Gathering it is I/O; deciding
@@ -154,6 +162,9 @@ public struct GitActionContext: Sendable {
     /// Set when this workspace is stacked on another.
     public var parentBranch: String?
     public var parentPullRequest: GitHubClient.PullRequest?
+    /// Local merge-tree against origin's default, independent of GitHub's
+    /// `mergeable` which can stay UNKNOWN for a long time after master moves.
+    public var wouldConflictWithOriginDefault: Bool
 
     public init(
         hasUncommittedChanges: Bool = false,
@@ -170,7 +181,8 @@ public struct GitActionContext: Sendable {
             isInstalled: true, isAuthenticated: true
         ),
         parentBranch: String? = nil,
-        parentPullRequest: GitHubClient.PullRequest? = nil
+        parentPullRequest: GitHubClient.PullRequest? = nil,
+        wouldConflictWithOriginDefault: Bool = false
     ) {
         self.hasUncommittedChanges = hasUncommittedChanges
         self.changedFileCount = changedFileCount
@@ -185,6 +197,7 @@ public struct GitActionContext: Sendable {
         self.gitHubStatus = gitHubStatus
         self.parentBranch = parentBranch
         self.parentPullRequest = parentPullRequest
+        self.wouldConflictWithOriginDefault = wouldConflictWithOriginDefault
     }
 }
 
@@ -264,7 +277,7 @@ public enum SuggestedGitActionResolver {
             return .push(commitCount: context.unpushedCommitCount, isFirstPush: false)
         }
 
-        if pullRequest.hasConflicts {
+        if pullRequest.hasConflicts || context.wouldConflictWithOriginDefault {
             return .resolveConflicts(
                 prNumber: pullRequest.number,
                 base: pullRequest.baseRefName

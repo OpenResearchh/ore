@@ -85,6 +85,12 @@ struct ProtocolBoundaryTests {
                 gitStatus: GitStatusSummary(
                     changedFileCount: 3, insertions: 40, deletions: 2,
                     hasUncommittedChanges: true, generation: 7
+                ),
+                baseSync: BaseSyncStatus(
+                    defaultBranch: "master",
+                    localDefaultBehindOrigin: 2,
+                    workspaceBehindOrigin: 4,
+                    wouldConflict: true
                 )
             )],
             chats: [ChatSummary(
@@ -132,6 +138,8 @@ struct ProtocolBoundaryTests {
             .resolveConflict(workspaceID, path: "Sources/App.swift", side: "ours"),
             .resolveConflictHunk(workspaceID, path: "Sources/App.swift", startLine: 12, side: "theirs"),
             .rerunFailedChecks(workspaceID),
+            .pullDefaultBranch(workspaceID),
+            .continueAfterMerge(workspaceID),
         ]
         for command in commands {
             let data = try JSONEncoder().encode(command)

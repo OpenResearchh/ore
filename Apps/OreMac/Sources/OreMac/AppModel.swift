@@ -55,6 +55,9 @@ final class AppModel {
     }
     private(set) var diffCache: [WorkspaceID: DiffSnapshot] = [:]
 
+    /// Speaks agent activity aloud for tabs whose speaker toggle is on.
+    let narration = NarrationEngine()
+
     private let client: InProcessCoreClient
     private var eventTask: Task<Void, Never>?
     /// Batches streaming deltas so a fast model can't drive the transcript's
@@ -519,6 +522,9 @@ final class AppModel {
         activeChatIDs[workspaceID] = chatID
         UserDefaults.standard.set(chatID.rawValue, forKey: "ore.activeChat.\(workspaceID.rawValue)")
         _ = chat(for: chatID)
+        if workspaceID == selectedWorkspaceID {
+            narration.activeChatChanged(chatID)
+        }
         Task {
             if let previous {
                 try? await client.setFocused(workspaceID: workspaceID, chatID: previous, focused: false)
@@ -1755,6 +1761,14 @@ final class AppModel {
         chat(for: chatID).apply(event)
         let isBackground = selectedWorkspaceID != workspaceID
             || activeChatIDs[workspaceID] != chatID
+        // Narration is the audio sibling of the background notifications
+        // below: same funnel, same active/background split.
+        narration.observe(
+            event: event,
+            chatID: chatID,
+            isBackground: isBackground,
+            workspaceName: workspaceName(workspaceID)
+        )
         guard isBackground else { return }
         switch event {
         case .permissionRequest:
@@ -1789,6 +1803,7 @@ final class AppModel {
     /// continuation would still fire against a deleted conversation, and the
     /// per-chat defaults accumulated one set of orphans per chat ever created.
     private func forget(_ chatID: ChatID) {
+        narration.forget(chatID)
         chatOwners.removeValue(forKey: chatID)
         coalescers.removeValue(forKey: chatID)
         chatStates.removeValue(forKey: chatID)
@@ -1854,6 +1869,10 @@ final class AppModel {
         } else {
             chatSummaries.append(summary)
         }
+        // The engine's queue gate, brought over as-is. The composer decides
+        // "send or queue" from this, so a guess derived from `status` would put
+        // the button and the engine back out of step.
+        chat(for: summary.id).reconcileTurnActive(summary.isTurnActive)
         if activeChatIDs[summary.workspaceID] == nil, !summary.isClosed {
             let saved = UserDefaults.standard.string(
                 forKey: "ore.activeChat.\(summary.workspaceID.rawValue)"
@@ -1968,6 +1987,7 @@ final class AppModel {
 
     private func focusChanged(from previous: WorkspaceID?, to next: WorkspaceID?) {
         if let next { UserDefaults.standard.set(next.rawValue, forKey: "ore.selectedWorkspace") }
+        narration.activeChatChanged(next.flatMap { activeChat(for: $0)?.id })
         Task {
             if let previous, let chatID = activeChatIDs[previous] {
                 try? await client.setFocused(

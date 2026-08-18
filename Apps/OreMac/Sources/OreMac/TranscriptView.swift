@@ -90,6 +90,21 @@ struct TranscriptView: NSViewRepresentable {
             name: NSView.boundsDidChangeNotification,
             object: scrollView.contentView
         )
+        // Knowing a gesture is in flight is what lets the transcript hold still
+        // while the reader scrolls: bounds changes alone cannot tell the reader's
+        // hand apart from the agent pinning to the bottom.
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.liveScrollWillStart),
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.liveScrollDidEnd),
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
 
         let container = TranscriptContainerView(scrollView: scrollView)
         // Row bitmaps (file chips, tool icons) bake in resolved colours, so a
@@ -151,7 +166,6 @@ struct TranscriptView: NSViewRepresentable {
         /// preference-file hits — those stalls are what made fast scrolling feel
         /// like the table was fighting the gesture.
         private var persistScrollWork: DispatchWorkItem?
-        private var prefetchWork: DispatchWorkItem?
         /// Rows whose text changed but whose reload hasn't been applied yet.
         /// Streaming deltas land ~40×/second; re-rendering the growing markdown
         /// block (twice — once to measure, once to draw) at that cadence is what
@@ -161,6 +175,25 @@ struct TranscriptView: NSViewRepresentable {
         private var pendingTextReload: IndexSet = []
         private var textFlushScheduled = false
         private static let textFlushInterval: TimeInterval = 0.1
+        /// Whether the agent or the reader owns the scroll offset right now.
+        private var policy = TranscriptScrollPolicy()
+        /// Set around the table's own `scroll(to:)` calls. Bounds-change
+        /// notifications post synchronously, so this reliably keeps a scroll the
+        /// transcript performed from being read back as the reader scrolling away.
+        private var isApplyingProgrammaticScroll = false
+        /// Rows whose text changed while they were offscreen. Their heights are
+        /// corrected immediately — the document must stay the right length — but
+        /// the redraw waits until the view settles, since nobody can see it.
+        private var deferredRedraw: IndexSet = []
+        /// Momentum keeps running past `didEndLiveScroll`, so settling is judged
+        /// by the offset going quiet rather than by the gesture ending.
+        private var settleWork: DispatchWorkItem?
+        private static let settleInterval: TimeInterval = 0.12
+        /// The next chunk of the idle measuring sweep, if one is owed. Measuring
+        /// the whole transcript at once — which is what this replaces — was the
+        /// stall the reader felt as a scroll that could not keep up.
+        private var idleMeasureWork: DispatchWorkItem?
+        private static let idleMeasureChunk = 50
 
         init(
             persistenceKey: String,
@@ -179,7 +212,6 @@ struct TranscriptView: NSViewRepresentable {
         func update(rows newRows: [TranscriptRow]) {
             guard let tableView else { return }
 
-            let wasAtBottom = isScrolledToBottom(tableView)
             let previous = rows
             rows = newRows
 
@@ -194,6 +226,7 @@ struct TranscriptView: NSViewRepresentable {
                     let new = newRows[index]
                     let textChanged = old.text != new.text || old.resultText != new.resultText
                     let restChanged = old.isComplete != new.isComplete
+                        || old.isQueued != new.isQueued
                         || old.isExpanded != new.isExpanded
                         || old.toolInput != new.toolInput
                         || old.resultMetadata != new.resultMetadata
@@ -244,20 +277,28 @@ struct TranscriptView: NSViewRepresentable {
                 }
             }
 
-            // Follow the conversation only if the user was already at the
-            // bottom; yanking them back while they read is worse than not
-            // following at all.
-            if wasAtBottom { scrollToBottom(tableView) }
+            // Follow the conversation only while the reader is not holding the
+            // view somewhere else — and never mid-gesture, where a programmatic
+            // scroll cancels their momentum instead of adding to it.
+            if policy.allowsAutoScroll {
+                scrollToBottom(tableView)
+            }
             if previous.count != newRows.count {
-                prefetchHeights(in: tableView, immediateVisible: true)
+                // Only the rows that just arrived, plus what surrounds the
+                // viewport, need measuring now. The rest of the transcript is
+                // swept in bounded chunks once nothing more urgent is happening.
+                measureAroundViewport(in: tableView)
+                scheduleIdleMeasurePass()
             }
         }
 
         func appearanceChanged() {
             guard let tableView else { return }
             pendingTextReload.removeAll()
+            deferredRedraw.removeAll()
             heightCache.removeAll()
-            prefetchHeights(in: tableView, immediateVisible: true)
+            measureAroundViewport(in: tableView)
+            scheduleIdleMeasurePass()
             tableView.reloadData()
         }
 
@@ -269,22 +310,44 @@ struct TranscriptView: NSViewRepresentable {
             let indexes = pendingTextReload.filteredIndexSet { rows.indices.contains($0) }
             pendingTextReload.removeAll()
             guard !indexes.isEmpty else { return }
-            let wasAtBottom = isScrolledToBottom(tableView)
-            // The growing last row must not animate its height change. The
-            // default row-height animation reflows the paragraph the reader
-            // is mid-way through on every streaming delta, which is the
-            // "bouncing" that makes the final response hard to read. A
-            // zero-duration context applies the new height in place instead.
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0
-                context.allowsImplicitAnimation = false
-                tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            let visible = visibleRowRange(in: tableView)
+            let apply = {
+                // The growing last row must not animate its height change. The
+                // default row-height animation reflows the paragraph the reader
+                // is mid-way through on every streaming delta, which is the
+                // "bouncing" that makes the final response hard to read. A
+                // zero-duration context applies the new height in place instead.
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0
+                    context.allowsImplicitAnimation = false
+                    tableView.noteHeightOfRows(withIndexesChanged: indexes)
+                }
+                // Re-drawing a row nobody is looking at is the bulk of the work
+                // a streaming turn asks for once the reader has scrolled up —
+                // the agent writes at the foot of a transcript they left behind.
+                // Its height is already corrected above, so holding the draw
+                // until the view settles changes nothing they can see.
+                let onscreen = indexes.filteredIndexSet { visible.contains($0) }
+                if self.policy.deferOffscreenRedraws {
+                    self.deferredRedraw.formUnion(indexes.subtracting(onscreen))
+                }
+                let redraw = self.policy.deferOffscreenRedraws ? onscreen : indexes
+                if !redraw.isEmpty {
+                    tableView.reloadData(
+                        forRowIndexes: redraw,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                }
             }
-            tableView.reloadData(
-                forRowIndexes: indexes,
-                columnIndexes: IndexSet(integer: 0)
-            )
-            if wasAtBottom { scrollToBottom(tableView) }
+
+            if policy.allowsAutoScroll {
+                apply()
+                scrollToBottom(tableView)
+            } else {
+                // Not following: the reader is reading something further up, and
+                // a row growing below — or above — must not slide it.
+                preservingVisualAnchor(apply)
+            }
         }
 
         private func scheduleTextFlush() {
@@ -309,9 +372,14 @@ struct TranscriptView: NSViewRepresentable {
             // Force the measure now so the offset lands on real content, not the
             // blank band above rows the table hasn't laid out yet.
             tableView.layoutSubtreeIfNeeded()
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            withProgrammaticScroll {
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
             pendingScrollRestore = nil
+            // Reopening a chat part-way up means the reader left it there; the
+            // agent should not haul them back down to resume it.
+            policy.didJump(toBottom: isScrolledToBottom(tableView))
         }
 
         @objc func viewDidResize(_ notification: Notification) {
@@ -320,10 +388,22 @@ struct TranscriptView: NSViewRepresentable {
             guard abs(width - cachedWidth) > 1 else { return }
             cachedWidth = width
             heightCache.removeAll()
-            prefetchHeights(in: tableView, immediateVisible: true)
+            measureAroundViewport(in: tableView)
+            scheduleIdleMeasurePass()
             // A width was just established; a restore that couldn't run on load
             // (view not yet sized) can finally land correctly.
             restorePendingScrollIfReady()
+        }
+
+        @objc func liveScrollWillStart(_ notification: Notification) {
+            policy.userDidBeginScroll()
+            settleWork?.cancel()
+        }
+
+        @objc func liveScrollDidEnd(_ notification: Notification) {
+            // The fingers have left the trackpad but the momentum has not; the
+            // offset going quiet is what actually marks the end of the gesture.
+            scheduleSettle()
         }
 
         @objc func scrollDidChange(_ notification: Notification) {
@@ -335,7 +415,37 @@ struct TranscriptView: NSViewRepresentable {
             }
             persistScrollWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+
+            // Anything that moved the offset and wasn't the transcript itself was
+            // the reader — a gesture, its momentum, or a keyboard scroll, which
+            // posts no live-scroll notification at all.
+            if !isApplyingProgrammaticScroll, let tableView {
+                policy.userDidScroll(atBottom: isScrolledToBottom(tableView))
+                scheduleSettle()
+            }
             updateActiveTurn()
+        }
+
+        /// Marks the view settled once the offset has been quiet for a moment,
+        /// then pays back the work held off during the gesture.
+        private func scheduleSettle() {
+            settleWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let tableView = self.tableView else { return }
+                self.policy.userDidEndScroll(atBottom: self.isScrolledToBottom(tableView))
+                let deferred = self.deferredRedraw.filteredIndexSet { self.rows.indices.contains($0) }
+                self.deferredRedraw.removeAll()
+                if !deferred.isEmpty {
+                    tableView.reloadData(
+                        forRowIndexes: deferred,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                }
+                self.measureAroundViewport(in: tableView)
+                self.scheduleIdleMeasurePass()
+            }
+            settleWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleInterval, execute: work)
         }
 
         // MARK: - Data source
@@ -385,47 +495,149 @@ struct TranscriptView: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
 
-        /// Measure the rows the reader can see *now*, then fill in the rest on
-        /// the next turn of the run loop. NSTableView otherwise asks for heights
-        /// only as rows enter the viewport, which is the blank band at the top
-        /// and bottom of a fast flick — those rows still had the placeholder
-        /// height until they were asked about.
-        private func prefetchHeights(in tableView: NSTableView, immediateVisible: Bool) {
-            guard tableView.bounds.width > 1, !rows.isEmpty else { return }
+        /// The rows the reader can see, plus a small margin so a row entering the
+        /// viewport is already measured rather than measured on arrival.
+        private func visibleRowRange(in tableView: NSTableView) -> Range<Int> {
             let visible = tableView.rows(in: tableView.visibleRect)
             // `rows(in:)` reports NSNotFound when the rect holds no rows; letting
-            // that flow into the range math would make `start` exceed `end` and
-            // trap. Anchor to the top instead so the deferred full pass still runs.
-            let anchor = visible.location == NSNotFound ? 0 : visible.location
-            let start = max(0, anchor - 40)
-            let end = min(rows.count, max(anchor + max(visible.length, 1) + 60, start + 1))
-            for index in start..<end {
-                _ = self.tableView(tableView, heightOfRow: index)
+            // that flow into the range math would make `start` exceed `end`.
+            guard visible.location != NSNotFound else { return 0..<0 }
+            let start = max(0, visible.location - 4)
+            let end = min(rows.count, visible.location + max(visible.length, 1) + 4)
+            guard start < end else { return 0..<0 }
+            return start..<end
+        }
+
+        /// Measures `indices`, invalidating only the rows whose height actually
+        /// moved.
+        ///
+        /// This filter is the point. `noteHeightOfRows` makes the table re-derive
+        /// every row origin below the ones it is given, so invalidating a row that
+        /// already has the right height costs a full re-layout for a result
+        /// identical to what was on screen. Most rows in a transcript never change
+        /// height at all, so measuring first and noting second turns what used to
+        /// be a whole-document reflow into, usually, nothing.
+        @discardableResult
+        private func measure(_ indices: some Sequence<Int>, in tableView: NSTableView) -> IndexSet {
+            var changed = IndexSet()
+            for index in indices where rows.indices.contains(index) {
+                let current = tableView.rect(ofRow: index).height
+                let measured = self.tableView(tableView, heightOfRow: index)
+                if abs(current - measured) > 0.5 { changed.insert(index) }
             }
+            guard !changed.isEmpty else { return changed }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0
                 context.allowsImplicitAnimation = false
-                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: start..<end))
+                tableView.noteHeightOfRows(withIndexesChanged: changed)
             }
+            return changed
+        }
 
-            prefetchWork?.cancel()
-            guard immediateVisible, heightCache.count < rows.count else { return }
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, let tableView = self.tableView, !self.rows.isEmpty else { return }
-                for index in self.rows.indices {
-                    _ = self.tableView(tableView, heightOfRow: index)
-                }
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0
-                    context.allowsImplicitAnimation = false
-                    tableView.noteHeightOfRows(withIndexesChanged: IndexSet(self.rows.indices))
-                }
+        /// Measures around the viewport, keeping whatever the reader is looking at
+        /// visually still if the correction lands above them.
+        private func measureAroundViewport(in tableView: NSTableView) {
+            guard tableView.bounds.width > 1, !rows.isEmpty else { return }
+            let window = visibleRowRange(in: tableView)
+            let start = max(0, window.lowerBound - 20)
+            let end = min(rows.count, max(window.upperBound + 30, start + 1))
+            guard start < end else { return }
+            if policy.allowsAutoScroll {
+                measure(start..<end, in: tableView)
+            } else {
+                preservingVisualAnchor { self.measure(start..<end, in: tableView) }
             }
-            prefetchWork = work
-            DispatchQueue.main.async(execute: work)
+        }
+
+        /// Sweeps the rest of the transcript in bounded chunks on idle turns of
+        /// the run loop.
+        ///
+        /// NSTableView asks for a height only as a row nears the viewport, so an
+        /// unmeasured row is the blank card at the edge of a fast flick. The fix
+        /// for that used to be measuring *every* row and invalidating *every*
+        /// row's height — on every appended row, which while an agent works is
+        /// constant. That reflowed the whole document tens of times a turn, and it
+        /// is what made scrolling during a live turn feel like wading. Chunking
+        /// bounds each turn's cost, yielding while a gesture is in flight keeps the
+        /// gesture smooth, and the measured-height filter means the sweep usually
+        /// invalidates nothing at all.
+        private func scheduleIdleMeasurePass() {
+            guard idleMeasureWork == nil else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.idleMeasureWork = nil
+                self.runIdleMeasureChunk()
+            }
+            idleMeasureWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+        }
+
+        private func runIdleMeasureChunk() {
+            guard let tableView, tableView.bounds.width > 1, !rows.isEmpty else { return }
+            // A gesture in flight outranks speculative work; try again once it
+            // settles rather than measuring underneath it.
+            guard policy.allowsBackgroundMeasuring else { scheduleIdleMeasurePass(); return }
+
+            // The unmeasured rows themselves, not the span they sit in: gaps
+            // between them are already measured, and sweeping across those would
+            // put the bound back on the span rather than on the work.
+            var chunk: [Int] = []
+            var pending = false
+            for index in rows.indices where heightCache[rows[index].id] == nil {
+                if chunk.count >= Self.idleMeasureChunk { pending = true; break }
+                chunk.append(index)
+            }
+            guard !chunk.isEmpty else { return }
+            if policy.allowsAutoScroll {
+                measure(chunk, in: tableView)
+            } else {
+                preservingVisualAnchor { self.measure(chunk, in: tableView) }
+            }
+            if pending { scheduleIdleMeasurePass() }
+        }
+
+        /// Applies a layout change while keeping the row the reader is looking at
+        /// visually still.
+        ///
+        /// A table preserves its *document* offset across a height change, not the
+        /// reader's place in it: correct a row above the viewport and everything
+        /// they are reading slides by that much. During a live turn those
+        /// corrections arrive continuously, which is the drift that makes scrolling
+        /// back through a working agent feel unsteady. Re-pinning the topmost
+        /// visible row to the same screen position turns the correction invisible.
+        private func preservingVisualAnchor(_ body: () -> Void) {
+            guard let tableView,
+                  let scrollView = tableView.enclosingScrollView,
+                  case let visible = tableView.rows(in: tableView.visibleRect),
+                  visible.location != NSNotFound, visible.length > 0
+            else { body(); return }
+
+            let clip = scrollView.contentView
+            let anchor = visible.location
+            let before = tableView.rect(ofRow: anchor).minY - clip.bounds.origin.y
+            body()
+            tableView.layoutSubtreeIfNeeded()
+            let after = tableView.rect(ofRow: anchor).minY - clip.bounds.origin.y
+            let drift = after - before
+            guard abs(drift) > 0.5 else { return }
+            withProgrammaticScroll {
+                clip.scroll(to: NSPoint(x: 0, y: max(0, clip.bounds.origin.y + drift)))
+                scrollView.reflectScrolledClipView(clip)
+            }
         }
 
         // MARK: - Scrolling
+
+        /// Marks a scroll as the transcript's own, so the bounds-change it causes
+        /// is not read back as the reader scrolling away — which would switch
+        /// following off the instant the agent pinned to the bottom. Bounds
+        /// notifications post synchronously, so the flag can be cleared here.
+        private func withProgrammaticScroll(_ body: () -> Void) {
+            let wasApplying = isApplyingProgrammaticScroll
+            isApplyingProgrammaticScroll = true
+            body()
+            isApplyingProgrammaticScroll = wasApplying
+        }
 
         private func isScrolledToBottom(_ tableView: NSTableView) -> Bool {
             guard let scrollView = tableView.enclosingScrollView else { return true }
@@ -446,13 +658,21 @@ struct TranscriptView: NSViewRepresentable {
             tableView.layoutSubtreeIfNeeded()
             let clip = scrollView.contentView
             let targetY = max(0, tableView.bounds.height - clip.bounds.height)
-            clip.scroll(to: NSPoint(x: 0, y: targetY))
-            scrollView.reflectScrolledClipView(clip)
+            // Already there: scrolling anyway would still post a bounds change and
+            // cancel any momentum the reader has in flight, for no movement.
+            guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
+            withProgrammaticScroll {
+                clip.scroll(to: NSPoint(x: 0, y: targetY))
+                scrollView.reflectScrolledClipView(clip)
+            }
         }
 
         func scroll(to row: Int) {
             guard let tableView, rows.indices.contains(row) else { return }
-            tableView.scrollRowToVisible(row)
+            withProgrammaticScroll { tableView.scrollRowToVisible(row) }
+            // Jumping to an earlier turn is a request to read there, so the agent
+            // stops pulling the view back down until the reader returns to the foot.
+            policy.didJump(toBottom: isScrolledToBottom(tableView))
         }
 
         private func updateActiveTurn() {
@@ -1127,6 +1347,7 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.text)
             hasher.combine(row.resultText)
             hasher.combine(row.isComplete)
+            hasher.combine(row.isQueued)
             hasher.combine(row.isExpanded)
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
@@ -1307,6 +1528,10 @@ final class TranscriptCell: NSTableCellView {
     }
 
     private static func badgeText(for row: TranscriptRow) -> String {
+        // A message the engine queued behind an open turn has not reached the
+        // agent yet. Saying so on the row is the difference between "waiting its
+        // turn" and "sent, and ignored".
+        if row.isQueued { return "QUEUED" }
         switch row.kind {
         // The visual treatment already says who is talking — a tinted block for
         // the user, plain prose for the agent — so "YOU"/"AGENT" on every row
@@ -1338,6 +1563,9 @@ final class TranscriptCell: NSTableCellView {
     }
 
     private static func textColor(for row: TranscriptRow) -> NSColor {
+        // Queued text is muted for the same reason its bubble is: it has been
+        // written, but the agent has not read it yet.
+        if row.isQueued { return .secondaryLabelColor }
         switch row.kind {
         case .thinking, .divider, .activityGroup, .turnFooter: return .secondaryLabelColor
         case .error: return .systemRed
@@ -1346,6 +1574,10 @@ final class TranscriptCell: NSTableCellView {
     }
 
     private static func background(for row: TranscriptRow) -> NSColor {
+        // A queued message is drawn as a faint outline of the bubble it will
+        // become, so it reads as waiting rather than as one more sent message
+        // the agent has silently skipped over.
+        if row.isQueued { return .controlAccentColor.withAlphaComponent(0.04) }
         switch row.kind {
         case .userMessage: return .controlAccentColor.withAlphaComponent(0.10)
         // Activity rows stay on the plain transcript — no full-width band. The

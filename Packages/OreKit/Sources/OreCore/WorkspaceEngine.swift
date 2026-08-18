@@ -187,6 +187,7 @@ public actor WorkspaceEngine {
                         for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
                     )?.capabilities ?? HarnessCapabilities(),
                     queuedMessageCount: runtime.queuedMessageCount,
+                    isTurnActive: runtime.isTurnActive,
                     contextUsage: runtime.latestUsage
                 )
             }
@@ -356,6 +357,7 @@ public actor WorkspaceEngine {
                 for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
             )?.capabilities ?? HarnessCapabilities(),
             queuedMessageCount: runtime.queuedMessageCount,
+            isTurnActive: runtime.isTurnActive,
             contextUsage: runtime.latestUsage
         )
     }
@@ -513,6 +515,9 @@ public actor WorkspaceEngine {
         runtime.transcript = nil
         runtime.isTurnActive = false
         setStatus(.idle, runtime: runtime)
+        // The turn is over as far as the queue gate is concerned, and the
+        // composer reads that gate to decide whether it queues or sends.
+        publishChatChange(runtime)
     }
 
     // MARK: - Messaging
@@ -594,29 +599,50 @@ public actor WorkspaceEngine {
             return false
         }
 
-        let harnessKind = HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-        if harnessKind == .claudeCode,
-           runtime.session != nil,
-           let requestedEffort = request.reasoningEffort,
-           runtime.sessionEffort != requestedEffort {
-            // Claude's effort override is session-scoped. Restarting and
-            // resuming the provider session applies the new level without
-            // losing the conversation.
-            await stopSession(chatID: runtime.record.chatID)
-        }
-        let session = try await ensureSession(
-            chatID: runtime.record.chatID,
-            reasoningEffort: request.reasoningEffort
-        )
-        try await captureCheckpoint(runtime: runtime)
-        await runtime.transcript?.recordPrompt(text, attachments: request.attachments)
-        try await session.send(UserMessage(
-            text: text,
-            attachmentPaths: request.attachments.map(\.relativePath),
-            reasoningEffort: request.reasoningEffort,
-            serviceTier: request.serviceTier
-        ))
+        // Claim the turn before the first suspension point, not after the last.
+        //
+        // This is an actor, so every `await` below is a place another `send` can
+        // interleave — and `ensureSession` can spend seconds spawning a CLI. A
+        // second message arriving in that window used to read `isTurnActive` as
+        // false, skip the queue above, and hand a running harness a second
+        // prompt: cursor-agent rejects that outright, and the message is lost.
+        // Claiming first makes the queue gate cover the whole send.
         runtime.isTurnActive = true
+        do {
+            let harnessKind = HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
+            if harnessKind == .claudeCode,
+               runtime.session != nil,
+               let requestedEffort = request.reasoningEffort,
+               runtime.sessionEffort != requestedEffort {
+                // Claude's effort override is session-scoped. Restarting and
+                // resuming the provider session applies the new level without
+                // losing the conversation.
+                await stopSession(chatID: runtime.record.chatID)
+                // `stopSession` releases the claim on its way past; the turn this
+                // call is about to start still needs it held.
+                runtime.isTurnActive = true
+            }
+            let session = try await ensureSession(
+                chatID: runtime.record.chatID,
+                reasoningEffort: request.reasoningEffort
+            )
+            try await captureCheckpoint(runtime: runtime)
+            await runtime.transcript?.recordPrompt(text, attachments: request.attachments)
+            try await session.send(UserMessage(
+                text: text,
+                attachmentPaths: request.attachments.map(\.relativePath),
+                reasoningEffort: request.reasoningEffort,
+                serviceTier: request.serviceTier
+            ))
+        } catch {
+            // The turn never started. Releasing the claim keeps the composer, and
+            // anything queued behind it, from waiting on a completion that can
+            // never arrive.
+            runtime.isTurnActive = false
+            publishChatChange(runtime)
+            throw error
+        }
+        publishChatChange(runtime)
 
         if !request.diffComments.isEmpty {
             try? await store.markDiffCommentsSent(workspaceID: workspaceID)
@@ -845,6 +871,7 @@ public actor WorkspaceEngine {
         let runtime = try await runtime(for: chatID)
         try await runtime.session?.interrupt()
         runtime.isTurnActive = false
+        publishChatChange(runtime)
     }
 
     /// Switches the running chat's permission mode. Never requires a new chat.
@@ -1526,6 +1553,7 @@ public actor WorkspaceEngine {
                 for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
             )?.capabilities ?? HarnessCapabilities(),
             queuedMessageCount: runtime.queuedMessageCount,
+            isTurnActive: runtime.isTurnActive,
             contextUsage: runtime.latestUsage
         ))
     }

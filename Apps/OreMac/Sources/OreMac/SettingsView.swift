@@ -19,6 +19,7 @@ struct SettingsView: View {
     @AppStorage("ore.notifications.enabled") private var notifications = true
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
     @AppStorage("ore.notifications.sound") private var sound = true
+    @AppStorage(NarrationEngine.masterSwitchKey) private var narrationEnabled = true
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
 
     @State private var selectedHarness: HarnessKind = .claudeCode
@@ -181,6 +182,15 @@ struct SettingsView: View {
                     .disabled(!notifications)
                 Toggle("Play completion sounds", isOn: $sound)
                     .disabled(!notifications)
+            }
+            SettingsCard(title: "Spoken narration", icon: "speaker.wave.2") {
+                Toggle("Allow spoken narration", isOn: $narrationEnabled)
+                Text("Tabs with the speaker toggled on narrate their agent's work aloud — what it's doing now, what needs you, and when it finishes. Summaries are generated on this Mac; nothing leaves it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
+                NarrationVoicePicker(voice: appModel.narration.neuralVoice)
+                    .disabled(!narrationEnabled)
             }
             SettingsCard(title: "Voice input", icon: "mic") {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")

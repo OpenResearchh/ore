@@ -226,6 +226,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         status: AgentStatus = .idle,
         capabilities: HarnessCapabilities = HarnessCapabilities(),
         queuedMessageCount: Int = 0,
+        isTurnActive: Bool = false,
         contextUsage: UsageReport? = nil
     ) -> ChatSummary {
         ChatSummary(
@@ -241,6 +242,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
             isClosed: isClosed,
             draftText: draftText,
             queuedMessageCount: queuedMessageCount,
+            isTurnActive: isTurnActive,
             contextUsage: contextUsage,
             createdAt: createdAt,
             lastActivity: lastActivityAt

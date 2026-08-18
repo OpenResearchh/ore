@@ -55,6 +55,15 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
     public var isClosed: Bool
     public var draftText: String
     public var queuedMessageCount: Int
+    /// Whether a turn is open — and so whether the next message sent will be
+    /// queued rather than delivered.
+    ///
+    /// Published rather than inferred from `status`, because the two genuinely
+    /// differ: an agent blocked on a permission request reads as `awaitingInput`
+    /// while its turn is still very much open. Deriving "will this queue?" from
+    /// the status is how the composer came to promise an immediate send for a
+    /// message the engine then quietly queued.
+    public var isTurnActive: Bool
     public var contextUsage: UsageReport?
     public var createdAt: Date
     public var lastActivity: Date?
@@ -72,6 +81,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         isClosed: Bool = false,
         draftText: String = "",
         queuedMessageCount: Int = 0,
+        isTurnActive: Bool = false,
         contextUsage: UsageReport? = nil,
         createdAt: Date = Date(),
         lastActivity: Date? = nil
@@ -88,6 +98,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         self.isClosed = isClosed
         self.draftText = draftText
         self.queuedMessageCount = queuedMessageCount
+        self.isTurnActive = isTurnActive
         self.contextUsage = contextUsage
         self.createdAt = createdAt
         self.lastActivity = lastActivity

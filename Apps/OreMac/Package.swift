@@ -26,6 +26,10 @@ let package = Package(
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.9.0"),
         // In-app updates.
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.9.0"),
+        // Neural on-device TTS. Apple's voices are intelligible but plainly
+        // synthetic; narration is listened to for minutes at a time, so the
+        // voice is the feature.
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
     ],
     targets: [
         .executableTarget(
@@ -40,6 +44,7 @@ let package = Package(
                 .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             resources: [
                 .copy("Resources/HarnessIcons"),

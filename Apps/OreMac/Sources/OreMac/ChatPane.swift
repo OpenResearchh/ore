@@ -328,6 +328,12 @@ struct ChatPane: View {
             guard voice.isActive else { return }
             applyLiveVoiceIntents(spoken: text)
         }
+        .onChange(of: voice.isActive) { _, active in
+            // Dictation owns the audio: narration stops for the mic's whole
+            // lifetime so the user isn't talked over and TTS can't leak into
+            // the transcription.
+            model.narration.setMicActive(active)
+        }
         .onChange(of: voice.status) { _, status in
             handleVoiceStatusChange(status)
         }
@@ -352,6 +358,9 @@ struct ChatPane: View {
         }
         .onDisappear {
             finishVoice(.commitToDraft)
+            // The pane is gone before `voice.isActive`'s onChange can fire;
+            // without this a dying mic would leave narration muted forever.
+            model.narration.setMicActive(false)
         }
         .onExitCommand {
             finishVoice(.cancel)
@@ -1535,13 +1544,48 @@ struct ChatPane: View {
         }
     }
 
-    /// Mic and send are one trailing pair: same 30pt circle, 8pt between them,
-    /// and a wider gap from the chips so the accent action isn't crowded.
+    /// Speaker, mic and send are one trailing cluster: same 30pt circle, 8pt
+    /// between them, and a wider gap from the chips so the accent action
+    /// isn't crowded.
     private var composerSendCluster: some View {
         HStack(spacing: OreTheme.Space.sm) {
+            speakerButton
             micButton
             sendButton
         }
+    }
+
+    /// Per-tab narration toggle: on means this chat's agent activity is
+    /// spoken aloud, even when the tab is in the background (where it only
+    /// interjects for things that need the user).
+    private var speakerButton: some View {
+        let narrationOn = chatSummary.map { model.narration.isEnabled($0.id) } ?? false
+        let isSpeaking = narrationOn && chatSummary != nil
+            && model.narration.speakingChatID == chatSummary?.id
+        return Button {
+            guard let chatID = chatSummary?.id else { return }
+            model.narration.toggle(chatID)
+        } label: {
+            Image(systemName: narrationOn ? "speaker.wave.2.fill" : "speaker.slash")
+                .font(.system(size: 13, weight: .semibold))
+                .symbolEffect(.variableColor.iterative, isActive: isSpeaking && !reduceMotion)
+                .foregroundStyle(narrationOn ? Color.accentColor : .primary)
+                .frame(width: 30, height: 30)
+                .background(
+                    narrationOn ? Color.accentColor.opacity(0.14) : OreTheme.subduedFill,
+                    in: Circle()
+                )
+                .overlay(
+                    Circle().stroke(
+                        narrationOn ? Color.accentColor.opacity(0.45) : OreTheme.hairline,
+                        lineWidth: 1
+                    )
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(chatSummary == nil)
+        .help(narrationOn ? "Stop narrating agent activity" : "Narrate agent activity aloud")
     }
 
     private var micButton: some View {
@@ -1967,7 +2011,7 @@ struct ChatPane: View {
     private var sendButton: some View {
         if #available(macOS 26.0, *) {
             Button(action: send) {
-                Image(systemName: chat.isBusy ? "text.append" : "arrow.up")
+                Image(systemName: chat.willQueueNextMessage ? "text.append" : "arrow.up")
                     .font(.system(size: 13, weight: .bold))
                     .frame(width: 30, height: 30)
             }
@@ -1976,10 +2020,10 @@ struct ChatPane: View {
             .tint(.accentColor)
             .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
-            .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
+            .help(chat.queueHint ?? "Send (⌘↩)")
         } else {
             Button(action: send) {
-                Image(systemName: chat.isBusy ? "text.append" : "arrow.up")
+                Image(systemName: chat.willQueueNextMessage ? "text.append" : "arrow.up")
                     .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 30, height: 30)
@@ -1989,7 +2033,7 @@ struct ChatPane: View {
             .buttonStyle(.plain)
             .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
             .keyboardShortcut(.return, modifiers: .command)
-            .help(chat.isBusy ? "Queue this message (⌘↩)" : "Send (⌘↩)")
+            .help(chat.queueHint ?? "Send (⌘↩)")
         }
     }
 

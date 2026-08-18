@@ -62,8 +62,48 @@ final class ChatState {
     /// pass over the diff, not one message per note.
     private(set) var draftComments: [DiffCommentReference] = []
 
+    /// The agent is actively producing — the spinner, the elapsed timer, the
+    /// live turn staying expanded. Deliberately *not* the same question as
+    /// whether a message would queue: an agent blocked on a permission prompt
+    /// has stopped working but has not finished its turn.
     var isBusy: Bool {
         status == .thinking || status == .requesting || status == .runningTool
+    }
+
+    /// Whether the next message sent will be queued instead of delivered.
+    ///
+    /// Mirrors the engine's own gate rather than guessing from `status`. The two
+    /// disagree precisely where it matters — an agent awaiting a permission
+    /// answer reads as not-busy while its turn is still open — and the composer
+    /// promising "Send" for a message the engine then queued is what made a sent
+    /// message appear to vanish.
+    var willQueueNextMessage: Bool { isTurnActive }
+
+    /// What the send button promises, when what it promises is not "send".
+    /// `awaitingInput` gets its own wording because it is the case that used to
+    /// look idle: the agent has stopped working, so "queued" on its own reads as
+    /// a bug rather than as the turn still being open on a question.
+    var queueHint: String? {
+        guard willQueueNextMessage else { return nil }
+        if status == .awaitingInput {
+            return "Queue this message — the agent is waiting on your answer (⌘↩)"
+        }
+        return "Queue this message (⌘↩)"
+    }
+
+    /// The client's copy of the engine's `isTurnActive`. Driven by turn events,
+    /// and optimistically by our own send so the very next keystroke is judged
+    /// against the turn we just started rather than the one that just ended.
+    private(set) var isTurnActive = false
+
+    /// Reconciles against the engine's published gate. Events are the fast path;
+    /// this is the correction when the two have drifted — a turn that ended in a
+    /// way the client never saw an event for, say a session killed underneath it.
+    func reconcileTurnActive(_ serverValue: Bool) {
+        // Our optimistic claim is newer than the summary that crossed it in
+        // flight: keep it until a turn event or a later summary agrees.
+        if isTurnActive, !serverValue, !hasTurnEventArrived { return }
+        isTurnActive = serverValue
     }
 
     /// When the current turn began, for the live "time elapsed" counter. Nil
@@ -91,9 +131,14 @@ final class ChatState {
 
         case .turnStarted(let turn):
             currentTurnID = turn.turnID
+            isTurnActive = true
             streamingRowIndex.removeAll()
             turnStartedAt = Date()
             hasTurnEventArrived = true
+            // A turn starting is what a queued message was waiting for. The
+            // oldest pending row is the one it drained, so it stops being
+            // pending and joins the turn it actually became.
+            claimOldestPendingRow(turnID: turn.turnID)
             // A new turn means the user pressed on past the last failure, and
             // past any plan that was still awaiting an answer.
             prominentError = nil
@@ -179,6 +224,7 @@ final class ChatState {
 
         case .turnCompleted(let result):
             currentTurnID = nil
+            isTurnActive = false
             streamingRowIndex.removeAll()
             turnStartedAt = nil
             hasTurnEventArrived = true
@@ -216,6 +262,10 @@ final class ChatState {
 
         case .sessionEnded:
             status = .idle
+            // The engine drops its own claim here; a session that died mid-turn
+            // never reports `.turnCompleted`, and a composer left believing a
+            // turn is open would queue every later message behind a dead one.
+            isTurnActive = false
 
         case .contextCompacted(let compaction):
             // The harness summarised its own history to stay under the window.
@@ -253,14 +303,24 @@ final class ChatState {
         attachments: [Attachment] = [],
         comments: [DiffCommentReference]
     ) {
+        // The engine queues whenever a turn is open, so predicting the same
+        // thing here is what keeps the row the user sees honest.
+        let willQueue = willQueueNextMessage
         rows.append(TranscriptRow(
             id: "user-\(UUID().uuidString)",
             turnID: currentTurnID ?? TurnID(rawValue: "pending"),
             kind: .userMessage,
             text: text,
+            isQueued: willQueue,
             attachedComments: comments,
             attachments: attachments
         ))
+        guard !willQueue else {
+            // Nothing has been handed to the agent, so claiming a turn started
+            // would run a spinner and an elapsed timer against a message that is
+            // sitting in a queue. The row says "queued" instead.
+            return
+        }
         // Optimistic: the agent hasn't reported anything yet, but the user
         // pressed send and the UI must not look idle. The timer starts now so
         // a slow-booting CLI still shows elapsed time; `.turnStarted`
@@ -268,6 +328,17 @@ final class ChatState {
         status = .requesting
         turnStartedAt = Date()
         hasTurnEventArrived = false
+        // Claim the turn locally for the same reason the engine claims it before
+        // its own awaits: a second message typed in the gap before `.turnStarted`
+        // must be judged against this turn, not the absence of one.
+        isTurnActive = true
+    }
+
+    /// A queued row becomes a real one when the turn it was waiting for starts.
+    private func claimOldestPendingRow(turnID: TurnID) {
+        guard let index = rows.firstIndex(where: { $0.isQueued }) else { return }
+        rows[index].isQueued = false
+        rows[index].turnID = turnID
     }
 
     func addDraftComment(_ reference: DiffCommentReference) {
@@ -386,9 +457,15 @@ struct TranscriptRow: Identifiable, Sendable {
     }
 
     let id: String
-    let turnID: TurnID
+    /// Not `let`: a queued message is written before the turn it will land in
+    /// exists, and adopts that turn's id when the turn finally starts.
+    var turnID: TurnID
     let kind: Kind
     var text: String
+    /// Written but not yet handed to the agent — it is sitting in the engine's
+    /// queue behind an open turn. Drawn as pending, and cleared when a turn
+    /// starts and claims it.
+    var isQueued = false
     var toolName: String?
     var toolCallID: ToolCallID?
     /// The subagent (Task) tool call this row belongs to, when it was produced

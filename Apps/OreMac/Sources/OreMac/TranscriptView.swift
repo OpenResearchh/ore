@@ -23,6 +23,9 @@ struct TranscriptView: NSViewRepresentable {
     }
 
     var rows: [TranscriptRow]
+    /// While the agent is working, skip per-move attachment hit-testing so
+    /// mouseMoved events cannot starve clicks on the main thread.
+    var isBusy: Bool = false
     var worktreePath: String = ""
     var persistenceKey: String
     var onRevert: (TurnID) -> Void
@@ -127,6 +130,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.onTurnAction = onTurnAction
         context.coordinator.canFork = canFork
         context.coordinator.worktreePath = worktreePath
+        context.coordinator.isBusy = isBusy
         context.coordinator.update(rows: rows)
     }
 
@@ -144,6 +148,7 @@ struct TranscriptView: NSViewRepresentable {
         var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
         var canFork = false
         var worktreePath: String
+        var isBusy = false
         let persistenceKey: String
 
         private var rows: [TranscriptRow] = []
@@ -224,18 +229,19 @@ struct TranscriptView: NSViewRepresentable {
                 for index in newRows.indices {
                     let old = previous[index]
                     let new = newRows[index]
-                    let textChanged = old.text != new.text || old.resultText != new.resultText
-                    let restChanged = old.isComplete != new.isComplete
+                    // Diff identity, not payload. Comparing `text` / `toolInput`
+                    // / hashing grouped tool output was O(transcript bytes) on
+                    // every flush and is what froze a long session.
+                    let isStructural = old.isComplete != new.isComplete
                         || old.isQueued != new.isQueued
                         || old.isExpanded != new.isExpanded
-                        || old.toolInput != new.toolInput
-                        || old.resultMetadata != new.resultMetadata
+                        || old.subagentChildCount != new.subagentChildCount
+                    let contentChanged = old.contentRevision != new.contentRevision
                         || old.activitySignature != new.activitySignature
-                        || old.attachments != new.attachments
-                    if textChanged || restChanged {
+                    if contentChanged || isStructural {
                         heightCache.removeValue(forKey: new.id)
                         changed.insert(index)
-                        if restChanged { structural = true }
+                        if isStructural { structural = true }
                     }
                 }
                 guard !changed.isEmpty else { return }
@@ -485,6 +491,7 @@ struct TranscriptView: NSViewRepresentable {
                 with: rows[row],
                 worktreePath: worktreePath,
                 canFork: canFork,
+                skipHoverTracking: isBusy,
                 onRevert: onRevert,
                 onToggleActivity: onToggleActivity,
                 onOpenFile: onOpenFile,
@@ -653,11 +660,13 @@ struct TranscriptView: NSViewRepresentable {
             // Once the streaming row grows taller than the viewport,
             // `scrollRowToVisible` aligns the row's *top*, so newest text keeps
             // jumping out of view; pinning the bottom keeps the latest line
-            // steady at the foot of the transcript. Layout first so the row's
-            // freshly-changed height is reflected in the measurement.
-            tableView.layoutSubtreeIfNeeded()
+            // steady at the foot of the transcript. `rect(ofRow:)` reads the
+            // height cache after `noteHeightOfRows` — laying out the whole
+            // subtree on every flush was a stall of its own.
+            let lastRect = tableView.rect(ofRow: rows.count - 1)
+            let contentHeight = lastRect == .zero ? tableView.bounds.height : lastRect.maxY
             let clip = scrollView.contentView
-            let targetY = max(0, tableView.bounds.height - clip.bounds.height)
+            let targetY = max(0, contentHeight - clip.bounds.height)
             // Already there: scrolling anyway would still post a bounds change and
             // cancel any momentum the reader has in flight, for no movement.
             guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
@@ -1029,6 +1038,7 @@ final class TranscriptCell: NSTableCellView {
         with row: TranscriptRow,
         worktreePath: String = "",
         canFork: Bool = false,
+        skipHoverTracking: Bool = false,
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
@@ -1080,6 +1090,7 @@ final class TranscriptCell: NSTableCellView {
         label.dismissAttachmentPreview()
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
+        label.skipHoverTracking = skipHoverTracking
         // Activity groups toggle on a click, so their text isn't selectable;
         // every other row is, now that selecting no longer restyles it. The
         // gestures the cell used to own are routed through the text view too,
@@ -1304,7 +1315,7 @@ final class TranscriptCell: NSTableCellView {
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
                 highlighter: SyntaxHighlighter.shared
-            ).render(row.text)
+            ).render(row.text, highlighting: row.isComplete ? .all : .stablePrefix)
 
         case .toolCall, .thinking, .error:
             rendered = processText(for: row, worktreePath: worktreePath)
@@ -1344,6 +1355,8 @@ final class TranscriptCell: NSTableCellView {
         private func signature(for row: TranscriptRow, appearance: String) -> Int {
             var hasher = Hasher()
             hasher.combine(appearance)
+            hasher.combine(row.contentRevision)
+            hasher.combine(row.activitySignature)
             hasher.combine(row.text)
             hasher.combine(row.resultText)
             hasher.combine(row.isComplete)
@@ -1351,7 +1364,7 @@ final class TranscriptCell: NSTableCellView {
             hasher.combine(row.isExpanded)
             hasher.combine(row.toolInput)
             hasher.combine(row.resultMetadata)
-            hasher.combine(row.activitySignature)
+            hasher.combine(row.resolvedSubject)
             hasher.combine(row.attachments)
             hasher.combine(row.subagentChildCount)
             return hasher.finalize()
@@ -1960,14 +1973,14 @@ final class TranscriptCell: NSTableCellView {
             if index > 0 { result.append(NSAttributedString(string: "   ", attributes: secondary)) }
             // The chip carries its own +/− counts, so the footer doesn't append
             // them again alongside it.
-            let pill = subjectPillImage(
+            let pill = Self.wrappingChipImage(subjectPillImage(
                 identity: FileVisualIdentity(path: file.path),
                 text: (file.path as NSString).lastPathComponent,
                 monospace: false,
                 tint: .systemOrange,
                 insertions: file.insertions,
                 deletions: file.deletions
-            )
+            ))
             let attachment = NSTextAttachment()
             attachment.image = pill
             let rowFont = NSFont.systemFont(ofSize: 11.5, weight: .regular)
@@ -1991,6 +2004,26 @@ final class TranscriptCell: NSTableCellView {
             ))
         }
         return result
+    }
+
+    /// Extra height around a wrapping footer chip. Half sits above the stroke
+    /// and half below, so two stacked rows have a visible gutter instead of
+    /// sharing an edge. Applied in the bitmap because TextKit scales an
+    /// attachment to `bounds` — padding the rect would stretch the chip.
+    private static let footerChipRowGap: CGFloat = 6
+
+    private static func wrappingChipImage(_ pill: NSImage) -> NSImage {
+        let gap = footerChipRowGap
+        let size = NSSize(width: pill.size.width, height: pill.size.height + gap)
+        return NSImage(size: size, flipped: false) { _ in
+            pill.draw(
+                in: NSRect(x: 0, y: gap / 2, width: pill.size.width, height: pill.size.height),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1
+            )
+            return true
+        }
     }
 
     private struct ChangedFile { var path: String; var insertions: Int; var deletions: Int }
@@ -2461,6 +2494,10 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
     var onSingleClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onOpenFile: ((String) -> Void)?
+    /// Agent-busy: don't TextKit-hit-test on every mouseMoved. Those events
+    /// queued ahead of clicks and are a large part of "the close button does
+    /// nothing until I click twice."
+    var skipHoverTracking = false
 
     private var hoverTracking: NSTrackingArea?
     private let attachmentPreview = AttachmentPreviewController()
@@ -2478,6 +2515,7 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        guard !skipHoverTracking else { return }
         updateAttachmentPreview(at: convert(event.locationInWindow, from: nil))
     }
 

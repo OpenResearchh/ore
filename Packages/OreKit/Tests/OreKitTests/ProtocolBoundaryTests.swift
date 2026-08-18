@@ -205,4 +205,17 @@ struct ProtocolBoundaryTests {
             #expect(decoded.name == request.name)
         }
     }
+
+    @Test func aSetModeSuggestionImpliesAcceptEdits() {
+        #expect(PermissionDecision.allowWithSuggestion([
+            "type": "setMode", "mode": "acceptEdits",
+        ]).impliedPermissionMode == .acceptEdits)
+        #expect(PermissionDecision.allowWithSuggestion([
+            "type": "setMode",
+        ]).impliedPermissionMode == .acceptEdits)
+        #expect(PermissionDecision.allow.impliedPermissionMode == nil)
+        #expect(PermissionDecision.allowWithSuggestion([
+            "decision": "acceptForSession",
+        ]).impliedPermissionMode == nil)
+    }
 }

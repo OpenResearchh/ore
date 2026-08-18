@@ -680,8 +680,30 @@ struct TranscriptAppearanceTests {
         #expect(darkPixels != lightPixels)
     }
 
+    @Test func footerFileChipsIncludeAWrapGutter() {
+        // Wrapped footer chips used to sit stroke-to-stroke. The bitmap is
+        // taller than the pill itself so a second row has a visible gap.
+        let edit = editRow()
+        let footer = TranscriptRow(
+            id: "footer",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [edit]
+        )
+        let processHeight = chipImage(in: TranscriptCell.attributedText(for: edit))?.size.height ?? 0
+        let footerHeight = chipImage(in: TranscriptCell.attributedText(for: footer))?.size.height ?? 0
+        #expect(processHeight > 0)
+        #expect(footerHeight >= processHeight + 6)
+    }
+
     /// The PNG bytes of the row's first inline image — the file chip.
     private func chipPixels(in text: NSAttributedString) -> Data? {
+        guard let found = chipImage(in: text), let tiff = found.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+    }
+
+    private func chipImage(in text: NSAttributedString) -> NSImage? {
         var found: NSImage?
         text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, _, stop in
             if let image = (value as? NSTextAttachment)?.image, image.size.width > 20 {
@@ -689,8 +711,7 @@ struct TranscriptAppearanceTests {
                 stop.pointee = true
             }
         }
-        guard let found, let tiff = found.tiffRepresentation else { return nil }
-        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+        return found
     }
 }
 

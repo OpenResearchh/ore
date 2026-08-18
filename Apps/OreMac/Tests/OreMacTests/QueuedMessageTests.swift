@@ -45,6 +45,36 @@ struct QueuedMessageTests {
         #expect(state.queueHint?.contains("waiting on your answer") == true)
     }
 
+    @Test func answeringAPermissionResumesTheBusyComposer() {
+        // After Allow / Accept Edits the card disappears. If status stays
+        // `awaitingInput`, the composer looks idle while the same turn is
+        // still running and the next message still queues.
+        let state = ChatState()
+        let turnID = started(state)
+        state.apply(.statusChanged(.runningTool))
+        let requestID = PermissionRequestID(rawValue: "p1")
+        state.apply(.permissionRequest(PermissionRequest(
+            turnID: turnID, id: requestID, toolName: "Write", input: .object([:])
+        )))
+        #expect(!state.isBusy)
+
+        state.resolvePermission(requestID)
+        #expect(state.status == .requesting)
+        #expect(state.isBusy)
+        #expect(state.willQueueNextMessage)
+    }
+
+    @Test func anOpenTurnStaysBusyEvenIfTheHarnessReportsIdle() {
+        // Claude emits `session_state_changed: idle` between tool calls. That
+        // is not the end of the turn — the composer must keep showing work.
+        let state = ChatState()
+        _ = started(state)
+        state.apply(.statusChanged(.runningTool))
+        state.apply(.statusChanged(.idle))
+        #expect(state.isTurnActive)
+        #expect(state.isBusy)
+    }
+
     @Test func aQueuedMessageDoesNotFakeARunningTurn() {
         let state = ChatState()
         _ = started(state)

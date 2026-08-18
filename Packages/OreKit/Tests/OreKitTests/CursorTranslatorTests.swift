@@ -86,6 +86,45 @@ struct CursorTranslatorTests {
         #expect(byID["sem"]?.input["pattern"]?.stringValue == "hover preview")
     }
 
+    @Test func createPlanBecomesAPlanProposal() {
+        // Cursor writes a plan with CreatePlan and then exits the turn. If that
+        // stays a generic tool chip, the user never sees a plan to approve and
+        // has to type "continue" to get the agent moving again.
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","overview":"Main-thread saturation.","plan":"Cause: the update loop.\nFix: profile, then batch."}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","plan":"Cause: the update loop.\nFix: profile, then batch."},"result":{"success":{}}}}}"#,
+            #"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        ])
+        let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
+        #expect(calls.contains { $0.name == "CreatePlan" })
+        let plans = all.compactMap { event -> String? in
+            if case .planUpdated(let update) = event,
+               case .proposal(let markdown, let requestID) = update.content {
+                #expect(requestID == nil)
+                return markdown
+            }
+            return nil
+        }
+        #expect(plans.count == 1, "started then completed must not double the card")
+        #expect(plans[0].contains("update loop"))
+        #expect(plans[0].contains("profile"))
+    }
+
+    @Test func createPlanComposesMarkdownFromNameOverviewAndTodos() {
+        let markdown = CursorAgentTranslator.planMarkdown(from: .object([
+            "name": .string("Fix freeze"),
+            "overview": .string("Main-thread saturation."),
+            "todos": .array([
+                .object(["content": .string("Profile the update loop")]),
+                .object(["content": .string("Batch invalidations")]),
+            ]),
+        ]))
+        #expect(markdown?.contains("Fix freeze") == true)
+        #expect(markdown?.contains("Main-thread saturation.") == true)
+        #expect(markdown?.contains("Profile the update loop") == true)
+        #expect(markdown?.contains("Batch invalidations") == true)
+    }
+
     @Test func payloadLevelStreamContentBecomesNewString() {
         let all = events([
             #"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"editToolCall":{"args":{"path":"/tmp/x.txt"},"streamContent":"hello\nworld\n"}}}"#,

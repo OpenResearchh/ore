@@ -26,12 +26,18 @@ struct MarkdownRenderer {
         self.highlighter = highlighter
     }
 
-    func render(_ markdown: String) -> NSAttributedString {
+    func render(
+        _ markdown: String,
+        highlighting: HighlightCachePolicy = .all
+    ) -> NSAttributedString {
         let document = Document(parsing: markdown, options: [.parseBlockDirectives])
+        let fenceCount = codeBlockCount(in: document)
         var visitor = Visitor(
             baseFont: baseFont,
             textColor: textColor,
-            highlighter: highlighter
+            highlighter: highlighter,
+            fenceCount: fenceCount,
+            skipCachingLastFence: highlighting == .stablePrefix
         )
         let result = NSMutableAttributedString(
             attributedString: trimmingTrailingNewlines(visitor.visit(document))
@@ -43,6 +49,25 @@ struct MarkdownRenderer {
         linkFileReferences(in: result)
         // Trailing block spacing is padding inside the bubble's own padding.
         return result
+    }
+
+    /// How aggressively fenced-block highlighting is cached.
+    ///
+    /// A streaming row re-renders on every delta. Completed fences above the
+    /// caret are stable and should hit the highlighter cache; the last open
+    /// fence is still growing and would only pollute it.
+    enum HighlightCachePolicy {
+        case all
+        case stablePrefix
+    }
+
+    private func codeBlockCount(in markup: any Markup) -> Int {
+        var count = 0
+        if markup is CodeBlock { count += 1 }
+        for child in markup.children {
+            count += codeBlockCount(in: child)
+        }
+        return count
     }
 
     private func trimmingTrailingNewlines(_ string: NSAttributedString) -> NSAttributedString {
@@ -206,8 +231,11 @@ struct MarkdownRenderer {
         let baseFont: NSFont
         let textColor: NSColor
         let highlighter: SyntaxHighlighter?
+        let fenceCount: Int
+        let skipCachingLastFence: Bool
         /// Nesting depth for list items, so a nested bullet indents.
         var listDepth = 0
+        var visitedFences = 0
 
         mutating func defaultVisit(_ markup: any Markup) -> NSAttributedString {
             children(of: markup)
@@ -398,8 +426,10 @@ struct MarkdownRenderer {
             let font = NSFont.monospacedSystemFont(
                 ofSize: baseFont.pointSize - 1, weight: .regular
             )
+            visitedFences += 1
+            let cache = !(skipCachingLastFence && visitedFences == fenceCount)
             let highlighted = highlighter?.highlight(
-                code, language: codeBlock.language, font: font
+                code, language: codeBlock.language, font: font, cache: cache
             ) ?? NSAttributedString(
                 string: code,
                 attributes: [.font: font, .foregroundColor: textColor]

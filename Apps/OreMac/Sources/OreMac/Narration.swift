@@ -585,11 +585,11 @@ enum NarrationPhraser {
 
     static func stopped() -> String { "Okay, stopped." }
 
-    /// Background utterances say who's talking before what happened. A comma
-    /// rather than a colon: the listener hears one sentence, not a label and
-    /// then a fragment.
-    static func prefixed(_ text: String, workspaceName: String) -> String {
-        "Over in \(workspaceName), \(lowercasedLead(text))"
+    /// Background utterances say where they're coming from before what
+    /// happened. A comma rather than a colon: the listener hears one sentence,
+    /// not a label and then a fragment.
+    static func prefixed(_ text: String, place: String) -> String {
+        "Over in \(place), \(lowercasedLead(text))"
     }
 
     // MARK: Text hygiene

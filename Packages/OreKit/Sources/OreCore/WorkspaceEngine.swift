@@ -917,6 +917,18 @@ public actor WorkspaceEngine {
     ) async throws {
         let runtime = try await runtime(for: chatID)
         runtime.pendingPermissions.removeValue(forKey: id)
+
+        // The CLI applies a `setMode` suggestion in the permission reply
+        // itself. Mirror it into the stored mode so the composer chip — which
+        // reads this, not the CLI — doesn't keep showing Ask.
+        if let mode = decision.impliedPermissionMode,
+           PermissionMode(rawValue: runtime.record.permissionMode) != mode {
+            runtime.record.permissionMode = mode.rawValue
+            try await store.saveChat(runtime.record)
+            await syncWorkspaceCompatibility(from: runtime)
+            publishChatChange(runtime)
+        }
+
         try await runtime.session?.resolvePermission(id, with: decision)
     }
 
@@ -927,6 +939,7 @@ public actor WorkspaceEngine {
     ) async throws {
         let runtime = try await runtime(for: chatID)
         runtime.pendingQuestions.removeValue(forKey: id)
+        resumeTurnAfterInput(runtime: runtime)
         try await runtime.session?.answerQuestion(id, answer: answer)
     }
 
@@ -1216,20 +1229,18 @@ public actor WorkspaceEngine {
               pullRequest.isMerged
         else { throw OreCoreError.pullRequestNotMerged(record.branch) }
 
-        // Uncommitted work would be stranded on the old branch by the switch;
-        // make the user decide (commit, or discard) before continuing.
-        let liveStatus = await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus
-        guard !liveStatus.hasUncommittedChanges else {
-            throw OreCoreError.uncommittedChanges
-        }
-
+        // Uncommitted work used to stop this dead — "commit or discard first".
+        // But the reason to continue is to keep working, and the edits in
+        // flight *are* that work; making the user commit half a thought just to
+        // get a fresh branch is a decision they shouldn't have to make. They
+        // come along instead, still uncommitted, exactly as they were.
         let defaultBranch = await git.defaultBranch()
         try await pullDefaultBranch(forceFetch: true)
         let newBranch = try await git.unusedBranchName(stem: nextContinueStem())
 
-        try await git.runSerialized(
-            ["switch", "-c", newBranch, defaultBranch], in: worktreeURL
-        )
+        let carried = try await BranchSwitch(git: git, worktree: worktreeURL)
+            .create(newBranch, from: defaultBranch)
+
         let baseSHA = (try? await git.run(
             ["rev-parse", "--short", "HEAD"], in: worktreeURL
         ).trimmedStandardOutput) ?? "HEAD"
@@ -1242,10 +1253,14 @@ public actor WorkspaceEngine {
         await statusWatcher?.refreshNow()
         await refreshBaseSync(forceFetch: false)
 
+        let carriedNote = carried
+            ? " The uncommitted changes from the old branch came across and are " +
+              "still uncommitted here."
+            : ""
         let memo = """
         PR #\(pullRequest.number) (\(pullRequest.title)) was merged into \(defaultBranch). \
         The old branch `\(oldBranch)` is done; this workspace continues on the fresh \
-        branch `\(newBranch)`, cut from local `\(defaultBranch)` at \(baseSHA).
+        branch `\(newBranch)`, cut from local `\(defaultBranch)` at \(baseSHA).\(carriedNote)
         """
         try await recordWorkspaceMemo(memo)
     }
@@ -1444,6 +1459,10 @@ public actor WorkspaceEngine {
 
         case .permissionResolved(let resolution):
             runtime.pendingPermissions.removeValue(forKey: resolution.id)
+            // The card is gone; the turn is not. Dropping back to requesting
+            // is what makes the composer show "working" again instead of
+            // looking idle while the agent continues the same turn.
+            resumeTurnAfterInput(runtime: runtime)
 
         case .question(let question):
             runtime.pendingQuestions[question.id] = question
@@ -1491,6 +1510,15 @@ public actor WorkspaceEngine {
         guard runtime.status != newStatus else { return }
         runtime.status = newStatus
         publishSummaryChange()
+    }
+
+    /// After a permission or question is answered the harness is running
+    /// again, but it often doesn't emit a new status until the next tool or
+    /// token. Without this the composer stays on `awaitingInput` — no busy
+    /// chrome — while the turn is still open and new messages still queue.
+    private func resumeTurnAfterInput(runtime: ChatRuntime) {
+        guard runtime.isTurnActive, runtime.status == .awaitingInput else { return }
+        setStatus(.requesting, runtime: runtime)
     }
 
     /// One unread per workspace, and never for the workspace the user is
@@ -1619,7 +1647,6 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case modelChangeRequiresIdle(ChatID)
     case noPullRequest(String)
     case pullRequestNotMerged(String)
-    case uncommittedChanges
     case conflictHunkMissing(String, Int)
 
     public var description: String {
@@ -1637,8 +1664,6 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "No pull request exists for \(branch)."
         case .pullRequestNotMerged(let branch):
             return "The pull request for \(branch) has not been merged."
-        case .uncommittedChanges:
-            return "There are uncommitted changes. Commit or discard them before continuing."
         case .conflictHunkMissing(let path, let line):
             return "No conflict hunk at \(path):\(line)."
         }

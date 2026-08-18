@@ -33,6 +33,9 @@ struct CursorAgentTranslator {
     /// Whether a `result` record already closed the current turn, so the
     /// process exit has nothing left to report.
     private var didReportResult = false
+    /// Last plan markdown emitted this turn, so a `started` then `completed`
+    /// CreatePlan with the same body is one card, not two.
+    private var lastPlanMarkdown: String?
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -158,6 +161,7 @@ struct CursorAgentTranslator {
         case "started":
             emitCall()
             append(status: .runningTool, to: &output)
+            emitPlanProposal(from: toolInputs[toolCallID], turnID: turnID, to: &output)
         case "completed":
             let result = payload["result"]
             emitCall(result: result)
@@ -168,9 +172,24 @@ struct CursorAgentTranslator {
                     || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
+            emitPlanProposal(from: toolInputs[toolCallID], turnID: turnID, to: &output)
         default:
             break
         }
+    }
+
+    private mutating func emitPlanProposal(
+        from input: JSONValue?,
+        turnID: TurnID,
+        to output: inout Output
+    ) {
+        guard let input, let markdown = Self.planMarkdown(from: input) else { return }
+        guard markdown != lastPlanMarkdown else { return }
+        lastPlanMarkdown = markdown
+        output.events.append(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: markdown, permissionRequestID: nil)
+        )))
     }
 
     /// Cursor's `tool_call` object mixes the real payload (`readToolCall`,
@@ -231,9 +250,58 @@ struct CursorAgentTranslator {
         case "readlints", "lints", "read_lints": return "ReadLints"
         case "task", "agent": return "Task"
         case "todowrite", "todoread", "todo": return "TodoWrite"
+        case "createplan", "create_plan": return "CreatePlan"
+        case "exitplanmode", "exit_plan_mode": return "ExitPlanMode"
         default:
             return base.isEmpty ? "Tool" : base.prefix(1).uppercased() + base.dropFirst()
         }
+    }
+
+    static func isPlanTool(_ name: String) -> Bool {
+        switch name {
+        case "CreatePlan", "ExitPlanMode": return true
+        default: return false
+        }
+    }
+
+    /// Cursor's CreatePlan args are `name` / `overview` / `plan` / `todos`,
+    /// sometimes with the body on `streamContent` while it is still writing.
+    static func planMarkdown(from input: JSONValue) -> String? {
+        let body = input["plan"]?.stringValue
+            ?? input["markdown"]?.stringValue
+            ?? input["content"]?.stringValue
+            ?? input["streamContent"]?.stringValue
+            ?? input["stream_content"]?.stringValue
+        if let body, body.contains("\n") || body.hasPrefix("#") {
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        var sections: [String] = []
+        if let name = input["name"]?.stringValue ?? input["title"]?.stringValue,
+           !name.isEmpty {
+            sections.append("# \(name)")
+        }
+        if let overview = input["overview"]?.stringValue ?? input["description"]?.stringValue,
+           !overview.isEmpty {
+            sections.append(overview)
+        }
+        if let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sections.append(body)
+        }
+        let todos = input["todos"]?.arrayValue ?? input["steps"]?.arrayValue ?? []
+        let items = todos.compactMap { item -> String? in
+            let text = item["content"]?.stringValue
+                ?? item["text"]?.stringValue
+                ?? item.stringValue
+            guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            return "- [ ] \(text)"
+        }
+        if !items.isEmpty { sections.append(items.joined(separator: "\n")) }
+        let markdown = sections.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return markdown.isEmpty ? nil : markdown
     }
 
     /// Maps Cursor's per-tool arg names onto the keys the UI's presentation
@@ -259,6 +327,7 @@ struct CursorAgentTranslator {
             dict["streamContent"] = .string(stream)
         }
         mergeDiffFields(from: result?["success"] ?? result, into: &dict)
+        mergePlanFields(from: result?["success"] ?? result, into: &dict)
 
         if let path = dict["path"]?.stringValue { dict["file_path"] = .string(path) }
         if let target = dict["targetDirectory"]?.stringValue ?? dict["target_directory"]?.stringValue {
@@ -293,6 +362,15 @@ struct CursorAgentTranslator {
         }
         if let path = object["path"]?.stringValue, dict["file_path"] == nil {
             dict["file_path"] = .string(path)
+        }
+    }
+
+    private static func mergePlanFields(from source: JSONValue?, into dict: inout [String: JSONValue]) {
+        guard let object = source?.objectValue else { return }
+        for key in ["plan", "markdown", "overview", "name", "title", "todos", "steps"] {
+            if let value = object[key], dict[key] == nil {
+                dict[key] = value
+            }
         }
     }
 
@@ -504,6 +582,9 @@ struct CursorAgentTranslator {
                     input: input
                 )))
                 append(status: .runningTool, to: &output)
+                if Self.isPlanTool(name) {
+                    emitPlanProposal(from: input, turnID: turnID, to: &output)
+                }
 
             default:
                 break
@@ -684,6 +765,7 @@ struct CursorAgentTranslator {
         textSegment = 0
         emittedAssistantText = ""
         didReportResult = false
+        lastPlanMarkdown = nil
         output.events.append(.turnStarted(TurnStarted(turnID: turnID, model: model)))
         return turnID
     }

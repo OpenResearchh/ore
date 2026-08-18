@@ -228,7 +228,7 @@ struct NarrationPhraserTests {
             NarrationPhraser.contextCompacted(),
             NarrationPhraser.toolFailure(),
             NarrationPhraser.stopped(),
-            NarrationPhraser.prefixed("It's finished.", workspaceName: "ahmed-zewail"),
+            NarrationPhraser.prefixed("It's finished.", place: "ahmed-zewail"),
             NarrationPhraser.phrase(for: [ToolActivity(kind: .read, subject: "ChatPane")]) ?? "",
         ]
         #expect(spoken.allSatisfy { !$0.contains(":") })
@@ -294,11 +294,11 @@ struct NarrationPhraserTests {
         #expect(NarrationPhraser.spokenDuration(3700) == "an hour")
     }
 
-    @Test func backgroundPrefixNamesTheWorkspace() {
-        #expect(NarrationPhraser.prefixed("It's finished.", workspaceName: "ahmed-zewail")
+    @Test func backgroundPrefixNamesThePlace() {
+        #expect(NarrationPhraser.prefixed("It's finished.", place: "ahmed-zewail")
             == "Over in ahmed-zewail, it's finished.")
         // Identifier-style leads keep their capitalization.
-        #expect(NarrationPhraser.prefixed("PR created.", workspaceName: "x")
+        #expect(NarrationPhraser.prefixed("PR created.", place: "x")
             == "Over in x, PR created.")
     }
 
@@ -308,6 +308,51 @@ struct NarrationPhraserTests {
             == "You're getting close to your usage limit.")
         #expect(NarrationPhraser.rateLimit(RateLimitReport(status: .exhausted))
             == "Usage limit reached.")
+    }
+}
+
+struct NarrationOriginTests {
+    @Test func theTabOnScreenIsNeverAnnounced() {
+        #expect(NarrationOrigin.foreground.isBackground == false)
+        #expect(NarrationOrigin.foreground.spokenLabel == nil)
+        #expect(NarrationOrigin.foreground.displayLabel == nil)
+    }
+
+    /// The case the workspace name can't cover: the user is already in this
+    /// workspace, so the only useful thing to say is which tab.
+    @Test func anotherTabInTheSameWorkspaceIsNamedByItsTab() {
+        let origin = NarrationOrigin.otherTab(chatTitle: "Fix the parser")
+        #expect(origin.isBackground)
+        #expect(origin.spokenLabel == "the Fix the parser tab")
+        #expect(origin.displayLabel == "Fix the parser")
+    }
+
+    @Test func anUntitledTabStillAnnouncesItself() {
+        let origin = NarrationOrigin.otherTab(chatTitle: "   ")
+        #expect(origin.spokenLabel == "another tab")
+        #expect(origin.displayLabel == "Another tab")
+    }
+
+    @Test func anotherWorkspaceLeadsWithTheWorkspace() {
+        let bare = NarrationOrigin.otherWorkspace(name: "ahmed-zewail", chatTitle: nil)
+        #expect(bare.spokenLabel == "ahmed-zewail")
+        #expect(bare.displayLabel == "ahmed-zewail")
+
+        let titled = NarrationOrigin.otherWorkspace(
+            name: "ahmed-zewail",
+            chatTitle: "Fix the parser"
+        )
+        #expect(titled.spokenLabel == "ahmed-zewail, Fix the parser")
+        #expect(titled.displayLabel == "ahmed-zewail — Fix the parser")
+    }
+
+    @Test func aPlaceReadsAsOneSentenceNotALabel() {
+        let spoken = NarrationPhraser.prefixed(
+            "It needs your permission for git push.",
+            place: NarrationOrigin.otherTab(chatTitle: "Chat 2").spokenLabel ?? ""
+        )
+        #expect(spoken == "Over in the Chat 2 tab, it needs your permission for git push.")
+        #expect(!spoken.contains(":"))
     }
 }
 

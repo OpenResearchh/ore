@@ -238,7 +238,7 @@ struct OreVoiceGlowStroke: View {
 struct OreComposerBusyBorder: View {
     let cornerRadius: CGFloat
     let reduceMotion: Bool
-    @State private var angle: Double = 0
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -246,26 +246,31 @@ struct OreComposerBusyBorder: View {
             if reduceMotion {
                 shape.strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5)
             } else {
-                shape
-                    .strokeBorder(
-                        AngularGradient(
-                            gradient: Gradient(colors: [
-                                Color.accentColor.opacity(0.0),
-                                Color.accentColor.opacity(0.15),
-                                Color.accentColor.opacity(0.85),
-                                Color.accentColor.opacity(0.15),
-                                Color.accentColor.opacity(0.0),
-                            ]),
-                            center: .center,
-                            angle: .degrees(angle)
-                        ),
-                        lineWidth: 1.75
+                TimelineView(
+                    .animation(
+                        minimumInterval: 1.0 / 30.0,
+                        paused: controlActiveState != .key
                     )
-                    .onAppear {
-                        withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) {
-                            angle = 360
-                        }
-                    }
+                ) { context in
+                    let period = 2.4
+                    let angle = context.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: period) / period * 360
+                    shape
+                        .strokeBorder(
+                            AngularGradient(
+                                gradient: Gradient(colors: [
+                                    Color.accentColor.opacity(0.0),
+                                    Color.accentColor.opacity(0.15),
+                                    Color.accentColor.opacity(0.85),
+                                    Color.accentColor.opacity(0.15),
+                                    Color.accentColor.opacity(0.0),
+                                ]),
+                                center: .center,
+                                angle: .degrees(angle)
+                            ),
+                            lineWidth: 1.75
+                        )
+                }
             }
         }
     }

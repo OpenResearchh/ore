@@ -13,18 +13,28 @@ import OreProtocol
 @Observable
 final class ChatState {
     private(set) var rows: [TranscriptRow] = [] {
-        didSet { rowsRevision &+= 1 }
+        didSet {
+            rowsRevision &+= 1
+            let nowHasRows = !rows.isEmpty
+            if hasRows != nowHasRows { hasRows = nowHasRows }
+        }
     }
     /// Bumped on every `rows` mutation (in-place edits included). Lets the pane
     /// memoize its derived display rows instead of regrouping the whole
     /// transcript on every body evaluation — at 40 flushes/second while text
     /// streams, that regrouping was a large share of the main thread.
     private(set) var rowsRevision = 0
+    /// Emptiness without observing `rows` itself. The empty-state check used to
+    /// subscribe the whole chat pane to every streaming mutation.
+    private(set) var hasRows = false
     private(set) var status: AgentStatus = .idle
     private(set) var usage: UsageReport?
     private(set) var pendingPermission: PermissionRequest?
     private(set) var pendingQuestion: AgentQuestion?
     private(set) var plan: PlanUpdate.Content?
+    /// Turn that currently owns the approval card, so the transcript can hide
+    /// its duplicate PLAN row while the card is up.
+    private(set) var planTurnID: TurnID?
     private(set) var rateLimit: RateLimitReport?
     private(set) var lastError: SessionError?
 
@@ -66,8 +76,15 @@ final class ChatState {
     /// live turn staying expanded. Deliberately *not* the same question as
     /// whether a message would queue: an agent blocked on a permission prompt
     /// has stopped working but has not finished its turn.
+    ///
+    /// An open turn still counts even if the last status event was `idle`.
+    /// Claude reports `session_state_changed: idle` between tool calls, and
+    /// treating that as a finished turn hid the composer chrome while messages
+    /// kept queueing.
     var isBusy: Bool {
-        status == .thinking || status == .requesting || status == .runningTool
+        if status == .awaitingInput { return false }
+        if isTurnActive { return true }
+        return status == .thinking || status == .requesting || status == .runningTool
     }
 
     /// Whether the next message sent will be queued instead of delivered.
@@ -127,7 +144,14 @@ final class ChatState {
             break
 
         case .statusChanged(let newStatus):
-            status = newStatus
+            // A Cursor (and similar) turn that proposed a plan then exits still
+            // needs the user. Don't let the harness's trailing `idle` hide that.
+            if (newStatus == .idle || newStatus == .interrupted),
+               case .proposal = plan {
+                status = .awaitingInput
+            } else {
+                status = newStatus
+            }
 
         case .turnStarted(let turn):
             currentTurnID = turn.turnID
@@ -142,7 +166,7 @@ final class ChatState {
             // A new turn means the user pressed on past the last failure, and
             // past any plan that was still awaiting an answer.
             prominentError = nil
-            plan = nil
+            clearPlan()
 
         case .textDelta(let delta):
             append(delta: delta, kind: .assistantText)
@@ -158,10 +182,12 @@ final class ChatState {
             // grows and again on completion with the real diff. Updating the
             // existing row keeps the chip live without duplicating it.
             if let index = rows.lastIndex(where: { $0.toolCallID == call.id }) {
-                rows[index].text = call.displayName ?? call.name
-                rows[index].toolName = call.name
-                rows[index].toolInput = call.input
-                rows[index].parentToolCallID = call.parentToolCallID
+                mutateRow(at: index) { row in
+                    row.text = call.displayName ?? call.name
+                    row.toolName = call.name
+                    row.toolInput = call.input
+                    row.parentToolCallID = call.parentToolCallID
+                }
                 return
             }
             rows.append(TranscriptRow(
@@ -179,15 +205,32 @@ final class ChatState {
             attach(result)
 
         case .planUpdated(let update):
-            plan = update.content
             if case .proposal(let markdown, let requestID) = update.content {
-                rows.append(TranscriptRow(
-                    id: "plan-\(update.turnID.rawValue)-\(rows.count)",
-                    turnID: update.turnID,
-                    kind: .plan,
-                    text: markdown,
-                    permissionRequestID: requestID
-                ))
+                plan = update.content
+                planTurnID = update.turnID
+                status = .awaitingInput
+                if let index = rows.lastIndex(where: {
+                    $0.kind == .plan && $0.turnID == update.turnID
+                }) {
+                    mutateRow(at: index) { row in
+                        row.text = markdown
+                        row.permissionRequestID = requestID
+                    }
+                } else {
+                    rows.append(TranscriptRow(
+                        id: "plan-\(update.turnID.rawValue)-\(rows.count)",
+                        turnID: update.turnID,
+                        kind: .plan,
+                        text: markdown,
+                        permissionRequestID: requestID
+                    ))
+                }
+            } else if case .proposal = plan {
+                // A TodoWrite after CreatePlan must not dismiss the approval card.
+                break
+            } else {
+                plan = update.content
+                planTurnID = nil
             }
 
         case .permissionRequest(let request):
@@ -200,6 +243,7 @@ final class ChatState {
             // this it survived its own approval, so a second proposal left two
             // cards and answering either one left the other on screen forever.
             resolvePlan(requestID: resolution.id)
+            resumeTurnAfterInput()
 
         case .question(let question):
             pendingQuestion = question
@@ -292,6 +336,7 @@ final class ChatState {
         hasLoadedHistory = true
         // Live events may already have arrived; history belongs before them.
         rows = historicalRows + rows
+        refreshRevertableTurns()
     }
 
     private(set) var hasLoadedHistory = false
@@ -315,6 +360,7 @@ final class ChatState {
             attachedComments: comments,
             attachments: attachments
         ))
+        refreshRevertableTurns()
         guard !willQueue else {
             // Nothing has been handed to the agent, so claiming a turn started
             // would run a spinner and an elapsed timer against a message that is
@@ -337,8 +383,11 @@ final class ChatState {
     /// A queued row becomes a real one when the turn it was waiting for starts.
     private func claimOldestPendingRow(turnID: TurnID) {
         guard let index = rows.firstIndex(where: { $0.isQueued }) else { return }
-        rows[index].isQueued = false
-        rows[index].turnID = turnID
+        mutateRow(at: index) { row in
+            row.isQueued = false
+            row.turnID = turnID
+        }
+        refreshRevertableTurns()
     }
 
     func addDraftComment(_ reference: DiffCommentReference) {
@@ -358,6 +407,7 @@ final class ChatState {
     func resolvePermission(_ id: PermissionRequestID) {
         if pendingPermission?.id == id { pendingPermission = nil }
         resolvePlan(requestID: id)
+        resumeTurnAfterInput()
     }
 
     /// Dismisses the plan card once its approval has been answered.
@@ -368,33 +418,63 @@ final class ChatState {
     private func resolvePlan(requestID: PermissionRequestID) {
         guard case .proposal(_, let planRequestID) = plan else { return }
         guard planRequestID == nil || planRequestID == requestID else { return }
-        plan = nil
+        clearPlan()
     }
 
     /// The user answered the plan card directly (approve, or reject with
     /// feedback). Clears it immediately rather than waiting for the harness to
     /// echo a resolution that, for a plan with no request id, never comes.
-    func dismissPlan() { plan = nil }
+    func dismissPlan() {
+        clearPlan()
+        if !isTurnActive, status == .awaitingInput {
+            status = .idle
+        }
+    }
+
+    private func clearPlan() {
+        plan = nil
+        planTurnID = nil
+    }
 
     func resolveQuestion(_ id: QuestionID) {
         if pendingQuestion?.id == id { pendingQuestion = nil }
+        resumeTurnAfterInput()
+    }
+
+    /// The permission/question card is gone; the turn is not. Show the
+    /// composer as working until the harness's next real status arrives.
+    private func resumeTurnAfterInput() {
+        guard isTurnActive, status == .awaitingInput else { return }
+        status = .requesting
     }
 
     /// Turns the user can revert to — every turn that produced something.
-    var revertableTurns: [TurnID] {
+    /// Stored so the tab bar's history menu does not observe `rows` (and
+    /// therefore does not rebuild on every streaming delta).
+    private(set) var revertableTurns: [TurnID] = []
+
+    // MARK: - Row assembly
+
+    private func mutateRow(at index: Int, _ body: (inout TranscriptRow) -> Void) {
+        guard rows.indices.contains(index) else { return }
+        var row = rows[index]
+        body(&row)
+        row.contentRevision &+= 1
+        rows[index] = row
+    }
+
+    private func refreshRevertableTurns() {
         var seen: Set<TurnID> = []
-        return rows.compactMap { row in
+        revertableTurns = rows.compactMap { row in
             guard row.kind == .userMessage, !seen.contains(row.turnID) else { return nil }
             seen.insert(row.turnID)
             return row.turnID
         }
     }
 
-    // MARK: - Row assembly
-
     private func append(delta: BlockDelta, kind: TranscriptRow.Kind) {
         if let index = streamingRowIndex[delta.blockID], rows.indices.contains(index) {
-            rows[index].text += delta.text
+            mutateRow(at: index) { $0.text += delta.text }
             return
         }
         rows.append(TranscriptRow(
@@ -412,8 +492,10 @@ final class ChatState {
     private func complete(_ block: BlockCompleted) {
         let kind: TranscriptRow.Kind = block.kind == .thinking ? .thinking : .assistantText
         if let index = streamingRowIndex[block.blockID], rows.indices.contains(index) {
-            rows[index].text = block.text
-            rows[index].isComplete = true
+            mutateRow(at: index) { row in
+                row.text = block.text
+                row.isComplete = true
+            }
             return
         }
         guard !block.text.isEmpty else { return }
@@ -431,10 +513,12 @@ final class ChatState {
         guard let index = rows.lastIndex(where: { $0.toolCallID == result.toolCallID }) else {
             return
         }
-        rows[index].resultText = result.text
-        rows[index].resultMetadata = result.metadata
-        rows[index].isError = result.isError
-        rows[index].isComplete = true
+        mutateRow(at: index) { row in
+            row.resultText = result.text
+            row.resultMetadata = result.metadata
+            row.isError = result.isError
+            row.isComplete = true
+        }
     }
 }
 
@@ -490,17 +574,27 @@ struct TranscriptRow: Identifiable, Sendable {
     /// this row's own payload. A `TaskUpdate` names its task only by id, so the
     /// human title has to come from the `TaskCreate` that made it.
     var resolvedSubject: String?
+    /// Bumped when this row's visible content changes. The table diffs on this
+    /// instead of hashing `text` / `toolInput` / grouped tool output on every
+    /// flush — that walk grew with the session and is what froze the UI.
+    var contentRevision: UInt64 = 0
+    /// Stored, not computed from grouped text. Derived rows (activity groups,
+    /// footers) seal this once from children's `contentRevision`s.
+    var activitySignature: Int = 0
 
-    var activitySignature: Int {
+    /// Records a cheap identity for a derived row so the table can diff it
+    /// without hashing the turn's tool output on every flush.
+    mutating func sealDerivedContent() {
         var hasher = Hasher()
         hasher.combine(resolvedSubject)
+        hasher.combine(groupedRows.count)
         for row in groupedRows {
             hasher.combine(row.id)
-            hasher.combine(row.text)
-            hasher.combine(row.resultText)
+            hasher.combine(row.contentRevision)
             hasher.combine(row.isComplete)
             hasher.combine(row.isError)
         }
-        return hasher.finalize()
+        activitySignature = hasher.finalize()
+        contentRevision = UInt64(truncatingIfNeeded: activitySignature)
     }
 }

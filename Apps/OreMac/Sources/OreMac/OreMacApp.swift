@@ -182,6 +182,16 @@ struct OreMacApp: App {
 
                 Divider()
 
+                Button("Allow Tool") { model.allowPendingPermission() }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+                    .disabled(model.actionablePermission == nil)
+
+                Button("Deny Tool") { model.denyPendingPermission() }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                    .disabled(model.actionablePermission == nil)
+
+                Divider()
+
                 // ⌘1–9 jumps straight to a workspace, so switching between
                 // parallel agents never requires the mouse.
                 ForEach(1...9, id: \.self) { index in
@@ -623,8 +633,11 @@ private struct KeyboardShortcutsView: View {
         ("New tab", "⌘T"), ("Close tab", "⌘W"),
         ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"),
+        ("Allow / deny tool", "↩  Esc"),
+        ("Allow / deny from composer", "⇧⌘A  ⇧⌘D"),
         ("Dictate prompt", "⌥⌘M"), ("Dictate — tap to start/stop", "⇧⌥"),
         ("Dictate from another app", "hold ⇧⌥"),
+        ("Narrate this tab", "⌥⌘S"),
         ("Next git step", "⌥⌘G"),
         ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),

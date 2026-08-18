@@ -35,7 +35,6 @@ struct ChatPane: View {
     @State private var effortStepPulse = 0
     @State private var modelScrollProgress: CGFloat = 0
     @State private var modelStepPulse = 0
-    @State private var hoveredTabKey: String?
     @State private var renameChatTarget: ChatSummary?
     @State private var renameChatText = ""
     @State private var workspaceFileIndex: [WorkspaceFileNode] = []
@@ -81,7 +80,13 @@ struct ChatPane: View {
     var body: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
-                tabBar(availableWidth: geometry.size.width)
+                ChatTabBar(
+                    workspace: workspace,
+                    availableWidth: geometry.size.width,
+                    revertTarget: $revertTarget,
+                    renameChatTarget: $renameChatTarget,
+                    renameChatText: $renameChatText
+                )
 
                 // The centre column shows either a chat transcript or — when a file
                 // tab is active — that file's diff, opened from the review list.
@@ -105,7 +110,7 @@ struct ChatPane: View {
     private func chatBody(paneHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
             ZStack(alignment: .bottomLeading) {
-                if chat.rows.isEmpty && !chat.isBusy {
+                if !chat.hasRows && !chat.isBusy {
                     ResearchEmptyState(
                         identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
                             ?? model.researchIdentity(for: workspace),
@@ -117,10 +122,12 @@ struct ChatPane: View {
                         }
                     )
                 } else {
-                    TranscriptView(
-                        rows: displayRows,
+                    TranscriptHost(
+                        chat: chat,
                         worktreePath: workspace.worktreePath,
                         persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
+                        expandedActivityGroups: expandedActivityGroups,
+                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
                         onRevert: { revertTarget = $0 },
                         onToggleActivity: { toggleActivity($0) },
                         onOpenFile: { openAgentFile($0) },
@@ -129,8 +136,7 @@ struct ChatPane: View {
                             case .fork: model.forkChat(into: workspace.id)
                             case .revert: revertTarget = turn
                             }
-                        },
-                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false
+                        }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -173,7 +179,18 @@ struct ChatPane: View {
                         model.resolvePermission(requestID, decision: .allow, for: workspace.id)
                     }
                     model.setPermissionMode(.default, for: workspace.id)
-                    if !feedback.isEmpty { model.send(feedback, to: workspace.id) }
+                    let followUp = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !followUp.isEmpty {
+                        model.send(followUp, to: workspace.id)
+                    } else if requestID == nil {
+                        // Cursor has no permission callback: the CreatePlan
+                        // turn already exited. Approving has to start the next
+                        // one or the agent waits for a typed "continue".
+                        model.send(
+                            "The user approved the plan. Implement it.",
+                            to: workspace.id
+                        )
+                    }
                 } onReject: { feedback in
                     chat.dismissPlan()
                     if let requestID {
@@ -181,6 +198,14 @@ struct ChatPane: View {
                             requestID,
                             decision: .deny(reason: feedback.isEmpty ? "Revise the plan." : feedback),
                             for: workspace.id
+                        )
+                    } else {
+                        let reason = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+                        model.send(
+                            reason.isEmpty
+                                ? "The user rejected the plan. Revise it."
+                                : "The user rejected the plan: \(reason)",
+                            to: workspace.id
                         )
                     }
                 }
@@ -455,273 +480,28 @@ struct ChatPane: View {
         )
     }
 
-    /// Memoization for `displayRows`. A class box rather than `@State` value
-    /// storage: the cache is invisible to SwiftUI on purpose — filling it during
-    /// a body evaluation must not schedule another one.
-    private final class DisplayRowsMemo {
-        struct Key: Equatable {
-            var revision: Int
-            var isBusy: Bool
-            var expanded: Set<String>
-        }
-        var key: Key?
-        var rows: [TranscriptRow] = []
-    }
-    @State private var displayRowsMemo = DisplayRowsMemo()
-
-    private var displayRows: [TranscriptRow] {
-        // Reading `rowsRevision` (not just `rows`) keeps observation intact:
-        // any transcript mutation still re-evaluates the body, but unrelated
-        // re-evaluations — hover, audio level, focus — reuse the last grouping
-        // instead of re-deriving it from every row.
-        let key = DisplayRowsMemo.Key(
-            revision: chat.rowsRevision,
-            isBusy: chat.isBusy,
-            expanded: expandedActivityGroups
-        )
-        if displayRowsMemo.key == key { return displayRowsMemo.rows }
-        let computed = computeDisplayRows()
-        displayRowsMemo.key = key
-        displayRowsMemo.rows = computed
-        return computed
-    }
-
-    private func computeDisplayRows() -> [TranscriptRow] {
-        let visible = chat.rows.compactMap { source -> TranscriptRow? in
-            if source.kind == .error, !Self.isMeaningfulError(source.text, result: source.resultText) {
-                return nil
-            }
-            var row = source
-            // Some harnesses report a successful empty result as an error
-            // carrying `null`. That should not paint a successful tool red or
-            // inflate the issue count for the turn.
-            if row.kind == .toolCall, row.isError,
-               !Self.isMeaningfulError(row.text, result: row.resultText) {
-                row.isError = false
-            }
-            if row.kind == .toolCall || row.kind == .thinking || row.kind == .error
-                || row.kind == .activityGroup {
-                row.isExpanded = expandedActivityGroups.contains(row.id)
-            }
-            return row
-        }
-
-        // A finished turn reads as three things: what the agent did (collapsed),
-        // what it concluded (always visible), and what that cost. While the
-        // agent is still working the live turn stays fully expanded, so its
-        // tool calls read inline until the final response has landed.
-        let activeTurn: TurnID? = chat.isBusy ? visible.last?.turnID : nil
-        let subjects = Self.taskSubjects(in: visible)
-
-        var result: [TranscriptRow] = []
-        var index = visible.startIndex
-        while index < visible.endIndex {
-            // Turns arrive contiguously, so one pass over the transcript can
-            // slice it into turns without sorting or grouping into a dictionary
-            // — which is also what keeps the original order intact.
-            let turn = visible[index].turnID
-            var slice: [TranscriptRow] = []
-            while index < visible.endIndex, visible[index].turnID == turn {
-                var row = visible[index]
-                row.resolvedSubject = Self.taskSubject(for: row, in: subjects)
-                slice.append(row)
-                index += 1
-            }
-            result.append(contentsOf: present(turn: slice, isActive: turn == activeTurn))
-        }
-        // Subagent nesting runs last, over the assembled transcript: a
-        // subagent's rows have to find their Agent row wherever the turn layout
-        // put it, including inside an expanded activity section.
-        return nestSubagents(result)
-    }
-
-    /// Lays out one turn's rows.
-    ///
-    /// Everything the agent did on the way to its answer folds into a single
-    /// collapsed section placed where the work happened; the last thing it said
-    /// stays visible below as the turn's outcome. A live turn is returned
-    /// untouched — collapsing work in progress hides the only thing worth
-    /// watching.
-    private func present(turn rows: [TranscriptRow], isActive: Bool) -> [TranscriptRow] {
-        guard !isActive, let turnID = rows.first?.turnID else { return rows }
-
-        // The answer is the last non-empty assistant block; everything before
-        // it is preamble and folds away with the tool calls. Found once, not
-        // per row — this runs on every transcript update while text streams.
-        let answer = rows.lastIndex {
-            $0.kind == .assistantText
-                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-        let collapsible = rows.indices.filter { Self.isCollapsible(rows[$0], isAnswer: $0 == answer) }
-        // A turn that only answered has nothing to hide and nothing to report:
-        // no tools ran, no files changed. It stays a bare response rather than
-        // gaining an empty section and a footer saying so.
-        guard let firstCollapsibleIndex = collapsible.first else { return rows }
-
-        let hidden = Set(collapsible)
-        let collapsed = collapsible.map { rows[$0] }
-        let groupID = "activity-\(turnID.rawValue)"
-        let expanded = expandedActivityGroups.contains(groupID)
-
-        var group = TranscriptRow(
-            id: groupID,
-            turnID: turnID,
-            kind: .activityGroup,
-            text: Self.activitySummary(for: collapsed),
-            groupedRows: collapsed,
-            isExpanded: expanded
-        )
-        group.createdAt = collapsed.first?.createdAt ?? Date()
-
-        var result: [TranscriptRow] = []
-        for (offset, row) in rows.enumerated() {
-            if offset == firstCollapsibleIndex {
-                result.append(group)
-                // Child rows are virtualized in only when the section is open,
-                // and each keeps its own expansion, so a 100-call turn stays
-                // quick to open and Bash/Edit/Read details expand separately.
-                if expanded {
-                    result.append(contentsOf: collapsed.map { child in
-                        var item = child
-                        item.isExpanded = expandedActivityGroups.contains(child.id)
-                        return item
-                    })
-                }
-                continue
-            }
-            guard !hidden.contains(offset) else { continue }
-            result.append(row)
-        }
-
-        var footer = TranscriptRow(
-            id: "footer-\(turnID.rawValue)",
-            turnID: turnID,
-            kind: .turnFooter,
-            text: "",
-            groupedRows: rows
-        )
-        footer.createdAt = rows.last?.createdAt ?? Date()
-        result.append(footer)
-        return result
-    }
-
-    /// Folds each subagent's tool uses under the Task ("Agent") row that spawned
-    /// them, so a subagent reads as its own collapsible group rather than a flat
-    /// indented run. A subagent's children appear only when its Agent row is
-    /// expanded; a normal transcript with no subagents passes through untouched.
-    private func nestSubagents(_ rows: [TranscriptRow]) -> [TranscriptRow] {
-        let childrenByParent = Dictionary(
-            grouping: rows.filter { $0.parentToolCallID != nil },
-            by: { $0.parentToolCallID! }
-        )
-        guard !childrenByParent.isEmpty else { return rows }
-        let present = Set(rows.compactMap(\.toolCallID))
-
-        var output: [TranscriptRow] = []
-        func emit(_ row: TranscriptRow) {
-            var item = row
-            if item.kind == .toolCall || item.kind == .thinking
-                || item.kind == .error || item.kind == .activityGroup {
-                item.isExpanded = expandedActivityGroups.contains(row.id)
-            }
-            if let id = row.toolCallID, let children = childrenByParent[id] {
-                item.subagentChildCount = children.count
-                output.append(item)
-                if item.isExpanded { children.forEach(emit) }
-            } else {
-                output.append(item)
-            }
-        }
-        for row in rows {
-            // A subagent child is emitted beneath its Agent, not at the top
-            // level — unless its Agent isn't shown here, in which case it stays
-            // inline so it never silently disappears.
-            if let parent = row.parentToolCallID, present.contains(parent) { continue }
-            emit(row)
-        }
-        return output
-    }
-
-    /// Which of a turn's rows fold away once it is done.
-    ///
-    /// Tool calls and thinking always do. Assistant prose does too — except the
-    /// last block, which is the answer the whole turn was for. Without that
-    /// exception a chatty turn showed three or four separate prose blocks and
-    /// nothing marked which one was the conclusion.
-    private static func isCollapsible(_ row: TranscriptRow, isAnswer: Bool) -> Bool {
-        switch row.kind {
-        case .toolCall, .thinking, .error:
-            return true
-        case .assistantText:
-            return !isAnswer
-        case .userMessage, .plan, .divider, .activityGroup, .turnFooter:
-            return false
-        }
-    }
-
-    private static func activitySummary(for rows: [TranscriptRow]) -> String {
-        let tools = rows.filter { $0.kind == .toolCall }.count
-        let thoughts = rows.filter { $0.kind == .thinking }.count
-        let notes = rows.filter { $0.kind == .assistantText }.count
-        let errors = rows.filter { $0.kind == .error || $0.isError }.count
-        var parts: [String] = []
-        if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
-        if thoughts > 0 { parts.append("\(thoughts) thought\(thoughts == 1 ? "" : "s")") }
-        if notes > 0 { parts.append("\(notes) note\(notes == 1 ? "" : "s")") }
-        if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
-        return parts.isEmpty ? "Activity" : parts.joined(separator: ", ")
-    }
-
-    /// Task ids mapped to the subject they were created with.
-    ///
-    /// `TaskUpdate` identifies its task by id alone, so on its own it can only
-    /// say "Task 8". The subject lives in the `TaskCreate` that made it, and
-    /// the id it was assigned comes back in that call's result.
-    private static func taskSubjects(in rows: [TranscriptRow]) -> [String: String] {
-        var subjects: [String: String] = [:]
-        for row in rows where row.kind == .toolCall {
-            // Suffix, not equality: the same tool arrives namespaced when it
-            // comes through MCP (`mcp__ore__TaskCreate`).
-            guard (row.toolName ?? "").lowercased().hasSuffix("taskcreate"),
-                  let subject = row.toolInput?["subject"]?.stringValue,
-                  let id = firstNumber(in: row.resultText ?? "")
-            else { continue }
-            subjects[id] = subject
-        }
-        return subjects
-    }
-
-    private static func taskSubject(
-        for row: TranscriptRow,
-        in subjects: [String: String]
-    ) -> String? {
-        guard row.kind == .toolCall,
-              (row.toolName ?? "").lowercased().contains("task") else { return nil }
-        if let subject = row.toolInput?["subject"]?.stringValue { return subject }
-        guard let id = row.toolInput?["taskId"]?.stringValue
-            ?? row.toolInput?["taskId"]?.intValue.map(String.init)
-        else { return nil }
-        return subjects[id]
-    }
-
-    private static func firstNumber(in text: String) -> String? {
-        let digits = text.drop { !$0.isNumber }.prefix { $0.isNumber }
-        return digits.isEmpty ? nil : String(digits)
-    }
-
-    private static func isMeaningfulError(_ text: String, result: String?) -> Bool {
-        let value = (result?.isEmpty == false ? result! : text)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return !value.isEmpty && !["null", "nil", "<null>", "(null)", "\"null\""].contains(value)
-    }
-
     private func toggleActivity(_ id: String) {
         if expandedActivityGroups.contains(id) { expandedActivityGroups.remove(id) }
         else { expandedActivityGroups.insert(id) }
     }
 
-    private func tabBar(availableWidth: CGFloat) -> some View {
+    /// Tab chrome is its own view so streaming `rowsRevision` cannot rebuild
+    /// the close buttons. Clicks on those used to sit behind 40 Hz transcript
+    /// invalidations.
+    private struct ChatTabBar: View {
+        @Environment(AppModel.self) private var model
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        let workspace: WorkspaceSummary
+        let availableWidth: CGFloat
+        @Binding var revertTarget: TurnID?
+        @Binding var renameChatTarget: ChatSummary?
+        @Binding var renameChatText: String
+        @State private var hoveredTabKey: String?
+
+        private var chat: ChatState { model.chat(for: workspace.id) }
+        private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
+
+        var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: OreTheme.Space.xs) {
@@ -949,6 +729,7 @@ struct ChatPane: View {
             .fixedSize()
             .help("Chat and checkpoint history")
         }
+    }
     }
 
     @ViewBuilder
@@ -1585,7 +1366,12 @@ struct ChatPane: View {
         }
         .buttonStyle(.plain)
         .disabled(chatSummary == nil)
-        .help(narrationOn ? "Stop narrating agent activity" : "Narrate agent activity aloud")
+        // ⌥⌘S next to the mic's ⌥⌘M: the two voice controls are one pair, and
+        // S is the only free letter that names what it does.
+        .keyboardShortcut("s", modifiers: [.option, .command])
+        .help(narrationOn
+            ? "Stop narrating agent activity (⌥⌘S)"
+            : "Narrate agent activity aloud (⌥⌘S)")
     }
 
     private var micButton: some View {
@@ -2763,12 +2549,27 @@ private struct ResearchEmptyState: View {
     private var shortcutHints: [Hint] {
         let groups: [[Hint]] = [
             [Hint(keys: "⌘P", label: "Open file"), Hint(keys: "@", label: "Reference file"), Hint(keys: "⌘↩", label: "Send")],
-            [Hint(keys: "⌘K", label: "Command palette"), Hint(keys: "/", label: "Prompt commands"), Hint(keys: "⌘.", label: "Stop agent")],
+            [Hint(keys: "⌘K", label: "Command palette"), Hint(keys: "↩ / Esc", label: "Allow / deny"), Hint(keys: "⌘.", label: "Stop agent")],
             [Hint(keys: "⌘T", label: "New chat"), Hint(keys: "⌘W", label: "Close chat"), Hint(keys: "⇧⌘[ / ]", label: "Switch chats")],
             [Hint(keys: "⌥⌘T", label: "Terminal"), Hint(keys: "⌘1–9", label: "Jump workspace"), Hint(keys: "⌘/", label: "All shortcuts")],
         ]
         let value = seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
         return groups[abs(value) % groups.count]
+    }
+}
+
+private struct ShortcutCaption: View {
+    let title: String
+    let keys: String
+    var onPrimary = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title)
+            Text(keys)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .opacity(onPrimary ? 0.72 : 0.55)
+        }
     }
 }
 
@@ -3425,6 +3226,7 @@ private struct RateLimitBanner: View {
 private struct PermissionCard: View {
     let request: PermissionRequest
     let onDecision: (PermissionDecision) -> Void
+    @FocusState private var allowFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
@@ -3445,15 +3247,24 @@ private struct PermissionCard: View {
             }
 
             HStack(spacing: 8) {
-                Button("Allow") { onDecision(.allow) }
+                Button {
+                    onDecision(.allow)
+                } label: {
+                    ShortcutCaption(title: "Allow", keys: "↩", onPrimary: true)
+                }
                     .buttonStyle(OrePrimaryButtonStyle())
-                    .keyboardShortcut("a", modifiers: [.command, .shift])
+                    .keyboardShortcut(.defaultAction)
+                    .focused($allowFocused)
+                    .help("Allow this tool (↩). From the composer, ⇧⌘A.")
 
-                Button("Deny") {
+                Button {
                     onDecision(.deny(reason: "The user denied this in ORE."))
+                } label: {
+                    ShortcutCaption(title: "Deny", keys: "Esc")
                 }
                 .buttonStyle(OreSecondaryButtonStyle())
-                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .keyboardShortcut(.cancelAction)
+                .help("Deny this tool (Esc). From the composer, ⇧⌘D.")
 
                 // Harness-suggested shortcuts, kept as raw payloads so what we
                 // send back is exactly what was offered.
@@ -3466,6 +3277,8 @@ private struct PermissionCard: View {
             }
         }
         .oreCard(padding: 12)
+        .id(request.id)
+        .onAppear { allowFocused = true }
     }
 }
 
@@ -3478,20 +3291,46 @@ private struct PlanApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
             Label("Plan ready for review", systemImage: "checklist")
-                .fontWeight(.semibold)
-            Text(markdown).lineLimit(8).textSelection(.enabled)
+                .font(.system(size: OreTheme.Font.title, weight: .semibold))
+            ScrollView {
+                Text(planBody)
+                    .font(.system(size: OreTheme.Font.prose))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 280)
             TextField("Optional feedback…", text: $feedback)
+                .onSubmit { onApprove(feedback) }
             HStack {
-                Button("Approve") { onApprove("") }.buttonStyle(OrePrimaryButtonStyle())
+                Button {
+                    onApprove("")
+                } label: {
+                    ShortcutCaption(title: "Approve", keys: "↩", onPrimary: true)
+                }
+                .buttonStyle(OrePrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
+                .help("Approve this plan (↩)")
+
                 Button("Approve with Feedback") { onApprove(feedback) }
                     .disabled(feedback.isEmpty)
                     .buttonStyle(OreSecondaryButtonStyle())
-                Button("Reject / Revise") { onReject(feedback) }
+
+                Button {
+                    onReject(feedback)
+                } label: {
+                    ShortcutCaption(title: "Reject / Revise", keys: "Esc")
+                }
                     .buttonStyle(OreSecondaryButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+                    .help("Reject this plan (Esc)")
                 Spacer()
             }
         }
         .oreCard(padding: 12)
+    }
+
+    private var planBody: AttributedString {
+        (try? AttributedString(markdown: markdown)) ?? AttributedString(markdown)
     }
 }
 
@@ -3631,24 +3470,70 @@ private struct ComposerModeTag: View {
     }
 }
 
+/// Observes transcript rows without invalidating the composer or tab bar.
+private struct TranscriptHost: View {
+    var chat: ChatState
+    var worktreePath: String
+    var persistenceKey: String
+    var expandedActivityGroups: Set<String>
+    var canFork: Bool
+    var onRevert: (TurnID) -> Void
+    var onToggleActivity: (String) -> Void
+    var onOpenFile: (String) -> Void
+    var onTurnAction: (TurnID, TranscriptView.TurnAction) -> Void
+
+    @State private var memo = TranscriptDisplay.Memo()
+
+    var body: some View {
+        TranscriptView(
+            rows: displayRows,
+            isBusy: chat.isBusy,
+            worktreePath: worktreePath,
+            persistenceKey: persistenceKey,
+            onRevert: onRevert,
+            onToggleActivity: onToggleActivity,
+            onOpenFile: onOpenFile,
+            onTurnAction: onTurnAction,
+            canFork: canFork
+        )
+    }
+
+    private var displayRows: [TranscriptRow] {
+        // Pin observation to the revision, then derive. Completed turns are
+        // reused inside the memo so a live stream does not regroup history.
+        _ = chat.rowsRevision
+        _ = chat.plan
+        return TranscriptDisplay.rows(
+            from: chat.rows,
+            isBusy: chat.isBusy,
+            expanded: expandedActivityGroups,
+            memo: memo,
+            hidingPlanTurnID: {
+                if case .proposal = chat.plan { return chat.planTurnID }
+                return nil
+            }()
+        )
+    }
+}
+
 /// A small accent dot that breathes while an agent works, so a background tab
 /// reads as "running" even after the sheen is dimmed by the tab's reduced
 /// opacity.
 private struct BusyTabDot: View {
     let reduceMotion: Bool
-    @State private var pulse = false
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        Circle()
-            .fill(Color.accentColor)
-            .frame(width: 6, height: 6)
-            .opacity(reduceMotion ? 1 : (pulse ? 0.3 : 1))
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
-                    pulse = true
-                }
-            }
+        let paused = reduceMotion || controlActiveState != .key
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { context in
+            let cycle = 1.4
+            let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
+            let pulse = 0.5 - 0.5 * cos(t * 2 * Double.pi)
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 6, height: 6)
+                .opacity(reduceMotion ? 1 : (0.3 + 0.7 * pulse))
+        }
     }
 }
 

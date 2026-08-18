@@ -304,8 +304,10 @@ struct ClaudeCodeTranslator {
         to output: inout Output
     ) {
         switch tool {
-        case "ExitPlanMode":
-            let plan = input["plan"]?.stringValue ?? ""
+        case "ExitPlanMode", "CreatePlan":
+            let plan = input["plan"]?.stringValue
+                ?? input["markdown"]?.stringValue
+                ?? ""
             // Held so the permission request that gates this plan can be
             // republished with the plan attached — see `handleControlRequest`.
             pendingPlanProposals[toolCallID] = plan
@@ -577,6 +579,8 @@ enum ClaudeToolSemantics {
             return input["pattern"]?.stringValue
         case "Task":
             return input["description"]?.stringValue
+        case "CreatePlan", "ExitPlanMode":
+            return input["name"]?.stringValue ?? input["title"]?.stringValue
         case "WebFetch":
             return input["url"]?.stringValue
         case "WebSearch":

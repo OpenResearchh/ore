@@ -172,13 +172,14 @@ final class NarrationEngine {
     func observe(
         event: AgentEvent,
         chatID: ChatID,
-        isBackground: Bool,
-        workspaceName: String
+        origin: NarrationOrigin
     ) {
         guard isMasterEnabled, enabledChats.contains(chatID) else { return }
         // Background tabs only interject for things that need the user;
-        // ambient progress would interleave into word salad.
-        let background = isBackground ? workspaceName : nil
+        // ambient progress would interleave into word salad. When they do
+        // interject they name where they are, since the user isn't looking at
+        // it — and "where" is the tab, not just the workspace.
+        let background = origin.spokenLabel
 
         switch event {
         case .turnStarted:
@@ -342,7 +343,7 @@ final class NarrationEngine {
                     chatID: chatID,
                     priority: .milestone,
                     kind: .turnCompleted,
-                    text: NarrationPhraser.prefixed("It's finished.", workspaceName: background)
+                    text: NarrationPhraser.prefixed("It's finished.", place: background)
                 ))
             } else if let direct = NarrationPhraser.directSummary(result.summary) {
                 enqueue(SpokenUtterance(
@@ -431,9 +432,9 @@ final class NarrationEngine {
 
     // MARK: - Queue & speech
 
-    private func prefixed(_ text: String, _ workspaceName: String?) -> String {
-        guard let workspaceName else { return text }
-        return NarrationPhraser.prefixed(text, workspaceName: workspaceName)
+    private func prefixed(_ text: String, _ place: String?) -> String {
+        guard let place else { return text }
+        return NarrationPhraser.prefixed(text, place: place)
     }
 
     private func enqueueProgress(_ text: String, kind: SpokenUtterance.Kind, chatID: ChatID) {

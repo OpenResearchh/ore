@@ -47,4 +47,158 @@ struct ChatStateTests {
         #expect(state.rows[1].toolName == "Read")
         #expect(state.rows[2].text == "Done")
     }
+
+    @Test func aPlanProposalStaysUntilTheUserAnswers() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Do the thing", permissionRequestID: nil)
+        )))
+        state.apply(.statusChanged(.idle))
+        state.apply(.turnCompleted(TurnResult(turnID: turnID, outcome: .completed)))
+
+        #expect(state.status == .awaitingInput)
+        guard case .proposal(let markdown, let requestID) = state.plan else {
+            Issue.record("expected a plan proposal to survive turn end")
+            return
+        }
+        #expect(requestID == nil)
+        #expect(markdown.contains("Do the thing"))
+        #expect(state.rows.contains { $0.kind == .plan })
+        #expect(state.planTurnID == turnID)
+
+        state.dismissPlan()
+        #expect(state.plan == nil)
+        #expect(state.planTurnID == nil)
+        #expect(state.status == .idle)
+    }
+
+    @Test func aLaterPlanUpdateEditsTheSameRow() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID, content: .proposal(markdown: "draft", permissionRequestID: nil)
+        )))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID, content: .proposal(markdown: "final", permissionRequestID: nil)
+        )))
+        let plans = state.rows.filter { $0.kind == .plan }
+        #expect(plans.count == 1)
+        #expect(plans[0].text == "final")
+    }
+
+    @Test func streamingDeltasBumpContentRevisionNotJustText() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.textDelta(BlockDelta(
+            turnID: turnID, blockID: BlockID(rawValue: "b1"), text: "Hello"
+        )))
+        #expect(state.rows[0].contentRevision == 0)
+        state.apply(.textDelta(BlockDelta(
+            turnID: turnID, blockID: BlockID(rawValue: "b1"), text: " world"
+        )))
+        #expect(state.rows[0].text == "Hello world")
+        #expect(state.rows[0].contentRevision == 1)
+        #expect(state.hasRows)
+        #expect(state.revertableTurns.isEmpty)
+    }
+
+    @Test func userMessagesPopulateStoredRevertableTurns() {
+        let state = ChatState()
+        state.appendUserMessage("go", comments: [])
+        #expect(state.revertableTurns.count == 1)
+        #expect(state.hasRows)
+    }
+}
+
+@MainActor
+struct TranscriptDisplayTests {
+    @Test func derivedSignatureIgnoresGroupedTextBytes() {
+        var child = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Read"
+        )
+        child.resultText = String(repeating: "a", count: 80_000)
+        child.contentRevision = 3
+        var footer = TranscriptRow(
+            id: "footer",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [child]
+        )
+        footer.sealDerivedContent()
+        let first = footer.activitySignature
+        footer.groupedRows[0].resultText = String(repeating: "b", count: 80_000)
+        footer.sealDerivedContent()
+        #expect(footer.activitySignature == first)
+        footer.groupedRows[0].contentRevision = 4
+        footer.sealDerivedContent()
+        #expect(footer.activitySignature != first)
+    }
+
+    @Test func streamingALaterTurnReusesCompletedTurnOutput() {
+        let turn1 = TurnID(rawValue: "t1")
+        let turn2 = TurnID(rawValue: "t2")
+        var rows = [
+            TranscriptRow(id: "u1", turnID: turn1, kind: .userMessage, text: "first"),
+            TranscriptRow(
+                id: "tool1", turnID: turn1, kind: .toolCall, text: "Read",
+                resultText: String(repeating: "x", count: 20_000), isComplete: true
+            ),
+            TranscriptRow(id: "a1", turnID: turn1, kind: .assistantText, text: "done", isComplete: true),
+            TranscriptRow(id: "u2", turnID: turn2, kind: .userMessage, text: "second"),
+            TranscriptRow(id: "a2", turnID: turn2, kind: .assistantText, text: "Hi"),
+        ]
+        let memo = TranscriptDisplay.Memo()
+        let first = TranscriptDisplay.rows(from: rows, isBusy: true, expanded: [], memo: memo)
+        #expect(memo.completedTurnCount == 1)
+        let completedIDs = first.prefix(while: { $0.turnID == turn1 }).map(\.id)
+
+        rows[4].text += " there"
+        rows[4].contentRevision += 1
+        let second = TranscriptDisplay.rows(from: rows, isBusy: true, expanded: [], memo: memo)
+        #expect(memo.completedTurnCount == 1)
+        #expect(second.prefix(while: { $0.turnID == turn1 }).map(\.id) == completedIDs)
+        #expect(second.last?.text == "Hi there")
+    }
+
+    @Test func sourceSignatureIsIndependentOfPayloadBytes() {
+        var row = TranscriptRow(
+            id: "t", turnID: TurnID(rawValue: "1"), kind: .toolCall, text: "Edit"
+        )
+        row.toolInput = .object(["old_string": .string(String(repeating: "a", count: 50_000))])
+        row.contentRevision = 1
+        let first = TranscriptDisplay.sourceSignature([row])
+        row.toolInput = .object(["old_string": .string(String(repeating: "b", count: 50_000))])
+        #expect(TranscriptDisplay.sourceSignature([row]) == first)
+        row.contentRevision = 2
+        #expect(TranscriptDisplay.sourceSignature([row]) != first)
+    }
+
+    @Test func pendingProposalIsOmittedFromTheTranscriptUntilAnswered() {
+        let turn = TurnID(rawValue: "t1")
+        let markdown = "## Steps\n1. Do the thing"
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "plan this"),
+            TranscriptRow(id: "plan", turnID: turn, kind: .plan, text: markdown),
+        ]
+        let hidden = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: TranscriptDisplay.Memo(),
+            hidingPlanTurnID: turn
+        )
+        #expect(!hidden.contains { $0.kind == .plan })
+        #expect(hidden.contains { $0.kind == .userMessage })
+
+        let shown = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(shown.contains { $0.kind == .plan })
+    }
 }

@@ -67,7 +67,64 @@ final class SyntaxHighlighter: @unchecked Sendable {
         _ code: String,
         language rawLanguage: String?,
         font: NSFont,
-        baseColor: NSColor = .labelColor
+        baseColor: NSColor = .labelColor,
+        cache: Bool = true
+    ) -> NSAttributedString {
+        let cacheKey = HighlightCacheKey(
+            language: Self.canonicalName(rawLanguage) ?? "",
+            code: code,
+            fontSize: font.pointSize,
+            appearance: NSAppearance.currentDrawing().name.rawValue
+        )
+        if cache {
+            lock.lock()
+            let cached = highlightCache[cacheKey]
+            lock.unlock()
+            if let cached { return cached }
+        }
+
+        let rendered = renderHighlight(
+            code, language: rawLanguage, font: font, baseColor: baseColor
+        )
+        if cache {
+            storeHighlight(rendered, for: cacheKey)
+        }
+        return rendered
+    }
+
+    private struct HighlightCacheKey: Hashable {
+        var language: String
+        var code: String
+        var fontSize: CGFloat
+        var appearance: String
+    }
+
+    private var highlightCache: [HighlightCacheKey: NSAttributedString] = [:]
+    private var highlightRecency: [HighlightCacheKey: UInt64] = [:]
+    private var highlightTick: UInt64 = 0
+    private static let highlightCacheCapacity = 48
+
+    private func storeHighlight(_ value: NSAttributedString, for key: HighlightCacheKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        if highlightCache.count >= Self.highlightCacheCapacity {
+            let survivors = highlightRecency.sorted { $0.value > $1.value }
+                .prefix(Self.highlightCacheCapacity / 2)
+                .map(\.key)
+            let keep = Set(survivors)
+            highlightCache = highlightCache.filter { keep.contains($0.key) }
+            highlightRecency = highlightRecency.filter { keep.contains($0.key) }
+        }
+        highlightTick += 1
+        highlightRecency[key] = highlightTick
+        highlightCache[key] = value
+    }
+
+    private func renderHighlight(
+        _ code: String,
+        language rawLanguage: String?,
+        font: NSFont,
+        baseColor: NSColor
     ) -> NSAttributedString {
         let result = NSMutableAttributedString(
             string: code,

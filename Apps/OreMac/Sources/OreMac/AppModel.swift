@@ -116,7 +116,6 @@ final class AppModel {
             await refreshRepositories()
             isLoaded = true
         }
-        startFlushTimer()
         restoreScheduledContinuations()
         NotificationCenter.default.addObserver(
             forName: .oreOpenFromNotification,
@@ -131,30 +130,49 @@ final class AppModel {
         }
     }
 
-    /// Flushes coalesced deltas at ~40Hz.
+    /// Flushes coalesced deltas at ~40Hz, but only while something is pending.
     ///
     /// The transcript is the app's hottest surface, and every delta that
     /// reaches it costs a layout pass. Batching at a fixed cadence decouples
-    /// rendering cost from token rate.
-    private func startFlushTimer() {
+    /// rendering cost from token rate. A timer that ran forever still woke the
+    /// main actor 40 times a second while the app sat idle.
+    private var lastBackgroundFlush: [ChatID: ContinuousClock.Instant] = [:]
+
+    private func scheduleFlush() {
+        guard flushTask == nil else { return }
         flushTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(25))
-                guard let self else { return }
-                self.flushCoalescedDeltas()
+            try? await Task.sleep(for: .milliseconds(25))
+            guard let self, !Task.isCancelled else { return }
+            self.flushTask = nil
+            self.flushCoalescedDeltas()
+            if self.coalescers.values.contains(where: \.hasPendingDeltas) {
+                self.scheduleFlush()
             }
         }
     }
 
     private func flushCoalescedDeltas() {
+        let now = ContinuousClock.now
         for chatID in Array(coalescers.keys) {
             guard var coalescer = coalescers[chatID], coalescer.hasPendingDeltas else { continue }
             guard let workspaceID = chatOwners[chatID] else { continue }
+            if !isVisibleTranscript(workspaceID: workspaceID, chatID: chatID) {
+                if let last = lastBackgroundFlush[chatID], now - last < .milliseconds(250) {
+                    continue
+                }
+                lastBackgroundFlush[chatID] = now
+            }
             for event in coalescer.flush() {
                 applyToChat(workspaceID: workspaceID, chatID: chatID, event: event)
             }
             coalescers[chatID] = coalescer
         }
+    }
+
+    private func isVisibleTranscript(workspaceID: WorkspaceID, chatID: ChatID) -> Bool {
+        selectedWorkspaceID == workspaceID
+            && activeChatIDs[workspaceID] == chatID
+            && activeFilePath[workspaceID] == nil
     }
 
     func shutdown() async {
@@ -430,6 +448,31 @@ final class AppModel {
         guard let chatID = activeChat(for: id)?.id else { return }
         chat(for: chatID).resolvePermission(requestID)
         Task { await client.send(.resolveChatPermission(id, chatID, requestID, decision)) }
+    }
+
+    /// The Allow/Deny card currently on screen, if the generic buttons own it.
+    /// AskUserQuestion and ExitPlanMode keep their dedicated cards instead.
+    var actionablePermission: PermissionRequest? {
+        guard let chat = selectedChat, let permission = chat.pendingPermission else { return nil }
+        if permission.toolName == "AskUserQuestion" { return nil }
+        if permission.toolName == "ExitPlanMode", case .proposal = chat.plan { return nil }
+        return permission
+    }
+
+    func allowPendingPermission() {
+        guard let workspaceID = selectedWorkspaceID,
+              let permission = actionablePermission else { return }
+        resolvePermission(permission.id, decision: .allow, for: workspaceID)
+    }
+
+    func denyPendingPermission() {
+        guard let workspaceID = selectedWorkspaceID,
+              let permission = actionablePermission else { return }
+        resolvePermission(
+            permission.id,
+            decision: .deny(reason: "The user denied this in ORE."),
+            for: workspaceID
+        )
     }
 
     func answerQuestion(_ questionID: QuestionID, answer: String, for id: WorkspaceID) {
@@ -1566,6 +1609,7 @@ final class AppModel {
                 applyToChat(workspaceID: id, chatID: chatID, event: flushed)
             }
             coalescers[chatID] = coalescer
+            if coalescer.hasPendingDeltas { scheduleFlush() }
             // An agent that ends its turn by pushing and opening a PR leaves the
             // worktree byte-for-byte identical to how it started it, so nothing
             // else asks whether the next step changed.
@@ -1759,42 +1803,60 @@ final class AppModel {
 
     private func applyToChat(workspaceID: WorkspaceID, chatID: ChatID, event: AgentEvent) {
         chat(for: chatID).apply(event)
-        let isBackground = selectedWorkspaceID != workspaceID
-            || activeChatIDs[workspaceID] != chatID
+        let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
         // Narration is the audio sibling of the background notifications
-        // below: same funnel, same active/background split.
-        narration.observe(
-            event: event,
-            chatID: chatID,
-            isBackground: isBackground,
-            workspaceName: workspaceName(workspaceID)
-        )
-        guard isBackground else { return }
+        // below: same funnel, same origin, so both name the same place.
+        narration.observe(event: event, chatID: chatID, origin: origin)
+        guard origin.isBackground else { return }
+        let place = origin.displayLabel ?? workspaceName(workspaceID)
         switch event {
         case .permissionRequest:
             postNotification(
                 title: "ORE needs you",
-                body: workspaceName(workspaceID) + " is waiting for permission.",
+                body: place + " is waiting for permission.",
                 workspaceID: workspaceID,
                 chatID: chatID
             )
         case .question:
             postNotification(
                 title: "ORE needs you",
-                body: workspaceName(workspaceID) + " has a question.",
+                body: place + " has a question.",
                 workspaceID: workspaceID,
                 chatID: chatID
             )
         case .turnCompleted where UserDefaults.standard.object(forKey: "ore.notifications.turnComplete") as? Bool ?? true:
             postNotification(
                 title: "Agent finished",
-                body: workspaceName(workspaceID) + " completed a turn.",
+                body: place + " completed a turn.",
                 workspaceID: workspaceID,
                 chatID: chatID
             )
         default:
             break
         }
+    }
+
+    /// Where a chat sits relative to what's on screen. "Background" covers two
+    /// genuinely different situations — another workspace, or another tab of
+    /// the workspace already open — and only the first is usefully named by
+    /// the workspace. Announcing "over in ahmed-zewail" to someone already
+    /// looking at ahmed-zewail tells them nothing and hides which tab it was.
+    private func narrationOrigin(
+        workspaceID: WorkspaceID,
+        chatID: ChatID
+    ) -> NarrationOrigin {
+        let title = chatSummaries.first { $0.id == chatID }?.title
+        guard selectedWorkspaceID == workspaceID else {
+            let name = workspaceName(workspaceID)
+            // The title earns its place only when it says something the
+            // workspace name doesn't.
+            let distinct = title.flatMap {
+                Self.isGenericChatTitle($0, workspaceName: name) ? nil : $0
+            }
+            return .otherWorkspace(name: name, chatTitle: distinct)
+        }
+        guard activeChatIDs[workspaceID] != chatID else { return .foreground }
+        return .otherTab(chatTitle: title ?? "")
     }
 
     /// Drops everything keyed by a chat that no longer exists.
@@ -1806,6 +1868,7 @@ final class AppModel {
         narration.forget(chatID)
         chatOwners.removeValue(forKey: chatID)
         coalescers.removeValue(forKey: chatID)
+        lastBackgroundFlush.removeValue(forKey: chatID)
         chatStates.removeValue(forKey: chatID)
         chatRenamesInFlight.remove(chatID)
         continuationTasks.removeValue(forKey: chatID)?.cancel()

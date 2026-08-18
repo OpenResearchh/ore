@@ -191,6 +191,9 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// model type is ML Program"). The Neural Engine looks like the obvious
     /// home for this and isn't; don't switch without re-measuring.
     @ObservationIgnored private let manager = PocketTtsManager(placement: .gpu)
+    /// Lines already spoken, so a repeat costs a buffer copy instead of a
+    /// second pass through the model. See `NarrationPhraseCache`.
+    @ObservationIgnored private let phraseCache = NarrationPhraseCache()
     @ObservationIgnored private let engine = AVAudioEngine()
     @ObservationIgnored private let player = AVAudioPlayerNode()
     @ObservationIgnored private let format = AVAudioFormat(
@@ -307,10 +310,10 @@ final class NeuralNarrationVoice: NarrationVoice {
             do {
                 if lead > .zero { try await Task.sleep(for: lead) }
                 try self.startEngineIfNeeded()
-                let frames = try await self.manager.synthesizeStreaming(text: text)
-                for try await frame in frames {
-                    if Task.isCancelled { break }
-                    self.accept(frame.samples, generation: generation)
+                if let remembered = await self.rememberedAudio(for: text) {
+                    self.playRemembered(remembered, generation: generation)
+                } else {
+                    try await self.synthesize(text, generation: generation)
                 }
             } catch {
                 // A synthesis failure ends the utterance like any other
@@ -318,6 +321,44 @@ final class NeuralNarrationVoice: NarrationVoice {
             }
             self.noteStreamEnded(generation: generation)
         }
+    }
+
+    /// Generates the line, playing each 80ms frame as it arrives and keeping a
+    /// copy so the next occurrence can skip all of this.
+    private func synthesize(_ text: String, generation: Int) async throws {
+        let worthKeeping = NarrationPhraseCache.isCacheable(text)
+        var recorded: [Float] = []
+        let frames = try await manager.synthesizeStreaming(text: text)
+        for try await frame in frames {
+            if Task.isCancelled { break }
+            if worthKeeping { recorded.append(contentsOf: frame.samples) }
+            accept(frame.samples, generation: generation)
+        }
+        // Only a line that ran to completion is worth remembering. A preempted
+        // one is half a sentence, and replaying half a sentence later would be
+        // worse than regenerating the whole one.
+        guard worthKeeping, !Task.isCancelled, generation == self.generation else { return }
+        phraseCache.store(recorded, for: text)
+    }
+
+    /// Memory first, then disk — the disk read is a few hundred kilobytes and
+    /// belongs off the main actor, which is where this voice otherwise lives.
+    private func rememberedAudio(for text: String) async -> [Float]? {
+        if let samples = phraseCache.cachedInMemory(text) { return samples }
+        let cache = phraseCache
+        return await Task.detached(priority: .userInitiated) {
+            cache.cachedOnDisk(text)
+        }.value
+    }
+
+    /// Replays a remembered line. The pre-roll cushion exists to cover
+    /// generation falling behind playback; with the whole waveform already in
+    /// hand there is nothing to fall behind, so the line starts immediately.
+    private func playRemembered(_ samples: [Float], generation: Int) {
+        guard generation == self.generation else { return }
+        pendingFrames = []
+        playbackStarted = true
+        schedule(samples, generation: generation)
     }
 
     func stop(immediate: Bool) {

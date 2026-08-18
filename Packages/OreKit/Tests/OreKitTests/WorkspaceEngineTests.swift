@@ -297,6 +297,54 @@ struct WorkspaceEngineTests {
             == PermissionMode.acceptEdits.rawValue)
     }
 
+    @Test func aSetModeSuggestionUpdatesTheStoredPermissionMode() async throws {
+        // "Switch to Accept Edits" on the permission card is applied by the
+        // CLI in the same reply. If ORE's stored mode stays Ask, the composer
+        // chip lies and the next spawn asks again.
+        let harness = try await makeEngine()
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+        let requestID = PermissionRequestID(rawValue: "p1")
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        session.emit(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+        try await Task.sleep(for: .milliseconds(150))
+
+        try await harness.engine.resolvePermission(
+            requestID,
+            with: .allowWithSuggestion([
+                "type": "setMode",
+                "mode": "acceptEdits",
+            ]),
+            chatID: defaultChatID
+        )
+
+        #expect(try await harness.store.chat(defaultChatID)?.permissionMode
+            == PermissionMode.acceptEdits.rawValue)
+        #expect(await session.permissionMode == nil,
+                "the CLI already took the mode via the permission reply")
+        #expect(await session.permissionDecisions[requestID] != nil)
+    }
+
+    @Test func allowingAToolWithoutAModeSuggestionLeavesTheChipAlone() async throws {
+        let harness = try await makeEngine()
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        try await harness.engine.resolvePermission(
+            PermissionRequestID(rawValue: "p1"),
+            with: .allow,
+            chatID: defaultChatID
+        )
+
+        #expect(try await harness.store.chat(defaultChatID)?.permissionMode
+            == PermissionMode.default.rawValue)
+    }
+
     @Test func aLaunchOnlyHarnessKeepsThePermissionModeItWasGiven() async throws {
         // The change used to be dropped entirely when the session refused it:
         // the chip showed Accept Edits, the stored mode stayed Ask, and the

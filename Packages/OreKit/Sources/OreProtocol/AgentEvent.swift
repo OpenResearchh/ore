@@ -359,6 +359,21 @@ public enum PermissionDecision: Sendable, Codable, Hashable {
     case deny(reason: String)
 
     public static var allow: PermissionDecision { .allow(updatedInput: nil) }
+
+    /// The permission mode a `setMode` suggestion would switch the session to.
+    ///
+    /// Claude offers "Switch to Accept Edits" on the permission card and applies
+    /// it in the CLI reply. Without this, ORE's stored mode — and the composer
+    /// chip that reads it — stay on Ask.
+    public var impliedPermissionMode: PermissionMode? {
+        guard case .allowWithSuggestion(let raw) = self else { return nil }
+        if let mode = raw["mode"]?.stringValue.flatMap(PermissionMode.init(rawValue:)) {
+            return mode
+        }
+        // Claude's `setMode` payload may omit `mode`; the default is acceptEdits.
+        if raw["type"]?.stringValue == "setMode" { return .acceptEdits }
+        return nil
+    }
 }
 
 public struct PermissionResolution: Sendable, Codable, Hashable {

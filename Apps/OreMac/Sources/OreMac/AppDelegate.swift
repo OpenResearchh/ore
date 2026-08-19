@@ -126,6 +126,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         false
     }
 
+    /// Right-click on the dock icon: jump straight to whichever agents need
+    /// you. The dock badge says how many; this menu says which. (State is
+    /// read inside the main-actor hop as plain strings; `NSMenu` itself isn't
+    /// Sendable, so it is assembled out here on the calling main thread.)
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let entries: [(name: String, id: String)] = MainActor.assumeIsolated {
+            guard let model = AppModel.running() else { return [] }
+            return model.sortedWorkspaces.filter(\.needsAttention).prefix(9)
+                .map { ($0.name, $0.id.rawValue) }
+        }
+        guard !entries.isEmpty else { return nil }
+
+        let menu = NSMenu()
+        for entry in entries {
+            let item = NSMenuItem(
+                title: "\(entry.name) — needs you",
+                action: #selector(revealWorkspaceFromDock(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = entry.id
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func revealWorkspaceFromDock(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        NotificationCenter.default.post(
+            name: .oreOpenFromNotification,
+            object: nil,
+            userInfo: ["workspaceID": raw]
+        )
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         // Child agent processes are terminated by their sessions on shutdown;
         // this is the last chance to make sure that happened. Terminal shells

@@ -93,6 +93,7 @@ public enum AssistantManager {
 
         - [Projects](memory/projects.md) — what the user is working on across workspaces
         - [Preferences](memory/preferences.md) — how the user likes things done
+        - [Watch](memory/watch.md) — what deserves interrupting the user, and what to mute
 
         """)
         seedIfMissing(home.appendingPathComponent("memory/projects.md"), contents: """
@@ -105,6 +106,19 @@ public enum AssistantManager {
         # Preferences
 
         Nothing recorded yet.
+
+        """)
+        seedIfMissing(home.appendingPathComponent("memory/watch.md"), contents: """
+        # Watch preferences
+
+        What deserves interrupting the user, judged against every [ORE watch] \
+        digest. Update this the moment the user says what to surface or mute.
+
+        Current rules (defaults until the user says otherwise):
+        - Surface: an agent finishing something the user explicitly asked to \
+        be told about; failures; anything blocked on the user's input.
+        - Stay quiet about: routine turn completions, progress chatter, and \
+        anything the user is already looking at.
 
         """)
 

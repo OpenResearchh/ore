@@ -255,6 +255,40 @@ struct AssistantBridgeTests {
         let response = try harness.callBridge(tool: "MergePullRequest", arguments: [:])
         #expect(!response.ok)
     }
+
+    @Test func listHarnessesRunsWithoutConfirmation() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        // The test registry has no harnesses, so probes stay empty — the tool
+        // still answers (auto tier, no confirmation event) rather than asking
+        // or failing.
+        let response = try harness.callBridge(tool: "ListHarnesses", arguments: [:])
+        #expect(response.ok)
+        #expect(response.result?.contains("probed") == true)
+
+        let audit = try await harness.store.assistantActions()
+        #expect(audit.first?.tool == "ListHarnesses")
+        #expect(audit.first?.decision == "auto")
+    }
+
+    @Test func creatingAWorkspaceOnAnUnreadyHarnessFailsHelpfully() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        await harness.client.send(.addRepository(path: fixture.repository.path))
+        let response = try harness.callBridge(
+            tool: "CreateWorkspace",
+            arguments: [
+                "repository": .string(fixture.repository.path),
+                "harness": .string("codex"),
+            ]
+        )
+        #expect(!response.ok)
+        #expect(response.error?.contains("isn't ready") == true)
+    }
 }
 
 /// A running core with its bridge up, plus a raw socket client — the same

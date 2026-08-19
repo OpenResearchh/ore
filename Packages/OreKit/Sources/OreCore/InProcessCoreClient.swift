@@ -24,8 +24,8 @@ public actor InProcessCoreClient: CoreClient {
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
     private var engineTasks: [WorkspaceID: [Task<Void, Never>]] = [:]
     private var gitClients: [String: GitClient] = [:]
-    private var harnessProbes: [HarnessProbeResult] = []
-    private var modelCatalog: [HarnessKind: [AgentModel]] = [:]
+    var harnessProbes: [HarnessProbeResult] = []
+    var modelCatalog: [HarnessKind: [AgentModel]] = [:]
 
     // Assistant action lane — see AssistantActions.swift for the policy and
     // dispatch. Stored here because extensions can't add storage.
@@ -286,6 +286,10 @@ public actor InProcessCoreClient: CoreClient {
     private func recordProbes(_ probes: [HarnessProbeResult]) {
         harnessProbes = probes
         continuation.yield(.harnessProbeCompleted(probes))
+        // The assistant may be configured for a harness this machine doesn't
+        // have (first launch, or claude was uninstalled); move it to one that
+        // works so voice never opens with a dead agent.
+        Task { [weak self] in await self?.reconcileAssistantConfiguration() }
     }
 
     private func recordModels(_ models: [AgentModel], for harness: HarnessKind) {

@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage("ore.notifications.sound") private var sound = true
     @AppStorage(NarrationEngine.masterSwitchKey) private var narrationEnabled = true
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
+    @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
 
     @State private var selectedHarness: HarnessKind = .claudeCode
@@ -196,6 +197,11 @@ struct SettingsView: View {
             SettingsCard(title: "Always on", icon: "menubar.arrow.up.rectangle") {
                 Toggle("Start ORE at login", isOn: launchAtLogin)
                 Text("ORE lives in the menu bar: agents keep running and the assistant keeps answering ⇧⌥ with every window closed. Starting at login makes that permanent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
+                Toggle("Proactive updates from the assistant", isOn: $assistantProactive)
+                Text("The assistant watches activity across your workspaces and speaks up only for what matters — failures, finished work you asked about, agents blocked on you. Tell it what to surface or mute (\u{201C}only update me about kailash\u{201D}) and it remembers.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

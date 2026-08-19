@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import LocalAuthentication
 import Observation
 import OreCore
 import OreGit
@@ -248,8 +249,43 @@ final class AppModel {
         _ id: String,
         decision: AssistantConfirmationDecision
     ) {
+        // "Always" is the one answer that outlives this moment — a standing
+        // permission deserves the user's fingerprint, from every surface
+        // (window, menu bar, voice). Failing or cancelling authentication
+        // degrades to allowing once: the user plainly wanted the action, only
+        // the permanence went unproven.
+        if case .allow(.always) = decision {
+            assistantConfirmations.removeAll { $0.id == id }
+            Task { @MainActor in
+                let proven = await Self.authenticateStandingGrant()
+                await client.send(.resolveAssistantConfirmation(
+                    id, .allow(proven ? .always : .once)
+                ))
+                if !proven, let chatID = assistantChatID {
+                    narration.speakAssistant(
+                        "I allowed it once — the standing permission needs Touch ID.",
+                        chatID: chatID
+                    )
+                }
+            }
+            return
+        }
         assistantConfirmations.removeAll { $0.id == id }
         Task { await client.send(.resolveAssistantConfirmation(id, decision)) }
+    }
+
+    /// Biometrics or the login password — whichever the Mac has. A machine
+    /// with neither (or a denied prompt) simply doesn't mint standing grants.
+    private static func authenticateStandingGrant() async -> Bool {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+            return false
+        }
+        return (try? await context.evaluatePolicy(
+            .deviceOwnerAuthentication,
+            localizedReason: "let the ORE assistant always perform this kind of action"
+        )) ?? false
     }
 
     /// The assistant's action audit, newest first, for the Actions tab.
@@ -288,6 +324,128 @@ final class AppModel {
         let waiters = assistantReplyWaiters
         assistantReplyWaiters = [:]
         for continuation in waiters.values { continuation.resume(returning: reply) }
+    }
+
+    // MARK: - Proactive watch
+
+    /// Events across the fleet, buffered for the assistant's judgment. The
+    /// assistant — not a rule engine — decides what deserves the user's
+    /// attention, judging against `memory/watch.md`, which it updates the
+    /// moment the user says what to surface or mute.
+    private var watchBuffer: [String] = []
+    private var watchFlushTask: Task<Void, Never>?
+    private var lastWatchDigestAt: Date = .distantPast
+    private var awaitingWatchReply = false
+    var assistantRateLimitHandled = false
+
+    /// Coalesce a burst of activity into one digest…
+    private static let watchDebounce: Duration = .seconds(30)
+    /// …and never brief more often than this, whatever is happening.
+    private static let watchMinimumGap: TimeInterval = 150
+
+    private var proactiveWatchEnabled: Bool {
+        UserDefaults.standard.object(forKey: "ore.assistant.proactive") as? Bool ?? true
+    }
+
+    private func collectWatchEvent(
+        _ event: AgentEvent,
+        workspaceID: WorkspaceID,
+        chatID: ChatID
+    ) {
+        guard proactiveWatchEnabled, assistantWorkspace != nil else { return }
+        let place = "\(workspaceName(workspaceID))"
+            + (chatSummaries.first { $0.id == chatID }.map { " / \($0.title)" } ?? "")
+
+        let line: String?
+        switch event {
+        case .turnCompleted(let result):
+            switch result.outcome {
+            case .completed:
+                let note = NarrationPhraser.spokenNarration(result.narration)
+                    ?? result.summary.map { String($0.prefix(160)) }
+                line = "\(place): finished a turn" + (note.map { " — \($0)" } ?? "")
+            case .failed:
+                line = "\(place): the turn FAILED"
+                    + (result.summary.map { " — \(String($0.prefix(160)))" } ?? "")
+            case .awaitingInput:
+                line = "\(place): stopped, waiting for the user's input"
+            case .interrupted:
+                line = nil
+            }
+        case .question(let question):
+            line = "\(place): asks the user — \(String(question.prompt.prefix(160)))"
+        case .sessionError(let error):
+            line = "\(place): session error — \(String(error.message.prefix(160)))"
+        default:
+            line = nil
+        }
+        guard let line else { return }
+        watchBuffer.append(line)
+        scheduleWatchFlush()
+    }
+
+    private func scheduleWatchFlush() {
+        guard watchFlushTask == nil else { return }
+        watchFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.watchDebounce)
+            guard let self, !Task.isCancelled else { return }
+            self.watchFlushTask = nil
+            self.flushWatchDigest()
+        }
+    }
+
+    private func flushWatchDigest() {
+        guard proactiveWatchEnabled,
+              let assistant = assistantWorkspace,
+              !watchBuffer.isEmpty
+        else {
+            watchBuffer.removeAll()
+            return
+        }
+        // One digest at a time, and never at a chattier cadence than the gap —
+        // whatever backed up simply rides the next digest.
+        guard !awaitingWatchReply,
+              Date().timeIntervalSince(lastWatchDigestAt) >= Self.watchMinimumGap
+        else {
+            scheduleWatchFlush()
+            return
+        }
+        let lines = watchBuffer.suffix(12)
+        watchBuffer.removeAll()
+        lastWatchDigestAt = Date()
+        awaitingWatchReply = true
+        send(
+            """
+            [ORE watch] Cross-workspace events since the last digest:
+            \(lines.map { "- \($0)" }.joined(separator: "\n"))
+
+            Judge these against memory/watch.md. Reply with exactly SKIP if \
+            none of it deserves interrupting the user; otherwise reply with \
+            one or two spoken-style sentences (they will be spoken aloud and \
+            shown as a notification). Take no actions.
+            """,
+            to: assistant.id
+        )
+    }
+
+    /// The assistant judged a digest. SKIP means the fleet's activity wasn't
+    /// worth the user's attention; anything else is worth a voice and a banner.
+    /// SKIP is detected in the reply body — the narration tag is a separate
+    /// line the model appends to every turn, and would mask the verdict.
+    private func deliverWatchVerdict(_ result: TurnResult) {
+        guard result.outcome == .completed else { return }
+        let body = (result.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.uppercased().hasPrefix("SKIP") { return }
+        guard let verdict = NarrationPhraser.spokenNarration(result.narration)
+            ?? (body.isEmpty ? nil : String(body.prefix(200)))
+        else { return }
+
+        postNotification(title: "ORE Assistant", body: verdict)
+        // Proactive speech honors the master narration switch — unlike voice
+        // replies, the user didn't just ask for this out loud.
+        if narration.isMasterEnabled, let chatID = assistantChatID {
+            narration.speakAssistant(verdict, chatID: chatID)
+        }
     }
 
     var selectedChat: ChatState? {
@@ -2086,17 +2244,36 @@ final class AppModel {
         // — its voice is the voice mode: replies to spoken requests are read
         // aloud by the controller, and everything else stays quiet.
         guard assistantWorkspace?.id != workspaceID else {
-            if case .turnCompleted(let result) = event, !assistantReplyWaiters.isEmpty {
-                // Someone is waiting synchronously — Siri, Shortcuts, or
-                // Spotlight via an App Intent.
-                flushAssistantReplyWaiters(
-                    with: NarrationPhraser.spokenNarration(result.narration)
-                        ?? "Done — the details are in ORE's Assistant window."
+            if case .turnCompleted(let result) = event {
+                if !assistantReplyWaiters.isEmpty {
+                    // Someone is waiting synchronously — Siri, Shortcuts, or
+                    // Spotlight via an App Intent.
+                    flushAssistantReplyWaiters(
+                        with: NarrationPhraser.spokenNarration(result.narration)
+                            ?? "Done — the details are in ORE's Assistant window."
+                    )
+                } else if awaitingWatchReply {
+                    awaitingWatchReply = false
+                    deliverWatchVerdict(result)
+                }
+                assistantRateLimitHandled = false
+            }
+            if case .rateLimit(let report) = event, report.status == .exhausted,
+               !assistantRateLimitHandled {
+                // The assistant's own provider ran dry; move it to another
+                // ready harness so the next question still gets answered.
+                assistantRateLimitHandled = true
+                Task { await client.assistantRateLimited(chatID: chatID) }
+                narration.speakAssistant(
+                    "I've hit my provider's rate limit — switching to another "
+                        + "agent to keep answering.",
+                    chatID: chatID
                 )
             }
             voiceAssistant.observe(event)
             return
         }
+        collectWatchEvent(event, workspaceID: workspaceID, chatID: chatID)
         let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
         // Narration is the audio sibling of the background notifications
         // below: same funnel, same origin, so both name the same place.

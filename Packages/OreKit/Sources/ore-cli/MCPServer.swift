@@ -178,7 +178,7 @@ private final class AssistantToolServer {
     ]
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
-        "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace",
+        "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
     ]
 
     init(enabled: Bool, databaseURL: URL) {
@@ -251,19 +251,21 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateWorkspace",
-                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation. Pass `prompt` to start its agent on a task immediately.",
+                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "repository": ["type": "string", "description": "Repository name or path. Optional when the user has exactly one."],
                         "name": ["type": "string", "description": "Workspace name. Omit for an auto-generated one."],
                         "prompt": ["type": "string", "description": "Initial task for the workspace's agent."],
+                        "harness": ["type": "string", "description": "claude | codex | cursor — must be ready per ListHarnesses. Omit for the default."],
+                        "model": ["type": "string", "description": "A model id from ListHarnesses for the chosen harness. Omit for its default."],
                     ],
                 ],
             ],
             [
                 "name": "CreateChat",
-                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation.",
+                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation. Use for work unrelated to any existing tab's conversation — continuing existing work belongs in its own tab via SendPromptToProject(chatID:). Give it a short, specific title.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -276,16 +278,22 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SendPromptToProject",
-                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. Queues automatically if that agent is mid-turn. Runs without confirmation.",
+                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. Queues automatically if that agent is mid-turn. Runs without confirmation. Write `text` as a full brief, not a relay of the user's words: goal in one line, concrete context you gathered (branch, recent turns, file/PR names), what done looks like — and quote the user's original phrasing at the end.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "workspaceID": ["type": "string"],
-                        "text": ["type": "string"],
-                        "chatID": ["type": "string", "description": "A specific chat tab; omit for the workspace's main chat."],
+                        "text": ["type": "string", "description": "A complete brief for the project agent, richer than the user's spoken request but inventing nothing."],
+                        "chatID": ["type": "string", "description": "The tab already carrying this work (find it via ListChats + GetTranscriptTail); omit only for the workspace's main chat."],
+                        "effort": ["type": "string", "description": "Reasoning depth for this one turn: low | medium | high. Reserve high for genuinely hard work."],
                     ],
                     "required": ["workspaceID", "text"],
                 ],
+            ],
+            [
+                "name": "ListHarnesses",
+                "description": "Which agent CLIs are installed, signed in, and what models each offers. Consult before choosing a harness/model for CreateWorkspace, or when a provider seems rate-limited or broken.",
+                "inputSchema": ["type": "object", "properties": [:]],
             ],
             [
                 "name": "OpenWorkspace",

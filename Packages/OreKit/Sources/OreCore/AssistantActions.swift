@@ -20,7 +20,10 @@ enum AssistantActionPolicy {
         switch tool {
         // Reversible, contained, and usually the very thing the user just
         // asked for. Prompting on these is how an assistant becomes paperwork.
-        case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace":
+        // ListHarnesses is a pure read that happens to need the app process —
+        // probe results and rate limits live there, not in the database.
+        case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
+             "ListHarnesses":
             return .auto
 
         // Consequential: they publish or remove things. Confirm — once.
@@ -36,7 +39,7 @@ enum AssistantActionPolicy {
 
     static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
-        "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace",
+        "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
     ]
 
     /// How long a "for this task" grant lasts, sliding on use. Long enough to
@@ -240,9 +243,12 @@ extension InProcessCoreClient {
         switch request.tool {
         case "CreateWorkspace":
             let repository = try await resolveRepository(arguments["repository"]?.stringValue)
+            let harness = try resolveHarness(arguments["harness"]?.stringValue)
             let record = try await createWorkspace(CreateWorkspaceRequest(
                 repositoryPath: repository.path,
                 name: arguments["name"]?.stringValue ?? "",
+                harness: harness ?? .claudeCode,
+                model: arguments["model"]?.stringValue,
                 initialPrompt: arguments["prompt"]?.stringValue
             ))
             return "Created workspace \"\(record.name)\" (id \(record.id)) "
@@ -270,12 +276,20 @@ extension InProcessCoreClient {
                 throw AssistantActionError.badRequest("SendPromptToProject needs text.")
             }
             let chatID = arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:))
+            let effort = arguments["effort"]?.stringValue
+                .flatMap(ReasoningEffort.init(rawValue:))
             let sent = try await engine(for: workspaceID).send(SendMessageRequest(
-                workspaceID: workspaceID, chatID: chatID, text: text
+                workspaceID: workspaceID,
+                chatID: chatID,
+                text: text,
+                reasoningEffort: effort
             ))
             return sent
                 ? "Sent. The project's agent is working on it."
                 : "The agent was mid-turn, so the prompt was queued and will run next."
+
+        case "ListHarnesses":
+            return harnessCatalogText()
 
         case "OpenWorkspace":
             let workspaceID = try requireWorkspace(arguments)
@@ -360,6 +374,117 @@ extension InProcessCoreClient {
 
     private func requestWorkspaceID(_ request: AssistantBridgeRequest) -> WorkspaceID? {
         request.arguments["workspaceID"]?.stringValue.map(WorkspaceID.init(rawValue:))
+    }
+
+    /// A harness by name, but only if this machine can actually run it —
+    /// creating a workspace on an agent that isn't installed produces a
+    /// mysterious dead tab ten minutes later.
+    private func resolveHarness(_ reference: String?) throws -> HarnessKind? {
+        guard let reference, !reference.isEmpty else { return nil }
+        let kind: HarnessKind? = switch reference.lowercased() {
+        case "claude", "claudecode", "claude-code": .claudeCode
+        case "codex": .codex
+        case "cursor", "cursor-agent": .cursorAgent
+        default: HarnessKind(rawValue: reference)
+        }
+        guard let kind else {
+            throw AssistantActionError.badRequest("Unknown harness \"\(reference)\".")
+        }
+        guard harnessProbes.first(where: { $0.kind == kind })?.isReady ?? false else {
+            let ready = harnessProbes.filter(\.isReady).map(\.kind.rawValue)
+            throw AssistantActionError.badRequest(
+                "\(kind.displayName) isn't ready on this Mac. Ready: "
+                    + (ready.isEmpty ? "none yet — ask again in a moment" : ready.joined(separator: ", "))
+            )
+        }
+        return kind
+    }
+
+    /// What's installed, signed in, and which models each agent offers —
+    /// the assistant's basis for choosing a configuration.
+    private func harnessCatalogText() -> String {
+        guard !harnessProbes.isEmpty else {
+            return "Harnesses are still being probed — ask again in a few seconds."
+        }
+        var lines: [String] = []
+        for probe in harnessProbes {
+            var line = "\(probe.kind.rawValue): "
+            if !probe.isInstalled {
+                line += "not installed"
+            } else if probe.authState == .notAuthenticated {
+                line += "installed but not signed in"
+            } else {
+                line += "ready"
+                if let version = probe.version { line += " (v\(version))" }
+                let models = modelCatalog[probe.kind] ?? []
+                if !models.isEmpty {
+                    let described = models.map { model in
+                        model.id + (model.isDefault ? " (default)" : "")
+                    }
+                    line += " — models: " + described.joined(separator: ", ")
+                }
+            }
+            if let diagnostic = probe.diagnostic { line += " — note: \(diagnostic)" }
+            lines.append(line)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Self-configuration
+
+    /// Moves the assistant onto a harness that actually works here. Runs after
+    /// every probe pass: first launch on a codex-only machine, or claude
+    /// disappearing between launches, must not leave the assistant mute.
+    func reconcileAssistantConfiguration() async {
+        guard let assistant = try? await store.assistantWorkspace(),
+              let chat = try? await store.chats(workspaceID: assistant.workspaceID).first
+        else { return }
+        let current = HarnessKind(rawValue: chat.harness)
+        if let current, harnessProbes.first(where: { $0.kind == current })?.isReady ?? false {
+            return
+        }
+        guard let fallback = harnessProbes.first(where: \.isReady)?.kind else { return }
+        await moveAssistant(to: fallback, workspaceID: assistant.workspaceID, chatID: chat.chatID)
+    }
+
+    /// The assistant's own provider hit a hard limit; move it to another
+    /// ready harness so the user's next question still gets answered. The
+    /// engine's harness switch carries a locally generated handoff summary,
+    /// so the conversation continues rather than restarting.
+    public func assistantRateLimited(chatID: ChatID) async {
+        guard let assistant = try? await store.assistantWorkspace(),
+              let chat = try? await store.chat(chatID),
+              chat.workspaceID == assistant.id
+        else { return }
+        let current = HarnessKind(rawValue: chat.harness)
+        guard let alternate = harnessProbes.first(where: {
+            $0.isReady && $0.kind != current
+        })?.kind else { return }
+        await moveAssistant(to: alternate, workspaceID: assistant.workspaceID, chatID: chatID)
+    }
+
+    private func moveAssistant(
+        to harness: HarnessKind,
+        workspaceID: WorkspaceID,
+        chatID: ChatID
+    ) async {
+        guard let chat = try? await engine(for: workspaceID).switchHarness(
+            chatID: chatID,
+            harness: harness,
+            model: Self.assistantModel(for: harness, catalog: modelCatalog)
+        ) else { return }
+        continuation.yield(.chatUpdated(chat))
+    }
+
+    /// The cheapest sensible model per harness for the assistant's own turns:
+    /// haiku on Claude; elsewhere the catalog default (we don't know another
+    /// provider's price ladder, and guessing a model id breaks the session).
+    static func assistantModel(
+        for harness: HarnessKind,
+        catalog: [HarnessKind: [AgentModel]]
+    ) -> String? {
+        if harness == .claudeCode { return AssistantManager.defaultModel }
+        return catalog[harness]?.first(where: \.isDefault)?.id
     }
 
     // MARK: - Audit

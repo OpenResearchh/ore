@@ -770,6 +770,81 @@ struct ChecklistRowTests {
     }
 }
 
+/// A subagent row used to say only that an agent existed and how many steps it
+/// took. What it was created for is the one thing worth reading at a glance.
+@MainActor
+struct SubagentRowTests {
+    private func row(input: JSONValue, children: Int? = nil, expanded: Bool = false) -> TranscriptRow {
+        var row = TranscriptRow(
+            id: "task-1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Task",
+            toolName: "Task",
+            toolCallID: ToolCallID(rawValue: "c1"),
+            toolInput: input
+        )
+        row.subagentChildCount = children
+        row.isExpanded = expanded
+        return row
+    }
+
+    @Test func theRowSaysWhatTheAgentWasCreatedFor() {
+        let rendered = TranscriptCell.attributedText(for: row(input: .object([
+            "subagent_type": .string("Explore"),
+            "description": .string("Find subagent UI"),
+            "prompt": .string(
+                "In this repo (/tmp/ore), find how sub-agents are displayed in the UI. "
+                    + "Report exact file paths."
+            ),
+        ])))
+        #expect(rendered.string.contains("Subagent · Explore"))
+        #expect(rendered.string.contains("Find how sub-agents are displayed in the UI."))
+        // The scoping clause the prompt opens with is noise to a reader who is
+        // already looking at that workspace.
+        #expect(!rendered.string.contains("/tmp/ore"))
+    }
+
+    @Test func aBriefThatOnlyRestatesTheChipIsNotPrintedTwice() {
+        let rendered = TranscriptCell.attributedText(for: row(input: .object([
+            "description": .string("Review the diff"),
+            "prompt": .string("Review the diff."),
+        ])))
+        #expect(rendered.string.contains("Subagent"))
+        #expect(!rendered.string.contains("Review the diff."))
+    }
+
+    @Test func aGroupedRowStillOpensOntoItsBrief() {
+        let input = JSONValue.object([
+            "description": .string("Map the harnesses"),
+            "prompt": .string("Map the harness abstraction.\nReport type names and line numbers."),
+        ])
+        let collapsed = TranscriptCell.attributedText(for: row(input: input, children: 12))
+        #expect(collapsed.string.contains("· 12 steps"))
+        #expect(!collapsed.string.contains("Report type names"))
+
+        let expanded = TranscriptCell.attributedText(
+            for: row(input: input, children: 12, expanded: true)
+        )
+        #expect(expanded.string.contains("· 12 steps"))
+        #expect(expanded.string.contains("Report type names and line numbers"))
+    }
+
+    /// Cursor and Codex spell the brief their own way; the translators alias it
+    /// onto the keys this row reads.
+    @Test func anAliasedBriefRendersTheSameWay() {
+        let rendered = TranscriptCell.attributedText(for: row(input: SubagentBrief.normalized(
+            .object([
+                "agentType": .string("reviewer"),
+                "title": .string("Check the tests"),
+                "instructions": .string("Check that every new branch has a test covering it."),
+            ])
+        )))
+        #expect(rendered.string.contains("Subagent · reviewer"))
+        #expect(rendered.string.contains("Check that every new branch has a test covering it."))
+    }
+}
+
 struct UsageLimitResetTests {
     @Test func parsesProviderResetCopyIntoTheNextWallClock() {
         var calendar = Calendar(identifier: .gregorian)
@@ -792,6 +867,19 @@ struct UsageLimitResetTests {
         let zone = TimeZone(identifier: "UTC")!
         let formatted = UsageLimitReset.format(date, timeZone: zone)
         #expect(formatted.contains(zone.identifier) || formatted.contains("GMT") || formatted.contains("UTC"))
+    }
+}
+
+struct ScheduledContinuationTests {
+    @Test func persistedItemsWithoutRetryFlagStillDecode() throws {
+        let payload = """
+        {"workspaceID":"w1","chatID":"c1","resumeAt":0,"prompt":"Continue from where you left off."}
+        """
+        let decoded = try JSONDecoder().decode(
+            ScheduledContinuation.self, from: Data(payload.utf8)
+        )
+        #expect(decoded.retriesLastTurn == false)
+        #expect(decoded.prompt == ScheduledContinuation.defaultPrompt)
     }
 }
 

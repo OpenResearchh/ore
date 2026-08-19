@@ -300,6 +300,14 @@ final class VoiceInputController {
     private var recognitionTask: SFSpeechRecognitionTask?
     private var analyzerStop: (@Sendable () async -> Void)?
 
+    /// Names the recognizer should be primed to hear — workspace and repo
+    /// names, which are exactly the words general English models get wrong.
+    /// Set before `start()`. The `SFSpeechRecognizer` path takes these as
+    /// contextual strings; the macOS 26 on-device transcriber exposes no
+    /// biasing hook yet, so its transcripts rely on `VoiceVocabulary`'s
+    /// post-pass correction instead.
+    var vocabulary: [String] = []
+
     func toggle() {
         if isActive { stop() } else { start() }
     }
@@ -469,6 +477,9 @@ final class VoiceInputController {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
+        if !vocabulary.isEmpty {
+            request.contextualStrings = vocabulary
+        }
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
         }

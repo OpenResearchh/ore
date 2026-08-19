@@ -76,6 +76,11 @@ public enum CoreCommand: Sendable, Codable {
     case stopSession(WorkspaceID)
     case stopChatSession(WorkspaceID, ChatID)
 
+    // Assistant
+    /// Answer a pending assistant action confirmation. The string is the
+    /// confirmation id from `CoreEvent.assistantConfirmationRequested`.
+    case resolveAssistantConfirmation(String, AssistantConfirmationDecision)
+
     // Diagnostics
     case probeHarnesses
     /// Resend the current snapshot — used on reconnect, and by a fresh window.
@@ -163,7 +168,7 @@ public struct SendMessageRequest: Sendable, Codable {
 }
 
 public enum ReasoningEffort: String, CaseIterable, Sendable, Codable, Hashable {
-    case none, low, medium, high, xhigh, max
+    case none, low, medium, high, xhigh, max, adaptive
 
     public var displayName: String {
         switch self {
@@ -173,6 +178,7 @@ public enum ReasoningEffort: String, CaseIterable, Sendable, Codable, Hashable {
         case .high: "High"
         case .xhigh: "Extra High"
         case .max: "Max"
+        case .adaptive: "Adaptive"
         }
     }
 }

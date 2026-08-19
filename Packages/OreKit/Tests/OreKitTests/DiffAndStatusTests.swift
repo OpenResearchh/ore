@@ -249,6 +249,35 @@ struct DiffEngineTests {
         #expect(created.insertions == 1)
     }
 
+    @Test func reviewDiffTextIncludesUntrackedAndCommittedBranchWork() async throws {
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "review-diff", baseRevision: "main", baseBranch: "main"
+        )).path
+
+        try fixture.write("on-branch.swift", "let committed = true\n", in: worktree)
+        try await fixture.run(["add", "-A"], in: worktree)
+        try await fixture.commit("branch work", in: worktree)
+        try fixture.write("brand-new.swift", "let untracked = true\n", in: worktree)
+
+        let text = await ReviewDiff.unifiedText(in: worktree)
+        #expect(text.contains("on-branch.swift"))
+        #expect(text.contains("brand-new.swift"))
+        #expect(text.contains("let committed"))
+        #expect(text.contains("let untracked"))
+    }
+
+    @Test func reviewCommentsRoundTripThroughTheSharedFile() async throws {
+        let fixture = try await GitFixture.initialized()
+        let comment = DiffCommentReference(
+            filePath: "A.swift", startLine: 3, endLine: 5, body: "check this"
+        )
+        let count = try DiffCommentFile.append(comment, in: fixture.repository)
+        #expect(count == 1)
+        #expect(DiffCommentFile.load(in: fixture.repository) == [comment])
+    }
+
     @Test func diffAgainstBaseIgnoresCommitsThatLandedOnTheBaseBranch() async throws {
         // Using the merge base means work merged into main while the agent was
         // running doesn't show up as this workspace's changes.

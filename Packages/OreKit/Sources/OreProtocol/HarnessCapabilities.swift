@@ -27,6 +27,11 @@ public enum HarnessKind: String, Sendable, Codable, CaseIterable {
     /// Harnesses that ship behind an experimental flag declare reduced
     /// capabilities rather than pretending to be at parity.
     public var isExperimental: Bool { self == .cursorAgent }
+
+    /// Cursor bakes thinking level into the model id (`cursor-grok-4.6-high`)
+    /// and `cursor-agent` has no `--effort` flag. Offering a chip would look
+    /// like a setting and then silently do nothing.
+    public var supportsReasoningEffort: Bool { self != .cursorAgent }
 }
 
 /// How a harness asks for permission before running a tool.

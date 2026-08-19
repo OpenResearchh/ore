@@ -7,10 +7,37 @@ struct ScheduledContinuation: Codable, Equatable, Sendable, Identifiable {
     var chatID: ChatID
     var resumeAt: Date
     var prompt: String
+    /// When true, fire by resending the last user turn instead of `prompt`.
+    /// Rate-limit retries want the original prompt; usage-limit continuations
+    /// send "Continue from where you left off."
+    var retriesLastTurn: Bool
 
     var id: ChatID { chatID }
 
     static let defaultPrompt = "Continue from where you left off."
+
+    init(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        resumeAt: Date,
+        prompt: String = ScheduledContinuation.defaultPrompt,
+        retriesLastTurn: Bool = false
+    ) {
+        self.workspaceID = workspaceID
+        self.chatID = chatID
+        self.resumeAt = resumeAt
+        self.prompt = prompt
+        self.retriesLastTurn = retriesLastTurn
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workspaceID = try container.decode(WorkspaceID.self, forKey: .workspaceID)
+        chatID = try container.decode(ChatID.self, forKey: .chatID)
+        resumeAt = try container.decode(Date.self, forKey: .resumeAt)
+        prompt = try container.decode(String.self, forKey: .prompt)
+        retriesLastTurn = try container.decodeIfPresent(Bool.self, forKey: .retriesLastTurn) ?? false
+    }
 }
 
 /// Wall-clock reset times as they appear in provider copy

@@ -45,7 +45,16 @@ final class ChatState {
     struct ProminentError: Equatable {
         var message: String
         var isUsageLimit: Bool
+        var needsCLIUpgrade: Bool
         var resetsAt: Date?
+
+        init(message: String, isUsageLimit: Bool, resetsAt: Date?, needsCLIUpgrade: Bool = false) {
+            let unwrapped = ProviderErrorCopy.unwrap(message)
+            self.message = unwrapped
+            self.needsCLIUpgrade = needsCLIUpgrade || ProviderErrorCopy.needsCLIUpgrade(unwrapped)
+            self.isUsageLimit = !self.needsCLIUpgrade && isUsageLimit
+            self.resetsAt = resetsAt
+        }
     }
     private(set) var prominentError: ProminentError?
 
@@ -127,6 +136,13 @@ final class ChatState {
     /// while idle.
     private(set) var turnStartedAt: Date?
 
+    /// Last agent event in the open turn. The composer uses this to say
+    /// "No output for Xm" when the harness goes silent mid-tool.
+    private(set) var lastEventAt: Date?
+
+    /// Human-readable phrase for the in-flight tool, e.g. "Reading ChatPane.swift".
+    private(set) var runningToolLabel: String?
+
     /// False between the user pressing send and the harness reporting its
     /// first turn event — the window where a one-shot CLI (Cursor) is still
     /// booting and the UI would otherwise look stuck.
@@ -139,6 +155,7 @@ final class ChatState {
     // MARK: - Applying events
 
     func apply(_ event: AgentEvent) {
+        lastEventAt = Date()
         switch event {
         case .sessionStarted:
             break
@@ -158,6 +175,8 @@ final class ChatState {
             isTurnActive = true
             streamingRowIndex.removeAll()
             turnStartedAt = Date()
+            lastEventAt = turnStartedAt
+            runningToolLabel = nil
             hasTurnEventArrived = true
             // A turn starting is what a queued message was waiting for. The
             // oldest pending row is the one it drained, so it stops being
@@ -195,6 +214,7 @@ final class ChatState {
                     row.toolInput = call.input
                     row.parentToolCallID = call.parentToolCallID
                 }
+                runningToolLabel = Self.runningToolPhrase(name: call.name, displayName: call.displayName)
                 return
             }
             rows.append(TranscriptRow(
@@ -207,6 +227,7 @@ final class ChatState {
                 parentToolCallID: call.parentToolCallID,
                 toolInput: call.input
             ))
+            runningToolLabel = Self.runningToolPhrase(name: call.name, displayName: call.displayName)
 
         case .toolResult(let result):
             attach(result)
@@ -278,6 +299,8 @@ final class ChatState {
             isTurnActive = false
             streamingRowIndex.removeAll()
             turnStartedAt = nil
+            lastEventAt = nil
+            runningToolLabel = nil
             hasTurnEventArrived = true
             // A proposal that arrived before we saw the Edit events still has
             // to drop: the turn already mutated the tree, so there is nothing
@@ -316,7 +339,9 @@ final class ChatState {
                     || Self.looksLikeUsageLimit(error.message),
                 resetsAt: rateLimit?.resetsAt
                     ?? UsageLimitReset.parse(error.message)
-                    ?? UsageLimitReset.parse(error.detail ?? "")
+                    ?? UsageLimitReset.parse(error.detail ?? ""),
+                needsCLIUpgrade: error.kind == .protocolMismatch
+                    || ProviderErrorCopy.needsCLIUpgrade(error.message)
             )
 
         case .sessionEnded:
@@ -325,6 +350,9 @@ final class ChatState {
             // never reports `.turnCompleted`, and a composer left believing a
             // turn is open would queue every later message behind a dead one.
             isTurnActive = false
+            turnStartedAt = nil
+            lastEventAt = nil
+            runningToolLabel = nil
 
         case .contextCompacted(let compaction):
             // The harness summarised its own history to stay under the window.
@@ -388,6 +416,8 @@ final class ChatState {
         // overwrites it with the harness's own clock.
         status = .requesting
         turnStartedAt = Date()
+        lastEventAt = turnStartedAt
+        runningToolLabel = nil
         hasTurnEventArrived = false
         // Claim the turn locally for the same reason the engine claims it before
         // its own awaits: a second message typed in the gap before `.turnStarted`
@@ -561,6 +591,28 @@ final class ChatState {
             row.resultMetadata = result.metadata
             row.isError = result.isError
             row.isComplete = true
+        }
+    }
+
+    /// A short live phrase for the composer, so "running a tool" can name the file.
+    static func runningToolPhrase(name: String, displayName: String?) -> String {
+        let subject = displayName.flatMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return URL(fileURLWithPath: trimmed).lastPathComponent
+        }
+        switch name {
+        case "Read": return subject.map { "Reading \($0)" } ?? "Reading a file"
+        case "Write", "Edit", "NotebookEdit":
+            return subject.map { "Editing \($0)" } ?? "Editing a file"
+        case "Bash": return displayName.map { "Running \($0)" } ?? "Running a command"
+        case "Grep", "Glob", "LS": return displayName.map { "Searching \($0)" } ?? "Searching"
+        case "Task": return displayName.map { "Running subagent · \($0)" } ?? "Running a subagent"
+        case "WebFetch": return displayName.map { "Fetching \($0)" } ?? "Fetching a page"
+        case "WebSearch": return displayName.map { "Searching the web for \($0)" } ?? "Searching the web"
+        default:
+            if let displayName, !displayName.isEmpty { return "\(name) · \(displayName)" }
+            return name
         }
     }
 }

@@ -17,6 +17,15 @@ import UserNotifications
 @Observable
 final class AppModel {
     private(set) var workspaces: [WorkspaceSummary] = []
+    /// The product-owned assistant workspace, routed out of `workspaces` at
+    /// event intake. This is the single point that keeps it off the sidebar,
+    /// out of ⌘1–9, and away from every picker — the Assistant window is the
+    /// only surface that reads it.
+    private(set) var assistantWorkspace: WorkspaceSummary?
+    /// Pending "may the assistant do this?" questions, newest last. Rendered
+    /// as cards in the Assistant window; the core times them out (denying)
+    /// after two minutes.
+    private(set) var assistantConfirmations: [AssistantConfirmation] = []
     private(set) var harnesses: [HarnessProbeResult] = []
     private(set) var modelCatalog: [HarnessKind: [AgentModel]] = [:]
     private(set) var repositories: [String] = []
@@ -57,6 +66,8 @@ final class AppModel {
 
     /// Speaks agent activity aloud for tabs whose speaker toggle is on.
     let narration = NarrationEngine()
+    /// Hold-⇧⌥-anywhere voice mode: speech in, narrated assistant replies out.
+    let voiceAssistant = VoiceAssistantController()
 
     private let client: InProcessCoreClient
     private var eventTask: Task<Void, Never>?
@@ -107,7 +118,26 @@ final class AppModel {
 
     // MARK: - Lifecycle
 
+    /// The one live model, for entry points that exist outside the SwiftUI
+    /// scene tree — App Intents (Siri, Shortcuts, Spotlight) chief among them.
+    private(set) static weak var shared: AppModel?
+
+    static func running() -> AppModel? { shared }
+
+    private var started = false
+
     func start() {
+        // Idempotent: called from app init (so intents and the menu bar work
+        // before any window exists) and again from the window's task.
+        guard !started else { return }
+        started = true
+        AppModel.shared = self
+        voiceAssistant.model = self
+        // Direct callback, not a SwiftUI onChange: hold-to-talk must survive
+        // every window being closed — the menu bar presence is enough.
+        VoiceHotkeyMonitor.shared.onCommand = { [weak self] command in
+            self?.voiceAssistant.handle(command)
+        }
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.client.events {
@@ -129,6 +159,18 @@ final class AppModel {
             let chat = notification.userInfo?["chatID"] as? String
             Task { @MainActor in
                 self?.openFromNotification(workspaceID: workspace, chatID: chat)
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .oreNotificationAction,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            // Everything we post is string-valued; narrowing here makes the
+            // payload Sendable for the actor hop.
+            let info = (notification.userInfo as? [String: String]) ?? [:]
+            Task { @MainActor in
+                self?.handleNotificationAction(info)
             }
         }
     }
@@ -193,6 +235,59 @@ final class AppModel {
 
     var selectedWorkspace: WorkspaceSummary? {
         workspaces.first { $0.id == selectedWorkspaceID }
+    }
+
+    /// The assistant's single chat tab, once the snapshot has arrived.
+    var assistantChatID: ChatID? {
+        guard let assistant = assistantWorkspace else { return nil }
+        return activeChat(for: assistant.id)?.id
+            ?? chatSummaries.first { $0.workspaceID == assistant.id }?.id
+    }
+
+    func resolveAssistantConfirmation(
+        _ id: String,
+        decision: AssistantConfirmationDecision
+    ) {
+        assistantConfirmations.removeAll { $0.id == id }
+        Task { await client.send(.resolveAssistantConfirmation(id, decision)) }
+    }
+
+    /// The assistant's action audit, newest first, for the Actions tab.
+    func assistantAuditActions() async -> [AssistantActionRecord] {
+        (try? await client.assistantActions()) ?? []
+    }
+
+    // MARK: - Ask (App Intents / Siri / Spotlight)
+
+    private var assistantReplyWaiters: [UUID: CheckedContinuation<String, Never>] = [:]
+
+    /// Sends a request to the assistant and waits for its answer — the
+    /// synchronous shape Siri, Shortcuts, and Spotlight need. The reply is
+    /// the turn's narration line: already written to be one breath long.
+    func askAssistant(_ text: String, timeout: Duration = .seconds(90)) async -> String {
+        guard assistantWorkspace != nil else {
+            return "ORE is still starting up — try again in a moment."
+        }
+        guard let assistant = assistantWorkspace else {
+            return "The assistant isn't available."
+        }
+        send(text, to: assistant.id)
+        let token = UUID()
+        return await withCheckedContinuation { continuation in
+            assistantReplyWaiters[token] = continuation
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.assistantReplyWaiters.removeValue(forKey: token)?.resume(
+                    returning: "Still working on it — the full answer will be in ORE's Assistant window."
+                )
+            }
+        }
+    }
+
+    private func flushAssistantReplyWaiters(with reply: String) {
+        let waiters = assistantReplyWaiters
+        assistantReplyWaiters = [:]
+        for continuation in waiters.values { continuation.resume(returning: reply) }
     }
 
     var selectedChat: ChatState? {
@@ -285,11 +380,26 @@ final class AppModel {
         }
         rows.sort { $0.createdAt < $1.createdAt }
         state.loadHistory(rows)
-        if let workspaceID = chatOwners[id],
-           let comments = try? await client.pendingDiffComments(workspaceID: workspaceID) {
-            for comment in comments where !state.draftComments.contains(comment) {
-                state.addDraftComment(comment)
-            }
+        await pullDraftComments(for: id)
+    }
+
+    /// Merge pending review comments (including ones an agent posted to the
+    /// JSON file) into this chat's draft list so they show as numbered anchors.
+    func pullDraftComments(for id: ChatID) async {
+        let workspaceID = chatOwners[id] ?? WorkspaceID(rawValue: id.rawValue)
+        await pullDraftComments(for: workspaceID, into: chat(for: id))
+    }
+
+    func pullDraftComments(for workspaceID: WorkspaceID) async {
+        await pullDraftComments(for: workspaceID, into: chat(for: workspaceID))
+    }
+
+    private func pullDraftComments(for workspaceID: WorkspaceID, into state: ChatState) async {
+        guard let comments = try? await client.pendingDiffComments(workspaceID: workspaceID) else {
+            return
+        }
+        for comment in comments where !state.draftComments.contains(comment) {
+            state.addDraftComment(comment)
         }
     }
 
@@ -831,13 +941,15 @@ final class AppModel {
         workspaceID: WorkspaceID,
         chatID: ChatID,
         resumeAt: Date,
-        prompt: String = ScheduledContinuation.defaultPrompt
+        prompt: String = ScheduledContinuation.defaultPrompt,
+        retriesLastTurn: Bool = false
     ) {
         let item = ScheduledContinuation(
             workspaceID: workspaceID,
             chatID: chatID,
             resumeAt: resumeAt,
-            prompt: prompt
+            prompt: prompt,
+            retriesLastTurn: retriesLastTurn
         )
         scheduledContinuations[chatID] = item
         persistScheduledContinuations()
@@ -899,10 +1011,16 @@ final class AppModel {
         selectChat(item.chatID, in: item.workspaceID)
         showChatInCenter(item.workspaceID)
         NSApp.activate(ignoringOtherApps: true)
-        send(item.prompt, to: item.workspaceID, chatID: item.chatID)
+        if item.retriesLastTurn {
+            retryLastTurn(in: item.workspaceID, chatID: item.chatID)
+        } else {
+            send(item.prompt, to: item.workspaceID, chatID: item.chatID)
+        }
         postNotification(
-            title: "Continuing \(workspaceName(item.workspaceID))",
-            body: "Session limit reset. Picking up where you left off.",
+            title: item.retriesLastTurn ? "Rate limit reset" : "Continuing \(workspaceName(item.workspaceID))",
+            body: item.retriesLastTurn
+                ? "Retrying your last message in \(workspaceName(item.workspaceID))."
+                : "Session limit reset. Picking up where you left off.",
             workspaceID: item.workspaceID,
             chatID: item.chatID
         )
@@ -910,8 +1028,10 @@ final class AppModel {
 
     private func scheduleContinuationNotification(_ item: ScheduledContinuation) {
         let content = UNMutableNotificationContent()
-        content.title = "Session limit reset"
-        content.body = "Continuing \(workspaceName(item.workspaceID)) where you left off."
+        content.title = item.retriesLastTurn ? "Rate limit reset" : "Session limit reset"
+        content.body = item.retriesLastTurn
+            ? "Retrying \(workspaceName(item.workspaceID))."
+            : "Continuing \(workspaceName(item.workspaceID)) where you left off."
         if UserDefaults.standard.object(forKey: "ore.notifications.sound") as? Bool ?? true {
             content.sound = .default
         }
@@ -1155,8 +1275,8 @@ final class AppModel {
         Task { await client.send(.rerunFailedChecks(id)) }
     }
 
-    func retryLastTurn(in workspaceID: WorkspaceID) {
-        guard let chatID = activeChat(for: workspaceID)?.id else { return }
+    func retryLastTurn(in workspaceID: WorkspaceID, chatID: ChatID? = nil) {
+        guard let chatID = chatID ?? activeChat(for: workspaceID)?.id else { return }
         let state = chat(for: chatID)
         guard let row = state.rows.last(where: { $0.kind == .userMessage }) else { return }
         state.dismissProminentError()
@@ -1499,6 +1619,34 @@ final class AppModel {
         Task { await client.send(.probeHarnesses) }
     }
 
+    struct HarnessCLIUpdate: Equatable {
+        var kind: HarnessKind
+        var isRunning: Bool
+        var error: String?
+    }
+    private(set) var harnessCLIUpdate: HarnessCLIUpdate?
+
+    /// Upgrade the chat's agent CLI, restart its session so the new binary
+    /// is the one we spawn, then resend the last prompt.
+    func updateHarnessCLI(for chat: ChatSummary) {
+        let kind = chat.harness
+        harnessCLIUpdate = HarnessCLIUpdate(kind: kind, isRunning: true, error: nil)
+        Task {
+            do {
+                try await client.updateHarnessCLI(kind)
+                await client.send(.stopChatSession(chat.workspaceID, chat.id))
+                harnessCLIUpdate = nil
+                retryLastTurn(in: chat.workspaceID, chatID: chat.id)
+            } catch {
+                harnessCLIUpdate = HarnessCLIUpdate(
+                    kind: kind,
+                    isRunning: false,
+                    error: error.localizedDescription
+                )
+            }
+        }
+    }
+
     /// Starts the provider's own browser-based login. Credentials remain in
     /// the CLI's credential store; ORE only observes the process exit and then
     /// re-runs its readiness probe.
@@ -1641,7 +1789,8 @@ final class AppModel {
     private func apply(_ event: CoreEvent) {
         switch event {
         case .snapshot(let snapshot):
-            workspaces = snapshot.workspaces
+            assistantWorkspace = snapshot.workspaces.first(where: \.isAssistant)
+            workspaces = snapshot.workspaces.filter { !$0.isAssistant }
             chatSummaries = snapshot.chats
             chatOwners = Dictionary(
                 snapshot.chats.map { ($0.id, $0.workspaceID) },
@@ -1661,12 +1810,20 @@ final class AppModel {
             warmWorkspaces()
 
         case .workspaceAdded(let summary):
+            guard !summary.isAssistant else {
+                assistantWorkspace = summary
+                break
+            }
             upsert(summary)
             rememberIdentityIfPresent(for: summary)
             selectedWorkspaceID = summary.id
             prefetchDiff(for: summary)
 
         case .workspaceUpdated(let summary):
+            guard !summary.isAssistant else {
+                assistantWorkspace = summary
+                break
+            }
             upsert(summary)
             identityRenamesInFlight.remove(summary.id)
             rememberIdentityIfPresent(for: summary)
@@ -1694,6 +1851,33 @@ final class AppModel {
                 UserDefaults.standard.removeObject(forKey: "\(key).\(id.rawValue)")
             }
             if selectedWorkspaceID == id { selectedWorkspaceID = sortedWorkspaces.first?.id }
+
+        case .assistantConfirmationRequested(let confirmation):
+            assistantConfirmations.append(confirmation)
+            // Mid-voice-exchange the question is narrated so it can be
+            // answered by voice; the notification covers the window being
+            // closed and the user being elsewhere.
+            voiceAssistant.confirmationArrived(confirmation)
+            postNotification(
+                title: "Assistant needs approval",
+                body: confirmation.summary,
+                workspaceID: confirmation.workspaceID,
+                category: NotificationCategory.assistantConfirmation,
+                extraInfo: ["confirmationID": confirmation.id]
+            )
+
+        case .assistantConfirmationResolved(let id):
+            assistantConfirmations.removeAll { $0.id == id }
+
+        case .assistantUIAction(let action):
+            switch action {
+            case .revealWorkspace(let id):
+                selectedWorkspaceID = id
+            case .revealChat(let id, let chatID):
+                selectedWorkspaceID = id
+                selectChat(chatID, in: id)
+            }
+            NSApp.activate(ignoringOtherApps: true)
 
         case .agent(let id, let chatID, let agentEvent):
             chatOwners[chatID] = id
@@ -1784,7 +1968,7 @@ final class AppModel {
         let curated: [AgentModel] = switch harness {
         case .claudeCode:
             [
-                AgentModel(id: "claude-fable-5", displayName: "Fable 5", description: "Highest capability for long-running agents", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
+                AgentModel(id: "claude-fable-5", displayName: "Fable 5", description: "Highest capability for long-running agents", supportedReasoningEfforts: ["adaptive"]),
                 AgentModel(id: "claude-opus-5", displayName: "Opus 5", description: "Complex agentic coding and enterprise work", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
                 AgentModel(id: "claude-opus-4-8[1m]", displayName: "Opus 4.8 · 1M", description: "Deep reasoning with long context", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
                 AgentModel(id: "claude-opus-4-7[1m]", displayName: "Opus 4.7 · 1M", description: "Previous Opus generation", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
@@ -1898,6 +2082,21 @@ final class AppModel {
 
     private func applyToChat(workspaceID: WorkspaceID, chatID: ChatID, event: AgentEvent) {
         chat(for: chatID).apply(event)
+        // The assistant never joins the ambient notification/narration funnel
+        // — its voice is the voice mode: replies to spoken requests are read
+        // aloud by the controller, and everything else stays quiet.
+        guard assistantWorkspace?.id != workspaceID else {
+            if case .turnCompleted(let result) = event, !assistantReplyWaiters.isEmpty {
+                // Someone is waiting synchronously — Siri, Shortcuts, or
+                // Spotlight via an App Intent.
+                flushAssistantReplyWaiters(
+                    with: NarrationPhraser.spokenNarration(result.narration)
+                        ?? "Done — the details are in ORE's Assistant window."
+                )
+            }
+            voiceAssistant.observe(event)
+            return
+        }
         let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
         // Narration is the audio sibling of the background notifications
         // below: same funnel, same origin, so both name the same place.
@@ -1905,19 +2104,24 @@ final class AppModel {
         guard origin.isBackground else { return }
         let place = origin.displayLabel ?? workspaceName(workspaceID)
         switch event {
-        case .permissionRequest:
+        case .permissionRequest(let request):
             postNotification(
                 title: "ORE needs you",
-                body: place + " is waiting for permission.",
+                body: place + " wants to run \(request.toolName)."
+                    + (request.summary.map { " \($0)" } ?? ""),
                 workspaceID: workspaceID,
-                chatID: chatID
+                chatID: chatID,
+                category: NotificationCategory.toolPermission,
+                extraInfo: ["permissionID": request.id.rawValue]
             )
-        case .question:
+        case .question(let question):
             postNotification(
                 title: "ORE needs you",
-                body: place + " has a question.",
+                body: place + " asks: \(question.prompt)",
                 workspaceID: workspaceID,
-                chatID: chatID
+                chatID: chatID,
+                category: NotificationCategory.agentQuestion,
+                extraInfo: ["questionID": question.id.rawValue]
             )
         case .turnCompleted where UserDefaults.standard.object(forKey: "ore.notifications.turnComplete") as? Bool ?? true:
             postNotification(
@@ -1988,7 +2192,9 @@ final class AppModel {
         title: String,
         body: String,
         workspaceID: WorkspaceID? = nil,
-        chatID: ChatID? = nil
+        chatID: ChatID? = nil,
+        category: String? = nil,
+        extraInfo: [String: String] = [:]
     ) {
         guard UserDefaults.standard.object(forKey: "ore.notifications.enabled") as? Bool ?? true else { return }
         let content = UNMutableNotificationContent()
@@ -1997,13 +2203,84 @@ final class AppModel {
         if UserDefaults.standard.object(forKey: "ore.notifications.sound") as? Bool ?? true {
             content.sound = .default
         }
-        var userInfo: [String: String] = [:]
+        // The category is what puts Allow/Deny/Reply buttons on the banner —
+        // see AppDelegate.notificationCategories.
+        if let category { content.categoryIdentifier = category }
+        var userInfo: [String: String] = extraInfo
         if let workspaceID { userInfo["workspaceID"] = workspaceID.rawValue }
         if let chatID { userInfo["chatID"] = chatID.rawValue }
         content.userInfo = userInfo
         UNUserNotificationCenter.current().add(UNNotificationRequest(
             identifier: UUID().uuidString, content: content, trigger: nil
         ))
+    }
+
+    // MARK: - Notification actions
+
+    /// A banner button was pressed — the app may not even have a window open.
+    /// Everything here routes through the same paths the in-app buttons use.
+    private func handleNotificationAction(_ info: [String: String]) {
+        guard let action = info["actionIdentifier"] else { return }
+        let workspaceID = info["workspaceID"].map(WorkspaceID.init(rawValue:))
+        let chatID = info["chatID"].map(ChatID.init(rawValue:))
+
+        switch action {
+        case NotificationAction.allowTask, NotificationAction.allowOnce, NotificationAction.deny:
+            guard let id = info["confirmationID"] else { return }
+            let decision: AssistantConfirmationDecision = switch action {
+            case NotificationAction.allowTask: .allow(.task)
+            case NotificationAction.allowOnce: .allow(.once)
+            default: .deny
+            }
+            resolveAssistantConfirmation(id, decision: decision)
+
+        case NotificationAction.reply:
+            guard let workspaceID, let chatID,
+                  let questionID = info["questionID"].map(QuestionID.init(rawValue:)),
+                  let text = info["replyText"]?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty
+            else { return }
+            let state = chat(for: chatID)
+            state.resolveQuestion(questionID)
+            // Claude's AskUserQuestion pairs the question with a permission
+            // gate; the answer has to travel through the permission reply or
+            // the turn stays blocked (see answerQuestion(_:viaPermission:)).
+            if let permission = state.pendingPermission,
+               permission.toolName == "AskUserQuestion" {
+                state.resolvePermission(permission.id)
+                Task {
+                    await client.send(.resolveChatPermission(
+                        workspaceID, chatID, permission.id,
+                        .deny(reason: "The user answered your question: \"\(text)\". Continue with this answer in mind.")
+                    ))
+                }
+            } else {
+                Task {
+                    await client.send(.answerChatQuestion(
+                        workspaceID, chatID, questionID, answer: text
+                    ))
+                }
+            }
+
+        case NotificationAction.allowPermission, NotificationAction.denyPermission:
+            guard let workspaceID, let chatID,
+                  let permissionID = info["permissionID"]
+                      .map(PermissionRequestID.init(rawValue:))
+            else { return }
+            chat(for: chatID).resolvePermission(permissionID)
+            let decision: PermissionDecision = action == NotificationAction.allowPermission
+                ? .allow
+                : .deny(reason: "The user denied this from a notification.")
+            Task {
+                await client.send(.resolveChatPermission(
+                    workspaceID, chatID, permissionID, decision
+                ))
+            }
+
+        default:
+            break
+        }
     }
 
     private func upsert(_ summary: WorkspaceSummary) {

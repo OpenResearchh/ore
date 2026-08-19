@@ -975,6 +975,7 @@ private extension ReasoningEffort {
         case .high: [["high"]]
         case .xhigh: [["extra", "high"], ["x", "high"], ["very", "high"], ["extremely", "high"]]
         case .max: [["maximum"], ["max"], ["highest"], ["full"]]
+        case .adaptive: [["adaptive"]]
         }
     }
 }

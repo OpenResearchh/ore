@@ -387,4 +387,33 @@ enum ClaudeWire {
             message = Body(content: [TextBlock(text: text)])
         }
     }
+
+    /// What to do with an inbound `control_request` line.
+    ///
+    /// `can_use_tool` is answered by the UI. Everything else — including a
+    /// payload we cannot decode — must get an error reply, or the CLI waits
+    /// forever with no card on screen.
+    enum InboundControl: Equatable {
+        case none
+        case permissionPrompt
+        case unsupported(requestID: String, subtype: String?)
+    }
+
+    static func inboundControl(in line: String) -> InboundControl {
+        guard line.contains("\"control_request\""),
+              let data = line.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["type"] as? String == "control_request"
+        else { return .none }
+
+        let requestID = json["request_id"] as? String
+        let subtype = (json["request"] as? [String: Any])?["subtype"] as? String
+        if subtype == "can_use_tool",
+           requestID != nil,
+           (try? JSONDecoder().decode(ControlRequest.self, from: data)) != nil {
+            return .permissionPrompt
+        }
+        guard let requestID else { return .none }
+        return .unsupported(requestID: requestID, subtype: subtype)
+    }
 }

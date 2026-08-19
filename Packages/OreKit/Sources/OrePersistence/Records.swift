@@ -50,6 +50,9 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     /// The user typed this name. When set, automatic research-identity and
     /// first-prompt renaming leave it alone.
     public var isNameUserSet: Bool
+    /// `standard` or `assistant` — see `WorkspaceKind`. A column rather than a
+    /// flag so a third kind never means a second migration of the same shape.
+    public var kind: String
 
     public init(
         id: WorkspaceID,
@@ -71,7 +74,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         sortIndex: Int = 0,
         createdAt: Date = Date(),
         lastActivityAt: Date? = nil,
-        isNameUserSet: Bool = false
+        isNameUserSet: Bool = false,
+        kind: WorkspaceKind = .standard
     ) {
         self.id = id.rawValue
         self.name = name
@@ -93,9 +97,12 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         self.createdAt = createdAt
         self.lastActivityAt = lastActivityAt
         self.isNameUserSet = isNameUserSet
+        self.kind = kind.rawValue
     }
 
     public var workspaceID: WorkspaceID { WorkspaceID(rawValue: id) }
+
+    public var workspaceKind: WorkspaceKind { WorkspaceKind(rawValue: kind) ?? .standard }
 
     /// The sidebar row for this workspace. Live state — status, git counts —
     /// is layered on by the engine, since it changes far faster than anything
@@ -126,7 +133,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
             gitStatus: gitStatus,
             contextUsage: contextUsage,
             lastActivity: lastActivityAt,
-            baseSync: baseSync
+            baseSync: baseSync,
+            kind: workspaceKind
         )
     }
 }
@@ -512,6 +520,52 @@ public struct ViewedFileRecord: Codable, FetchableRecord, PersistableRecord, Sen
         self.filePath = filePath
         self.contentHash = contentHash
         self.viewedAt = viewedAt
+    }
+}
+
+public struct AssistantActionRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "assistantAction"
+
+    public var id: Int64?
+    public var tool: String
+    public var summary: String
+    public var arguments: String
+    public var decision: String
+    public var workspaceID: String?
+    public var createdAt: Date
+
+    public init(
+        id: Int64? = nil,
+        tool: String,
+        summary: String,
+        arguments: String = "{}",
+        decision: String,
+        workspaceID: WorkspaceID? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.tool = tool
+        self.summary = summary
+        self.arguments = arguments
+        self.decision = decision
+        self.workspaceID = workspaceID?.rawValue
+        self.createdAt = createdAt
+    }
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+public struct AssistantGrantRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "assistantGrant"
+
+    public var actionClass: String
+    public var createdAt: Date
+
+    public init(actionClass: String, createdAt: Date = Date()) {
+        self.actionClass = actionClass
+        self.createdAt = createdAt
     }
 }
 

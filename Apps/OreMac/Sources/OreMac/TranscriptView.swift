@@ -1704,6 +1704,9 @@ final class TranscriptCell: NSTableCellView {
         var tint: NSColor
         var fileIdentity: FileVisualIdentity?
         var subject: String? = nil
+        /// A second line under the title, for rows whose subject chip is a
+        /// label rather than an explanation. Only subagents use it today.
+        var purpose: String? = nil
         var filePath: String? = nil
         var insertions = 0
         var deletions = 0
@@ -1931,9 +1934,9 @@ final class TranscriptCell: NSTableCellView {
                 ))
             }
         }
-        // A subagent (Task) row is a collapsible group: show how many steps ran
-        // inside it and a disclosure chevron, and stop here — its children are
-        // separate rows below, so the noisy launch blob isn't worth showing.
+        // A subagent row is a collapsible group: say how many steps ran inside
+        // it. Those children are separate rows below, and the disclosure also
+        // reveals the brief this row's detail carries.
         if let steps = row.subagentChildCount {
             result.append(NSAttributedString(
                 string: "  · \(steps) step\(steps == 1 ? "" : "s")",
@@ -1942,16 +1945,23 @@ final class TranscriptCell: NSTableCellView {
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ]
             ))
+        }
+        if !item.detail.isEmpty || row.subagentChildCount != nil {
             result.append(NSAttributedString(
                 string: row.isExpanded ? "   ⌄" : "   ›",
                 attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor]
             ))
-            return result
         }
-        if !item.detail.isEmpty {
+        // The title names the agent and the chip labels it; neither says what
+        // it was created for. That belongs on the row itself, not behind a
+        // disclosure, so it sits on a second line whether or not it is open.
+        if let purpose = item.purpose, !purpose.isEmpty {
             result.append(NSAttributedString(
-                string: row.isExpanded ? "   ⌄" : "   ›",
-                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor]
+                string: "\n" + purpose,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
             ))
         }
         guard row.isExpanded, !item.detail.isEmpty else { return result }
@@ -2168,10 +2178,12 @@ final class TranscriptCell: NSTableCellView {
         // Subagent tasks are a first-class thing the harness does, so they get
         // their own icon and read "created" while running, "completed" once the
         // result attaches — not the generic gear fallback.
-        if tool == "task" || tool.hasSuffix("_task") || tool.contains("subagent") {
-            let subagentType = input?["subagent_type"]?.stringValue
-            let description = input?["description"]?.stringValue ?? row.text
-            let prompt = input?["prompt"]?.stringValue ?? description
+        if SubagentBrief.isSubagentTool(tool) {
+            let input = input.map(SubagentBrief.normalized) ?? .object([:])
+            let subagentType = SubagentBrief.agentType(from: input)
+            let description = SubagentBrief.label(from: input) ?? row.text
+            let subject = compact(description, limit: 64)
+            let brief = SubagentBrief.brief(from: input) ?? description
             let done = row.isComplete && !row.isError
             // The Task result is often just the harness's internal launch blob
             // ("Async agent launched… agentId… output_file… Do NOT Read…").
@@ -2181,7 +2193,14 @@ final class TranscriptCell: NSTableCellView {
             let isLaunchMetadata = resultText.contains("Async agent launched")
                 || resultText.contains("agentId:")
                 || resultText.contains("output_file:")
-            let detail = (resultText.isEmpty || isLaunchMetadata) ? prompt : resultText
+            // When the harness nests the subagent's own blocks under this row,
+            // its closing report is already the last child — repeating it here
+            // would print the same text twice. Show the brief instead, so
+            // expanding reads as ask, then steps, then answer.
+            let hasChildren = (row.subagentChildCount ?? 0) > 0
+            let detail = hasChildren || resultText.isEmpty || isLaunchMetadata
+                ? brief
+                : resultText
             let title: String
             if row.isError { title = "Subagent failed" }
             else if done { title = "Subagent finished" }
@@ -2193,7 +2212,10 @@ final class TranscriptCell: NSTableCellView {
                 detail: detail,
                 tint: row.isError ? .systemRed
                     : done ? .systemGreen : .controlAccentColor,
-                subject: compact(description, limit: 64)
+                subject: subject,
+                // The chip is a 3–5 word label; this is the ask itself, so the
+                // row says what the agent was created for without expanding.
+                purpose: SubagentBrief.purpose(from: input, distinctFrom: subject)
             )
         }
 

@@ -296,19 +296,7 @@ struct ChatPane: View {
             // Hard failures — usage limits especially — belong where the user
             // is about to act, not buried as a red row up in the transcript.
             if let error = chat.prominentError {
-                ProminentErrorBanner(
-                    error: error,
-                    scheduled: model.scheduledContinuation(for: chatSummary?.id),
-                    onContinueWhenAvailable: scheduleContinuation,
-                    onCancelSchedule: cancelScheduledContinuation,
-                    onRetry: { model.retryLastTurn(in: workspace.id) },
-                    onDismiss: { chat.dismissProminentError() }
-                )
-                    .frame(maxWidth: OreTheme.contentMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, OreTheme.Space.md)
-                    .padding(.top, OreTheme.Space.sm)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                composerErrorBanner(error)
             } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
                 ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
                     .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -317,12 +305,7 @@ struct ChatPane: View {
                     .padding(.top, OreTheme.Space.sm)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if let limit = chat.rateLimit, limit.status == .warning || limit.status == .exhausted {
-                RateLimitBanner(report: limit, onRetry: { model.retryLastTurn(in: workspace.id) })
-                    .frame(maxWidth: OreTheme.contentMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, OreTheme.Space.md)
-                    .padding(.top, OreTheme.Space.sm)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                composerRateLimitBanner(limit)
             }
 
             if let question = chat.pendingQuestion {
@@ -438,12 +421,15 @@ struct ChatPane: View {
         }
         .onChange(of: hotkey.command) { _, command in
             // Panes exist for background workspaces too; only the one on screen
-            // should answer the global chord.
-            guard let command, model.selectedWorkspaceID == workspace.id else { return }
+            // should answer the global chord — and only for its own target:
+            // assistant-bound holds are handled app-wide, not here.
+            guard let command, command.target == .composer,
+                  model.selectedWorkspaceID == workspace.id else { return }
             switch command.kind {
             case .toggle: toggleVoice()
             case .start: if !voice.isActive { startVoice() }
             case .stop: finishVoice(.send)
+            case .commit: finishVoice(.commitToDraft)
             }
         }
         .onDisappear {
@@ -470,6 +456,7 @@ struct ChatPane: View {
             let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
             if let raw = UserDefaults.standard.string(forKey: key),
                let effort = ReasoningEffort(rawValue: raw) { reasoningEffort = effort }
+            if let tab = chatSummary { clampEffort(to: tab) }
             let fastKey = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
             fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
         }
@@ -829,6 +816,8 @@ struct ChatPane: View {
                     harness: chatSummary?.harness ?? workspace.harness,
                     status: chat.status,
                     startedAt: chat.turnStartedAt,
+                    lastEventAt: chat.lastEventAt,
+                    runningToolLabel: chat.runningToolLabel,
                     // Booting a one-shot CLI takes seconds before its first
                     // event; the status row says so rather than claiming work
                     // is already happening.
@@ -1181,6 +1170,7 @@ struct ChatPane: View {
             ) { harness, selectedModel in
                 if harness == tab.harness { model.setModel(selectedModel, for: tab) }
                 else { model.switchHarness(harness, model: selectedModel, for: tab) }
+                clampEffort(to: tab, harness: harness, modelID: selectedModel)
                 showModelChooser = false
             }
         }
@@ -1355,13 +1345,45 @@ struct ChatPane: View {
         !availableEfforts(for: tab).isEmpty
     }
 
-    private func availableEfforts(for tab: ChatSummary) -> [ReasoningEffort] {
-        let choices = model.knownModels(for: tab.harness)
-        let selected = tab.model.flatMap { id in choices.first { $0.id == id } }
+    private func availableEfforts(
+        for tab: ChatSummary,
+        harness: HarnessKind? = nil,
+        modelID: String? = nil
+    ) -> [ReasoningEffort] {
+        let kind = harness ?? tab.harness
+        guard kind.supportsReasoningEffort else { return [] }
+        let choices = model.knownModels(for: kind)
+        let selected = (modelID ?? tab.model).flatMap { id in choices.first { $0.id == id } }
             ?? choices.first(where: \.isDefault)
         let advertised = Set(selected?.supportedReasoningEfforts ?? [])
         guard !advertised.isEmpty else { return [] }
         return ReasoningEffort.allCases.filter { advertised.contains($0.rawValue) }
+    }
+
+    /// Effort the next send should actually apply. A leftover High from another
+    /// model must not ride onto Fable 5, which only advertises adaptive.
+    private func resolvedEffort(for tab: ChatSummary?) -> ReasoningEffort? {
+        guard let tab, supportsEffort(for: tab) else { return nil }
+        let efforts = availableEfforts(for: tab)
+        if efforts.contains(reasoningEffort) { return reasoningEffort }
+        return preferredEffort(in: efforts)
+    }
+
+    private func clampEffort(
+        to tab: ChatSummary,
+        harness: HarnessKind? = nil,
+        modelID: String? = nil
+    ) {
+        let efforts = availableEfforts(for: tab, harness: harness, modelID: modelID)
+        guard !efforts.isEmpty else { return }
+        if efforts.contains(reasoningEffort) { return }
+        reasoningEffort = preferredEffort(in: efforts)
+    }
+
+    private func preferredEffort(in efforts: [ReasoningEffort]) -> ReasoningEffort {
+        if let adaptive = efforts.first(where: { $0 == .adaptive }) { return adaptive }
+        if let high = efforts.first(where: { $0 == .high }) { return high }
+        return efforts[efforts.count / 2]
     }
 
     private func adjustEffort(_ direction: Int, for tab: ChatSummary) -> Bool {
@@ -1853,6 +1875,7 @@ struct ChatPane: View {
         } else {
             model.switchHarness(chosen.harness, model: chosen.id, for: tab)
         }
+        clampEffort(to: tab, harness: chosen.harness, modelID: chosen.id)
     }
 
     @ViewBuilder
@@ -1915,7 +1938,7 @@ struct ChatPane: View {
         model.send(
             text,
             attachments: outgoing,
-            effort: chatSummary.map { supportsEffort(for: $0) } == true ? reasoningEffort : nil,
+            effort: resolvedEffort(for: chatSummary),
             serviceTier: chatSummary.map { supportsFastMode($0) } == true && fastModeEnabled ? "fast" : nil,
             to: workspace.id
         )
@@ -2263,6 +2286,47 @@ struct ChatPane: View {
         model.openSourceFile(path, in: workspace.id, line: focusLine)
     }
 
+    private func composerErrorBanner(_ error: ChatState.ProminentError) -> some View {
+        let harness = chatSummary?.harness ?? workspace.harness
+        let update = model.harnessCLIUpdate
+        let matchingUpdate: AppModel.HarnessCLIUpdate? = update?.kind == harness ? update : nil
+        return ProminentErrorBanner(
+            error: error,
+            harnessName: harness.displayName,
+            scheduled: model.scheduledContinuation(for: chatSummary?.id),
+            cliUpdate: matchingUpdate,
+            onContinueWhenAvailable: scheduleContinuation,
+            onCancelSchedule: cancelScheduledContinuation,
+            onRetry: { model.retryLastTurn(in: workspace.id) },
+            onUpdateCLI: {
+                guard let chatSummary else { return }
+                model.updateHarnessCLI(for: chatSummary)
+            },
+            onDismiss: { chat.dismissProminentError() }
+        )
+        .frame(maxWidth: OreTheme.contentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.top, OreTheme.Space.sm)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func composerRateLimitBanner(_ limit: RateLimitReport) -> some View {
+        let retryWhenAvailable: (() -> Void)? = limit.status == .exhausted
+            ? { self.scheduleRateLimitRetry() }
+            : nil
+        return RateLimitBanner(
+            report: limit,
+            onRetry: { model.retryLastTurn(in: workspace.id) },
+            onRetryWhenAvailable: retryWhenAvailable
+        )
+        .frame(maxWidth: OreTheme.contentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.top, OreTheme.Space.sm)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
     private func scheduleContinuation() {
         guard let chatSummary else { return }
         let resumeAt = chat.prominentError?.resetsAt
@@ -2273,6 +2337,19 @@ struct ChatPane: View {
             workspaceID: workspace.id,
             chatID: chatSummary.id,
             resumeAt: resumeAt
+        )
+    }
+
+    private func scheduleRateLimitRetry() {
+        guard let chatSummary else { return }
+        let resumeAt = chat.rateLimit?.resetsAt
+            ?? chat.prominentError?.resetsAt
+            ?? Date().addingTimeInterval(60 * 60)
+        model.scheduleContinuation(
+            workspaceID: workspace.id,
+            chatID: chatSummary.id,
+            resumeAt: resumeAt,
+            retriesLastTurn: true
         )
     }
 
@@ -2324,6 +2401,51 @@ private struct ComposerCommand: Identifiable {
     ]
 }
 
+/// Copy for the composer's live status row. Kept out of the view so the stall
+/// wording can be tested without spinning SwiftUI.
+enum ComposerBusyCopy {
+    static let stallSilence: TimeInterval = 90
+
+    static func label(
+        harness: HarnessKind,
+        status: AgentStatus,
+        runningToolLabel: String?,
+        isStarting: Bool,
+        lastEventAt: Date?,
+        now: Date
+    ) -> String {
+        if isStarting { return "Starting \(harness.displayName)…" }
+        if let lastEventAt, now.timeIntervalSince(lastEventAt) >= stallSilence {
+            return "No output for \(elapsed(from: lastEventAt, to: now))"
+        }
+        switch status {
+        case .runningTool:
+            if let runningToolLabel, !runningToolLabel.isEmpty {
+                return runningToolLabel
+            }
+            return "\(harness.displayName) is running a tool"
+        case .thinking:
+            return "\(harness.displayName) is thinking"
+        case .requesting:
+            return "\(harness.displayName) is waiting on the model"
+        default:
+            return "\(harness.displayName) is working"
+        }
+    }
+
+    static func turnElapsed(from start: Date, to now: Date) -> String {
+        "\(elapsed(from: start, to: now)) this turn"
+    }
+
+    static func elapsed(from start: Date, to now: Date) -> String {
+        let total = max(0, Int(now.timeIntervalSince(start)))
+        let hours = total / 3600, minutes = (total % 3600) / 60, seconds = total % 60
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        if minutes > 0 { return "\(minutes)m \(seconds)s" }
+        return "\(seconds)s"
+    }
+}
+
 /// A stable overlay rather than another transcript row. It makes work obvious
 /// at a glance while keeping streamed text from repeatedly inserting/removing
 /// loading content and shifting the scroll position.
@@ -2334,59 +2456,48 @@ private struct ComposerBusyStatus: View {
     let harness: HarnessKind
     let status: AgentStatus
     var startedAt: Date?
+    var lastEventAt: Date?
+    var runningToolLabel: String?
     var isStarting: Bool = false
     let onStop: () -> Void
 
     var body: some View {
-        HStack(spacing: 7) {
-            ProgressView()
-                .controlSize(.small)
-                .scaleEffect(0.8)
-            Text(label)
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.8)
+                Text(ComposerBusyCopy.label(
+                    harness: harness,
+                    status: status,
+                    runningToolLabel: runningToolLabel,
+                    isStarting: isStarting,
+                    lastEventAt: lastEventAt,
+                    now: context.date
+                ))
                 .font(.system(size: OreTheme.Font.caption, weight: .medium))
                 .foregroundStyle(.secondary)
-            if let startedAt {
-                // A live counter that ticks each second while the turn runs.
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    Text(Self.elapsed(from: startedAt, to: context.date))
+                if let startedAt {
+                    Text(ComposerBusyCopy.turnElapsed(from: startedAt, to: context.date))
                         .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-            }
-            Spacer(minLength: 0)
-            Button(action: onStop) {
-                HStack(spacing: 4) {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 8, weight: .bold))
-                    Text("Stop")
-                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                Spacer(minLength: 0)
+                Button(action: onStop) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 8, weight: .bold))
+                        Text("Stop")
+                            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    }
+                    .foregroundStyle(.red)
                 }
-                .foregroundStyle(.red)
+                .buttonStyle(OrePressableButtonStyle())
+                .keyboardShortcut(".", modifiers: .command)
+                .help("Stop the running turn (⌘.)")
             }
-            .buttonStyle(OrePressableButtonStyle())
-            .keyboardShortcut(".", modifiers: .command)
-            .help("Stop the running turn (⌘.)")
         }
         .padding(.horizontal, 2)
-    }
-
-    private var label: String {
-        // Booting a one-shot CLI can take several seconds before any event
-        // arrives; name that state rather than claiming work is happening.
-        if isStarting { return "Starting \(harness.displayName)…" }
-        switch status {
-        case .runningTool: return "\(harness.displayName) is running a tool"
-        case .thinking: return "\(harness.displayName) is thinking"
-        default: return "\(harness.displayName) is working"
-        }
-    }
-
-    static func elapsed(from start: Date, to now: Date) -> String {
-        let total = max(0, Int(now.timeIntervalSince(start)))
-        let hours = total / 3600, minutes = (total % 3600) / 60, seconds = total % 60
-        if hours > 0 { return "\(hours)h \(minutes)m" }
-        if minutes > 0 { return "\(minutes)m \(seconds)s" }
-        return "\(seconds)s"
     }
 }
 
@@ -3108,20 +3219,29 @@ private struct ContextMeter: View {
 /// often a usage/rate limit the user needs to act on before sending again.
 private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
+    var harnessName: String = "CLI"
     var scheduled: ScheduledContinuation?
+    var cliUpdate: AppModel.HarnessCLIUpdate?
     var onContinueWhenAvailable: () -> Void
     var onCancelSchedule: () -> Void
     var onRetry: () -> Void
+    var onUpdateCLI: () -> Void
     let onDismiss: () -> Void
 
-    private var tint: Color { error.isUsageLimit ? OreTheme.warning : .red }
+    private var tint: Color {
+        if error.needsCLIUpgrade { return OreTheme.warning }
+        return error.isUsageLimit ? OreTheme.warning : .red
+    }
     private var icon: String {
-        error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
+        if error.needsCLIUpgrade { return "arrow.down.app.fill" }
+        return error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
     }
     private var title: String {
-        error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
+        if error.needsCLIUpgrade { return "\(harnessName) needs an update" }
+        return error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
     }
     private var resetDate: Date? { scheduled?.resumeAt ?? error.resetsAt }
+    private var isUpdatingCLI: Bool { cliUpdate?.isRunning == true }
 
     var body: some View {
         HStack(alignment: .top, spacing: OreTheme.Space.sm) {
@@ -3140,7 +3260,17 @@ private struct ProminentErrorBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                if error.isUsageLimit {
+                if let updateError = cliUpdate?.error, !isUpdatingCLI {
+                    Text(updateError)
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if error.needsCLIUpgrade {
+                    updateCLIButton
+                } else if error.isUsageLimit {
                     if let scheduled {
                         scheduledActions(scheduled)
                     } else {
@@ -3175,6 +3305,27 @@ private struct ProminentErrorBanner: View {
             RoundedRectangle(cornerRadius: OreTheme.controlRadius)
                 .stroke(tint.opacity(0.35), lineWidth: 1)
         }
+    }
+
+    private var updateCLIButton: some View {
+        Button(action: onUpdateCLI) {
+            HStack(spacing: 6) {
+                if isUpdatingCLI {
+                    ProgressView().controlSize(.small)
+                    Text("Updating \(harnessName)…")
+                } else {
+                    Image(systemName: "arrow.down.app")
+                    Text("Update \(harnessName)")
+                }
+            }
+            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(tint.opacity(0.18), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isUpdatingCLI)
+        .help("Install the latest \(harnessName) CLI, then retry this prompt")
     }
 
     private var continueButton: some View {
@@ -3224,7 +3375,9 @@ private struct ScheduledContinuationBanner: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(OreTheme.warning)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Continuing when the limit resets")
+                Text(item.retriesLastTurn
+                     ? "Retrying when the limit resets"
+                     : "Continuing when the limit resets")
                     .font(.system(size: OreTheme.Font.body, weight: .semibold))
                 Text(UsageLimitReset.format(item.resumeAt))
                     .font(.system(size: OreTheme.Font.caption))
@@ -3249,6 +3402,7 @@ private struct ScheduledContinuationBanner: View {
 private struct RateLimitBanner: View {
     let report: RateLimitReport
     var onRetry: () -> Void
+    var onRetryWhenAvailable: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .center, spacing: OreTheme.Space.sm) {
@@ -3269,11 +3423,20 @@ private struct RateLimitBanner: View {
                 }
             }
             Spacer(minLength: 0)
-            Button(action: onRetry) {
-                Label("Retry", systemImage: "arrow.clockwise")
-                    .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            if let onRetryWhenAvailable {
+                Button(action: onRetryWhenAvailable) {
+                    Label("Retry when it resets", systemImage: "clock.arrow.circlepath")
+                        .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .help("Automatically retry the last prompt when the rate limit resets")
+            } else {
+                Button(action: onRetry) {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                        .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(12)
         .background(OreTheme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))

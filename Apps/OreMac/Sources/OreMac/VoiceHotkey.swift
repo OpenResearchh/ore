@@ -96,11 +96,22 @@ struct VoiceChordRecognizer {
     }
 }
 
-/// What the composer should do, with an id so an identical repeat still lands.
+/// What a voice surface should do, with an id so an identical repeat still
+/// lands. `target` is which surface: the on-screen composer (tap to dictate)
+/// or the global assistant (hold to talk).
 struct VoiceCommand: Equatable {
-    enum Kind: Equatable { case toggle, start, stop }
+    enum Kind: Equatable {
+        case toggle
+        case start
+        case stop
+        /// Park whatever is being dictated in the draft without sending —
+        /// used when the assistant takes the microphone over mid-dictation.
+        case commit
+    }
+    enum Target: Equatable { case composer, assistant }
     var id: Int
     var kind: Kind
+    var target: Target = .composer
 }
 
 @MainActor
@@ -111,6 +122,10 @@ final class VoiceHotkeyMonitor {
     /// The latest gesture. Views watch this rather than being called back, so
     /// the gesture stays decoupled from whichever composer is on screen.
     private(set) var command: VoiceCommand?
+    /// Direct delivery for app-level consumers (the assistant), which must
+    /// keep hearing gestures when no window — and so no observing view —
+    /// exists.
+    var onCommand: (@MainActor (VoiceCommand) -> Void)?
     /// Whether macOS lets us see events from other apps. Without it the tap
     /// still works while ORE is frontmost.
     private(set) var isTrusted = false
@@ -122,7 +137,19 @@ final class VoiceHotkeyMonitor {
     /// Only send `.stop` for a hold we actually started, so releasing the chord
     /// can never cancel a dictation the user began by tapping.
     private var holdIsDictating = false
+    /// Where the current hold's words are going, fixed at `beginHold` so the
+    /// release always lands on the surface that started listening.
+    private var holdTarget: VoiceCommand.Target = .assistant
     private var sequence = 0
+
+    /// Pre-assistant behavior: holding the chord outside ORE dictated into the
+    /// focused composer (pulling ORE frontmost). Off by default now that hold
+    /// belongs to the assistant; the Settings toggle brings it back.
+    static let legacyHoldDictationKey = "ore.voice.holdDictatesComposer"
+
+    private var legacyHoldDictation: Bool {
+        UserDefaults.standard.bool(forKey: Self.legacyHoldDictationKey)
+    }
 
     private init() {}
 
@@ -221,31 +248,48 @@ final class VoiceHotkeyMonitor {
     private func emit(_ event: VoiceChordEvent?) {
         switch event {
         case .toggle:
-            // In ORE a tap toggles. Outside it, a stray tap must not quietly
-            // open the microphone in an app the user is busy typing in.
+            // In ORE a tap toggles composer dictation. Outside it, a stray tap
+            // must not quietly open the microphone in an app the user is busy
+            // typing in.
             guard NSApp.isActive else { return }
-            publish(.toggle)
+            publish(.toggle, target: .composer)
 
         case .beginHold:
-            // Hold-to-talk is the away-from-ORE gesture. In-app the chord is a
-            // text-selection prefix, so holding it there stays inert.
-            guard !NSApp.isActive else { return }
-            NSApp.activate(ignoringOtherApps: true)
+            if legacyHoldDictation {
+                // The old behavior: hold outside ORE dictates into the focused
+                // composer, pulling the app frontmost. In-app it stays inert
+                // (the chord is a text-selection prefix there).
+                guard !NSApp.isActive else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                holdTarget = .composer
+            } else {
+                // Hold is the assistant, everywhere — and the assistant is
+                // headless, so the user's focus stays exactly where it is.
+                holdTarget = .assistant
+            }
             holdIsDictating = true
-            publish(.start)
+            publish(.start, target: holdTarget)
 
         case .endHold:
             guard holdIsDictating else { return }
             holdIsDictating = false
-            publish(.stop)
+            publish(.stop, target: holdTarget)
 
         case nil:
             break
         }
     }
 
-    private func publish(_ kind: VoiceCommand.Kind) {
+    /// Lets the assistant ask the visible composer to park an in-flight
+    /// dictation in its draft before the assistant takes the microphone.
+    func requestComposerCommit() {
+        publish(.commit, target: .composer)
+    }
+
+    private func publish(_ kind: VoiceCommand.Kind, target: VoiceCommand.Target) {
         sequence += 1
-        command = VoiceCommand(id: sequence, kind: kind)
+        let published = VoiceCommand(id: sequence, kind: kind, target: target)
+        command = published
+        onCommand?(published)
     }
 }

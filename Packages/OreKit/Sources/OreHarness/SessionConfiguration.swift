@@ -33,6 +33,11 @@ public struct SessionConfiguration: Sendable {
     /// parent environment is scrubbed so a stray key never gets billed.
     public var allowAPIKeyFallback: Bool
     public var mcpServer: MCPServer?
+    /// Tool patterns the harness should run without asking (Claude Code's
+    /// `--allowedTools`). Used for the assistant's own MCP tools, whose real
+    /// safety gate is ORE's app-side policy — a CLI prompt on top of that is
+    /// pure nagging.
+    public var allowedTools: [String]
 
     public init(
         workingDirectory: URL,
@@ -44,7 +49,8 @@ public struct SessionConfiguration: Sendable {
         environmentOverrides: [String: String] = [:],
         executablePath: String? = nil,
         allowAPIKeyFallback: Bool = false,
-        mcpServer: MCPServer? = nil
+        mcpServer: MCPServer? = nil,
+        allowedTools: [String] = []
     ) {
         self.workingDirectory = workingDirectory
         self.model = model
@@ -56,5 +62,6 @@ public struct SessionConfiguration: Sendable {
         self.executablePath = executablePath
         self.allowAPIKeyFallback = allowAPIKeyFallback
         self.mcpServer = mcpServer
+        self.allowedTools = allowedTools
     }
 }

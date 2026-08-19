@@ -428,7 +428,11 @@ public actor WorkspaceEngine {
             appendSystemPrompt: systemPromptAddition(handoffContext: runtime.handoffContext),
             environmentOverrides: environmentOverrides,
             allowAPIKeyFallback: allowAPIKeyFallback,
-            mcpServer: oreMCPServer()
+            mcpServer: oreMCPServer(),
+            // The assistant's ORE tools never prompt at the CLI layer: the
+            // real gate is ORE's own action policy, and a second prompt on
+            // top of it is what makes an assistant feel like paperwork.
+            allowedTools: record.workspaceKind == .assistant ? ["mcp__ore"] : []
         )
 
         let session = try await harness.makeSession(configuration)
@@ -464,19 +468,26 @@ public actor WorkspaceEngine {
         return false
     }
 
-    /// What ORE tells the agent about the workspace it's in.
+    /// What ORE tells the agent about the workspace it's in. The assistant
+    /// workspace gets its own identity instead — it isn't working on a
+    /// project, it's the product's concierge across all of them.
     private func systemPromptAddition(handoffContext: String? = nil) -> String {
-        var prompt = """
-        You are working in an ORE workspace: an isolated git worktree on branch \
-        `\(record.branch)`, based on `\(record.baseBranch)`.
+        var prompt: String
+        if record.workspaceKind == .assistant {
+            prompt = AssistantPrompt.systemPrompt(home: worktreeURL)
+        } else {
+            prompt = """
+            You are working in an ORE workspace: an isolated git worktree on branch \
+            `\(record.branch)`, based on `\(record.baseBranch)`.
 
-        - Scratch space for plans, notes and attachments is in `.context/`. It is \
-        excluded from git, so nothing you put there will appear in the user's diff.
-        - Review feedback arrives as comments anchored to specific lines of a diff. \
-        Address the code at those lines directly.
-        - Do not switch branches or create commits on another branch; this worktree \
-        exists so that parallel work stays isolated.
-        """
+            - Scratch space for plans, notes and attachments is in `.context/`. It is \
+            excluded from git, so nothing you put there will appear in the user's diff.
+            - Review feedback arrives as comments anchored to specific lines of a diff. \
+            Address the code at those lines directly.
+            - Do not switch branches or create commits on another branch; this worktree \
+            exists so that parallel work stays isolated.
+            """
+        }
         if let handoffContext, !handoffContext.isEmpty {
             prompt += """
 
@@ -519,10 +530,17 @@ public actor WorkspaceEngine {
         } else {
             executable = ShellEnvironment.locate("ore-cli")
         }
+        var arguments = ["mcp-server", "--dir", worktreeURL.path]
+        if record.workspaceKind == .assistant {
+            // The assistant's server also answers cross-workspace read tools,
+            // straight from a read-only view of the same database.
+            arguments.append("--assistant")
+            if let databasePath = store.url?.path {
+                arguments += ["--db", databasePath]
+            }
+        }
         return executable.map {
-            SessionConfiguration.MCPServer(
-                command: $0, arguments: ["mcp-server", "--dir", worktreeURL.path]
-            )
+            SessionConfiguration.MCPServer(command: $0, arguments: arguments)
         }
     }
 
@@ -630,9 +648,10 @@ public actor WorkspaceEngine {
         runtime.isTurnActive = true
         do {
             let harnessKind = HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
+            let requestedEffort = harnessKind.supportsReasoningEffort ? request.reasoningEffort : nil
             if harnessKind == .claudeCode,
                runtime.session != nil,
-               let requestedEffort = request.reasoningEffort,
+               let requestedEffort,
                runtime.sessionEffort != requestedEffort {
                 // Claude's effort override is session-scoped. Restarting and
                 // resuming the provider session applies the new level without
@@ -644,23 +663,32 @@ public actor WorkspaceEngine {
             }
             let session = try await ensureSession(
                 chatID: runtime.record.chatID,
-                reasoningEffort: request.reasoningEffort
+                reasoningEffort: requestedEffort
             )
             try await captureCheckpoint(runtime: runtime)
             await runtime.transcript?.recordPrompt(text, attachments: request.attachments)
             try await session.send(UserMessage(
                 text: text,
                 attachmentPaths: request.attachments.map(\.relativePath),
-                reasoningEffort: request.reasoningEffort,
+                reasoningEffort: requestedEffort,
                 serviceTier: request.serviceTier
             ))
         } catch {
             // The turn never started. Releasing the claim keeps the composer, and
             // anything queued behind it, from waiting on a completion that can
-            // never arrive.
+            // never arrive. Surface it as a session error so the composer can
+            // offer Upgrade CLI / Retry rather than a toast of raw JSON.
             runtime.isTurnActive = false
+            let raw = (error as? HarnessError)?.description ?? error.localizedDescription
+            let message = ProviderErrorCopy.unwrap(raw)
+            await handle(.sessionError(SessionError(
+                kind: ProviderErrorCopy.sessionKind(for: message),
+                message: message,
+                detail: raw == message ? nil : raw,
+                isRecoverable: true
+            )), chatID: runtime.record.chatID)
             publishChatChange(runtime)
-            throw error
+            return false
         }
         publishChatChange(runtime)
 
@@ -1074,6 +1102,7 @@ public actor WorkspaceEngine {
     }
 
     public func addDiffComment(_ reference: DiffCommentReference) async throws {
+        try await ingestPostedComments()
         _ = try await store.addDiffComment(DiffCommentRecord(
             workspaceID: workspaceID,
             filePath: reference.filePath,
@@ -1082,20 +1111,44 @@ public actor WorkspaceEngine {
             body: reference.body,
             context: reference.context
         ))
-        let comments = try await pendingDiffComments()
-        let contextDirectory = worktreeURL.appendingPathComponent(".context", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: contextDirectory, withIntermediateDirectories: true
-        )
-        let data = try JSONEncoder().encode(comments)
-        try data.write(
-            to: contextDirectory.appendingPathComponent("ore-diff-comments.json"),
-            options: .atomic
-        )
+        try await persistPendingComments()
     }
 
     public func pendingDiffComments() async throws -> [DiffCommentReference] {
-        try await store.pendingDiffComments(workspaceID: workspaceID).map(\.reference)
+        try await ingestPostedComments()
+        return try await store.pendingDiffComments(workspaceID: workspaceID).map(\.reference)
+    }
+
+    /// Agent `PostDiffComment` writes the JSON file; the Review pane and the
+    /// next send read the database. Pull new file entries in so the two stay
+    /// one list — and so a UI comment cannot wipe the agent's.
+    private func ingestPostedComments() async throws {
+        let incoming = DiffCommentFile.load(in: worktreeURL)
+        guard !incoming.isEmpty else { return }
+        let existing = try await store.pendingDiffComments(workspaceID: workspaceID)
+        var seen: Set<String> = Set(existing.map {
+            "\($0.filePath):\($0.startLine):\($0.endLine):\($0.body)"
+        })
+        var added = false
+        for comment in incoming {
+            let key = "\(comment.filePath):\(comment.startLine):\(comment.endLine):\(comment.body)"
+            guard seen.insert(key).inserted else { continue }
+            _ = try await store.addDiffComment(DiffCommentRecord(
+                workspaceID: workspaceID,
+                filePath: comment.filePath,
+                startLine: comment.startLine,
+                endLine: comment.endLine,
+                body: comment.body,
+                context: comment.context
+            ))
+            added = true
+        }
+        if added { try await persistPendingComments() }
+    }
+
+    private func persistPendingComments() async throws {
+        let comments = try await store.pendingDiffComments(workspaceID: workspaceID).map(\.reference)
+        try DiffCommentFile.save(comments, in: worktreeURL)
     }
 
     public func conflictHunks(path: String) throws -> [ConflictHunk] {
@@ -1668,6 +1721,7 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case noPullRequest(String)
     case pullRequestNotMerged(String)
     case conflictHunkMissing(String, Int)
+    case assistantWorkspaceProtected
 
     public var description: String {
         switch self {
@@ -1686,6 +1740,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "The pull request for \(branch) has not been merged."
         case .conflictHunkMissing(let path, let line):
             return "No conflict hunk at \(path):\(line)."
+        case .assistantWorkspaceProtected:
+            return "The assistant workspace belongs to ORE and can't be archived or deleted."
         }
     }
 }

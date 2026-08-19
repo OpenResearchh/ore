@@ -20,6 +20,13 @@ public enum OreHome {
     public static var worktreeRoot: URL {
         directory.appendingPathComponent("workspaces", isDirectory: true)
     }
+
+    /// The product-owned assistant workspace's home. Deliberately outside
+    /// `worktreeRoot`: it is not a worktree of any user repository, it's the
+    /// assistant's own memory and scratch space.
+    public static var assistantDirectory: URL {
+        directory.appendingPathComponent("assistant", isDirectory: true)
+    }
 }
 
 /// The database.
@@ -31,6 +38,11 @@ public enum OreHome {
 /// worth a write; a token counter updating at 60Hz is not.
 public actor OreStore {
     private let writer: any DatabaseWriter
+
+    /// Where this store lives on disk; nil for the in-memory test store. Lets
+    /// the engine hand the database's location to a second process (the
+    /// assistant's MCP server) without re-deriving `OreHome` there.
+    public nonisolated let url: URL?
 
     public init(path: URL) throws {
         var configuration = Configuration()
@@ -49,6 +61,7 @@ public actor OreStore {
         let pool = try DatabasePool(path: path.path, configuration: configuration)
         try OreSchema.migrator.migrate(pool)
         self.writer = pool
+        self.url = path
     }
 
     /// In-memory store, for tests.
@@ -60,6 +73,20 @@ public actor OreStore {
         let queue = try DatabaseQueue(configuration: configuration)
         try OreSchema.migrator.migrate(queue)
         self.writer = queue
+        self.url = nil
+    }
+
+    /// A read-only view of another process's live database — the assistant's
+    /// MCP server reads the app's store this way. No migrator on purpose: a
+    /// reader must never race the owning process over the schema, and WAL
+    /// already lets one writer and this reader coexist.
+    public init(readOnlyPath: URL) throws {
+        var configuration = Configuration()
+        configuration.readonly = true
+        configuration.busyMode = .timeout(5)
+        let queue = try DatabaseQueue(path: readOnlyPath.path, configuration: configuration)
+        self.writer = queue
+        self.url = readOnlyPath
     }
 
     public static var defaultURL: URL {
@@ -83,9 +110,21 @@ public actor OreStore {
         }
     }
 
+    /// Every repository the user added. The assistant workspace's home is
+    /// registered as a repository too (workspaces have a foreign key to one),
+    /// but it is the product's, not the user's, so it never appears here — no
+    /// picker should offer to create a workspace in it.
     public func repositories() throws -> [RepositoryRecord] {
         try writer.read { db in
-            try RepositoryRecord.order(Column("name")).fetchAll(db)
+            try RepositoryRecord.fetchAll(db, sql: """
+                SELECT repository.* FROM repository
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM workspace
+                    WHERE workspace.repositoryPath = repository.path
+                      AND workspace.kind = 'assistant'
+                )
+                ORDER BY name
+                """)
         }
     }
 
@@ -101,11 +140,21 @@ public actor OreStore {
 
     /// Sidebar order: pinned first, then most recently active. A workspace the
     /// user pinned is one they're coming back to; recency handles the rest.
-    public func workspaces(includeArchived: Bool = false) throws -> [WorkspaceRecord] {
+    ///
+    /// The assistant workspace is excluded by default so every existing caller
+    /// — the sidebar, name uniqueness, engine startup — keeps seeing only the
+    /// user's own workspaces without knowing the assistant exists.
+    public func workspaces(
+        includeArchived: Bool = false,
+        includeAssistant: Bool = false
+    ) throws -> [WorkspaceRecord] {
         try writer.read { db in
             var request = WorkspaceRecord.all()
             if !includeArchived {
                 request = request.filter(Column("isArchived") == false)
+            }
+            if !includeAssistant {
+                request = request.filter(Column("kind") != WorkspaceKind.assistant.rawValue)
             }
             return try request
                 .order(
@@ -114,6 +163,15 @@ public actor OreStore {
                     Column("createdAt").desc
                 )
                 .fetchAll(db)
+        }
+    }
+
+    /// The product-owned assistant workspace, if it has been created.
+    public func assistantWorkspace() throws -> WorkspaceRecord? {
+        try writer.read { db in
+            try WorkspaceRecord
+                .filter(Column("kind") == WorkspaceKind.assistant.rawValue)
+                .fetchOne(db)
         }
     }
 
@@ -452,7 +510,7 @@ public actor OreStore {
                 JOIN turn ON turn.id = block.turnID
                 JOIN session ON session.id = turn.sessionID
                 JOIN workspace ON workspace.id = session.workspaceID
-                WHERE blockSearch MATCH ?
+                WHERE blockSearch MATCH ? AND workspace.kind != 'assistant'
                 ORDER BY block.createdAt DESC
                 LIMIT ?
                 """,
@@ -517,6 +575,42 @@ public actor OreStore {
                 records.map { ($0.filePath, $0.contentHash) },
                 uniquingKeysWith: { _, last in last }
             )
+        }
+    }
+
+    // MARK: - Assistant actions
+
+    public func recordAssistantAction(_ record: AssistantActionRecord) throws {
+        try writer.write { db in
+            var record = record
+            try record.insert(db)
+        }
+    }
+
+    public func assistantActions(limit: Int = 200) throws -> [AssistantActionRecord] {
+        try writer.read { db in
+            try AssistantActionRecord
+                .order(Column("createdAt").desc, Column("id").desc)
+                .limit(limit)
+                .fetchAll(db)
+        }
+    }
+
+    public func saveAssistantGrant(_ actionClass: String) throws {
+        try writer.write { db in
+            try AssistantGrantRecord(actionClass: actionClass).save(db)
+        }
+    }
+
+    public func assistantGrants() throws -> [String] {
+        try writer.read { db in
+            try AssistantGrantRecord.fetchAll(db).map(\.actionClass)
+        }
+    }
+
+    public func deleteAssistantGrant(_ actionClass: String) throws {
+        _ = try writer.write { db in
+            try AssistantGrantRecord.deleteOne(db, key: actionClass)
         }
     }
 

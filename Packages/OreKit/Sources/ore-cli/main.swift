@@ -17,7 +17,7 @@ let options = CommandLineOptions(arguments: Array(arguments.dropFirst()))
 
 switch command {
 case "mcp-server":
-    runMCPServer(options: options)
+    await runMCPServer(options: options)
 case "doctor":
     await runDoctor()
 case "chat":

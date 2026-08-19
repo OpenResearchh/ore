@@ -300,6 +300,44 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v6.workspaceKind") { db in
+            // The product-owned assistant workspace lives in the same table as
+            // real workspaces — same engine, same transcript — and is told
+            // apart by kind, so every existing query stays one query.
+            try db.alter(table: "workspace") { table in
+                table.add(column: "kind", .text).notNull().defaults(to: "standard")
+            }
+        }
+
+        migrator.registerMigration("v7.assistantActions") { db in
+            // Every action the assistant takes on the user's behalf, with how
+            // it was authorized. The Actions tab renders this; trust in an
+            // agent that acts for you is built on being able to check.
+            try db.create(table: "assistantAction") { table in
+                table.autoIncrementedPrimaryKey("id")
+                table.column("tool", .text).notNull()
+                table.column("summary", .text).notNull()
+                table.column("arguments", .text).notNull().defaults(to: "{}")
+                // auto | grantedTask | grantedAlways | allowedOnce |
+                // allowedTask | allowedAlways | denied | timedOut | failed
+                table.column("decision", .text).notNull()
+                table.column("workspaceID", .text)
+                table.column("createdAt", .datetime).notNull()
+            }
+            try db.create(
+                index: "assistantAction_on_createdAt",
+                on: "assistantAction",
+                columns: ["createdAt"]
+            )
+
+            // "Always allow" grants. One row per action class the user has
+            // permanently granted; deleting the row revokes it.
+            try db.create(table: "assistantGrant") { table in
+                table.primaryKey("actionClass", .text)
+                table.column("createdAt", .datetime).notNull()
+            }
+        }
+
         return migrator
     }
 }

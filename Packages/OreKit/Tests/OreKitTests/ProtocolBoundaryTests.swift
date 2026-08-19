@@ -181,6 +181,12 @@ struct ProtocolBoundaryTests {
         #expect(models.first?.supportedServiceTiers == ["fast"])
     }
 
+    @Test func cursorAgentDoesNotAdvertiseReasoningEffort() {
+        #expect(HarnessKind.claudeCode.supportsReasoningEffort)
+        #expect(HarnessKind.codex.supportsReasoningEffort)
+        #expect(!HarnessKind.cursorAgent.supportsReasoningEffort)
+    }
+
     @Test func jsonValuePreservesIntegersExactly() throws {
         // Tool inputs are handed straight back to the CLI when a permission is
         // allowed; turning `5` into `5.0` would corrupt the call being approved.

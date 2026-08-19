@@ -243,9 +243,14 @@ public actor ClaudeCodeSession: AgentSession {
         }
 
         // Inbound control requests we don't implement still have to be
-        // answered — the CLI blocks on every one of them.
-        if let unsupported = unsupportedControlRequestID(in: line) {
-            replyUnsupported(requestID: unsupported)
+        // answered — the CLI blocks on every one of them. A line we cannot
+        // decode as `can_use_tool` used to be dropped, which left the CLI
+        // hung with the composer still saying "running a tool".
+        switch ClaudeWire.inboundControl(in: line) {
+        case .none, .permissionPrompt:
+            break
+        case .unsupported(let requestID, let subtype):
+            replyUnsupported(requestID: requestID, subtype: subtype)
         }
     }
 
@@ -358,25 +363,17 @@ public actor ClaudeCodeSession: AgentSession {
         pendingPermissions.removeAll()
     }
 
-    /// Detects an inbound control request whose subtype we don't handle, so we
-    /// can send an error response instead of leaving the CLI blocked forever.
-    private func unsupportedControlRequestID(in line: String) -> String? {
-        guard line.contains("\"control_request\""),
-              let data = line.data(using: .utf8),
-              let request = try? JSONDecoder().decode(ClaudeWire.ControlRequest.self, from: data),
-              request.request.subtype != "can_use_tool"
-        else { return nil }
-        return request.requestID
-    }
-
-    private func replyUnsupported(requestID: String) {
+    private func replyUnsupported(requestID: String, subtype: String? = nil) {
         guard let process else { return }
+        let detail = subtype.map { " (\($0))" } ?? ""
+        let message = "ore: unanswered claude control_request id=\(requestID) subtype=\(subtype ?? "unknown")\n"
+        try? FileHandle.standardError.write(contentsOf: Data(message.utf8))
         let response = ClaudeWire.ControlResponse(
             response: .init(
                 subtype: "error",
                 requestID: requestID,
                 response: nil,
-                error: "ORE does not implement this control request"
+                error: "ORE does not implement this control request\(detail)"
             )
         )
         if let line = try? encode(response) { process.writeLine(line) }
@@ -423,6 +420,10 @@ public actor ClaudeCodeSession: AgentSession {
                "mcpServers": ["ore": ["command": mcp.command, "args": mcp.arguments]],
            ]), let json = String(data: data, encoding: .utf8) {
             arguments += ["--mcp-config", json]
+        }
+
+        if !configuration.allowedTools.isEmpty {
+            arguments += ["--allowedTools", configuration.allowedTools.joined(separator: ",")]
         }
 
         arguments += configuration.extraArguments

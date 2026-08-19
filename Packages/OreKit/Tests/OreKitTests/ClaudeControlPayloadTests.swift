@@ -115,4 +115,25 @@ struct ClaudeControlPayloadTests {
         #expect(message.renderedText.contains(".context/attachments/plan.md"))
         #expect(message.renderedText.hasPrefix("Follow this plan."))
     }
+
+    @Test func aWellFormedCanUseToolIsAPermissionPrompt() {
+        let line = #"{"type":"control_request","request_id":"req_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#
+        #expect(ClaudeWire.inboundControl(in: line) == .permissionPrompt)
+    }
+
+    @Test func anUnsupportedControlRequestCarriesItsIDForAnErrorReply() {
+        let line = #"{"type":"control_request","request_id":"req_hook","request":{"subtype":"hook_callback"}}"#
+        #expect(ClaudeWire.inboundControl(in: line) == .unsupported(requestID: "req_hook", subtype: "hook_callback"))
+    }
+
+    @Test func aMalformedControlRequestStillYieldsARequestID() {
+        // Missing fields used to fail the typed decode and leave the CLI blocked.
+        let line = #"{"type":"control_request","request_id":"req_broken","request":{}}"#
+        #expect(ClaudeWire.inboundControl(in: line) == .unsupported(requestID: "req_broken", subtype: nil))
+    }
+
+    @Test func ordinaryStdoutIsNotTreatedAsAControlRequest() {
+        #expect(ClaudeWire.inboundControl(in: #"{"type":"assistant","message":{}}"#) == .none)
+        #expect(ClaudeWire.inboundControl(in: "not json") == .none)
+    }
 }

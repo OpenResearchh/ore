@@ -225,6 +225,34 @@ struct CursorTranslatorTests {
         }
         #expect(completed == ["Hello there"])
     }
+
+    @Test func anAgentToolCarriesItsBriefOnTheSharedKeys() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"c9","tool_call":{"agentToolCall":{"args":{"instructions":"Audit the router for dead routes.","title":"Route audit","agentType":"reviewer"}}},"timestamp_ms":1}"#,
+        ])
+        let call = all.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "Task")
+        #expect(call?.input["prompt"]?.stringValue == "Audit the router for dead routes.")
+        #expect(call?.input["description"]?.stringValue == "Route audit")
+        #expect(call?.input["subagent_type"]?.stringValue == "reviewer")
+    }
+
+    @Test func planArgumentsAreLeftAloneByTheSubagentAliases() {
+        // CreatePlan's `name` is a plan title, not a subagent label — aliasing
+        // it would leak a bogus overview into the rendered plan markdown.
+        let all = events([
+            ##"{"type":"tool_call","subtype":"started","call_id":"c8","tool_call":{"createPlanToolCall":{"args":{"name":"Ship the fix","plan":"# Ship\n\nDo the thing."}}},"timestamp_ms":1}"##,
+        ])
+        let call = all.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "CreatePlan")
+        #expect(call?.input["description"] == nil)
+    }
 }
 
 /// cursor-agent explains a failure only on stderr, and exits with an empty

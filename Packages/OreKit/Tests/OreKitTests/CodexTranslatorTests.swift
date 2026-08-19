@@ -321,4 +321,105 @@ struct CodexTranslatorTests {
         #expect(!capabilities.supportsPlanMode)
         #expect(!capabilities.supportsRuntimePermissionModeChange)
     }
+
+    @Test func aDelegationToolLandsOnTheSubagentRow() {
+        // codex app-server has no subagent item type, so a handoff can only
+        // arrive as an MCP tool. Naming it `Task` and aliasing its arguments is
+        // what lets the transcript say what the child was created for.
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("i1"),
+                "type": .string("mcpToolCall"),
+                "tool": .string("spawn_agent"),
+                "server": .string("agents"),
+                "arguments": .object([
+                    "instructions": .string("Audit the migration for missing indexes."),
+                    "title": .string("Index audit"),
+                    "agentType": .string("reviewer"),
+                ]),
+            ])])
+        ).events
+        let call = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "Task")
+        #expect(call?.displayName == "Index audit")
+        #expect(call?.input["prompt"]?.stringValue == "Audit the migration for missing indexes.")
+        #expect(call?.input["subagent_type"]?.stringValue == "reviewer")
+        // Codex sends no parent link, so the row stays flat.
+        #expect(call?.parentToolCallID == nil)
+    }
+
+    @Test func anOrdinaryMCPToolKeepsItsOwnNameAndArguments() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("i2"),
+                "type": .string("mcpToolCall"),
+                "tool": .string("search_docs"),
+                "server": .string("docs"),
+                "arguments": .object(["title": .string("Indexes")]),
+            ])])
+        ).events
+        let call = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "search_docs")
+        #expect(call?.displayName == "docs")
+        #expect(call?.input["description"] == nil)
+    }
+
+    @Test func nestedJSONTurnErrorsUnwrapToTheHumanMessage() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let json = #"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}"#
+        let output = translator.translate(method: "turn/completed", params: .object([
+            "turn": .object([
+                "status": .string("failed"),
+                "error": .object(["message": .string(json)]),
+            ]),
+        ]))
+        guard case .turnCompleted(let result)? = output.events.first(where: {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no turnCompleted event")
+            return
+        }
+        #expect(result.outcome == .failed)
+        #expect(result.errorMessage?.contains("requires a newer version of Codex") == true)
+        #expect(result.errorMessage?.contains("\"status\"") != true)
+    }
+
+    @Test func errorNotificationsClassifyACLIUpgrade() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        let json = #"{"type":"error","status":400,"error":{"message":"Please upgrade to the latest app or CLI and try again."}}"#
+        let output = translator.translate(
+            method: "error",
+            params: .object(["message": .string(json)])
+        )
+        guard case .sessionError(let error)? = output.events.first(where: {
+            if case .sessionError = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no sessionError event")
+            return
+        }
+        #expect(error.kind == .protocolMismatch)
+        #expect(error.message.contains("upgrade to the latest"))
+        #expect(!error.message.contains("\"status\""))
+    }
 }

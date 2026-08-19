@@ -337,6 +337,53 @@ struct ClaudeCodeTranslatorTests {
         #expect(question.options.map(\.label) == ["master", "develop"])
         #expect(question.toolCallID == ToolCallID(rawValue: "toolu_1"))
     }
+
+    @Test func aFinishedToolMovesStatusToRequesting() {
+        // The composer used to keep "running a tool" after the Read returned,
+        // so a long model wait looked like a hung tool.
+        var translator = ClaudeCodeTranslator(sessionID: SessionID(rawValue: "test"))
+        let call = translator.translate(line: """
+        {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/a.swift"}}]},"session_id":"s1"}
+        """)
+        #expect(call.events.contains { if case .statusChanged(.runningTool) = $0 { return true }; return false })
+
+        let result = translator.translate(line: """
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]},"session_id":"s1"}
+        """)
+        let statuses = result.events.compactMap { event -> AgentStatus? in
+            if case .statusChanged(let status) = event { return status }
+            return nil
+        }
+        #expect(statuses == [.requesting])
+    }
+
+    @Test func parallelToolsStayRunningUntilTheLastResult() {
+        var translator = ClaudeCodeTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(line: """
+        {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/a.swift"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/tmp/b.swift"}}]},"session_id":"s1"}
+        """)
+        let first = translator.translate(line: """
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a","is_error":false}]},"session_id":"s1"}
+        """)
+        #expect(!first.events.contains { if case .statusChanged = $0 { return true }; return false })
+
+        let second = translator.translate(line: """
+        {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"b","is_error":false}]},"session_id":"s1"}
+        """)
+        #expect(second.events.contains { if case .statusChanged(.requesting) = $0 { return true }; return false })
+    }
+
+    @Test func askUserQuestionDoesNotClaimARunningTool() {
+        var translator = ClaudeCodeTranslator(sessionID: SessionID(rawValue: "test"))
+        let events = translator.translate(line: """
+        {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"AskUserQuestion","input":{"questions":[{"question":"Which base?"}]}}]},"session_id":"s1"}
+        """).events
+        let statuses = events.compactMap { event -> AgentStatus? in
+            if case .statusChanged(let status) = event { return status }
+            return nil
+        }
+        #expect(statuses == [.awaitingInput])
+    }
 }
 
 enum Fixtures {

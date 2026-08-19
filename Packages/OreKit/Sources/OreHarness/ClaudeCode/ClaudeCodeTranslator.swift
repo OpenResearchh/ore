@@ -51,6 +51,10 @@ struct ClaudeCodeTranslator {
     /// Tool name by id, so a permission request and a tool result can both be
     /// labelled even though only the `tool_use` block carries the name.
     private var toolNames: [ToolCallID: String] = [:]
+    /// Tools whose results have not arrived yet. Status stays `.runningTool`
+    /// until this hits zero — otherwise a finished Read still looks like a hang
+    /// while the model thinks about the next step.
+    private var inFlightToolCalls = 0
     private var sawInterruptMarker = false
     /// Plan text by tool call id, awaiting the permission request that gates it.
     private var pendingPlanProposals: [ToolCallID: String] = [:]
@@ -297,7 +301,12 @@ struct ClaudeCodeTranslator {
                     tool: name, toolCallID: toolCallID, input: input,
                     turnID: turnID, to: &output
                 )
-                append(status: .runningTool, to: &output)
+                // AskUserQuestion is a prompt, not work in flight — leaving
+                // `.runningTool` on top of `.awaitingInput` hid the card.
+                if name != "AskUserQuestion" {
+                    inFlightToolCalls += 1
+                    append(status: .runningTool, to: &output)
+                }
 
             default:
                 break
@@ -395,6 +404,10 @@ struct ClaudeCodeTranslator {
                     text: block.flattenedResultText,
                     metadata: payload.toolUseResult
                 )))
+                if inFlightToolCalls > 0 { inFlightToolCalls -= 1 }
+                if inFlightToolCalls == 0 {
+                    append(status: .requesting, to: &output)
+                }
 
             case "text":
                 // The CLI injects this marker when an interrupt lands. It's the
@@ -465,6 +478,7 @@ struct ClaudeCodeTranslator {
         sawInterruptMarker = false
         currentTurnID = nil
         currentMessageID = nil
+        inFlightToolCalls = 0
         streamingBlocks.removeAll(keepingCapacity: true)
         narrationFilters.removeAll(keepingCapacity: true)
         pendingNarration = nil

@@ -335,6 +335,13 @@ actor CoreEventPrinter {
             endLine()
             print("! \(failure.message)")
             if let detail = failure.detail { print("  \(detail)") }
+
+        case .assistantConfirmationRequested(let confirmation):
+            endLine()
+            print("? assistant asks: \(confirmation.summary)")
+
+        case .assistantConfirmationResolved, .assistantUIAction:
+            break
         }
     }
 

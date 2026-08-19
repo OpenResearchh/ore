@@ -14,9 +14,9 @@ import OreSupport
 /// rewrite.
 public actor InProcessCoreClient: CoreClient {
     public nonisolated let events: AsyncStream<CoreEvent>
-    private nonisolated let continuation: AsyncStream<CoreEvent>.Continuation
+    nonisolated let continuation: AsyncStream<CoreEvent>.Continuation
 
-    private let store: OreStore
+    let store: OreStore
     private let harnessRegistry: HarnessRegistry
     private let worktreeRoot: URL?
     private let allowAPIKeyFallback: Bool
@@ -26,6 +26,13 @@ public actor InProcessCoreClient: CoreClient {
     private var gitClients: [String: GitClient] = [:]
     private var harnessProbes: [HarnessProbeResult] = []
     private var modelCatalog: [HarnessKind: [AgentModel]] = [:]
+
+    // Assistant action lane — see AssistantActions.swift for the policy and
+    // dispatch. Stored here because extensions can't add storage.
+    var assistantBridge: AssistantBridgeServer?
+    var pendingAssistantConfirmations: [String: CheckedContinuation<AssistantResolution, Never>] = [:]
+    var assistantTaskGrants: [AssistantTaskGrantKey: Date] = [:]
+    var assistantAlwaysGrants: Set<AssistantActionClass> = []
 
     public init(
         store: OreStore,
@@ -223,6 +230,9 @@ public actor InProcessCoreClient: CoreClient {
         case .stopChatSession(let id, let chatID):
             try await engine(for: id).stopSession(chatID: chatID)
 
+        case .resolveAssistantConfirmation(let id, let decision):
+            resolveAssistantConfirmation(id: id, decision: decision)
+
         case .probeHarnesses:
             async let probes = harnessRegistry.probeAll()
             async let catalogs = harnessRegistry.discoverAllModels()
@@ -248,6 +258,14 @@ public actor InProcessCoreClient: CoreClient {
         // Pay the login-shell probe now, off the critical path, so the first
         // agent launch doesn't stall on it.
         ShellEnvironment.warm()
+
+        // The product's own hidden workspace. Ensured before the engines load
+        // so it starts — and resumes its session — exactly like any other
+        // workspace; `store.workspaces()` below deliberately excludes it.
+        if let assistant = ((try? await AssistantManager.ensureAssistant(store: store)) ?? nil) {
+            _ = try? await makeEngine(for: assistant)
+            startAssistantBridge()
+        }
 
         for record in try await store.workspaces() {
             _ = try? await makeEngine(for: record)
@@ -285,7 +303,9 @@ public actor InProcessCoreClient: CoreClient {
 
         var summaries: [WorkspaceSummary] = []
         var chats: [ChatSummary] = []
-        for record in try await store.workspaces(includeArchived: true) {
+        // The assistant rides the snapshot too — tagged by kind, so the app
+        // can route it to the Assistant window instead of the sidebar.
+        for record in try await store.workspaces(includeArchived: true, includeAssistant: true) {
             if let engine = engines[record.workspaceID] {
                 summaries.append(await engine.summary())
                 chats.append(contentsOf: (try? await engine.chatSummaries()) ?? [])
@@ -337,7 +357,8 @@ public actor InProcessCoreClient: CoreClient {
 
     // MARK: - Workspaces
 
-    private func createWorkspace(_ request: CreateWorkspaceRequest) async throws {
+    @discardableResult
+    func createWorkspace(_ request: CreateWorkspaceRequest) async throws -> WorkspaceRecord {
         let repositoryPath = try await canonicalRepositoryURL(request.repositoryPath)
         guard try await store.repositories().contains(where: { $0.path == repositoryPath.path })
         else {
@@ -461,11 +482,15 @@ public actor InProcessCoreClient: CoreClient {
                 workspaceID: record.workspaceID, text: initialPrompt, queueIfBusy: false
             ))
         }
+        return record
     }
 
-    private func archiveWorkspace(_ id: WorkspaceID) async throws {
+    func archiveWorkspace(_ id: WorkspaceID) async throws {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
+        }
+        guard record.workspaceKind != .assistant else {
+            throw OreCoreError.assistantWorkspaceProtected
         }
         let configuration = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
@@ -554,6 +579,9 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
+        guard record.workspaceKind != .assistant else {
+            throw OreCoreError.assistantWorkspaceProtected
+        }
         await stopEngine(id)
 
         let git = try gitClient(for: record.repositoryPath)
@@ -584,7 +612,7 @@ public actor InProcessCoreClient: CoreClient {
         )
     }
 
-    private func commit(_ id: WorkspaceID, message: String) async throws {
+    func commit(_ id: WorkspaceID, message: String) async throws {
         let (_, git, worktree) = try await workspaceAndGit(id)
         try await git.runSerialized(["add", "-A"], in: worktree)
         try await git.runSerialized([
@@ -593,7 +621,7 @@ public actor InProcessCoreClient: CoreClient {
         try await resync(id)
     }
 
-    private func push(_ id: WorkspaceID) async throws {
+    func push(_ id: WorkspaceID) async throws {
         let (record, git, worktree) = try await workspaceAndGit(id)
         try await git.runSerialized(["push", "-u", "origin", record.branch], in: worktree)
         try await resync(id)
@@ -613,7 +641,7 @@ public actor InProcessCoreClient: CoreClient {
     }
 
     @discardableResult
-    private func createPullRequest(
+    func createPullRequest(
         _ id: WorkspaceID, title: String, body: String, base: String, draft: Bool
     ) async throws -> String {
         let (record, git, worktree) = try await workspaceAndGit(id)
@@ -670,7 +698,7 @@ public actor InProcessCoreClient: CoreClient {
 
     // MARK: - Engines
 
-    private func engine(for id: WorkspaceID) async throws -> WorkspaceEngine {
+    func engine(for id: WorkspaceID) async throws -> WorkspaceEngine {
         if let engine = engines[id] { return engine }
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
@@ -728,6 +756,7 @@ public actor InProcessCoreClient: CoreClient {
     }
 
     public func shutdown() async {
+        stopAssistantBridge()
         for id in engines.keys {
             await stopEngine(id)
         }
@@ -966,6 +995,22 @@ public actor InProcessCoreClient: CoreClient {
         )
     }
 
+    /// Upgrade the locally installed agent CLI, then re-probe so the next
+    /// session picks up the new binary. The running session is left alone —
+    /// the caller should stop it before retrying a turn.
+    public func updateHarnessCLI(_ kind: HarnessKind) async throws {
+        let path = harnessProbes.first(where: { $0.kind == kind })?.executablePath
+            ?? ShellEnvironment.locate(kind.defaultExecutableName)
+        try await HarnessCLIUpdater.update(kind: kind, executablePath: path)
+        async let probes = harnessRegistry.probeAll()
+        async let catalogs = harnessRegistry.discoverAllModels()
+        harnessProbes = await probes
+        continuation.yield(.harnessProbeCompleted(harnessProbes))
+        for (harness, models) in await catalogs {
+            recordModels(models, for: harness)
+        }
+    }
+
     public struct WorkspaceEnvironment: Sendable, Hashable {
         public var worktreePath: String
         public var runScript: String?
@@ -1014,7 +1059,8 @@ private extension CoreCommand {
             return id
         case .resync(let id):
             return id
-        case .addRepository, .createWorkspace, .probeHarnesses:
+        case .addRepository, .createWorkspace, .probeHarnesses,
+             .resolveAssistantConfirmation:
             return nil
         }
     }

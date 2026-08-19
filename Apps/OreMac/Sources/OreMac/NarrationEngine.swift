@@ -173,6 +173,54 @@ final class NarrationEngine {
         stopSpeaking(immediate: true)
     }
 
+    /// Whether some dictation currently owns the audio. The assistant's
+    /// hold-to-talk reads this to know a composer mic is live before taking
+    /// the microphone over.
+    var isMicActive: Bool { micActive }
+
+    // MARK: - Assistant
+
+    /// Speaks for the assistant, bypassing the per-chat speaker toggles and
+    /// the master narration switch: the user just *spoke* to it, and a spoken
+    /// question deserves a spoken answer regardless of how the ambient
+    /// narration is configured. Answers ride interrupt priority; mid-turn
+    /// milestones ride progress, so they thin out under load and the reply
+    /// always wins.
+    func speakAssistant(
+        _ text: String,
+        chatID: ChatID,
+        priority: NarrationPriority = .interrupt
+    ) {
+        guard let spoken = NarrationPhraser.spokenNarration(text) else { return }
+        enqueue(SpokenUtterance(
+            chatID: chatID,
+            priority: priority,
+            kind: priority == .progress ? .toolActivity : .turnCompleted,
+            text: spoken
+        ))
+    }
+
+    /// Runs `handler` once nothing is speaking and nothing is waiting to be —
+    /// how the assistant knows its spoken question has finished before it
+    /// opens the microphone for the answer (opening it earlier would cut the
+    /// question off; see `setMicActive`).
+    func notifyWhenQuiet(_ handler: @escaping @MainActor () -> Void) {
+        if currentUtterance == nil, queue.peek == nil {
+            handler()
+            return
+        }
+        quietWaiters.append(handler)
+    }
+
+    private var quietWaiters: [@MainActor () -> Void] = []
+
+    private func flushQuietWaitersIfIdle() {
+        guard !quietWaiters.isEmpty, currentUtterance == nil, queue.peek == nil else { return }
+        let waiters = quietWaiters
+        quietWaiters = []
+        for waiter in waiters { waiter() }
+    }
+
     // MARK: - Event intake
 
     func observe(
@@ -551,6 +599,7 @@ final class NarrationEngine {
         speakingChatID = nil
         lastUtteranceEndedAt = Date()
         pump()
+        flushQuietWaitersIfIdle()
     }
 
     private func dropState(for chatID: ChatID) {

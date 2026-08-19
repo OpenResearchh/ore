@@ -398,6 +398,36 @@ struct WorkspaceEngineTests {
         #expect(sent.contains("let value = optional!"))
     }
 
+    @Test func postedJSONCommentsLandInPendingDiffComments() async throws {
+        // PostDiffComment writes the JSON file from a side process. The review
+        // pane and the next send read the database — ingest is what joins them.
+        let harness = try await makeEngine()
+        try DiffCommentFile.append(
+            DiffCommentReference(
+                filePath: "Sources/App.swift",
+                startLine: 12,
+                endLine: 14,
+                body: "unwrap this"
+            ),
+            in: harness.worktree
+        )
+
+        let pending = try await harness.engine.pendingDiffComments()
+        #expect(pending.count == 1)
+        #expect(pending[0].filePath == "Sources/App.swift")
+        #expect(pending[0].body == "unwrap this")
+
+        // A UI comment must not wipe the ingested one when it rewrites the file.
+        try await harness.engine.addDiffComment(DiffCommentReference(
+            filePath: "Sources/App.swift",
+            startLine: 20,
+            endLine: 20,
+            body: "and this"
+        ))
+        let after = try await harness.engine.pendingDiffComments()
+        #expect(after.map(\.body).sorted() == ["and this", "unwrap this"])
+    }
+
     @Test func aWorkspaceNeedingInputIsMarkedUnreadUnlessItIsOnScreen() async throws {
         // The sidebar answers "which agent needs me"; the one the user is
         // already looking at does not.

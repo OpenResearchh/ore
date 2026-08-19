@@ -346,4 +346,90 @@ struct TranscriptDisplayTests {
         )
         #expect(shown.contains { $0.kind == .plan })
     }
+
+    @Test func aToolCallRemembersARunningLabel() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "c1"), name: "Read",
+            displayName: "ChatPane.swift", input: .object([:])
+        )))
+        #expect(state.runningToolLabel == "Reading ChatPane.swift")
+        #expect(state.lastEventAt != nil)
+
+        state.apply(.turnCompleted(TurnResult(turnID: turnID, outcome: .completed)))
+        #expect(state.runningToolLabel == nil)
+        #expect(state.lastEventAt == nil)
+    }
+
+    @Test func runningToolPhrasesNameTheFile() {
+        #expect(ChatState.runningToolPhrase(name: "Read", displayName: "a.swift") == "Reading a.swift")
+        #expect(ChatState.runningToolPhrase(name: "Edit", displayName: "a.swift") == "Editing a.swift")
+        #expect(ChatState.runningToolPhrase(name: "Bash", displayName: "git status") == "Running git status")
+        #expect(ChatState.runningToolPhrase(name: "Task", displayName: "Explore") == "Running subagent · Explore")
+    }
+
+    @Test func aCodexCLIUpgradeErrorOffersAnUpdateNotAUsageLimit() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        let json = #"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}"#
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.turnCompleted(TurnResult(
+            turnID: turnID, outcome: .failed, errorMessage: json
+        )))
+        #expect(state.prominentError?.needsCLIUpgrade == true)
+        #expect(state.prominentError?.isUsageLimit == false)
+        #expect(state.prominentError?.message.contains("requires a newer version of Codex") == true)
+        #expect(state.prominentError?.message.contains("\"status\"") != true)
+    }
+
+    @Test func aRateLimitSessionErrorIsAUsageLimit() {
+        let state = ChatState()
+        state.apply(.rateLimit(RateLimitReport(
+            status: .exhausted,
+            resetsAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )))
+        state.apply(.sessionError(SessionError(
+            kind: .rateLimited, message: "Rate limit exceeded"
+        )))
+        #expect(state.prominentError?.isUsageLimit == true)
+        #expect(state.prominentError?.needsCLIUpgrade == false)
+        #expect(state.prominentError?.resetsAt != nil)
+    }
+}
+
+struct ComposerBusyCopyTests {
+    @Test func requestingWaitsOnTheModel() {
+        let text = ComposerBusyCopy.label(
+            harness: .claudeCode, status: .requesting, runningToolLabel: nil,
+            isStarting: false, lastEventAt: Date(), now: Date()
+        )
+        #expect(text == "Claude Code is waiting on the model")
+    }
+
+    @Test func aRunningToolNamesTheFile() {
+        let text = ComposerBusyCopy.label(
+            harness: .claudeCode, status: .runningTool,
+            runningToolLabel: "Reading WorkspaceEngine.swift",
+            isStarting: false, lastEventAt: Date(), now: Date()
+        )
+        #expect(text == "Reading WorkspaceEngine.swift")
+    }
+
+    @Test func silenceAfterNinetySecondsIsCalledOut() {
+        let last = Date()
+        let now = last.addingTimeInterval(95)
+        let text = ComposerBusyCopy.label(
+            harness: .claudeCode, status: .runningTool,
+            runningToolLabel: "Reading a.swift",
+            isStarting: false, lastEventAt: last, now: now
+        )
+        #expect(text == "No output for 1m 35s")
+    }
+
+    @Test func turnElapsedIsLabeledAsTheTurn() {
+        let start = Date()
+        #expect(ComposerBusyCopy.turnElapsed(from: start, to: start.addingTimeInterval(65)) == "1m 5s this turn")
+    }
 }

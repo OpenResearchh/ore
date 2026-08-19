@@ -146,7 +146,9 @@ public actor JSONRPCConnection {
         else { return }
 
         if let error = message["error"] {
-            let text = error["message"]?.stringValue ?? error.description
+            let text = ProviderErrorCopy.unwrap(
+                error["message"]?.stringValue ?? error.description
+            )
             waiting.resume(throwing: HarnessError.transportFailure(text))
         } else {
             waiting.resume(returning: message["result"] ?? .null)

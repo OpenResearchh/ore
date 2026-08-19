@@ -159,6 +159,7 @@ struct ReviewPane: View {
             hasLoadedOnce = model.cachedDiff(for: workspace.id)?.diffs.isEmpty == false
             diffScope = .all
             await refresh()
+            await model.pullDraftComments(for: workspace.id)
             async let checkpoints = model.loadTurnCheckpoints(for: workspace.id)
             async let neighbors = model.loadStackNeighbors(for: workspace.id)
             turnCheckpoints = await checkpoints
@@ -169,6 +170,14 @@ struct ReviewPane: View {
         // Silent catch-up: the agent writing files should grow this list in
         // place, not flash a spinner over it.
         .task(id: workspace.gitStatus.generation) { await refresh() }
+        // Agent PostDiffComment writes a gitignored file, so status generation
+        // does not move. Poll while this pane is up so numbered anchors appear.
+        .task(id: "comments-\(workspace.id.rawValue)") {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                await model.pullDraftComments(for: workspace.id)
+            }
+        }
     }
 
     /// Show the cached diff for this workspace at once, or clear whatever diff

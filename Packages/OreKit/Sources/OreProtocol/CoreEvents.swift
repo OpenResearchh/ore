@@ -22,6 +22,13 @@ public enum CoreEvent: Sendable, Codable {
     case harnessProbeCompleted([HarnessProbeResult])
     case modelCatalogUpdated(HarnessKind, [AgentModel])
     case commandFailed(CommandFailure)
+
+    // The assistant's action lane surfacing into the client: a pending
+    // confirmation, its resolution (however it resolved — user, timeout, or
+    // another window), and UI-level effects like revealing a workspace.
+    case assistantConfirmationRequested(AssistantConfirmation)
+    case assistantConfirmationResolved(String)
+    case assistantUIAction(AssistantUIAction)
 }
 
 public struct CoreSnapshot: Sendable, Codable {
@@ -105,6 +112,17 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
     }
 }
 
+/// What a workspace is for.
+///
+/// `.assistant` marks the product-owned assistant workspace: one per user,
+/// hidden from the sidebar and every picker, surfaced only through the
+/// Assistant activity window and voice mode. It runs the same engine as any
+/// other workspace — being hidden is a client concern, not an engine one.
+public enum WorkspaceKind: String, Sendable, Codable, Hashable {
+    case standard
+    case assistant
+}
+
 /// Everything the sidebar needs to render one row, in one struct — the sidebar
 /// is the app's "which agent needs me right now" dashboard, so it must never
 /// have to fan out to other queries to draw itself.
@@ -136,6 +154,10 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
     /// Origin default vs local default vs this branch. Nil until the first
     /// fetch lands; missing from older snapshots.
     public var baseSync: BaseSyncStatus?
+    /// Nil in snapshots from cores predating the assistant; treat as `.standard`.
+    public var kind: WorkspaceKind?
+
+    public var isAssistant: Bool { kind == .assistant }
 
     public init(
         id: WorkspaceID,
@@ -157,7 +179,8 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         gitStatus: GitStatusSummary = GitStatusSummary(),
         contextUsage: UsageReport? = nil,
         lastActivity: Date? = nil,
-        baseSync: BaseSyncStatus? = nil
+        baseSync: BaseSyncStatus? = nil,
+        kind: WorkspaceKind? = nil
     ) {
         self.id = id
         self.name = name
@@ -179,6 +202,7 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         self.contextUsage = contextUsage
         self.lastActivity = lastActivity
         self.baseSync = baseSync
+        self.kind = kind
     }
 }
 

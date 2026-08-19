@@ -21,12 +21,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NSApp.appearance = NSAppearance(named: .aqua)
         }
         NSApp.activate(ignoringOtherApps: true)
-        UNUserNotificationCenter.current().delegate = self
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.setNotificationCategories(Self.notificationCategories())
 
         MainActor.assumeIsolated {
             WindowSnapshot.scheduleIfRequested()
         }
     }
+
+    // MARK: - Notification actions
+
+    /// What a banner can do without the app being opened. Answering from the
+    /// notification is the whole point of asking through one — the user is in
+    /// another app precisely when these arrive. (A function, not a stored
+    /// static: `UNNotificationCategory` isn't Sendable, so a shared constant
+    /// trips strict concurrency.)
+    static func notificationCategories() -> Set<UNNotificationCategory> { [
+        // "Assistant needs approval" — the M2 confirmation tiers, inline.
+        UNNotificationCategory(
+            identifier: NotificationCategory.assistantConfirmation,
+            actions: [
+                UNNotificationAction(
+                    identifier: NotificationAction.allowTask,
+                    title: "Allow for This Task"
+                ),
+                UNNotificationAction(
+                    identifier: NotificationAction.allowOnce,
+                    title: "Allow Once"
+                ),
+                UNNotificationAction(
+                    identifier: NotificationAction.deny,
+                    title: "Deny",
+                    options: [.destructive]
+                ),
+            ],
+            intentIdentifiers: []
+        ),
+        // "Agent has a question" — an inline text field beats a round trip
+        // through the whole app for a one-line answer.
+        UNNotificationCategory(
+            identifier: NotificationCategory.agentQuestion,
+            actions: [
+                UNTextInputNotificationAction(
+                    identifier: NotificationAction.reply,
+                    title: "Reply",
+                    textInputButtonTitle: "Send",
+                    textInputPlaceholder: "Answer the agent…"
+                ),
+            ],
+            intentIdentifiers: []
+        ),
+        // "Waiting for permission" — a tool call the user can wave through.
+        UNNotificationCategory(
+            identifier: NotificationCategory.toolPermission,
+            actions: [
+                UNNotificationAction(
+                    identifier: NotificationAction.allowPermission,
+                    title: "Allow"
+                ),
+                UNNotificationAction(
+                    identifier: NotificationAction.denyPermission,
+                    title: "Deny",
+                    options: [.destructive]
+                ),
+            ],
+            intentIdentifiers: []
+        ),
+    ] }
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -39,18 +101,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        NotificationCenter.default.post(
-            name: .oreOpenFromNotification,
-            object: nil,
-            userInfo: response.notification.request.content.userInfo
-        )
+        var info = response.notification.request.content.userInfo
+        switch response.actionIdentifier {
+        case UNNotificationDefaultActionIdentifier, UNNotificationDismissActionIdentifier:
+            NotificationCenter.default.post(
+                name: .oreOpenFromNotification, object: nil, userInfo: info
+            )
+        default:
+            info["actionIdentifier"] = response.actionIdentifier
+            if let text = (response as? UNTextInputNotificationResponse)?.userText {
+                info["replyText"] = text
+            }
+            NotificationCenter.default.post(
+                name: .oreNotificationAction, object: nil, userInfo: info
+            )
+        }
     }
 
-    /// Closing the last window quits. ORE is a single-window app; leaving a
-    /// dockless process behind would mean agents running with nothing to show
-    /// for them.
+    /// The menu bar presence is what stays: closing the window parks ORE
+    /// rather than quitting it, so agents keep running, the assistant keeps
+    /// listening, and notifications stay answerable. Quit lives in the menu
+    /// bar item and ⌘Q.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -63,7 +136,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 }
 
+/// String constants shared between registration (here), posting (`AppModel`),
+/// and handling (`AppModel` again).
+enum NotificationCategory {
+    static let assistantConfirmation = "ore.category.assistantConfirmation"
+    static let agentQuestion = "ore.category.agentQuestion"
+    static let toolPermission = "ore.category.toolPermission"
+}
+
+enum NotificationAction {
+    static let allowTask = "ore.action.allowTask"
+    static let allowOnce = "ore.action.allowOnce"
+    static let deny = "ore.action.deny"
+    static let reply = "ore.action.reply"
+    static let allowPermission = "ore.action.allowPermission"
+    static let denyPermission = "ore.action.denyPermission"
+}
+
 extension Notification.Name {
     static let oreApplicationWillTerminate = Notification.Name("ore.applicationWillTerminate")
     static let oreOpenFromNotification = Notification.Name("ore.openFromNotification")
+    static let oreNotificationAction = Notification.Name("ore.notificationAction")
 }

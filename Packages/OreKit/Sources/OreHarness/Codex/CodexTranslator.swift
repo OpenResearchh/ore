@@ -107,9 +107,13 @@ struct CodexTranslator {
             applyTurnCompleted(params["turn"], to: &output)
 
         case "error":
-            let message = params["message"]?.stringValue ?? "The agent reported an error."
+            let message = ProviderErrorCopy.unwrap(
+                params["message"]?.stringValue ?? params["error"]?.description ?? "The agent reported an error."
+            )
             output.events.append(.sessionError(SessionError(
-                kind: .unknown, message: message, isRecoverable: true
+                kind: ProviderErrorCopy.sessionKind(for: message),
+                message: message,
+                isRecoverable: true
             )))
 
         default:
@@ -229,14 +233,26 @@ struct CodexTranslator {
             )
 
         case "mcpToolCall", "dynamicToolCall":
+            // The item types above are the whole of codex app-server's
+            // vocabulary: there is no subagent item, so a handoff can only
+            // reach us as an MCP or dynamic tool. Naming it `Task` puts it on
+            // the transcript's subagent row, which says what the child was
+            // created for. It stays flat — Codex never sends a parent link, so
+            // there are no child rows to nest under it.
+            let rawName = item["tool"]?.stringValue ?? type
+            let isSubagent = SubagentBrief.isSubagentTool(rawName)
+            let arguments = item["arguments"] ?? .object([:])
+            let input = isSubagent ? SubagentBrief.normalized(arguments) : arguments
             applyToolItem(
                 item,
                 itemID: itemID,
                 turnID: turnID,
                 completed: completed,
-                name: item["tool"]?.stringValue ?? type,
-                displayName: item["server"]?.stringValue ?? item["namespace"]?.stringValue,
-                input: item["arguments"] ?? .object([:]),
+                name: isSubagent ? "Task" : rawName,
+                displayName: isSubagent
+                    ? SubagentBrief.label(from: input)
+                    : (item["server"]?.stringValue ?? item["namespace"]?.stringValue),
+                input: input,
                 resultText: item["result"]?.description ?? item["error"]?.stringValue ?? "",
                 isError: item["error"] != nil && item["error"]?.isNull == false,
                 to: &output
@@ -297,6 +313,7 @@ struct CodexTranslator {
             isError: isError,
             text: resultText
         )))
+        append(status: .requesting, to: &output)
     }
 
     // MARK: - Plans, usage, completion
@@ -384,7 +401,7 @@ struct CodexTranslator {
             narration: pendingNarration,
             usage: nil,
             duration: turn?["durationMs"]?.doubleValue.map { $0 / 1000 },
-            errorMessage: turn?["error"]?["message"]?.stringValue
+            errorMessage: turnErrorMessage(turn?["error"])
         )))
         switch outcome {
         case .failed: append(status: .failed, to: &output)
@@ -398,6 +415,23 @@ struct CodexTranslator {
         narrationFilters.removeAll(keepingCapacity: true)
         lastAssistantText = nil
         pendingNarration = nil
+    }
+
+    /// Codex sometimes puts OpenAI's JSON body in `error.message`, and
+    /// sometimes the whole object. Either way the UI wants the inner sentence.
+    private func turnErrorMessage(_ error: JSONValue?) -> String? {
+        guard let error, !error.isNull else { return nil }
+        if let message = error["message"]?.stringValue, !message.isEmpty {
+            return ProviderErrorCopy.unwrap(message)
+        }
+        if let nested = error["error"]?["message"]?.stringValue, !nested.isEmpty {
+            return ProviderErrorCopy.unwrap(nested)
+        }
+        if let message = error.stringValue, !message.isEmpty {
+            return ProviderErrorCopy.unwrap(message)
+        }
+        let rendered = error.description
+        return rendered.isEmpty ? nil : ProviderErrorCopy.unwrap(rendered)
     }
 
     // MARK: - Server requests

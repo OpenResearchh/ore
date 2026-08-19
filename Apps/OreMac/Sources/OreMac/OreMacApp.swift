@@ -23,12 +23,13 @@ struct OreMacApp: App {
     init() {
         // The store and the core are created before the first window exists, so
         // a broken database surfaces as a message rather than a blank window.
+        let created: AppModel
         do {
             let store = try OreStore(path: OreStore.defaultURL)
             let experimental: Set<HarnessKind> = UserDefaults.standard.bool(
                 forKey: "ore.cursorExperimental"
             ) ? [.cursorAgent] : []
-            _model = State(initialValue: AppModel(client: InProcessCoreClient(
+            created = AppModel(client: InProcessCoreClient(
                 store: store,
                 harnessRegistry: .standard(
                     enabledExperimental: experimental,
@@ -37,19 +38,23 @@ struct OreMacApp: App {
                     )
                 ),
                 allowAPIKeyFallback: UserDefaults.standard.bool(forKey: "ore.apiKeyFallback")
-            )))
+            ))
         } catch {
-            _model = State(initialValue: AppModel(
-                client: InProcessCoreClient(
-                    store: try! OreStore(), harnessRegistry: .standard()
-                )
+            created = AppModel(client: InProcessCoreClient(
+                store: try! OreStore(), harnessRegistry: .standard()
             ))
             _launchFailure = State(initialValue: String(describing: error))
         }
+        _model = State(initialValue: created)
+        // Started here, not in the window's task: App Intents, notification
+        // actions, and the menu bar all need a live core before — or without —
+        // any window existing. `start()` is idempotent, so the window calling
+        // it again is harmless.
+        created.start()
     }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             RootView(
                 isShowingNewWorkspace: $isShowingNewWorkspace,
                 isShowingPalette: $isShowingPalette,
@@ -119,6 +124,9 @@ struct OreMacApp: App {
                 GitHubUpdateCommand().environment(githubUpdater)
             }
             CommandGroup(after: .toolbar) {
+                // ⌥⌘A opens the assistant's activity window from anywhere.
+                OpenAssistantCommand()
+
                 Button("Command Palette") { isShowingPalette = true }
                     .keyboardShortcut("k", modifiers: .command)
 
@@ -204,6 +212,24 @@ struct OreMacApp: App {
         }
 
         Settings { SettingsView().environment(model) }
+
+        // The assistant's only visible surface: an auditable activity log with
+        // a composer, in its own window so it floats over any workspace.
+        Window("Assistant", id: "assistant") {
+            AssistantActivityView()
+                .environment(model)
+        }
+        .defaultSize(width: 560, height: 700)
+
+        // The always-there ORE: fleet status, inline approvals, and the
+        // assistant — alive with every window closed.
+        MenuBarExtra {
+            MenuBarDashboard()
+                .environment(model)
+        } label: {
+            Image(systemName: model.attentionCount > 0 ? "sparkles.square.filled.on.square" : "sparkles")
+        }
+        .menuBarExtraStyle(.window)
     }
 
     private func selectWorkspace(at index: Int) {
@@ -215,6 +241,18 @@ struct OreMacApp: App {
     private func requestNotificationPermission() async {
         _ = try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound, .badge])
+    }
+}
+
+/// Menu command for the Assistant window. A tiny view rather than a plain
+/// `Button` because `openWindow` is an environment action, and only views
+/// have environments.
+private struct OpenAssistantCommand: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Assistant") { openWindow(id: "assistant") }
+            .keyboardShortcut("a", modifiers: [.command, .option])
     }
 }
 
@@ -636,8 +674,9 @@ private struct KeyboardShortcutsView: View {
         ("Allow / deny tool", "↩  Esc"),
         ("Allow / deny from composer", "⇧⌘A  ⇧⌘D"),
         ("Dictate prompt", "⌥⌘M"), ("Dictate — tap to start/stop", "⇧⌥"),
-        ("Dictate from another app", "hold ⇧⌥"),
+        ("Talk to the assistant, anywhere", "hold ⇧⌥"),
         ("Narrate this tab", "⌥⌘S"),
+        ("Assistant", "⌥⌘A"),
         ("Next git step", "⌥⌘G"),
         ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),

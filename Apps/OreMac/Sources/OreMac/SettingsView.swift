@@ -1,6 +1,7 @@
 import AppKit
 import OreCore
 import OreProtocol
+import ServiceManagement
 import SwiftUI
 
 /// Settings is an inspector, not a pile of unrelated forms. The left rail is
@@ -20,6 +21,7 @@ struct SettingsView: View {
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
     @AppStorage("ore.notifications.sound") private var sound = true
     @AppStorage(NarrationEngine.masterSwitchKey) private var narrationEnabled = true
+    @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
 
     @State private var selectedHarness: HarnessKind = .claudeCode
@@ -163,10 +165,25 @@ struct SettingsView: View {
 
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
+    /// Bound straight to `SMAppService` — the system is the source of truth,
+    /// so the toggle can never disagree with System Settings › Login Items.
+    private var launchAtLogin: Binding<Bool> {
+        Binding(
+            get: { SMAppService.mainApp.status == .enabled },
+            set: { enabled in
+                if enabled {
+                    try? SMAppService.mainApp.register()
+                } else {
+                    try? SMAppService.mainApp.unregister()
+                }
+            }
+        )
+    }
+
     private var hotkeyDetail: String {
         hotkey.isGlobal
-            ? "In ORE, tap to start and tap again to stop. In any other app, hold ⇧⌥ to talk and release to stop."
-            : "Tap to start and stop while ORE is frontmost. Allow Accessibility to also hold ⇧⌥ to talk from any other app."
+            ? "Tap ⇧⌥ in ORE to dictate into the composer; tap again to stop. Hold ⇧⌥ anywhere to talk to the assistant."
+            : "Tap to dictate while ORE is frontmost. Allow Accessibility to also hold ⇧⌥ for the assistant from any other app."
     }
 
     private var general: some View {
@@ -175,6 +192,12 @@ struct SettingsView: View {
                 SettingsRow("Branch prefix", detail: "Used for new worktree branches") {
                     TextField("ore", text: $branchPrefix).frame(width: 180)
                 }
+            }
+            SettingsCard(title: "Always on", icon: "menubar.arrow.up.rectangle") {
+                Toggle("Start ORE at login", isOn: launchAtLogin)
+                Text("ORE lives in the menu bar: agents keep running and the assistant keeps answering ⇧⌥ with every window closed. Starting at login makes that permanent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "Notifications", icon: "bell") {
                 Toggle("Allow notifications", isOn: $notifications)
@@ -204,7 +227,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Divider()
                 SettingsRow(
-                    "Tap ⇧⌥ to dictate",
+                    "⇧⌥ — tap to dictate, hold for the assistant",
                     detail: hotkeyDetail
                 ) {
                     if hotkey.isGlobal {
@@ -217,6 +240,11 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Divider()
+                Toggle("Hold ⇧⌥ dictates into the composer instead", isOn: $legacyHoldDictation)
+                Text("Restores the pre-assistant gesture: holding the chord in another app pulls ORE frontmost and dictates into the focused composer, instead of talking to the assistant.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .onAppear { hotkey.refreshTrust() }
         }

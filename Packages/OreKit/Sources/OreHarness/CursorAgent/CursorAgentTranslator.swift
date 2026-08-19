@@ -155,7 +155,7 @@ struct CursorAgentTranslator {
         let name = Self.cursorToolName(rawKey)
 
         func emitCall(result: JSONValue? = nil) {
-            let input = mergedToolInput(id: toolCallID, from: payload, result: result)
+            let input = mergedToolInput(id: toolCallID, tool: name, from: payload, result: result)
             let isNew = reportedToolCallIDs.insert(toolCallID).inserted
             if isNew {
                 closeCurrentTextSegment(turnID: turnID, to: &output)
@@ -182,6 +182,7 @@ struct CursorAgentTranslator {
                     || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
+            append(status: .requesting, to: &output)
             emitPlanProposal(from: toolInputs[toolCallID], turnID: turnID, to: &output)
         default:
             break
@@ -317,6 +318,7 @@ struct CursorAgentTranslator {
     /// Maps Cursor's per-tool arg names onto the keys the UI's presentation
     /// layer already understands (`file_path`, `command`, `pattern`, …).
     private static func cursorToolInput(
+        tool: String,
         from payload: JSONValue,
         result: JSONValue? = nil
     ) -> JSONValue {
@@ -356,7 +358,13 @@ struct CursorAgentTranslator {
             dict["pattern"] = .string(query)
         }
         applyEditContent(to: &dict)
-        return .object(dict)
+        let input = JSONValue.object(dict)
+        // Cursor's agent tool names the child's brief its own way. Only
+        // subagent calls go through this — `name` and `title` mean something
+        // else to CreatePlan, and aliasing them there would leak a bogus
+        // overview into the plan markdown.
+        guard SubagentBrief.isSubagentTool(tool) else { return input }
+        return SubagentBrief.normalized(input)
     }
 
     private static func mergeDiffFields(from source: JSONValue?, into dict: inout [String: JSONValue]) {
@@ -428,10 +436,11 @@ struct CursorAgentTranslator {
 
     private mutating func mergedToolInput(
         id: ToolCallID,
+        tool: String,
         from payload: JSONValue,
         result: JSONValue?
     ) -> JSONValue {
-        let incoming = Self.cursorToolInput(from: payload, result: result)
+        let incoming = Self.cursorToolInput(tool: tool, from: payload, result: result)
         let merged = Self.mergePreferringNonEmpty(toolInputs[id], incoming)
         toolInputs[id] = merged
         return merged
@@ -582,7 +591,10 @@ struct CursorAgentTranslator {
                 } else {
                     break
                 }
-                let input = block["input"] ?? block["arguments"] ?? .object([:])
+                let raw = block["input"] ?? block["arguments"] ?? .object([:])
+                let input = SubagentBrief.isSubagentTool(name)
+                    ? SubagentBrief.normalized(raw)
+                    : raw
                 toolInputs[toolCallID] = input
                 output.events.append(.toolCall(ToolCall(
                     turnID: turnID,

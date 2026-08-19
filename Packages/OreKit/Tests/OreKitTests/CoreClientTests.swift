@@ -370,9 +370,57 @@ struct CoreClientTests {
             Issue.record("no snapshot after restart")
             return
         }
-        #expect(snapshot.workspaces.map(\.name) == ["persistent"])
+        // The assistant workspace rides the snapshot too (tagged by kind, for
+        // the Assistant window); the user's own list is everything else.
+        #expect(snapshot.workspaces.filter { !$0.isAssistant }.map(\.name) == ["persistent"])
 
         await second.shutdown()
+    }
+
+    @Test func theAssistantWorkspaceIsCreatedHiddenAndProtected() async throws {
+        let fixture = try await GitFixture.initialized()
+        let databasePath = fixture.root.appendingPathComponent("ore.sqlite")
+        let store = try OreStore(path: databasePath)
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+        try await client.start()
+
+        // The home is created beside the database — a scratch ORE_HOME or a
+        // test fixture never touches the real one.
+        let home = fixture.root.appendingPathComponent("assistant")
+        #expect(FileManager.default.fileExists(
+            atPath: home.appendingPathComponent("MEMORY.md").path
+        ))
+
+        // Present in the store, absent from the user's lists and pickers.
+        let assistant = try #require(try await store.assistantWorkspace())
+        #expect(assistant.workspaceKind == .assistant)
+        #expect(try await store.workspaces(includeArchived: true).isEmpty)
+        #expect(try await store.repositories().isEmpty)
+
+        // In the snapshot, tagged so the app routes it away from the sidebar.
+        guard case .snapshot(let snapshot)? = await recorder.waitFor(matching: {
+            if case .snapshot = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no snapshot")
+            return
+        }
+        #expect(snapshot.workspaces.first { $0.isAssistant }?.name == "Assistant")
+
+        // Destructive commands must bounce off it.
+        await client.send(.deleteWorkspace(assistant.workspaceID, deleteBranch: false))
+        _ = await recorder.waitFor {
+            if case .commandFailed = $0 { return true }
+            return false
+        }
+        #expect(try await store.assistantWorkspace() != nil)
+
+        await client.shutdown()
     }
 }
 

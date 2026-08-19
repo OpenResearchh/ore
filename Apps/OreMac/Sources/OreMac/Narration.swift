@@ -170,8 +170,14 @@ enum SpokenToolClass {
             || tool.contains("todo") {
             return nil
         }
-        if tool == "task" || tool.hasSuffix("_task") || tool.contains("subagent") {
-            let description = input?["description"]?.stringValue ?? displayName
+        if SubagentBrief.isSubagentTool(tool) {
+            // The short label is the better line for the ear when it exists —
+            // already imperative, already a few words. The brief only stands in
+            // when a harness omits it, so the phrase never collapses to the
+            // bare "It's launching a subagent."
+            let description = input.flatMap(SubagentBrief.label)
+                ?? input.flatMap { SubagentBrief.purpose(from: $0) }
+                ?? displayName
             return ToolActivity(kind: .subagent, subject: description)
         }
         // Lints and listings before the generic read/file matchers —

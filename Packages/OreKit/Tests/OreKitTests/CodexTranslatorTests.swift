@@ -180,6 +180,54 @@ struct CodexTranslatorTests {
         #expect(zip(statuses, statuses.dropFirst()).allSatisfy { $0 != $1 })
     }
 
+    @Test func turnCompletionCarriesSummaryAndStrippedNarration() {
+        // Codex's `turn/completed` carries no text of its own, so the last
+        // completed agent message must become the summary — with the narration
+        // tag stripped from every surface and carried on the result instead.
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let deltas = [
+            translator.translate(method: "item/agentMessage/delta", params: .object([
+                "itemId": .string("i1"), "delta": .string("Done.\n<narr"),
+            ])),
+            translator.translate(method: "item/agentMessage/delta", params: .object([
+                "itemId": .string("i1"), "delta": .string("ation>I fixed the test.</narration>"),
+            ])),
+        ].flatMap(\.events).compactMap { event -> String? in
+            if case .textDelta(let delta) = event { return delta.text }
+            return nil
+        }
+        #expect(!deltas.joined().contains("<"), "no tag fragment may flash in live text")
+
+        let completion = translator.translate(method: "item/completed", params: .object([
+            "item": .object([
+                "id": .string("i1"),
+                "type": .string("agentMessage"),
+                "text": .string("Done.\n<narration>I fixed the test.</narration>"),
+            ]),
+        ]))
+        let blocks = completion.events.compactMap { event -> String? in
+            if case .blockCompleted(let block) = event, block.kind == .text { return block.text }
+            return nil
+        }
+        #expect(blocks == ["Done."])
+
+        let output = translator.translate(method: "turn/completed", params: .object([
+            "turn": .object(["status": .string("completed")]),
+        ]))
+        guard case .turnCompleted(let result)? = output.events.first(where: {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no turnCompleted event")
+            return
+        }
+        #expect(result.summary == "Done.")
+        #expect(result.narration == "I fixed the test.")
+    }
+
     @Test func unknownNotificationsAreIgnoredRatherThanFatal() {
         // Codex emits a large and growing set of notifications; a CLI upgrade
         // must not be able to break the transcript.

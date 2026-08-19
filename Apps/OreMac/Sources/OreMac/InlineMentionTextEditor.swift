@@ -263,9 +263,16 @@ struct InlineMentionTextEditor: NSViewRepresentable {
     /// Given an inline token's name (without the `@`), a file URL to preview when
     /// the pointer rests on it. Return nil for tokens with nothing to show.
     var previewURL: (String) -> URL? = { _ in nil }
+    /// The height the text actually occupies, so the composer can grow with its
+    /// content. Measured from the layout manager rather than by rendering a
+    /// hidden copy of the string in SwiftUI: that copy re-laid out the whole
+    /// draft on every keystroke, and — because `onChange` reads the geometry
+    /// from *before* the layout it triggered — reported the height one
+    /// keystroke late.
+    var onHeightChange: (CGFloat) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onTab: onTab)
+        Coordinator(text: $text, onTab: onTab, onHeightChange: onHeightChange)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -300,13 +307,24 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         editor.setAccessibilityLabel("Agent prompt")
         scrollView.documentView = editor
         context.coordinator.editor = editor
+        // A narrower editor re-wraps and so grows taller; the height has to be
+        // re-reported on width changes, not only on edits.
+        editor.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.editorFrameChanged),
+            name: NSView.frameDidChangeNotification,
+            object: editor
+        )
         context.coordinator.apply(text: text, mentionNames: mentionNames)
+        context.coordinator.reportHeight(deferred: true)
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         context.coordinator.parentText = $text
         context.coordinator.onTab = onTab
+        context.coordinator.onHeightChange = onHeightChange
         if let editor = scrollView.documentView as? PromptTextView {
             editor.onPaste = onPaste
             editor.onCopy = onCopy
@@ -314,6 +332,10 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             editor.mentionNames = mentionNames
         }
         context.coordinator.apply(text: text, mentionNames: mentionNames)
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        NotificationCenter.default.removeObserver(coordinator)
     }
 
     @MainActor
@@ -329,16 +351,58 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         /// the exact same content — a redundant full re-layout that showed up as
         /// a flicker. Skipping when nothing changed makes it one pass, not two.
         private var lastStyledSignature: String?
+        var onHeightChange: (CGFloat) -> Void
+        /// The last height handed up, so an unchanged measurement doesn't write
+        /// state. This is what keeps the measurement from looping: the height
+        /// feeds the editor's frame, which re-measures, and only a genuine
+        /// change propagates — so it converges in one step.
+        private var lastReportedHeight: CGFloat = -1
 
-        init(text: Binding<String>, onTab: @escaping () -> Bool) {
+        init(
+            text: Binding<String>,
+            onTab: @escaping () -> Bool,
+            onHeightChange: @escaping (CGFloat) -> Void
+        ) {
             parentText = text
             self.onTab = onTab
+            self.onHeightChange = onHeightChange
         }
 
         func textDidChange(_ notification: Notification) {
             guard !isApplying, let editor else { return }
             parentText.wrappedValue = editor.string
             styleMentions(currentMentionNames, preservingSelection: true)
+            // Typing is an AppKit event, outside SwiftUI's update cycle, so the
+            // height can be written synchronously and lands in the same frame
+            // as the character.
+            reportHeight(deferred: false)
+        }
+
+        @objc func editorFrameChanged() {
+            reportHeight(deferred: true)
+        }
+
+        /// Reports the height the laid-out text occupies, including the
+        /// container inset.
+        ///
+        /// `deferred` moves the callback off the current turn of the run loop.
+        /// It is required whenever this runs inside `updateNSView`, where
+        /// writing SwiftUI state synchronously would mutate state during a view
+        /// update; a one-frame delay on programmatic text changes is invisible.
+        func reportHeight(deferred: Bool) {
+            guard let editor,
+                  let layout = editor.layoutManager,
+                  let container = editor.textContainer else { return }
+            layout.ensureLayout(for: container)
+            let height = ceil(layout.usedRect(for: container).height)
+                + editor.textContainerInset.height * 2
+            guard abs(height - lastReportedHeight) > 0.5 else { return }
+            lastReportedHeight = height
+            if deferred {
+                DispatchQueue.main.async { [self] in onHeightChange(height) }
+            } else {
+                onHeightChange(height)
+            }
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -349,6 +413,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         func apply(text: String, mentionNames: [String]) {
             guard let editor else { return }
             currentMentionNames = mentionNames
+            var changed = false
             if editor.string != text {
                 isApplying = true
                 let selection = Self.adjustedSelection(
@@ -359,8 +424,14 @@ struct InlineMentionTextEditor: NSViewRepresentable {
                 editor.string = text
                 editor.setSelectedRange(selection)
                 isApplying = false
+                changed = true
             }
             styleMentions(mentionNames, preservingSelection: true)
+            // Only for text set from outside (slash command, voice commit, a
+            // tab switch restoring a draft). Typing already reported itself
+            // synchronously in `textDidChange`, and this runs inside
+            // `updateNSView`, so it has to defer.
+            if changed { reportHeight(deferred: true) }
         }
 
         /// SwiftUI updates the binding after a completion replaces `@ind` with

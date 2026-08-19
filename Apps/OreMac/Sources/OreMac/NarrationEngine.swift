@@ -50,6 +50,12 @@ final class NarrationEngine {
         UserDefaults.standard.object(forKey: Self.masterSwitchKey) as? Bool ?? true
     }
 
+    /// Whether the on-device summarizer can run on this machine, as a sentence
+    /// for the settings pane. Exposed here so the summarizer stays private.
+    var summarizerAvailability: String {
+        summarizer.availabilityDescription
+    }
+
     /// Which voice the user picked. The neural one only actually speaks once
     /// its weights are loaded; `voice` is what resolves that.
     var voiceKind: NarrationVoiceKind {
@@ -250,13 +256,8 @@ final class NarrationEngine {
                     advanceVariant(for: chatID)
                     enqueueProgress(phrase, kind: .todo, chatID: chatID)
                 }
-            case .proposal:
-                enqueue(SpokenUtterance(
-                    chatID: chatID,
-                    priority: .interrupt,
-                    kind: .planProposal,
-                    text: prefixed(NarrationPhraser.planProposal(), background)
-                ))
+            case .proposal(let markdown, _):
+                speakPlanProposal(markdown, chatID: chatID, background: background)
             }
 
         case .permissionRequest(let request):
@@ -338,7 +339,18 @@ final class NarrationEngine {
     ) {
         switch result.outcome {
         case .completed:
-            if let background {
+            if let narration = NarrationPhraser.spokenNarration(result.narration) {
+                // The agent wrote this line for the ear itself (see
+                // `NarrationTag`) — it beats anything derived locally, and
+                // it's the one place a background completion carries real
+                // content instead of a bare "It's finished."
+                enqueue(SpokenUtterance(
+                    chatID: chatID,
+                    priority: .milestone,
+                    kind: .turnCompleted,
+                    text: prefixed(narration, background)
+                ))
+            } else if let background {
                 enqueue(SpokenUtterance(
                     chatID: chatID,
                     priority: .milestone,
@@ -377,6 +389,41 @@ final class NarrationEngine {
             // The plan proposal or question that caused this already spoke as
             // its own interrupt.
             break
+        }
+    }
+
+    /// Speaks a plan proposal with its crux when the model can produce one.
+    ///
+    /// The canned line only names the moment; what makes the interrupt worth
+    /// hearing is what the plan would *do*. When the model is available the
+    /// interrupt trades up to ≤2.5s of delay (the summarizer's race deadline)
+    /// for that sentence — acceptable for a "come look at this" line, since
+    /// the plan card is already on screen either way. Timeout or absence
+    /// falls back to the canned phrase.
+    private func speakPlanProposal(_ markdown: String, chatID: ChatID, background: String?) {
+        guard summarizer.isAvailable, !markdown.isEmpty else {
+            enqueue(SpokenUtterance(
+                chatID: chatID,
+                priority: .interrupt,
+                kind: .planProposal,
+                text: prefixed(NarrationPhraser.planProposal(), background)
+            ))
+            return
+        }
+        let generation = digests[chatID]?.generation ?? 0
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let crux = await self.summarizer.planCrux(markdown)
+            // A newer turn started while the model ran: its plan is history.
+            guard self.digests[chatID]?.generation ?? 0 == generation else { return }
+            let line = crux.map { NarrationPhraser.planProposal(crux: $0) }
+                ?? NarrationPhraser.planProposal()
+            self.enqueue(SpokenUtterance(
+                chatID: chatID,
+                priority: .interrupt,
+                kind: .planProposal,
+                text: self.prefixed(line, background)
+            ))
         }
     }
 
@@ -480,8 +527,13 @@ final class NarrationEngine {
         case .milestone: NarrationPolicy.milestoneGap
         case .progress: NarrationPolicy.progressGap
         }
-        // Not yet: the ticker retries once the quiet time has passed.
-        guard Date().timeIntervalSince(lastUtteranceEndedAt) >= gap else { return }
+        // Not yet: the ticker retries once the quiet time has passed. The
+        // wait is synthesis time for free — a voice that renders ahead of
+        // playback can have the waveform finished before the gap opens.
+        guard Date().timeIntervalSince(lastUtteranceEndedAt) >= gap else {
+            voice.prepare(next.text, priority: next.priority)
+            return
+        }
         guard let utterance = queue.next() else { return }
         speak(utterance)
     }

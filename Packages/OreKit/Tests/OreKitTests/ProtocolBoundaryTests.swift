@@ -57,7 +57,10 @@ struct ProtocolBoundaryTests {
             )),
             .usage(UsageReport(turnID: turnID, inputTokens: 3, outputTokens: 5, contextWindow: 200_000)),
             .rateLimit(RateLimitReport(status: .allowed, window: "five_hour")),
-            .turnCompleted(TurnResult(turnID: turnID, outcome: .completed, summary: "done")),
+            .turnCompleted(TurnResult(
+                turnID: turnID, outcome: .completed, summary: "done",
+                narration: "I fixed the tests."
+            )),
             .sessionError(SessionError(kind: .notAuthenticated, message: "sign in")),
             .sessionEnded(SessionEnded(
                 sessionID: SessionID(rawValue: "s"), exitCode: 0, wasUnexpected: false
@@ -67,6 +70,15 @@ struct ProtocolBoundaryTests {
         for event in events {
             #expect(try roundTrip(event) == event)
         }
+    }
+
+    /// Transcripts persisted before `TurnResult.narration` existed must keep
+    /// decoding — the field arrived after users had history on disk.
+    @Test func turnResultDecodesWithoutNarrationKey() throws {
+        let json = #"{"turnID":"turn-1","outcome":"completed","summary":"done"}"#
+        let decoded = try JSONDecoder().decode(TurnResult.self, from: Data(json.utf8))
+        #expect(decoded.summary == "done")
+        #expect(decoded.narration == nil)
     }
 
     @Test func coreEventSnapshotRoundTrips() throws {

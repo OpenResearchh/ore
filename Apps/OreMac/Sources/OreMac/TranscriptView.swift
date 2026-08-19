@@ -14,11 +14,39 @@ import SwiftUI
 /// the important one — the ability to update a single visible row's text
 /// without touching the rest of the table. A streaming paragraph therefore
 /// costs one text mutation per delta rather than a re-layout of the document.
+/// Two-way handle between SwiftUI and the transcript's AppKit scroller: SwiftUI
+/// asks it to jump, and it reports back whether the reader has left the foot of
+/// the transcript so a "jump to latest" affordance can appear.
+///
+/// A shared object rather than a `Binding` plus a closure because the transcript
+/// host compares equal on its stored properties — a fresh closure per body pass
+/// is exactly what used to re-render the whole transcript on every keystroke.
+/// This reference is stable for the pane's lifetime, so it compares cheaply.
+@MainActor
+@Observable
+final class TranscriptScrollAnchor {
+    /// Whether the reader has scrolled away from the newest output.
+    private(set) var isAwayFromBottom = false
+
+    @ObservationIgnored fileprivate var jump: (() -> Void)?
+
+    func jumpToBottom() { jump?() }
+
+    /// Edge-triggered: the scroll observer fires on every tick, and all but a
+    /// couple of them leave this flag exactly where it was. Writing it
+    /// unconditionally would invalidate the pane on every frame of a flick.
+    fileprivate func report(isAwayFromBottom away: Bool) {
+        guard away != isAwayFromBottom else { return }
+        isAwayFromBottom = away
+    }
+}
+
 struct TranscriptView: NSViewRepresentable {
     /// What the footer's ⋯ menu can do to a finished turn. Copying is handled
     /// inside the cell, which already holds the turn's rows.
     enum TurnAction {
         case fork
+        case handoffPlan
         case revert
     }
 
@@ -33,6 +61,7 @@ struct TranscriptView: NSViewRepresentable {
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
     var canFork = false
+    var scrollAnchor: TranscriptScrollAnchor?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -131,11 +160,15 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.canFork = canFork
         context.coordinator.worktreePath = worktreePath
         context.coordinator.isBusy = isBusy
+        context.coordinator.bind(scrollAnchor: scrollAnchor)
         context.coordinator.update(rows: rows)
     }
 
     static func dismantleNSView(_ container: TranscriptContainerView, coordinator: Coordinator) {
         NotificationCenter.default.removeObserver(coordinator)
+        // The anchor outlives this view (it is the pane's `@State`), so leaving
+        // the closure attached would keep a dead coordinator reachable.
+        coordinator.bind(scrollAnchor: nil)
     }
 
     @MainActor
@@ -182,6 +215,10 @@ struct TranscriptView: NSViewRepresentable {
         private static let textFlushInterval: TimeInterval = 0.1
         /// Whether the agent or the reader owns the scroll offset right now.
         private var policy = TranscriptScrollPolicy()
+        /// SwiftUI's handle on the scroller, and the last value pushed through
+        /// it, so a flick doesn't write the same flag on every frame.
+        private var scrollAnchor: TranscriptScrollAnchor?
+        private var lastReportedAway: Bool?
         /// Set around the table's own `scroll(to:)` calls. Bounds-change
         /// notifications post synchronously, so this reliably keeps a scroll the
         /// transcript performed from being read back as the reader scrolling away.
@@ -427,6 +464,7 @@ struct TranscriptView: NSViewRepresentable {
             // posts no live-scroll notification at all.
             if !isApplyingProgrammaticScroll, let tableView {
                 policy.userDidScroll(atBottom: isScrolledToBottom(tableView))
+                reportFollowState()
                 scheduleSettle()
             }
             updateActiveTurn()
@@ -439,6 +477,7 @@ struct TranscriptView: NSViewRepresentable {
             let work = DispatchWorkItem { [weak self] in
                 guard let self, let tableView = self.tableView else { return }
                 self.policy.userDidEndScroll(atBottom: self.isScrolledToBottom(tableView))
+                self.reportFollowState()
                 let deferred = self.deferredRedraw.filteredIndexSet { self.rows.indices.contains($0) }
                 self.deferredRedraw.removeAll()
                 if !deferred.isEmpty {
@@ -646,6 +685,37 @@ struct TranscriptView: NSViewRepresentable {
             isApplyingProgrammaticScroll = wasApplying
         }
 
+        /// Wires the SwiftUI-facing handle to this coordinator. Re-runs on every
+        /// `updateNSView`, so it must stay idempotent — rebinding the same
+        /// anchor twice has to leave exactly one live jump closure.
+        func bind(scrollAnchor: TranscriptScrollAnchor?) {
+            guard scrollAnchor !== self.scrollAnchor else { return }
+            self.scrollAnchor?.jump = nil
+            self.scrollAnchor = scrollAnchor
+            scrollAnchor?.jump = { [weak self] in self?.jumpToBottom() }
+            lastReportedAway = nil
+            reportFollowState()
+        }
+
+        /// The reader asked to catch up. This resumes following, so the agent's
+        /// next output keeps the view pinned rather than dropping it again the
+        /// moment the jump lands.
+        func jumpToBottom() {
+            guard let tableView else { return }
+            scrollToBottom(tableView)
+            policy.didJump(toBottom: true)
+            reportFollowState()
+        }
+
+        /// Pushes the follow state out to SwiftUI, but only when it actually
+        /// flipped — see `TranscriptScrollAnchor.report`.
+        private func reportFollowState() {
+            let away = !policy.isFollowingBottom
+            guard away != lastReportedAway else { return }
+            lastReportedAway = away
+            scrollAnchor?.report(isAwayFromBottom: away)
+        }
+
         private func isScrolledToBottom(_ tableView: NSTableView) -> Bool {
             guard let scrollView = tableView.enclosingScrollView else { return true }
             let visible = scrollView.contentView.documentVisibleRect
@@ -682,6 +752,7 @@ struct TranscriptView: NSViewRepresentable {
             // Jumping to an earlier turn is a request to read there, so the agent
             // stops pulling the view back down until the reader returns to the foot.
             policy.didJump(toBottom: isScrolledToBottom(tableView))
+            reportFollowState()
         }
 
         private func updateActiveTurn() {
@@ -885,6 +956,7 @@ final class TranscriptCell: NSTableCellView {
     private var footerTurnID: TurnID?
     private var footerResponse = ""
     private var footerCanFork = false
+    private var footerHasPlan = false
     private var onTurnAction: ((TurnID, TranscriptView.TurnAction) -> Void)?
 
     init(identifier: NSUserInterfaceItemIdentifier) {
@@ -1052,6 +1124,9 @@ final class TranscriptCell: NSTableCellView {
         labelTrailingConstraint.constant = -Self.trailingInset(for: row)
         footerTurnID = isFooter ? row.turnID : nil
         footerCanFork = canFork
+        footerHasPlan = isFooter && row.groupedRows.contains {
+            $0.kind == .plan && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
 
@@ -1198,6 +1273,16 @@ final class TranscriptCell: NSTableCellView {
             fork.toolTip = "Continue this conversation in a new tab, leaving this one intact"
             menu.addItem(fork)
         }
+        if footerHasPlan {
+            let handoff = NSMenuItem(
+                title: "Handoff Plan to New Tab",
+                action: #selector(handoffPlanTurn),
+                keyEquivalent: ""
+            )
+            handoff.target = self
+            handoff.toolTip = "Copy this plan into a new tab so you can run it with another agent"
+            menu.addItem(handoff)
+        }
         menu.addItem(.separator())
         let revert = NSMenuItem(
             title: "Revert to Before This Turn", action: #selector(revertTurn), keyEquivalent: ""
@@ -1220,6 +1305,11 @@ final class TranscriptCell: NSTableCellView {
     @objc private func forkTurn() {
         guard let footerTurnID else { return }
         onTurnAction?(footerTurnID, .fork)
+    }
+
+    @objc private func handoffPlanTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .handoffPlan)
     }
 
     @objc private func revertTurn() {

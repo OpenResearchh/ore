@@ -105,9 +105,19 @@ struct CursorAgentTranslator {
             return output
         }
         flushStreamedBlocks(turnID: turnID, to: &output)
+        // The process-exit path used to end the turn with no summary at all,
+        // which is why Cursor completions could only ever narrate "All done."
+        // The text streamed this turn *is* the final report; hand it over.
+        // The tag extraction is defensive — this harness is never taught the
+        // narration tag, but the user's own rules files might teach it one day.
+        let (summaryBody, narration) = NarrationTag.extract(
+            from: String(emittedAssistantText.suffix(4000))
+        )
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: exitCode == 0 ? .completed : .failed,
+            summary: summaryBody.isEmpty ? nil : summaryBody,
+            narration: narration,
             errorMessage: failure?.message
         )))
         append(status: exitCode == 0 ? .idle : .failed, to: &output)
@@ -629,13 +639,15 @@ struct CursorAgentTranslator {
         }
 
         let isError = message["is_error"]?.boolValue ?? false
-        let summary = message["result"]?.stringValue
+        // Defensive tag strip; see `closeTurn`.
+        let (summary, narration) = NarrationTag.extract(from: message["result"]?.stringValue ?? "")
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: isError ? .failed : .completed,
-            summary: summary?.isEmpty == false ? summary : nil,
+            summary: summary.isEmpty ? nil : summary,
+            narration: narration,
             duration: message["duration_ms"]?.doubleValue.map { $0 / 1000 },
-            errorMessage: isError ? summary : nil
+            errorMessage: isError && !summary.isEmpty ? summary : nil
         )))
         append(status: isError ? .failed : .idle, to: &output)
         currentTurnID = nil
@@ -747,6 +759,10 @@ struct CursorAgentTranslator {
         where !text.isEmpty {
             let kind: BlockCompleted.Kind =
                 blockID.rawValue.contains("#thinking-") ? .thinking : .text
+            // Flushed prose is part of the turn's final report just as much as
+            // a closed segment; without this the exit-path summary misses any
+            // text that only ever arrived as deltas.
+            if kind == .text { emittedAssistantText += text }
             output.events.append(.blockCompleted(BlockCompleted(
                 turnID: turnID, blockID: blockID, kind: kind, text: text
             )))

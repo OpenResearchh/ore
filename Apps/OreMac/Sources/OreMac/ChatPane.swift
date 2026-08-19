@@ -15,7 +15,10 @@ struct ChatPane: View {
     /// Prevents a tab switch from briefly writing the previous tab's text into
     /// the newly selected chat before its persisted draft has loaded.
     @State private var draftOwnerID: ChatID?
-    @State private var composerTextHeight: CGFloat = 22
+    /// Reported by the editor's layout manager, including its container inset,
+    /// so it is the composer's height directly rather than a text height that
+    /// needs padding added. Seeded at the one-line floor.
+    @State private var composerTextHeight: CGFloat = 38
     @State private var queuedMessages: [QueuedMessageRecord] = []
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
@@ -38,6 +41,9 @@ struct ChatPane: View {
     @State private var renameChatTarget: ChatSummary?
     @State private var renameChatText = ""
     @State private var workspaceFileIndex: [WorkspaceFileNode] = []
+    /// Owns the transcript's "jump to latest" affordance. Held here rather than
+    /// in `TranscriptHost` so its identity survives every body pass.
+    @State private var scrollAnchor = TranscriptScrollAnchor()
     @FocusState private var composerFocused: Bool
     @State private var voice = VoiceInputController()
     @State private var voiceAttachedClipboard = false
@@ -106,50 +112,101 @@ struct ChatPane: View {
         .navigationSubtitle("\(workspace.branch) → \(workspace.baseBranch)")
     }
 
+    /// Reloads the queued-message strip when the tab changes or its queue does.
+    private var queuedMessagesTaskID: String {
+        let id = chatSummary?.id.rawValue ?? ""
+        let count = chatSummary?.queuedMessageCount ?? 0
+        return "\(id)-\(count)"
+    }
+
+    private func handleTurnAction(_ turn: TurnID, _ action: TranscriptView.TurnAction) {
+        switch action {
+        case .fork:
+            model.forkChat(into: workspace.id)
+        case .handoffPlan:
+            let plan = chat.rows.last { $0.turnID == turn && $0.kind == .plan }
+            if let markdown = plan?.text {
+                model.handoffPlan(markdown, in: workspace.id)
+            }
+        case .revert:
+            revertTarget = turn
+        }
+    }
+
+    /// Bottom-trailing, in the band the turn rail deliberately leaves clear (it
+    /// stops 50pt short of the foot), so the button sits on neither the rail nor
+    /// the centred prose.
+    @ViewBuilder
+    private var jumpToLatestOverlay: some View {
+        let away = scrollAnchor.isAwayFromBottom
+        ZStack {
+            if away {
+                JumpToLatestButton { scrollAnchor.jumpToBottom() }
+                    .transition(
+                        reduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity)
+                    )
+            }
+        }
+        .padding(.trailing, OreTheme.Space.md)
+        .padding(.bottom, OreTheme.Space.sm)
+        .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.8), value: away)
+    }
+
+    /// The transcript itself, or the empty state before a chat has any rows.
+    ///
+    /// Split out of `chatBody` because that one expression had grown past what
+    /// the type checker will solve in reasonable time.
+    @ViewBuilder
+    private var transcriptViewport: some View {
+        ZStack(alignment: .bottomLeading) {
+            if !chat.hasRows && !chat.isBusy {
+                ResearchEmptyState(
+                    identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
+                        ?? model.researchIdentity(for: workspace),
+                    title: chatSummary?.title,
+                    seed: chatSummary?.id.rawValue ?? workspace.id.rawValue,
+                    onSuggestion: { suggestion in
+                        draft = suggestion
+                        composerFocused = true
+                    }
+                )
+            } else {
+                TranscriptHost(
+                    chat: chat,
+                    worktreePath: workspace.worktreePath,
+                    persistenceKey: transcriptScrollKey,
+                    expandedActivityGroups: expandedActivityGroups,
+                    canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
+                    onRevert: { revertTarget = $0 },
+                    onToggleActivity: { toggleActivity($0) },
+                    onOpenFile: { openAgentFile($0) },
+                    onTurnAction: { turn, action in handleTurnAction(turn, action) },
+                    scrollAnchor: scrollAnchor
+                )
+                .equatable()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .bottomTrailing) { jumpToLatestOverlay }
+            }
+            // The "agent is working" state now lives on the composer itself
+            // (an animated border plus an inline status row), so there is no
+            // longer a separate floating pill hovering over the transcript.
+        }
+    }
+
+    private var transcriptScrollKey: String {
+        "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+    }
+
     @ViewBuilder
     private func chatBody(paneHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .bottomLeading) {
-                if !chat.hasRows && !chat.isBusy {
-                    ResearchEmptyState(
-                        identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
-                            ?? model.researchIdentity(for: workspace),
-                        title: chatSummary?.title,
-                        seed: chatSummary?.id.rawValue ?? workspace.id.rawValue,
-                        onSuggestion: { suggestion in
-                            draft = suggestion
-                            composerFocused = true
-                        }
-                    )
-                } else {
-                    TranscriptHost(
-                        chat: chat,
-                        worktreePath: workspace.worktreePath,
-                        persistenceKey: "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)",
-                        expandedActivityGroups: expandedActivityGroups,
-                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
-                        onRevert: { revertTarget = $0 },
-                        onToggleActivity: { toggleActivity($0) },
-                        onOpenFile: { openAgentFile($0) },
-                        onTurnAction: { turn, action in
-                            switch action {
-                            case .fork: model.forkChat(into: workspace.id)
-                            case .revert: revertTarget = turn
-                            }
-                        }
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-                // The "agent is working" state now lives on the composer itself
-                // (an animated border plus an inline status row), so there is no
-                // longer a separate floating pill hovering over the transcript.
-            }
-            // Transition snapshots of an infinitely-sized empty view could
-            // paint over sibling split-view columns while changing tabs. The
-            // transcript viewport owns and clips all of its content now.
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .layoutPriority(1)
-            .clipped()
+            transcriptViewport
+                // Transition snapshots of an infinitely-sized empty view could
+                // paint over sibling split-view columns while changing tabs. The
+                // transcript viewport owns and clips all of its content now.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+                .clipped()
 
             // Anything blocking the agent sits directly above the composer,
             // where the user is already looking. AskUserQuestion and
@@ -169,7 +226,9 @@ struct ChatPane: View {
             }
 
             if case .proposal(let markdown, let requestID) = chat.plan {
-                PlanApprovalCard(markdown: markdown) { feedback in
+                PlanApprovalCard(markdown: markdown, onHandoff: {
+                    model.handoffPlan(markdown, in: workspace.id)
+                }) { feedback in
                     // Dismiss first, and unconditionally. The card used to
                     // linger until a `permissionResolved` that a proposal
                     // without a request id never sends — which is why a second
@@ -324,7 +383,7 @@ struct ChatPane: View {
             draft = injection.text
             composerFocused = true
         }
-        .task(id: "\(chatSummary?.id.rawValue ?? "")-\(chatSummary?.queuedMessageCount ?? 0)") {
+        .task(id: queuedMessagesTaskID) {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
             queuedMessages = await model.queuedMessages(for: id)
         }
@@ -332,6 +391,12 @@ struct ChatPane: View {
             // The guard keeps a tab switch from writing the previous tab's text
             // into the newly selected chat before its draft has loaded.
             guard let chatSummary, draftOwnerID == chatSummary.id else { return }
+            // The common case is a draft with no attachments at all, which the
+            // scan below would still walk on every keystroke.
+            guard !chat.draftAttachments.isEmpty else {
+                model.setDraft(value, for: chatSummary)
+                return
+            }
             // Mentions and inline pasted images/text live as `@name` tokens in
             // the draft; drop the attachment once its token is gone. Shelf files
             // (attached, not inline) persist regardless of the text.
@@ -383,6 +448,17 @@ struct ChatPane: View {
         }
         .onDisappear {
             finishVoice(.commitToDraft)
+            // Covers the workspace switch, which tears this pane down without
+            // going through `selectChat`.
+            //
+            // The explicit `setDraft` is not redundant: `onChange(of: draft)` is
+            // what normally records the text, and it cannot fire on a view that
+            // is going away — so a prompt `finishVoice` just committed would be
+            // lost without this.
+            if let chatSummary, draftOwnerID == chatSummary.id {
+                model.setDraft(draft, for: chatSummary)
+            }
+            model.flushPendingDrafts()
             // The pane is gone before `voice.isActive`'s onChange can fire;
             // without this a dying mic would leave narration muted forever.
             model.narration.setMicActive(false)
@@ -874,9 +950,10 @@ struct ChatPane: View {
                     onTab: acceptFirstMentionSuggestion,
                     onPaste: handlePasteboard,
                     onCopy: handleComposerCopy,
-                    previewURL: previewURL(for:)
+                    previewURL: previewURL(for:),
+                    onHeightChange: { composerTextHeight = $0 }
                 )
-                    .frame(height: min(max(composerTextHeight + 16, 38), 200))
+                    .frame(height: min(max(composerTextHeight, 38), 200))
                     .focused($composerFocused)
                     .overlay(alignment: .topLeading) {
                         if draft.isEmpty {
@@ -891,21 +968,6 @@ struct ChatPane: View {
                                 .allowsHitTesting(false)
                         }
                     }
-                    .background(
-                        // A hidden copy of the text, measured at the editor's width,
-                        // grows the composer with its content — one line by default,
-                        // up to a scroll cap — instead of a fixed 72pt box.
-                        Text(draft.isEmpty ? " " : draft)
-                            .font(.system(size: OreTheme.Font.prose))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(GeometryReader { geo in
-                                Color.clear
-                                    .onAppear { composerTextHeight = geo.size.height }
-                                    .onChange(of: draft) { _, _ in composerTextHeight = geo.size.height }
-                            })
-                            .hidden()
-                    )
             }
 
             if let tab = chatSummary {
@@ -3284,6 +3346,7 @@ private struct PermissionCard: View {
 
 private struct PlanApprovalCard: View {
     let markdown: String
+    let onHandoff: () -> Void
     let onApprove: (String) -> Void
     let onReject: (String) -> Void
     @State private var feedback = ""
@@ -3324,6 +3387,9 @@ private struct PlanApprovalCard: View {
                     .keyboardShortcut(.cancelAction)
                     .help("Reject this plan (Esc)")
                 Spacer()
+                Button("Handoff") { onHandoff() }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    .help("Open this plan in a new tab so you can run it with another agent")
             }
         }
         .oreCard(padding: 12)
@@ -3470,8 +3536,9 @@ private struct ComposerModeTag: View {
     }
 }
 
-/// Observes transcript rows without invalidating the composer or tab bar.
-private struct TranscriptHost: View {
+/// Observes transcript rows without invalidating the composer or tab bar — and,
+/// via `Equatable`, without being invalidated *by* them.
+private struct TranscriptHost: View, Equatable {
     var chat: ChatState
     var worktreePath: String
     var persistenceKey: String
@@ -3481,6 +3548,41 @@ private struct TranscriptHost: View {
     var onToggleActivity: (String) -> Void
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TranscriptView.TurnAction) -> Void
+    var scrollAnchor: TranscriptScrollAnchor
+
+    /// Compared on identity-bearing inputs only.
+    ///
+    /// The four action closures are deliberately excluded. A capturing closure
+    /// is `{function pointer, context box}` and allocates a fresh context box on
+    /// every evaluation of the parent's body, and it has no `Equatable`
+    /// conformance — so including them would make this view unequal on every
+    /// keystroke in the composer. That is exactly what made typing cost
+    /// O(transcript): an unequal host re-runs `displayRows`, which hashes every
+    /// row of every completed turn, and then re-diffs every row in
+    /// `TranscriptView.updateNSView`.
+    ///
+    /// The consequence, and the rule for anyone adding a closure here: the
+    /// transcript may hold closures from an *older* body evaluation. That is
+    /// safe only because each one reaches its data through a stable
+    /// indirection — `@State` storage boxes, the `AppModel` reference, and ids
+    /// that are fixed for the workspace's lifetime. A closure that captures a
+    /// *value* which can change (a `ChatSummary`, a diff snapshot) would
+    /// silently go stale; add it to `==` or route it through `@State`.
+    ///
+    /// Streaming is unaffected: `@Observable` invalidates this view's body
+    /// directly when `chat` changes, which is independent of the equality
+    /// verdict — that only suppresses updates pushed down from the parent.
+    /// `nonisolated` because `Equatable` is: SwiftUI compares view values
+    /// without promising the main actor. Only reference identity is read from
+    /// `chat`, never its isolated state, so this is race-free.
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.chat === rhs.chat
+            && lhs.scrollAnchor === rhs.scrollAnchor
+            && lhs.worktreePath == rhs.worktreePath
+            && lhs.persistenceKey == rhs.persistenceKey
+            && lhs.canFork == rhs.canFork
+            && lhs.expandedActivityGroups == rhs.expandedActivityGroups
+    }
 
     @State private var memo = TranscriptDisplay.Memo()
 
@@ -3494,14 +3596,19 @@ private struct TranscriptHost: View {
             onToggleActivity: onToggleActivity,
             onOpenFile: onOpenFile,
             onTurnAction: onTurnAction,
-            canFork: canFork
+            canFork: canFork,
+            // Passing the reference registers no observation — only the button
+            // below reads `isAwayFromBottom`, so the transcript is not rebuilt
+            // when the reader scrolls away.
+            scrollAnchor: scrollAnchor
         )
     }
 
     private var displayRows: [TranscriptRow] {
-        // Pin observation to the revision, then derive. Completed turns are
-        // reused inside the memo so a live stream does not regroup history.
-        _ = chat.rowsRevision
+        // The revision both pins observation and keys the memo: it is bumped by
+        // every mutation of `chat.rows`, so an unchanged one means the derived
+        // transcript cannot have changed either. Completed turns are reused
+        // inside the memo so a live stream does not regroup history.
         _ = chat.plan
         return TranscriptDisplay.rows(
             from: chat.rows,
@@ -3511,8 +3618,40 @@ private struct TranscriptHost: View {
             hidingPlanTurnID: {
                 if case .proposal = chat.plan { return chat.planTurnID }
                 return nil
-            }()
+            }(),
+            revision: chat.rowsRevision
         )
+    }
+}
+
+/// Returns the reader to the newest output after they have scrolled up.
+///
+/// Only rendered while the transcript is actually scrolled away, which is what
+/// keeps ⌘↓ out of the composer's way: with no button on screen there is no key
+/// equivalent to claim, so the keystroke falls through to the text view's own
+/// "move to end of document".
+private struct JumpToLatestButton: View {
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.primary)
+                .frame(width: 28, height: 28)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().stroke(OreTheme.hairline))
+                .overlay(Circle().fill(Color.primary.opacity(isHovered ? 0.06 : 0)))
+                .shadow(color: .black.opacity(0.14), radius: 5, y: 2)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .keyboardShortcut(.downArrow, modifiers: .command)
+        .help("Jump to latest (⌘↓)")
+        .accessibilityLabel("Jump to latest")
     }
 }
 

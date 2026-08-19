@@ -178,6 +178,13 @@ final class ChatState {
             complete(block)
 
         case .toolCall(let call):
+            // Cursor (and similar) often CreatePlan then edit in the same turn.
+            // The card is only for a decision; once the agent is writing, it
+            // has moved on — leaving `.proposal` up is why it survived Approve
+            // and came back after an app switch.
+            if case .proposal = plan, Self.proceedsPastPlanProposal(call.name) {
+                clearPlan()
+            }
             // Cursor (and similar) re-emits the same call as `streamContent`
             // grows and again on completion with the real diff. Updating the
             // existing row keeps the chip live without duplicating it.
@@ -272,6 +279,14 @@ final class ChatState {
             streamingRowIndex.removeAll()
             turnStartedAt = nil
             hasTurnEventArrived = true
+            // A proposal that arrived before we saw the Edit events still has
+            // to drop: the turn already mutated the tree, so there is nothing
+            // left to approve. Status was forced to `awaitingInput` by the
+            // trailing `idle` while `.proposal` was still set.
+            if clearPlanIfTurnAlreadyProceeded(result.turnID),
+               status == .awaitingInput {
+                status = .idle
+            }
             if result.outcome == .failed, let message = result.errorMessage {
                 rows.append(TranscriptRow(
                     id: "error-\(result.turnID.rawValue)",
@@ -434,6 +449,34 @@ final class ChatState {
     private func clearPlan() {
         plan = nil
         planTurnID = nil
+    }
+
+    /// True when the tool means the agent is implementing rather than still
+    /// researching a plan the user has not answered.
+    private static func proceedsPastPlanProposal(_ toolName: String) -> Bool {
+        switch toolName {
+        case "Edit", "Write", "Delete", "Bash":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Drops a leftover proposal when this turn already mutated the tree —
+    /// whether the Edit landed before or after the PLAN row (a late CreatePlan
+    /// replay after writes would otherwise resurrect the card).
+    /// Returns whether a card was showing.
+    @discardableResult
+    private func clearPlanIfTurnAlreadyProceeded(_ turnID: TurnID) -> Bool {
+        guard case .proposal = plan else { return false }
+        let proceeded = rows.contains { row in
+            row.turnID == turnID
+                && row.kind == .toolCall
+                && Self.proceedsPastPlanProposal(row.toolName ?? "")
+        }
+        guard proceeded else { return false }
+        clearPlan()
+        return true
     }
 
     func resolveQuestion(_ id: QuestionID) {

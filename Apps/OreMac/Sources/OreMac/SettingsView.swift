@@ -191,6 +191,12 @@ struct SettingsView: View {
                 Divider()
                 NarrationVoicePicker(voice: appModel.narration.neuralVoice)
                     .disabled(!narrationEnabled)
+                // Whether the smarter narration path exists on this machine.
+                // "Ready" versus "turn on Apple Intelligence" is the answer to
+                // why narration is or isn't summarizing the agent's own words.
+                Text("On-device summaries — \(appModel.narration.summarizerAvailability)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "Voice input", icon: "mic") {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")

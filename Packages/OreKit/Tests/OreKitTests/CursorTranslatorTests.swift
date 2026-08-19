@@ -361,4 +361,37 @@ struct CursorAgentFailureTests {
         }
         #expect(outcomes == [.completed])
     }
+
+    private func exitSummary(of events: [AgentEvent]) -> String? {
+        events.compactMap { event -> TurnResult? in
+            if case .turnCompleted(let result) = event { return result }
+            return nil
+        }.first?.summary
+    }
+
+    @Test func exitPathSummaryComesFromClosedTextSegments() {
+        // This CLI may exit without a `result` record; the text it streamed is
+        // the turn's final report and must reach `TurnResult.summary` — it's
+        // what the narration engine summarizes when the process just ends.
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"I renamed the module."}]},"timestamp_ms":1}"#
+        )
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"I renamed the module."}]}}"#
+        )
+        let events = translator.closeTurn(exitCode: 0).events
+        #expect(exitSummary(of: events) == "I renamed the module.")
+    }
+
+    @Test func exitPathSummaryIncludesTextThatOnlyStreamed() {
+        // Text that only ever arrived as deltas is flushed at exit; the
+        // summary must see it too, not just segments that closed in-band.
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(
+            line: #"{"type":"assistant","message":{"content":[{"type":"text","text":"Halfway done"}]},"timestamp_ms":1}"#
+        )
+        let events = translator.closeTurn(exitCode: 0).events
+        #expect(exitSummary(of: events) == "Halfway done")
+    }
 }

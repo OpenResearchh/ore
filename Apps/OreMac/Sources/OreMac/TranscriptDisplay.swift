@@ -23,15 +23,51 @@ enum TranscriptDisplay {
         fileprivate var completed: [TurnEntry] = []
         fileprivate var subjects: [String: String] = [:]
         var completedTurnCount: Int { completed.count }
+
+        /// Everything the output depends on. `revision` stands in for `source`:
+        /// `ChatState.rows` is `private(set)` and its `didSet` bumps
+        /// `rowsRevision` on every mutation path, so nothing can change the rows
+        /// without changing the revision. The rest are the inputs that move
+        /// independently of the rows.
+        fileprivate struct CacheKey: Equatable {
+            var revision: Int
+            var sourceCount: Int
+            var isBusy: Bool
+            var expanded: Set<String>
+            var hidingPlanTurnID: TurnID?
+        }
+
+        fileprivate var lastKey: CacheKey?
+        fileprivate var lastOutput: [TranscriptRow] = []
     }
 
+    /// - Parameter revision: `ChatState.rowsRevision`, or `nil` to opt out of the
+    ///   whole-result cache. Callers that mutate `source` directly (tests) must
+    ///   pass `nil`, since without a revision there is no way to notice.
     static func rows(
         from source: [TranscriptRow],
         isBusy: Bool,
         expanded: Set<String>,
         memo: Memo,
-        hidingPlanTurnID: TurnID? = nil
+        hidingPlanTurnID: TurnID? = nil,
+        revision: Int? = nil
     ) -> [TranscriptRow] {
+        // The per-turn memo below still walks and hashes every row, which is
+        // O(transcript) — fine per stream flush, but this function also runs on
+        // any body evaluation that had nothing to do with the rows (the busy
+        // flag flipping, a plan arriving, a window resize). Short-circuiting
+        // before `prepared` keeps those free.
+        let key = revision.map {
+            Memo.CacheKey(
+                revision: $0,
+                sourceCount: source.count,
+                isBusy: isBusy,
+                expanded: expanded,
+                hidingPlanTurnID: hidingPlanTurnID
+            )
+        }
+        if let key, key == memo.lastKey { return memo.lastOutput }
+
         let visible = source.compactMap { prepared($0, expanded: expanded, hidingPlanTurnID: hidingPlanTurnID) }
         let activeTurn: TurnID? = isBusy ? visible.last?.turnID : nil
 
@@ -106,6 +142,8 @@ enum TranscriptDisplay {
 
         memo.completed = completed
         memo.subjects = subjects
+        memo.lastKey = key
+        memo.lastOutput = result
         return result
     }
 

@@ -270,6 +270,25 @@ struct NarrationPhraserTests {
         #expect(NarrationPhraser.directSummary(nil) == nil)
     }
 
+    @Test func spokenNarrationIsHygienedButNotSecondGuessed() {
+        // The agent wrote the line for the ear; it gets sanitize-and-punctuate
+        // only, never the length rejection `directSummary` applies.
+        #expect(NarrationPhraser.spokenNarration("I fixed the flaky test")
+            == "I fixed the flaky test.")
+        #expect(NarrationPhraser.spokenNarration("Renamed `AppModel` to  `ChatModel`.")
+            == "Renamed AppModel to ChatModel.")
+        #expect(NarrationPhraser.spokenNarration(nil) == nil)
+        #expect(NarrationPhraser.spokenNarration("  ") == nil)
+    }
+
+    @Test func planProposalWithCruxKeepsTheNudgeToRead() {
+        let line = NarrationPhraser.planProposal(crux: "It would split the parser into two passes")
+        #expect(line.contains("split the parser"))
+        #expect(line.hasSuffix("Have a look when you're ready."))
+        // A crux that sanitizes to nothing falls back to the plain line.
+        #expect(NarrationPhraser.planProposal(crux: " ") == NarrationPhraser.planProposal())
+    }
+
     @Test func sanitizeStripsWhatReadsFineButSpeaksTerribly() {
         let spoken = NarrationPhraser.sanitize(
             "Edited `ChatPane.swift` — see [the docs](https://example.com/docs) and https://example.com **now**"
@@ -537,6 +556,25 @@ struct NarrationPreRollTests {
         let spokenLine = 5.0
         let dip = 0.85
         #expect(cushion(.progress) >= spokenLine * (1 - dip))
+    }
+
+    @Test func onlyAmbientLinesTradeLatencyForFullSynthesis() {
+        // Progress lines are gap-gated by seconds of enforced quiet, so
+        // rendering the whole waveform first costs nothing and cannot
+        // stutter; anything more urgent keeps streaming behind its cushion.
+        #expect(NeuralNarrationVoice.prefersFullSynthesis(.progress))
+        #expect(!NeuralNarrationVoice.prefersFullSynthesis(.milestone))
+        #expect(!NeuralNarrationVoice.prefersFullSynthesis(.interrupt))
+    }
+
+    @Test func underrunReBankIsSmallerThanEveryStartingCushion() {
+        // The recovery pause must read as a breath, not a restart.
+        for priority in [NarrationPriority.progress, .milestone, .interrupt] {
+            #expect(
+                NeuralNarrationVoice.underrunReBankFrames
+                    <= NeuralNarrationVoice.preRollFrames(for: priority)
+            )
+        }
     }
 
     @Test func interjectionsStayLatencyCheap() {

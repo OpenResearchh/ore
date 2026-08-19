@@ -75,6 +75,90 @@ struct ChatStateTests {
         #expect(state.status == .idle)
     }
 
+    @Test func aMutatingToolAfterAProposalDismissesTheCard() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps", permissionRequestID: nil)
+        )))
+        state.apply(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "c1"), name: "Edit",
+            displayName: "x.txt", input: .object(["file_path": .string("x.txt")])
+        )))
+
+        #expect(state.plan == nil)
+        #expect(state.planTurnID == nil)
+        #expect(state.rows.contains { $0.kind == .plan })
+        #expect(state.rows.contains { $0.kind == .toolCall && $0.toolName == "Edit" })
+    }
+
+    @Test func readingAfterAProposalKeepsTheCard() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps", permissionRequestID: nil)
+        )))
+        state.apply(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "c1"), name: "Read",
+            displayName: "x.txt", input: .object(["file_path": .string("x.txt")])
+        )))
+
+        guard case .proposal = state.plan else {
+            Issue.record("research after a proposal must not dismiss the card")
+            return
+        }
+        #expect(state.planTurnID == turnID)
+    }
+
+    @Test func todoWriteAfterAProposalKeepsTheCard() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps", permissionRequestID: nil)
+        )))
+        state.apply(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "c1"), name: "TodoWrite",
+            displayName: "Updated plan", input: .object([:])
+        )))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .todos([TodoItem(text: "Do the thing", status: .pending)])
+        )))
+
+        guard case .proposal = state.plan else {
+            Issue.record("TodoWrite after CreatePlan must not dismiss the card")
+            return
+        }
+    }
+
+    @Test func turnEndDropsAProposalIfTheTurnAlreadyEdited() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "c1"), name: "Edit",
+            displayName: "x.txt", input: .object(["file_path": .string("x.txt")])
+        )))
+        // A late planUpdated (replay, coalesced flush) after the Edit would
+        // resurrect the card; turnCompleted must still drop it.
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps", permissionRequestID: nil)
+        )))
+        state.apply(.statusChanged(.idle))
+        state.apply(.turnCompleted(TurnResult(turnID: turnID, outcome: .completed)))
+
+        #expect(state.plan == nil)
+        #expect(state.status == .idle)
+        #expect(state.rows.contains { $0.kind == .plan })
+    }
+
     @Test func aLaterPlanUpdateEditsTheSameRow() {
         let state = ChatState()
         let turnID = TurnID(rawValue: "t1")
@@ -167,6 +251,67 @@ struct TranscriptDisplayTests {
         #expect(memo.completedTurnCount == 1)
         #expect(second.prefix(while: { $0.turnID == turn1 }).map(\.id) == completedIDs)
         #expect(second.last?.text == "Hi there")
+    }
+
+    /// The revision is the sole authority on `rows`, which is what lets a body
+    /// evaluation that changed nothing about the transcript cost nothing. Safe
+    /// only because `ChatState.rows` is `private(set)` and bumps the revision on
+    /// every mutation path — this pins that contract.
+    @Test func anUnchangedRevisionSkipsRederivingTheTranscript() {
+        let turn = TurnID(rawValue: "t1")
+        var rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "first"),
+            TranscriptRow(id: "a1", turnID: turn, kind: .assistantText, text: "Hi"),
+        ]
+        let memo = TranscriptDisplay.Memo()
+        let first = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+        )
+
+        // A mutation the revision does not describe is deliberately not seen.
+        rows[1].text = "mutated behind the revision's back"
+        rows[1].contentRevision += 1
+        let cached = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+        )
+        #expect(cached.map(\.text) == first.map(\.text))
+
+        // Bumping it re-derives.
+        let fresh = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: memo, revision: 2
+        )
+        #expect(fresh.last?.text == "mutated behind the revision's back")
+    }
+
+    /// `isBusy` and `expanded` change the output without touching the rows, so
+    /// they belong in the cache key alongside the revision.
+    @Test func inputsOtherThanTheRowsStillInvalidateTheCache() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "go"),
+            TranscriptRow(
+                id: "tool1", turnID: turn, kind: .toolCall, text: "Read",
+                resultText: "out", isComplete: true
+            ),
+            TranscriptRow(id: "a1", turnID: turn, kind: .assistantText, text: "done", isComplete: true),
+        ]
+        let memo = TranscriptDisplay.Memo()
+        let idle = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+        )
+        let busy = TranscriptDisplay.rows(
+            from: rows, isBusy: true, expanded: [], memo: memo, revision: 1
+        )
+        #expect(idle.map(\.id) != busy.map(\.id))
+
+        // Expanding the activity group at the same revision must re-derive too.
+        let collapsed = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+        )
+        let expanded = TranscriptDisplay.rows(
+            from: rows, isBusy: false, expanded: ["activity-t1"], memo: memo, revision: 1
+        )
+        #expect(expanded.count > collapsed.count)
     }
 
     @Test func sourceSignatureIsIndependentOfPayloadBytes() {

@@ -52,6 +52,16 @@ protocol NarrationVoice: AnyObject {
     /// natural boundary it can honour, so preemption doesn't clip a word in
     /// half.
     func stop(immediate: Bool)
+    /// A hint that `text` will likely be the next utterance. The engine calls
+    /// this while an utterance waits out its quiet gap, so a voice that
+    /// renders ahead of playback can spend that idle time synthesizing and
+    /// start the line with the waveform already in hand. Purely advisory —
+    /// the system voice, which renders in real time anyway, ignores it.
+    func prepare(_ text: String, priority: NarrationPriority)
+}
+
+extension NarrationVoice {
+    func prepare(_ text: String, priority: NarrationPriority) {}
 }
 
 // MARK: - System voice
@@ -205,6 +215,17 @@ final class NeuralNarrationVoice: NarrationVoice {
 
     @ObservationIgnored private var speakTask: Task<Void, Never>?
     @ObservationIgnored private var installTask: Task<Void, Never>?
+    /// Ahead-of-need synthesis for the next queued utterance (see `prepare`).
+    /// Keyed by exact text, so a prepared waveform survives everything except
+    /// the line itself being replaced.
+    @ObservationIgnored private var prepareTask: Task<[Float]?, Never>?
+    @ObservationIgnored private var preparedText: String?
+    @ObservationIgnored private var preparedSamples: [Float]?
+    /// Underruns during the current utterance, and the count carried from the
+    /// last one — the cushion for the next line grows while the machine is
+    /// demonstrably too busy for the default, and resets after a clean run.
+    @ObservationIgnored private var underrunsThisUtterance = 0
+    @ObservationIgnored private var recentUnderruns = 0
     /// Bumped on every stop and every new utterance, so frames and completion
     /// callbacks belonging to an abandoned utterance can be recognised and
     /// ignored. Without it a buffer finishing after a preemption would report
@@ -244,6 +265,22 @@ final class NeuralNarrationVoice: NarrationVoice {
         case .interrupt: 4  // 320ms
         }
     }
+
+    /// Which priorities render the whole waveform before playback rather than
+    /// streaming against the clock.
+    ///
+    /// Progress lines are the longest, the least urgent, and gap-gated by
+    /// seconds of enforced quiet anyway — extra latency there is free, and a
+    /// fully rendered line *cannot* stutter, no matter what the agent's build
+    /// is doing to the cores. Milestones and interrupts want to land now, so
+    /// they keep streaming behind their cushions.
+    nonisolated static func prefersFullSynthesis(_ priority: NarrationPriority) -> Bool {
+        priority == .progress
+    }
+
+    /// The cushion to re-bank after an underrun: enough to absorb another
+    /// hiccup, small enough that the pause reads as a breath, not a dropout.
+    nonisolated static let underrunReBankFrames = 4  // 320ms
 
     init() {
         // Even a previously-installed model starts here: the weights are on
@@ -293,7 +330,10 @@ final class NeuralNarrationVoice: NarrationVoice {
         scheduledBuffers = 0
         pendingFrames = []
         playbackStarted = false
-        preRollTarget = Self.preRollFrames(for: priority)
+        underrunsThisUtterance = 0
+        // A line that underran is evidence the default cushion is too small
+        // for the machine's current load; the next one banks more.
+        preRollTarget = Self.preRollFrames(for: priority) + min(6, 2 * recentUnderruns)
         // Pocket TTS exposes no rate or pitch control, so of the system
         // voice's three delivery levers only loudness and the lead-in pause
         // survive. The model's own prosody covers more of the difference than
@@ -312,6 +352,12 @@ final class NeuralNarrationVoice: NarrationVoice {
                 try self.startEngineIfNeeded()
                 if let remembered = await self.rememberedAudio(for: text) {
                     self.playRemembered(remembered, generation: generation)
+                } else if let prepared = await self.consumePrepared(for: text) {
+                    // `prepare` already rendered this exact line during the
+                    // queue's quiet gap: zero latency and zero stutter.
+                    self.playRemembered(prepared, generation: generation)
+                } else if Self.prefersFullSynthesis(priority) {
+                    try await self.synthesizeWhole(text, generation: generation)
                 } else {
                     try await self.synthesize(text, generation: generation)
                 }
@@ -321,6 +367,77 @@ final class NeuralNarrationVoice: NarrationVoice {
             }
             self.noteStreamEnded(generation: generation)
         }
+    }
+
+    // MARK: Ahead-of-need synthesis
+
+    /// Renders the likely-next utterance while the engine's quiet gap runs
+    /// down, so a progress line can start fully in hand — the streaming path's
+    /// stutter risk disappears along with its latency win.
+    func prepare(_ text: String, priority: NarrationPriority) {
+        guard readiness == .ready,
+              Self.prefersFullSynthesis(priority),
+              // The model is single-tenant: rendering ahead while another
+              // line's synthesis streams would cause the very stutter this
+              // exists to remove.
+              !isSpeaking,
+              text != preparedText,
+              phraseCache.cachedInMemory(text) == nil
+        else { return }
+        prepareTask?.cancel()
+        preparedSamples = nil
+        preparedText = text
+        prepareTask = Task { [weak self] in
+            guard let self else { return nil }
+            let samples = try? await self.synthesizeAll(text)
+            if let samples, !Task.isCancelled, self.preparedText == text {
+                self.preparedSamples = samples
+                if NarrationPhraseCache.isCacheable(text) {
+                    self.phraseCache.store(samples, for: text)
+                }
+            }
+            return samples
+        }
+    }
+
+    /// Hands over prepared audio for `text`, waiting out an in-flight render
+    /// of the same line — finishing it is faster than starting over. A
+    /// prepare for a *different* line is cancelled instead: the utterance it
+    /// served was replaced in the queue, and the model is needed now.
+    private func consumePrepared(for text: String) async -> [Float]? {
+        defer {
+            prepareTask = nil
+            preparedText = nil
+            preparedSamples = nil
+        }
+        guard preparedText == text else {
+            prepareTask?.cancel()
+            return nil
+        }
+        if let preparedSamples { return preparedSamples }
+        return await prepareTask?.value
+    }
+
+    /// The whole line as one waveform, no playback until it's finished.
+    private func synthesizeAll(_ text: String) async throws -> [Float] {
+        var recorded: [Float] = []
+        let frames = try await manager.synthesizeStreaming(text: text)
+        for try await frame in frames {
+            try Task.checkCancellation()
+            recorded.append(contentsOf: frame.samples)
+        }
+        return recorded
+    }
+
+    /// Full pre-synthesis for the current utterance: render everything, then
+    /// play through the remembered-audio path, which cannot underrun.
+    private func synthesizeWhole(_ text: String, generation: Int) async throws {
+        let samples = try await synthesizeAll(text)
+        guard generation == self.generation else { return }
+        if NarrationPhraseCache.isCacheable(text) {
+            phraseCache.store(samples, for: text)
+        }
+        playRemembered(samples, generation: generation)
     }
 
     /// Generates the line, playing each 80ms frame as it arrives and keeping a
@@ -462,6 +579,21 @@ final class NeuralNarrationVoice: NarrationVoice {
     private func noteBufferPlayed(generation: Int) {
         guard generation == self.generation else { return }
         scheduledBuffers -= 1
+        // Underrun: playback caught up with generation mid-stream. Left
+        // alone, the next frame would land after an audible gap torn out of
+        // the middle of a word. Pausing to re-bank a small cushion turns
+        // that glitch into one breath-length pause at a frame boundary —
+        // `accept` banks again because `playbackStarted` is false, and
+        // `schedule`'s `player.play()` resumes the paused node when the
+        // cushion releases. Mutually exclusive with `finishIfDrained`, whose
+        // `streamEnded` guard this check mirrors.
+        if scheduledBuffers == 0, !streamEnded, playbackStarted {
+            player.pause()
+            playbackStarted = false
+            preRollTarget = Self.underrunReBankFrames
+            underrunsThisUtterance += 1
+            return
+        }
         finishIfDrained(generation: generation)
     }
 
@@ -481,6 +613,9 @@ final class NeuralNarrationVoice: NarrationVoice {
     private func finishIfDrained(generation: Int) {
         guard streamEnded, scheduledBuffers == 0, isSpeaking else { return }
         isSpeaking = false
+        // A clean utterance is evidence the machine can keep up again; one
+        // that starved carries its count into the next line's cushion.
+        recentUnderruns = underrunsThisUtterance
         reportEnd()
     }
 }

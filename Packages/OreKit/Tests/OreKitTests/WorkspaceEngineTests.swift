@@ -554,6 +554,8 @@ struct WorkspaceEngineTests {
         #expect(session.configuration.workingDirectory.path == harness.worktree.path)
         // And it's told where its scratch space is, so `.context` is usable.
         #expect(session.configuration.appendSystemPrompt?.contains(".context/") == true)
+        // And it's taught the narration-tag convention the translators strip.
+        #expect(session.configuration.appendSystemPrompt?.contains(NarrationTag.open) == true)
     }
 
     @Test func aMissingHarnessFailsWithSomethingActionable() async throws {

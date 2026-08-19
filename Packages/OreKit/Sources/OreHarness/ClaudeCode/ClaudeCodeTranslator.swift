@@ -54,6 +54,12 @@ struct ClaudeCodeTranslator {
     private var sawInterruptMarker = false
     /// Plan text by tool call id, awaiting the permission request that gates it.
     private var pendingPlanProposals: [ToolCallID: String] = [:]
+    /// Per-block suppressors keeping the narration tag out of live deltas.
+    private var narrationFilters: [BlockID: NarrationTagStreamFilter] = [:]
+    /// Narration found in a completed block, held for the turn's `result` —
+    /// the tag rides the last assistant message, but the event that carries
+    /// it to the app is `turnCompleted`.
+    private var pendingNarration: String?
 
     static let interruptMarker = "[Request interrupted"
     /// Observed values of `terminal_reason` on a cancelled turn. Treated as a
@@ -196,9 +202,17 @@ struct ClaudeCodeTranslator {
             let id = blockID(forIndex: index)
             if let text = delta.text, !text.isEmpty {
                 streamingBlocks[index, default: StreamingBlock(id: id, kind: .text)].text += text
-                output.events.append(.textDelta(BlockDelta(
-                    turnID: turnID, blockID: id, text: text, parentToolCallID: parent
-                )))
+                // Top-level assistant text may end in a narration tag; the
+                // filter keeps it from flashing in the live transcript. The
+                // authoritative strip happens on the completed block.
+                let visible = parent == nil
+                    ? narrationFilters[id, default: NarrationTagStreamFilter()].filter(text)
+                    : text
+                if !visible.isEmpty {
+                    output.events.append(.textDelta(BlockDelta(
+                        turnID: turnID, blockID: id, text: visible, parentToolCallID: parent
+                    )))
+                }
             } else if let thinking = delta.thinking, !thinking.isEmpty {
                 streamingBlocks[index, default: StreamingBlock(id: id, kind: .thinking)]
                     .text += thinking
@@ -220,7 +234,7 @@ struct ClaudeCodeTranslator {
                 turnID: turnID,
                 blockID: block.id,
                 kind: block.kind,
-                text: block.text,
+                text: strippingNarration(from: block.text, kind: block.kind, parent: parent),
                 parentToolCallID: parent
             )))
 
@@ -249,7 +263,11 @@ struct ClaudeCodeTranslator {
                 guard let text = block.text, !completedBlockIDs.contains(id) else { break }
                 completedBlockIDs.insert(id)
                 output.events.append(.blockCompleted(BlockCompleted(
-                    turnID: turnID, blockID: id, kind: .text, text: text, parentToolCallID: parent
+                    turnID: turnID,
+                    blockID: id,
+                    kind: .text,
+                    text: strippingNarration(from: text, kind: .text, parent: parent),
+                    parentToolCallID: parent
                 )))
 
             case "thinking":
@@ -424,13 +442,19 @@ struct ClaudeCodeTranslator {
             outcome = (payload.isError ?? false) ? .failed : .completed
         }
 
+        // The result echoes the final assistant text, tag included — strip it
+        // here too so titles, notifications and search never see the marker.
+        let (summaryBody, taggedNarration) = NarrationTag.extract(from: payload.result ?? "")
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: outcome,
-            summary: payload.result?.isEmpty == false ? payload.result : nil,
+            summary: summaryBody.isEmpty ? nil : summaryBody,
+            narration: taggedNarration ?? pendingNarration,
             usage: usage,
             duration: payload.durationMS.map { Double($0) / 1000 },
-            errorMessage: outcome == .failed ? (payload.result ?? payload.subtype) : nil
+            errorMessage: outcome == .failed
+                ? (summaryBody.isEmpty ? payload.subtype : summaryBody)
+                : nil
         )))
         switch outcome {
         case .failed: append(status: .failed, to: &output)
@@ -442,6 +466,8 @@ struct ClaudeCodeTranslator {
         currentTurnID = nil
         currentMessageID = nil
         streamingBlocks.removeAll(keepingCapacity: true)
+        narrationFilters.removeAll(keepingCapacity: true)
+        pendingNarration = nil
         return output
     }
 
@@ -526,6 +552,20 @@ struct ClaudeCodeTranslator {
     }
 
     // MARK: - Helpers
+
+    /// Strips the narration tag from a completed block's text and remembers
+    /// its content for the turn's result. Only top-level assistant prose can
+    /// carry the tag — thinking and subagent text pass through untouched.
+    private mutating func strippingNarration(
+        from text: String,
+        kind: BlockCompleted.Kind,
+        parent: ToolCallID?
+    ) -> String {
+        guard kind == .text, parent == nil else { return text }
+        let (body, narration) = NarrationTag.extract(from: text)
+        if let narration { pendingNarration = narration }
+        return body
+    }
 
     /// Opens a turn if one isn't already open, emitting `.turnStarted` exactly
     /// once. Turns are closed by `result`.

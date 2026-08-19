@@ -27,6 +27,14 @@ struct CodexTranslator {
     private var model: String?
     private var cliVersion: String?
     private var workingDirectory: String = ""
+    /// Per-item suppressors keeping the narration tag out of live deltas.
+    private var narrationFilters: [String: NarrationTagStreamFilter] = [:]
+    /// The last completed assistant message, tag already stripped. Codex's
+    /// `turn/completed` carries no text of its own, so this is what fills
+    /// `TurnResult.summary` — Claude gets the same for free from `result`.
+    private var lastAssistantText: String?
+    /// Narration stripped from a completed message, held for `turn/completed`.
+    private var pendingNarration: String?
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -61,8 +69,14 @@ struct CodexTranslator {
             guard let delta = params["delta"]?.stringValue, !delta.isEmpty,
                   let itemID = params["itemId"]?.stringValue
             else { break }
+            // Assistant text may end in a narration tag; keep it from flashing
+            // in the live transcript. The completed item is the authoritative
+            // strip.
+            let visible = narrationFilters[itemID, default: NarrationTagStreamFilter()]
+                .filter(delta)
+            guard !visible.isEmpty else { break }
             output.events.append(.textDelta(BlockDelta(
-                turnID: ensureTurn(&output), blockID: BlockID(rawValue: itemID), text: delta
+                turnID: ensureTurn(&output), blockID: BlockID(rawValue: itemID), text: visible
             )))
 
         case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
@@ -154,11 +168,15 @@ struct CodexTranslator {
 
         case "agentMessage":
             guard completed else { break }
+            let (body, narration) = NarrationTag.extract(from: item["text"]?.stringValue ?? "")
+            if let narration { pendingNarration = narration }
+            if !body.isEmpty { lastAssistantText = body }
+            narrationFilters.removeValue(forKey: itemID)
             output.events.append(.blockCompleted(BlockCompleted(
                 turnID: turnID,
                 blockID: BlockID(rawValue: itemID),
                 kind: .text,
-                text: item["text"]?.stringValue ?? ""
+                text: body
             )))
 
         case "reasoning":
@@ -362,6 +380,8 @@ struct CodexTranslator {
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: outcome,
+            summary: lastAssistantText,
+            narration: pendingNarration,
             usage: nil,
             duration: turn?["durationMs"]?.doubleValue.map { $0 / 1000 },
             errorMessage: turn?["error"]?["message"]?.stringValue
@@ -375,6 +395,9 @@ struct CodexTranslator {
         currentTurnID = nil
         providerTurnID = nil
         reportedItemIDs.removeAll(keepingCapacity: true)
+        narrationFilters.removeAll(keepingCapacity: true)
+        lastAssistantText = nil
+        pendingNarration = nil
     }
 
     // MARK: - Server requests

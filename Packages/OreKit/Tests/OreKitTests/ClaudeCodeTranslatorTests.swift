@@ -280,6 +280,46 @@ struct ClaudeCodeTranslatorTests {
         #expect(items[0].text == "Write the driver")
     }
 
+    @Test func narrationTagIsStrippedEverywhereAndCarriedOnTheTurnResult() {
+        // The agent ends its final message with the narration tag ORE's system
+        // prompt teaches. The tag must never surface — not in live deltas, not
+        // in the completed block, not in the summary — and its content must
+        // ride the turn result for the narration engine.
+        let transcript = """
+        {"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}},"session_id":"s1"}
+        {"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}},"session_id":"s1"}
+        {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}},"session_id":"s1"}
+        {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\\n<narr"}},"session_id":"s1"}
+        {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ation>I fixed the flaky test.</narration>"}},"session_id":"s1"}
+        {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"Done.\\n<narration>I fixed the flaky test.</narration>"}]},"session_id":"s1"}
+        {"type":"result","subtype":"success","result":"Done.\\n<narration>I fixed the flaky test.</narration>","session_id":"s1"}
+        """
+        let events = ClaudeCodeTranscriptReplay.events(transcript: transcript)
+
+        let streamedText = events.compactMap { event -> String? in
+            if case .textDelta(let delta) = event { return delta.text }
+            return nil
+        }.joined()
+        #expect(!streamedText.contains("<"), "no tag fragment may flash in live text")
+        #expect(streamedText.contains("Done."))
+
+        let completed = events.compactMap { event -> BlockCompleted? in
+            if case .blockCompleted(let block) = event, block.kind == .text { return block }
+            return nil
+        }
+        #expect(completed.map(\.text) == ["Done."])
+
+        guard case .turnCompleted(let result)? = events.last(where: {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no turnCompleted event")
+            return
+        }
+        #expect(result.summary == "Done.")
+        #expect(result.narration == "I fixed the flaky test.")
+    }
+
     @Test func askUserQuestionBecomesAQuestionEvent() {
         let transcript = """
         {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"AskUserQuestion","input":{"questions":[{"question":"Which base branch?","options":[{"label":"master","description":"the default"},{"label":"develop"}]}]}}]},"session_id":"s1"}

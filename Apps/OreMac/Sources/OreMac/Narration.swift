@@ -510,6 +510,26 @@ enum NarrationPhraser {
         "It's got a plan ready for you to look at."
     }
 
+    /// The plan interrupt with its crux attached — what the plan would do,
+    /// then the nudge to go read the full text. Falls back to the plain line
+    /// when the crux sanitizes away to nothing.
+    static func planProposal(crux: String) -> String {
+        let spoken = sanitize(lowercasedLead(crux), limit: 200)
+        guard !spoken.isEmpty else { return planProposal() }
+        return "It's got a plan ready — \(spoken.ensuringTerminalPunctuation()) "
+            + "Have a look when you're ready."
+    }
+
+    /// The agent's own spoken line for the turn (see `NarrationTag`). Already
+    /// written for the ear by instruction, so it only gets hygiene — the same
+    /// sanitize-and-punctuate every other dynamic line gets.
+    static func spokenNarration(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let spoken = sanitize(text)
+        guard !spoken.isEmpty else { return nil }
+        return spoken.ensuringTerminalPunctuation()
+    }
+
     /// Only when the in-progress item actually changed; harnesses re-emit the
     /// whole checklist on every touch.
     static func todoPhrase(

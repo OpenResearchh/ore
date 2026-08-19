@@ -91,6 +91,9 @@ final class AppModel {
     }
     private(set) var gitOpsInFlight: [WorkspaceID: GitOperation] = [:]
     private var flushTask: Task<Void, Never>?
+    /// Composer text waiting to be written back, keyed by chat. See `setDraft`.
+    private var pendingDrafts: [ChatID: (workspaceID: WorkspaceID, text: String)] = [:]
+    private var draftFlushTask: Task<Void, Never>?
 
     struct Banner: Identifiable, Sendable {
         let id = UUID()
@@ -176,6 +179,9 @@ final class AppModel {
     }
 
     func shutdown() async {
+        // Last chance to get an unsent draft to disk, and it has to complete
+        // before the core below us shuts down.
+        await flushPendingDraftsAwaitingWrites()
         eventTask?.cancel()
         flushTask?.cancel()
         for task in continuationTasks.values { task.cancel() }
@@ -416,6 +422,14 @@ final class AppModel {
         let comments = state.takeDraftComments()
         cancelScheduledContinuation(for: chatID)
         persistDraftAttachments([], for: chatID)
+        // The text just left the composer, so any buffered copy of it is stale.
+        // Clearing the summary here rather than waiting out the debounce is what
+        // keeps the tab bar's unsent-draft pencil from lingering after a send.
+        discardPendingDraft(for: chatID)
+        if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
+            summary.draftText = ""
+            upsertChat(summary)
+        }
         state.appendUserMessage(text, attachments: attachments, comments: comments)
         Task {
             await client.send(.sendMessage(SendMessageRequest(
@@ -540,6 +554,16 @@ final class AppModel {
         ))) }
     }
 
+    /// Opens a new tab with the plan already in the composer, unsent.
+    ///
+    /// The source tab is left alone — this is a copy, not a transfer — so the
+    /// user can still approve or reject there. The new tab uses workspace
+    /// defaults so they can pick a different harness and model before sending.
+    func handoffPlan(_ markdown: String, in workspaceID: WorkspaceID) {
+        guard let draft = PlanHandoff.composerDraft(from: markdown) else { return }
+        createChat(in: workspaceID, draft: draft)
+    }
+
     /// Branches the active chat into a new tab.
     ///
     /// The new tab resumes the same provider session with a fork, so the agent
@@ -561,6 +585,10 @@ final class AppModel {
     }
 
     func selectChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
+        // Before the switch: the pane restores its composer from the summary's
+        // `draftText`, so the outgoing tab's buffered text has to be in there
+        // first or it would be restored as the text from one debounce ago.
+        flushPendingDrafts()
         let previous = activeChatIDs[workspaceID]
         activeChatIDs[workspaceID] = chatID
         UserDefaults.standard.set(chatID.rawValue, forKey: "ore.activeChat.\(workspaceID.rawValue)")
@@ -577,6 +605,9 @@ final class AppModel {
     }
 
     func closeChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
+        // A closed chat can be reopened, so its draft is written rather than
+        // dropped.
+        flushPendingDrafts()
         // Pick the neighbor before the close lands, so the UI never flashes
         // the first remaining tab via `activeChat`'s fallback.
         if let replacement = TabCloseSelection.replacement(
@@ -664,6 +695,9 @@ final class AppModel {
     }
 
     func selectDiffFile(_ path: String, in workspaceID: WorkspaceID) {
+        // A file tab replaces the composer, so its text has to be written back
+        // before the pane goes away.
+        flushPendingDrafts()
         activeFilePath[workspaceID] = path
     }
 
@@ -680,6 +714,7 @@ final class AppModel {
 
     /// Switches the centre back to the chat transcript (a chat tab was picked).
     func showChatInCenter(_ workspaceID: WorkspaceID) {
+        flushPendingDrafts()
         activeFilePath[workspaceID] = nil
     }
 
@@ -697,9 +732,69 @@ final class AppModel {
         Task { await client.send(.setChatModel(chat.workspaceID, chat.id, model: selectedModel)) }
     }
 
+    /// Records the composer's text, coalescing keystrokes.
+    ///
+    /// Writing on every character meant every character mutated `chatSummaries`
+    /// — invalidating every view that reads `AppModel` — and queued an IPC send.
+    /// Drafts only have to survive leaving the composer, not each keystroke, so
+    /// they are buffered and flushed on a delay, plus explicitly at every exit
+    /// path (`flushPendingDrafts`'s callers).
     func setDraft(_ text: String, for chat: ChatSummary) {
-        upsertChat({ var copy = chat; copy.draftText = text; return copy }())
-        Task { await client.send(.setChatDraft(chat.workspaceID, chat.id, text: text)) }
+        pendingDrafts[chat.id] = (chat.workspaceID, text)
+        scheduleDraftFlush()
+    }
+
+    private func scheduleDraftFlush() {
+        guard draftFlushTask == nil else { return }
+        draftFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, !Task.isCancelled else { return }
+            self.draftFlushTask = nil
+            self.flushPendingDrafts()
+        }
+    }
+
+    /// Writes buffered drafts through. Safe to call when nothing is pending.
+    func flushPendingDrafts() {
+        for command in takePendingDraftCommands() {
+            Task { await client.send(command) }
+        }
+    }
+
+    /// `flushPendingDrafts` for callers that must not outrun the writes — the
+    /// only one being `shutdown`, where a fire-and-forget send would race the
+    /// core going away and silently drop the draft.
+    func flushPendingDraftsAwaitingWrites() async {
+        for command in takePendingDraftCommands() {
+            await client.send(command)
+        }
+    }
+
+    /// Applies buffered drafts to the local summaries and returns the commands
+    /// the core still needs, so the caller decides whether to await them.
+    private func takePendingDraftCommands() -> [CoreCommand] {
+        draftFlushTask?.cancel()
+        draftFlushTask = nil
+        guard !pendingDrafts.isEmpty else { return [] }
+        let pending = pendingDrafts
+        pendingDrafts.removeAll()
+        return pending.compactMap { chatID, entry in
+            // Re-read the current summary rather than reusing the one the view
+            // captured: over the debounce window the engine may have updated the
+            // title or unread flag, and writing back a stale copy would clobber
+            // them.
+            guard var current = chatSummaries.first(where: { $0.id == chatID }),
+                  current.draftText != entry.text else { return nil }
+            current.draftText = entry.text
+            upsertChat(current)
+            return .setChatDraft(entry.workspaceID, chatID, text: entry.text)
+        }
+    }
+
+    /// Drops a buffered draft without writing it — for when the text has already
+    /// left the composer by another route (it was sent, or the chat closed).
+    private func discardPendingDraft(for chatID: ChatID) {
+        pendingDrafts.removeValue(forKey: chatID)
     }
 
     func persistDraftAttachments(_ attachments: [Attachment], for chatID: ChatID) {

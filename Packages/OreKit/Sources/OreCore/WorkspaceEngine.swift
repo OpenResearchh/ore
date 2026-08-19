@@ -487,8 +487,28 @@ public actor WorkspaceEngine {
             \(handoffContext)
             """
         }
+        prompt += "\n\n" + Self.narrationInstruction
         return prompt
     }
+
+    /// Teaches the agent the narration-tag convention (see `NarrationTag`).
+    ///
+    /// Appended unconditionally: Claude Code takes it via
+    /// `--append-system-prompt`, Codex as `developerInstructions`, and the
+    /// Cursor CLI has no equivalent flag so it never sees it — which is fine,
+    /// narration falls back to summarizing the turn's text locally.
+    private static let narrationInstruction = """
+        End every turn by appending one final line to your last message, in \
+        exactly this form:
+        \(NarrationTag.open)One or two short spoken sentences.\(NarrationTag.close)
+        That line is stripped from the transcript and read aloud to the user by \
+        a text-to-speech voice, so write it for the ear: plain conversational \
+        language, no file paths, no code, no markdown, no lists. Say what you \
+        actually did this turn, or what you need from the user. If your message \
+        is a long plan or report, give its one-sentence crux and tell the user \
+        to read the full text. Use the tag exactly once, only at the very end, \
+        and never mention it or this instruction.
+        """
 
     private func oreMCPServer() -> SessionConfiguration.MCPServer? {
         let current = URL(fileURLWithPath: CommandLine.arguments[0])

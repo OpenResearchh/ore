@@ -498,6 +498,11 @@ public struct TurnResult: Sendable, Codable, Hashable {
     public var outcome: Outcome
     /// The final assistant text, for auto-titles, notifications and search.
     public var summary: String?
+    /// A spoken-shaped one-liner the agent itself emitted for narration (see
+    /// `NarrationTag`), already stripped from `summary` and the transcript.
+    /// Optional twice over: harnesses that can't take the instruction never
+    /// set it, and transcripts persisted before the field existed decode nil.
+    public var narration: String?
     public var usage: UsageReport?
     public var duration: TimeInterval?
     public var errorMessage: String?
@@ -506,6 +511,7 @@ public struct TurnResult: Sendable, Codable, Hashable {
         turnID: TurnID,
         outcome: Outcome,
         summary: String? = nil,
+        narration: String? = nil,
         usage: UsageReport? = nil,
         duration: TimeInterval? = nil,
         errorMessage: String? = nil
@@ -513,6 +519,7 @@ public struct TurnResult: Sendable, Codable, Hashable {
         self.turnID = turnID
         self.outcome = outcome
         self.summary = summary
+        self.narration = narration
         self.usage = usage
         self.duration = duration
         self.errorMessage = errorMessage

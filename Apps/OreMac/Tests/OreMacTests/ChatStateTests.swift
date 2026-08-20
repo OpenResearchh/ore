@@ -241,13 +241,15 @@ struct TranscriptDisplayTests {
             TranscriptRow(id: "a2", turnID: turn2, kind: .assistantText, text: "Hi"),
         ]
         let memo = TranscriptDisplay.Memo()
-        let first = TranscriptDisplay.rows(from: rows, isBusy: true, expanded: [], memo: memo)
+        let first = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: memo)
         #expect(memo.completedTurnCount == 1)
         let completedIDs = first.prefix(while: { $0.turnID == turn1 }).map(\.id)
 
         rows[4].text += " there"
         rows[4].contentRevision += 1
-        let second = TranscriptDisplay.rows(from: rows, isBusy: true, expanded: [], memo: memo)
+        let second = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: memo)
         #expect(memo.completedTurnCount == 1)
         #expect(second.prefix(while: { $0.turnID == turn1 }).map(\.id) == completedIDs)
         #expect(second.last?.text == "Hi there")
@@ -265,26 +267,26 @@ struct TranscriptDisplayTests {
         ]
         let memo = TranscriptDisplay.Memo()
         let first = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 1
         )
 
         // A mutation the revision does not describe is deliberately not seen.
         rows[1].text = "mutated behind the revision's back"
         rows[1].contentRevision += 1
         let cached = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 1
         )
         #expect(cached.map(\.text) == first.map(\.text))
 
         // Bumping it re-derives.
         let fresh = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: memo, revision: 2
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 2
         )
         #expect(fresh.last?.text == "mutated behind the revision's back")
     }
 
-    /// `isBusy` and `expanded` change the output without touching the rows, so
-    /// they belong in the cache key alongside the revision.
+    /// `keepLiveTurnExpanded` and `expanded` change the output without touching
+    /// the rows, so they belong in the cache key alongside the revision.
     @Test func inputsOtherThanTheRowsStillInvalidateTheCache() {
         let turn = TurnID(rawValue: "t1")
         let rows = [
@@ -297,21 +299,52 @@ struct TranscriptDisplayTests {
         ]
         let memo = TranscriptDisplay.Memo()
         let idle = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 1
         )
         let busy = TranscriptDisplay.rows(
-            from: rows, isBusy: true, expanded: [], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: memo, revision: 1
         )
         #expect(idle.map(\.id) != busy.map(\.id))
 
         // Expanding the activity group at the same revision must re-derive too.
         let collapsed = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 1
         )
         let expanded = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: ["activity-t1"], memo: memo, revision: 1
+            from: rows, keepLiveTurnExpanded: false, expanded: ["activity-t1"], memo: memo, revision: 1
         )
         #expect(expanded.count > collapsed.count)
+    }
+
+    /// A permission prompt used to flip `isBusy` off, which folded the live
+    /// turn's thinking into an activity group and jumped the transcript.
+    /// Expansion follows `isTurnActive`, so awaiting input keeps the turn open.
+    @Test func awaitingPermissionKeepsTheLiveTurnExpanded() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "run it"),
+            TranscriptRow(
+                id: "think1", turnID: turn, kind: .thinking,
+                text: "I should check the sandbox first.", isComplete: true
+            ),
+            TranscriptRow(
+                id: "tool1", turnID: turn, kind: .toolCall, text: "Bash",
+                resultText: nil, isComplete: false
+            ),
+        ]
+
+        let collapsedWhileWaiting = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(collapsedWhileWaiting.contains { $0.kind == .activityGroup })
+        #expect(!collapsedWhileWaiting.contains { $0.kind == .thinking })
+
+        let openTurn = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(!openTurn.contains { $0.kind == .activityGroup })
+        #expect(openTurn.contains { $0.kind == .thinking })
+        #expect(openTurn.contains { $0.id == "think1" })
     }
 
     @Test func sourceSignatureIsIndependentOfPayloadBytes() {
@@ -335,14 +368,14 @@ struct TranscriptDisplayTests {
             TranscriptRow(id: "plan", turnID: turn, kind: .plan, text: markdown),
         ]
         let hidden = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: TranscriptDisplay.Memo(),
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo(),
             hidingPlanTurnID: turn
         )
         #expect(!hidden.contains { $0.kind == .plan })
         #expect(hidden.contains { $0.kind == .userMessage })
 
         let shown = TranscriptDisplay.rows(
-            from: rows, isBusy: false, expanded: [], memo: TranscriptDisplay.Memo()
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
         )
         #expect(shown.contains { $0.kind == .plan })
     }

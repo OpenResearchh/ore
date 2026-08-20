@@ -110,6 +110,40 @@ struct AgentPromptVisibilityTests {
         #expect(state.status == .requesting)
     }
 
+    // The prompt is announced before the harness is asked for a session, so the
+    // tab shows what it is working on while a CLI boots. When that boot fails,
+    // the turn claimed on the user's behalf has to be given back — nothing else
+    // gives it back, and an assistant-sent prompt has no one at the keyboard to
+    // notice the tab has been spinning against a turn that never began.
+    @Test func aPromptWhoseSessionNeverStartsStopsLookingBusy() {
+        let state = ChatState()
+        state.applyPromptSubmission(submission("start something"))
+        #expect(state.isTurnActive)
+
+        state.apply(.sessionError(SessionError(
+            kind: .notInstalled, message: "claude: command not found"
+        )))
+
+        #expect(!state.isTurnActive, "the turn never started")
+        #expect(state.status == .idle)
+        #expect(state.turnStartedAt == nil, "no elapsed timer against a dead turn")
+        #expect(!state.willQueueNextMessage, "and the composer sends rather than queues")
+    }
+
+    // The correction must not fire on a turn the harness has actually reported
+    // on: that turn is real, and may still complete.
+    @Test func aSessionErrorDuringARealTurnLeavesItRunning() {
+        let state = ChatState()
+        state.applyPromptSubmission(submission("start something"))
+        state.apply(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+
+        state.apply(.sessionError(SessionError(
+            kind: .transport, message: "a blip", isRecoverable: true
+        )))
+
+        #expect(state.isTurnActive, "a turn the harness confirmed is still open")
+    }
+
     // The queued row and the send that follows it share one submission id, so
     // the drained message is recognised as the row already on screen rather
     // than added beneath it.

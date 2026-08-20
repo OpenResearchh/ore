@@ -81,15 +81,16 @@ final class ChatState {
     /// pass over the diff, not one message per note.
     private(set) var draftComments: [DiffCommentReference] = []
 
-    /// The agent is actively producing — the spinner, the elapsed timer, the
-    /// live turn staying expanded. Deliberately *not* the same question as
-    /// whether a message would queue: an agent blocked on a permission prompt
-    /// has stopped working but has not finished its turn.
+    /// The agent is actively producing — the spinner, the elapsed timer.
+    /// Deliberately *not* the same question as whether a turn is still open:
+    /// an agent blocked on a permission prompt has stopped working (`isBusy`
+    /// is false) but the turn stays expanded via `isTurnActive`, so thinking
+    /// does not collapse the moment a permission card appears.
     ///
-    /// An open turn still counts even if the last status event was `idle`.
-    /// Claude reports `session_state_changed: idle` between tool calls, and
-    /// treating that as a finished turn hid the composer chrome while messages
-    /// kept queueing.
+    /// An open turn still counts as busy even if the last status event was
+    /// `idle`. Claude reports `session_state_changed: idle` between tool calls,
+    /// and treating that as a finished turn hid the composer chrome while
+    /// messages kept queueing.
     var isBusy: Bool {
         if status == .awaitingInput { return false }
         if isTurnActive { return true }
@@ -343,6 +344,23 @@ final class ChatState {
                 needsCLIUpgrade: error.kind == .protocolMismatch
                     || ProviderErrorCopy.needsCLIUpgrade(error.message)
             )
+            // A turn claimed on send that no harness event ever confirmed, and
+            // now the session has failed: the turn never started, so release it.
+            //
+            // Nothing else will. The engine drops its own claim and republishes,
+            // but `reconcileTurnActive` keeps an unconfirmed local claim on
+            // purpose — it can't tell a correction from a summary that crossed
+            // the send in flight. Without this the tab runs an elapsed timer
+            // against a turn that does not exist, and the composer queues every
+            // later message behind it. A claim the harness *has* reported on is
+            // left alone: that turn is real and may still complete.
+            if isTurnActive, !hasTurnEventArrived {
+                status = .idle
+                isTurnActive = false
+                turnStartedAt = nil
+                lastEventAt = nil
+                runningToolLabel = nil
+            }
 
         case .sessionEnded:
             status = .idle

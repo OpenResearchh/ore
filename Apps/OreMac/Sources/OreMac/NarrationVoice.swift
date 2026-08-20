@@ -44,6 +44,16 @@ protocol NarrationVoice: AnyObject {
     /// short by a higher-priority interjection, or dropped when the mic opened.
     /// The engine pumps its queue on all three, so it doesn't distinguish them.
     var onEnd: (@MainActor () -> Void)? { get set }
+    /// How far into an utterance the voice has actually got, in characters, and
+    /// which utterance the position belongs to. The assistant HUD reveals the
+    /// line at this pace, so the pill reads like the assistant speaking rather
+    /// than a finished sentence sitting there — which is the same live quality
+    /// the listening waveform has.
+    ///
+    /// The text is passed back because these callbacks are deferred: a boundary
+    /// from a line that was just preempted can land after the next one started,
+    /// and without it that stale position would flash the wrong words.
+    var onProgress: (@MainActor (String, Int) -> Void)? { get set }
     /// `priority` shapes delivery, not just what plays first — ambient
     /// progress sits back, interjections lean in. How much of that a given
     /// voice can express depends on the synthesizer.
@@ -74,10 +84,16 @@ final class SystemNarrationVoice: NarrationVoice {
     private var chosenVoice: AVSpeechSynthesisVoice?
 
     var onEnd: (@MainActor () -> Void)?
+    var onProgress: (@MainActor (String, Int) -> Void)?
     var isSpeaking: Bool { synthesizer.isSpeaking }
 
     init() {
-        let delegate = SpeechDelegate { [weak self] in self?.onEnd?() }
+        let delegate = SpeechDelegate(
+            onEnd: { [weak self] in self?.onEnd?() },
+            onProgress: { [weak self] text, characters in
+                self?.onProgress?(text, characters)
+            }
+        )
         self.delegate = delegate
         synthesizer.delegate = delegate
     }
@@ -141,12 +157,32 @@ final class SystemNarrationVoice: NarrationVoice {
 /// `AVSpeechSynthesizer` reports through a delegate; this adapter turns the
 /// two endings — finished and cancelled — into one MainActor callback.
 /// Cancelled matters as much as finished: preemption and mic ducking both
-/// land there.
+/// land there. It also forwards the word boundaries, which is the exact spoken
+/// position the HUD reveals its transcript at.
 private final class SpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {
     private let onEnd: @Sendable () -> Void
+    private let onProgress: @Sendable (String, Int) -> Void
 
-    init(onEnd: @escaping @MainActor () -> Void) {
+    init(
+        onEnd: @escaping @MainActor () -> Void,
+        onProgress: @escaping @MainActor (String, Int) -> Void
+    ) {
         self.onEnd = { Task { @MainActor in onEnd() } }
+        self.onProgress = { text, characters in
+            Task { @MainActor in onProgress(text, characters) }
+        }
+    }
+
+    /// Fires just before each word is voiced, so the reported position is
+    /// "what you are hearing now" rather than what has already gone by.
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        willSpeakRangeOfSpeechString characterRange: NSRange,
+        utterance: AVSpeechUtterance
+    ) {
+        // `speechString` is immutable and a `String`, which is what keeps this
+        // hop off the main actor free of a non-`Sendable` capture.
+        onProgress(utterance.speechString, characterRange.location + characterRange.length)
     }
 
     nonisolated func speechSynthesizer(
@@ -238,8 +274,15 @@ final class NeuralNarrationVoice: NarrationVoice {
     @ObservationIgnored private var pendingFrames: [[Float]] = []
     @ObservationIgnored private var playbackStarted = false
     @ObservationIgnored private var preRollTarget = 0
+    /// Spoken-position tracking for `onProgress`. Pocket TTS reports no word
+    /// boundaries, so position is inferred from how much audio has actually
+    /// left the speakers against how much there is in total.
+    @ObservationIgnored private var progressText = ""
+    @ObservationIgnored private var playedSamples = 0
+    @ObservationIgnored private var scheduledSamples = 0
 
     @ObservationIgnored var onEnd: (@MainActor () -> Void)?
+    @ObservationIgnored var onProgress: (@MainActor (String, Int) -> Void)?
     private(set) var isSpeaking = false
 
     var isReady: Bool { readiness == .ready }
@@ -281,6 +324,11 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// The cushion to re-bank after an underrun: enough to absorb another
     /// hiccup, small enough that the pause reads as a breath, not a dropout.
     nonisolated static let underrunReBankFrames = 4  // 320ms
+
+    /// Rough delivery pace, used to guess an utterance's length while the model
+    /// is still generating it. It only has to be close: the moment generation
+    /// finishes the real sample count is known and the estimate snaps to it.
+    nonisolated static let charactersPerSecond = 15.0
 
     init() {
         // Even a previously-installed model starts here: the weights are on
@@ -331,6 +379,10 @@ final class NeuralNarrationVoice: NarrationVoice {
         pendingFrames = []
         playbackStarted = false
         underrunsThisUtterance = 0
+        progressText = text
+        playedSamples = 0
+        scheduledSamples = 0
+        onProgress?(text, 0)
         // A line that underran is evidence the default cushion is too small
         // for the machine's current load; the next one banks more.
         preRollTarget = Self.preRollFrames(for: priority) + min(6, 2 * recentUnderruns)
@@ -567,18 +619,22 @@ final class NeuralNarrationVoice: NarrationVoice {
             )
         }
         scheduledBuffers += 1
+        scheduledSamples += samples.count
+        let played = samples.count
         player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) {
             [weak self] _ in
             Task { @MainActor in
-                self?.noteBufferPlayed(generation: generation)
+                self?.noteBufferPlayed(samples: played, generation: generation)
             }
         }
         if !player.isPlaying { player.play() }
     }
 
-    private func noteBufferPlayed(generation: Int) {
+    private func noteBufferPlayed(samples: Int, generation: Int) {
         guard generation == self.generation else { return }
         scheduledBuffers -= 1
+        playedSamples += samples
+        reportProgress()
         // Underrun: playback caught up with generation mid-stream. Left
         // alone, the next frame would land after an audible gap torn out of
         // the middle of a word. Pausing to re-bank a small cushion turns
@@ -604,7 +660,27 @@ final class NeuralNarrationVoice: NarrationVoice {
         // forever and never spoken.
         startPlayback(generation: generation)
         streamEnded = true
+        // The line's true length is known now, so the estimate stops guessing.
+        reportProgress()
         finishIfDrained(generation: generation)
+    }
+
+    /// Where in the line the speakers have got to, as a character count.
+    ///
+    /// Until generation finishes, the total is guessed from the text's length;
+    /// after it, the scheduled sample count is exact. Either way the fraction
+    /// can only move forward, which is what the HUD needs — a transcript that
+    /// un-reveals a word would read as a glitch.
+    private func reportProgress() {
+        guard onProgress != nil, !progressText.isEmpty else { return }
+        let rate = Double(PocketTtsConstants.audioSampleRate)
+        let played = Double(playedSamples) / rate
+        let total = streamEnded
+            ? max(Double(scheduledSamples) / rate, played)
+            : max(Double(progressText.count) / Self.charactersPerSecond, played)
+        guard total > 0 else { return }
+        let fraction = min(1, played / total)
+        onProgress?(progressText, Int((fraction * Double(progressText.count)).rounded()))
     }
 
     /// The utterance is over only when generation has stopped *and* every

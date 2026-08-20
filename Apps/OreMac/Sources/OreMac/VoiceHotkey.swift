@@ -107,6 +107,9 @@ struct VoiceCommand: Equatable {
         /// Park whatever is being dictated in the draft without sending —
         /// used when the assistant takes the microphone over mid-dictation.
         case commit
+        /// Stop now: drop the utterance, the turn, or the speech, depending on
+        /// where the exchange had got to.
+        case cancel
     }
     enum Target: Equatable { case composer, assistant }
     var id: Int
@@ -126,6 +129,11 @@ final class VoiceHotkeyMonitor {
     /// keep hearing gestures when no window — and so no observing view —
     /// exists.
     var onCommand: (@MainActor (VoiceCommand) -> Void)?
+    /// Whether a voice exchange is actually on screen. Escape is only claimed
+    /// while the HUD is up: the rest of the time it belongs to whatever app the
+    /// user is in, and publishing a command per keystroke would churn every
+    /// view observing `command` for nothing.
+    var isAssistantEngaged: (@MainActor () -> Bool)?
     /// Whether macOS lets us see events from other apps. Without it the tap
     /// still works while ORE is frontmost.
     private(set) var isTrusted = false
@@ -224,10 +232,30 @@ final class VoiceHotkeyMonitor {
             emit(recognizer.modifiersChanged(to: flags))
             armHoldTimerIfNeeded()
         default:
-            emit(recognizer.otherInputArrived())
             holdTimer?.cancel()
             holdTimer = nil
+            // Escape is only *observed*, never swallowed — the monitors can't
+            // consume events anyway, so it still does whatever it does in the
+            // app the user is looking at. Stopping the assistant is additive.
+            if Self.isCancelKey(event), isAssistantEngaged?() == true {
+                // It also wins over the hold it interrupts. Escape mid-sentence
+                // means "forget it", so releasing the chord afterwards must not
+                // still send the words the user just abandoned.
+                _ = recognizer.otherInputArrived()
+                holdIsDictating = false
+                publish(.cancel, target: .assistant)
+                return
+            }
+            emit(recognizer.otherInputArrived())
         }
+    }
+
+    /// Bare Escape. With a modifier it is someone else's shortcut.
+    nonisolated static func isCancelKey(_ event: NSEvent) -> Bool {
+        let escape: UInt16 = 53
+        return event.type == .keyDown
+            && event.keyCode == escape
+            && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
     }
 
     /// Nothing is delivered while keys are merely held down, so a hold has to be

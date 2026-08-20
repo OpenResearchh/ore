@@ -583,3 +583,46 @@ struct NarrationPreRollTests {
         #expect(cushion(.interrupt) <= 0.4)
     }
 }
+
+/// What the assistant HUD streams while a line is being spoken. The pill used
+/// to show the finished sentence with a leading ellipsis, which looked the same
+/// whether the voice was on the first word or the last.
+struct SpokenPrefixTests {
+    private let line = "Kaguya's agent is on it."
+
+    @Test func nothingIsRevealedBeforeTheFirstWordIsVoiced() {
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 0).isEmpty)
+    }
+
+    @Test func theLineIsRevealedAsItIsSpoken() {
+        // Word boundaries, as `AVSpeechSynthesizer` reports them.
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 8) == "Kaguya's")
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 14) == "Kaguya's agent")
+        #expect(NarrationEngine.wholeWords(of: line, upTo: line.utf16.count) == line)
+    }
+
+    /// The neural voice estimates its position from the playback clock, so it
+    /// lands mid-word constantly. Half a word appearing and then completing
+    /// reads as a glitch; the previous whole word is the honest thing to show.
+    @Test func aMidWordEstimateFallsBackToTheLastWholeWord() {
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 11) == "Kaguya's")
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 4) == "")
+    }
+
+    /// A count past the end — the estimate rounding up on the final frame —
+    /// is the whole line, not a crash.
+    @Test func anOverrunIsJustTheWholeLine() {
+        #expect(NarrationEngine.wholeWords(of: line, upTo: 500) == line)
+        #expect(NarrationEngine.wholeWords(of: "", upTo: 3).isEmpty)
+    }
+
+    /// Emoji and accents are more than one UTF-16 unit; slicing at a raw
+    /// offset must not split one.
+    @Test func multiByteCharactersSurviveTheSlice() {
+        let text = "Café ✅ done"
+        for cut in 0...text.utf16.count {
+            let prefix = NarrationEngine.wholeWords(of: text, upTo: cut)
+            #expect(text.hasPrefix(prefix))
+        }
+    }
+}

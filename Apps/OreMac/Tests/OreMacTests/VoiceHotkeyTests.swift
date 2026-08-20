@@ -173,3 +173,37 @@ struct VoiceChordRecognizerTests {
         #expect(!recognizer.isArmed)
     }
 }
+
+/// Escape stops the assistant mid-thought. It is only claimed while the HUD is
+/// up, and only bare — with a modifier it belongs to whatever app the user is
+/// actually in.
+@MainActor
+struct VoiceCancelKeyTests {
+    private func key(_ code: UInt16, _ flags: NSEvent.ModifierFlags = []) -> NSEvent? {
+        NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: code
+        )
+    }
+
+    @Test func bareEscapeCancels() throws {
+        let escape = try #require(key(53))
+        #expect(VoiceHotkeyMonitor.isCancelKey(escape))
+    }
+
+    @Test func modifiedEscapeBelongsToSomeoneElse() throws {
+        for flags in [NSEvent.ModifierFlags.command, .option, .shift, .control] {
+            let event = try #require(key(53, flags))
+            #expect(!VoiceHotkeyMonitor.isCancelKey(event))
+        }
+    }
+
+    @Test func otherKeysDoNotCancel() throws {
+        // Return, in particular: it is how a dictated prompt gets sent.
+        for code: UInt16 in [36, 49, 0, 12] {
+            let event = try #require(key(code))
+            #expect(!VoiceHotkeyMonitor.isCancelKey(event))
+        }
+    }
+}

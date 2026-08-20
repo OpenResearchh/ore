@@ -40,9 +40,16 @@ final class VoiceAssistantController {
     /// `@Observable` — so the HUD animates without any forwarding.
     var liveTranscript: String { voice.transcript }
     var audioLevel: Double { voice.audioLevel }
-    /// Tail of the utterance currently being spoken, for the HUD.
-    var spokenTail: String {
-        model?.narration.currentSpokenText ?? ""
+    /// How much of the utterance being spoken has actually been voiced, for the
+    /// HUD to stream.
+    var spokenSoFar: String {
+        model?.narration.spokenPrefix ?? ""
+    }
+
+    /// Whether Escape has something to stop — a turn in flight or a line being
+    /// spoken. The HUD shows the key cap exactly when this is true.
+    var canInterrupt: Bool {
+        phase == .thinking || phase == .speaking
     }
 
     weak var model: AppModel?
@@ -60,6 +67,11 @@ final class VoiceAssistantController {
     /// tool calls narrates as a beat, not a commentary track.
     private var lastMilestone: String?
     private var lastMilestoneAt: Date = .distantPast
+    /// Bumped by `cancel()`. Every `notifyWhenQuiet` continuation captures it
+    /// and bails if it changed — stopping the speech *causes* those callbacks
+    /// to fire, and without this the one that opens the hands-free answer mic
+    /// would open it a beat after the user asked for silence.
+    private var cancelToken = 0
 
     /// How long after a voice exchange a confirmation is still narrated (and
     /// answerable by voice). Matches the action policy's task-grant window —
@@ -82,7 +94,48 @@ final class VoiceAssistantController {
         switch command.kind {
         case .start: begin()
         case .stop: finish()
+        case .cancel: cancel()
         case .toggle, .commit: break
+        }
+    }
+
+    /// Escape: stop whatever the assistant is doing, from wherever the user is.
+    ///
+    /// What "stop" means depends on where the exchange got to — abandoning a
+    /// half-spoken request, killing a turn that is taking too long, or cutting
+    /// off an answer the user has already heard enough of. All three end with
+    /// the pill gone and nothing running.
+    private func cancel() {
+        guard phase != .idle else { return }
+        cancelToken += 1
+        startTask?.cancel()
+        startTask = nil
+        stillWorkingTask?.cancel()
+        stillWorkingTask = nil
+
+        switch phase {
+        case .answering:
+            // The confirmation itself stays pending: Escape declines to answer
+            // by voice, it doesn't answer. The window and the notification
+            // still carry it.
+            closeAnswerWindow()
+        case .listening:
+            // The words are dropped rather than sent — the user changed their
+            // mind mid-sentence, which is the whole reason they reached for the
+            // key instead of releasing the chord.
+            if voice.isActive { voice.stop() }
+            model?.narration.setMicActive(false)
+            phase = .idle
+        case .thinking, .speaking:
+            let wasWaiting = awaitingSpokenReply
+            awaitingSpokenReply = false
+            model?.narration.stopAll()
+            // Only a turn we're actually waiting on: cutting off "Okay, going
+            // ahead." shouldn't kill a turn the user didn't start by voice.
+            if wasWaiting { model?.interruptAssistant() }
+            phase = .idle
+        case .idle:
+            break
         }
     }
 
@@ -190,8 +243,11 @@ final class VoiceAssistantController {
             else { return }
             model.narration.speakAssistant("Still on it — a moment.", chatID: chatID)
             phase = .speaking
+            let token = cancelToken
             model.narration.notifyWhenQuiet { [weak self] in
-                guard let self, self.phase == .speaking, self.awaitingSpokenReply else { return }
+                guard let self, self.cancelToken == token,
+                      self.phase == .speaking, self.awaitingSpokenReply
+                else { return }
                 self.phase = .thinking
             }
         }
@@ -217,8 +273,11 @@ final class VoiceAssistantController {
             model.narration.speakAssistant(phrase, chatID: chatID, priority: .progress)
             if phase == .thinking {
                 phase = .speaking
+                let token = cancelToken
                 model.narration.notifyWhenQuiet { [weak self] in
-                    guard let self, self.phase == .speaking, self.awaitingSpokenReply else { return }
+                    guard let self, self.cancelToken == token,
+                          self.phase == .speaking, self.awaitingSpokenReply
+                    else { return }
                     self.phase = .thinking
                 }
             }
@@ -260,8 +319,10 @@ final class VoiceAssistantController {
             chatID: chatID
         )
         phase = .speaking
+        let token = cancelToken
         model.narration.notifyWhenQuiet { [weak self] in
-            self?.openAnswerWindow(for: confirmation.id)
+            guard let self, self.cancelToken == token else { return }
+            self.openAnswerWindow(for: confirmation.id)
         }
     }
 
@@ -278,8 +339,10 @@ final class VoiceAssistantController {
             chatID: chatID
         )
         phase = .speaking
+        let token = cancelToken
         model.narration.notifyWhenQuiet { [weak self] in
-            self?.openNeedsYouWindow(for: item.id)
+            guard let self, self.cancelToken == token else { return }
+            self.openNeedsYouWindow(for: item.id)
         }
     }
 
@@ -293,8 +356,9 @@ final class VoiceAssistantController {
         guard let model else { return }
         model.narration.speakAssistant(text, chatID: chatID)
         phase = .speaking
+        let token = cancelToken
         model.narration.notifyWhenQuiet { [weak self] in
-            guard let self, self.phase == .speaking else { return }
+            guard let self, self.cancelToken == token, self.phase == .speaking else { return }
             self.phase = self.awaitingSpokenReply ? .thinking : resume
         }
     }

@@ -38,6 +38,11 @@ public struct SessionConfiguration: Sendable {
     /// safety gate is ORE's app-side policy — a CLI prompt on top of that is
     /// pure nagging.
     public var allowedTools: [String]
+    /// Tool patterns the harness must refuse outright (Claude Code's
+    /// `--disallowedTools`). Used for the assistant, whose job is to route work
+    /// to project agents — a prompt asking it not to run `git` is a suggestion,
+    /// a missing `Bash` tool is a fact.
+    public var disallowedTools: [String]
 
     public init(
         workingDirectory: URL,
@@ -50,7 +55,8 @@ public struct SessionConfiguration: Sendable {
         executablePath: String? = nil,
         allowAPIKeyFallback: Bool = false,
         mcpServer: MCPServer? = nil,
-        allowedTools: [String] = []
+        allowedTools: [String] = [],
+        disallowedTools: [String] = []
     ) {
         self.workingDirectory = workingDirectory
         self.model = model
@@ -63,5 +69,6 @@ public struct SessionConfiguration: Sendable {
         self.allowAPIKeyFallback = allowAPIKeyFallback
         self.mcpServer = mcpServer
         self.allowedTools = allowedTools
+        self.disallowedTools = disallowedTools
     }
 }

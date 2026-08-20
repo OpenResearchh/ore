@@ -35,6 +35,8 @@ final class ChatState {
     /// Turn that currently owns the approval card, so the transcript can hide
     /// its duplicate PLAN row while the card is up.
     private(set) var planTurnID: TurnID?
+    /// The live rate-limit warning, or nil once its window has rolled. Only
+    /// ever holds a report that still applies — see `setRateLimit`.
     private(set) var rateLimit: RateLimitReport?
     private(set) var lastError: SessionError?
 
@@ -290,7 +292,7 @@ final class ChatState {
             usage = merged
 
         case .rateLimit(let report):
-            rateLimit = report
+            setRateLimit(report)
             if prominentError?.isUsageLimit == true {
                 prominentError?.resetsAt = report.resetsAt ?? prominentError?.resetsAt
             }
@@ -401,6 +403,37 @@ final class ChatState {
     }
 
     private(set) var hasLoadedHistory = false
+
+    // MARK: - Rate limits
+
+    private var rateLimitExpiry: Task<Void, Never>?
+
+    /// Holds a rate-limit report only for as long as it is true.
+    ///
+    /// Harnesses report the limit while a turn runs and say nothing after it
+    /// ends, so the last report of the day used to stay on screen for the rest
+    /// of the day — a banner reading "approaching rate limit, resets 4:30 PM"
+    /// still up at 5:24, contradicting itself. The report carries its own
+    /// expiry, so the window rolling is what takes the banner down, whether or
+    /// not another turn ever runs to say so.
+    private func setRateLimit(_ report: RateLimitReport) {
+        rateLimitExpiry?.cancel()
+        rateLimitExpiry = nil
+        guard report.applies() else {
+            rateLimit = nil
+            return
+        }
+        rateLimit = report
+        guard let resetsAt = report.resetsAt else { return }
+        // `Task.sleep` is on the continuous clock, which keeps running while
+        // the Mac is asleep — a lid closed over a rate limit still comes back
+        // to a cleared banner.
+        rateLimitExpiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(max(1, resetsAt.timeIntervalSinceNow)))
+            guard !Task.isCancelled, let self, self.rateLimit?.applies() == false else { return }
+            self.rateLimit = nil
+        }
+    }
 
     // MARK: - Local edits
 

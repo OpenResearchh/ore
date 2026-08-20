@@ -426,6 +426,12 @@ public actor ClaudeCodeSession: AgentSession {
             arguments += ["--allowedTools", configuration.allowedTools.joined(separator: ",")]
         }
 
+        if !configuration.disallowedTools.isEmpty {
+            arguments += [
+                "--disallowedTools", configuration.disallowedTools.joined(separator: ","),
+            ]
+        }
+
         arguments += configuration.extraArguments
         return arguments
     }

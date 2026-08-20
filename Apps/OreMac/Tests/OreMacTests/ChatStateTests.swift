@@ -466,3 +466,70 @@ struct ComposerBusyCopyTests {
         #expect(ComposerBusyCopy.turnElapsed(from: start, to: start.addingTimeInterval(65)) == "1m 5s this turn")
     }
 }
+
+/// A rate-limit report is a snapshot of a rolling window, and harnesses only
+/// report while a turn is running — so nothing arrives to retract one. Without
+/// an expiry the banner outlived the limit it described.
+@MainActor
+struct RateLimitExpiryTests {
+    @Test func aWarningWhoseWindowHasRolledIsNotShown() {
+        let state = ChatState()
+        state.apply(.rateLimit(RateLimitReport(
+            status: .warning,
+            window: "5h",
+            resetsAt: Date().addingTimeInterval(-60 * 54)  // 4:30 PM, seen at 5:24
+        )))
+        #expect(state.rateLimit == nil)
+    }
+
+    @Test func aLiveWarningIsKept() {
+        let state = ChatState()
+        let report = RateLimitReport(
+            status: .warning, window: "5h", resetsAt: Date().addingTimeInterval(600)
+        )
+        state.apply(.rateLimit(report))
+        #expect(state.rateLimit == report)
+    }
+
+    /// An exhausted window is the one the user most wants gone the moment it
+    /// resets — that is when they can work again.
+    @Test func anExhaustedReportExpiresTheSameWay() {
+        let state = ChatState()
+        state.apply(.rateLimit(RateLimitReport(
+            status: .exhausted, resetsAt: Date().addingTimeInterval(-1)
+        )))
+        #expect(state.rateLimit == nil)
+    }
+
+    /// `allowed` is the harness saying the limit is off; it must not leave a
+    /// stale warning behind it.
+    @Test func returningToAllowedClearsAnEarlierWarning() {
+        let state = ChatState()
+        state.apply(.rateLimit(RateLimitReport(
+            status: .warning, resetsAt: Date().addingTimeInterval(600)
+        )))
+        state.apply(.rateLimit(RateLimitReport(status: .allowed)))
+        #expect(state.rateLimit == nil)
+    }
+
+    /// Nothing in a report without a reset time says when it stops being true,
+    /// so it stands until the harness says otherwise.
+    @Test func aReportWithNoResetTimeStands() {
+        let state = ChatState()
+        let report = RateLimitReport(status: .warning, window: "weekly")
+        state.apply(.rateLimit(report))
+        #expect(state.rateLimit == report)
+    }
+
+    @Test func theBannerTakesItselfDownWhenTheWindowRolls() async throws {
+        let state = ChatState()
+        state.apply(.rateLimit(RateLimitReport(
+            status: .warning, resetsAt: Date().addingTimeInterval(0.2)
+        )))
+        #expect(state.rateLimit != nil)
+        // The expiry timer, not another event, is what clears it: an idle tab
+        // never sees another rate-limit event.
+        try await Task.sleep(for: .milliseconds(1400))
+        #expect(state.rateLimit == nil)
+    }
+}

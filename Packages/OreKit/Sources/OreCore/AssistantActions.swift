@@ -57,6 +57,26 @@ enum AssistantActionPolicy {
         "ResolveChatPermission", "AnswerChatQuestion",
     ]
 
+    /// The harness tools the assistant is launched without.
+    ///
+    /// The assistant is an orchestrator: it answers questions about the fleet
+    /// and hands work to the agent that owns the repository. Left with a shell
+    /// and an editor it does the opposite — reaches into a worktree it doesn't
+    /// own, runs `git` there, and lands the user in a half-applied change with
+    /// no tab holding the context. A system prompt asking it not to is a
+    /// suggestion; taking the tools away is the boundary.
+    ///
+    /// Nothing is lost: the fleet is visible through ORE's own read tools
+    /// (`ListWorkspaces`, `WorkspaceStatus`, `SearchTranscripts`,
+    /// `GetTranscriptTail`), its memory through `ReadMemory` / `WriteMemory`,
+    /// and every change through the project agent it delegates to.
+    static let disallowedHarnessTools: [String] = [
+        "Bash", "BashOutput", "KillShell", "KillBash",
+        "Edit", "MultiEdit", "Write", "NotebookEdit",
+        "Read", "Glob", "Grep",
+        "Task", "WebFetch", "WebSearch",
+    ]
+
     /// How long a "for this task" grant lasts, sliding on use. Long enough to
     /// cover a multi-step request with the agent working in between; short
     /// enough that tomorrow is a fresh question.

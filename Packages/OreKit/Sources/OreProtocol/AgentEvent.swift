@@ -480,6 +480,23 @@ public struct RateLimitReport: Sendable, Codable, Hashable {
         self.window = window
         self.resetsAt = resetsAt
     }
+
+    /// Whether this report still describes the present.
+    ///
+    /// A rate-limit report is a snapshot of a rolling window, and `resetsAt` is
+    /// its own expiry date: once that instant passes the window has rolled and
+    /// the warning describes a limit that no longer exists. Harnesses only
+    /// report while a turn is running, so nothing arrives to retract a stale
+    /// one — a tab left idle would otherwise keep saying "approaching rate
+    /// limit, resets 4:30" at half past five.
+    ///
+    /// A report with no reset time can't expire on its own: nothing in it says
+    /// when it stops being true.
+    public func applies(at now: Date = Date()) -> Bool {
+        guard status == .warning || status == .exhausted else { return false }
+        guard let resetsAt else { return true }
+        return now < resetsAt
+    }
 }
 
 // MARK: - Turn completion and errors

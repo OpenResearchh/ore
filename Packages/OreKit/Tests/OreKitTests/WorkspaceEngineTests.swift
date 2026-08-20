@@ -586,6 +586,48 @@ struct WorkspaceEngineTests {
         #expect(session.configuration.appendSystemPrompt?.contains(".context/") == true)
         // And it's taught the narration-tag convention the translators strip.
         #expect(session.configuration.appendSystemPrompt?.contains(NarrationTag.open) == true)
+        // A project agent keeps every tool it came with — it's the one doing
+        // the work.
+        #expect(session.configuration.disallowedTools.isEmpty)
+    }
+
+    /// The assistant orchestrates; it does not open a shell in someone else's
+    /// worktree. Asking it not to in the prompt is a suggestion — launching it
+    /// without `Bash` is the boundary.
+    @Test func theAssistantRunsWithoutAShellOrAnEditor() async throws {
+        let fixture = try await GitFixture.initialized()
+        let store = try OreStore()
+        try await store.addRepository(RepositoryRecord(
+            path: fixture.repository.path, name: "repo", defaultBranch: "main"
+        ))
+        let record = WorkspaceRecord(
+            id: WorkspaceID.generate(),
+            name: "Assistant",
+            repositoryPath: fixture.repository.path,
+            worktreePath: fixture.repository.path,
+            branch: "main", baseBranch: "main",
+            harness: .claudeCode,
+            kind: .assistant
+        )
+        try await store.saveWorkspace(record)
+
+        let fake = FakeHarness()
+        let engine = WorkspaceEngine(
+            record: record, store: store, git: fixture.git,
+            harnessRegistry: HarnessRegistry(harnesses: [fake])
+        )
+        _ = try await engine.ensureSession()
+        let session = try #require(fake.latestSession)
+
+        let disallowed = Set(session.configuration.disallowedTools)
+        for tool in ["Bash", "Edit", "Write", "Read", "Task", "WebFetch"] {
+            #expect(disallowed.contains(tool), "the assistant must not be given \(tool)")
+        }
+        // Its own ORE tools are the other half of the arrangement: no CLI
+        // prompt on top of ORE's action policy.
+        #expect(session.configuration.allowedTools == ["mcp__ore"])
+        // And it's told it is the concierge, not a worktree's agent.
+        #expect(session.configuration.appendSystemPrompt?.contains("never do the work") == true)
     }
 
     @Test func aMissingHarnessFailsWithSomethingActionable() async throws {

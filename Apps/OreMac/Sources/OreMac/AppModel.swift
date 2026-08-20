@@ -142,6 +142,9 @@ final class AppModel {
         VoiceHotkeyMonitor.shared.onCommand = { [weak self] command in
             self?.voiceAssistant.handle(command)
         }
+        VoiceHotkeyMonitor.shared.isAssistantEngaged = { [weak self] in
+            self?.voiceAssistant.phase != .idle
+        }
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.client.events {
@@ -740,6 +743,15 @@ final class AppModel {
     func interrupt(_ id: WorkspaceID) {
         guard let chatID = activeChat(for: id)?.id else { return }
         Task { await client.send(.interruptChatTurn(id, chatID)) }
+    }
+
+    /// Stops the assistant's own turn — the Escape key in voice mode. Goes
+    /// through `assistantChatID` rather than `interrupt(_:)`: the assistant's
+    /// workspace is routed off `workspaces`, so it has no "active chat" in the
+    /// sense the sidebar means.
+    func interruptAssistant() {
+        guard let assistant = assistantWorkspace, let chatID = assistantChatID else { return }
+        Task { await client.send(.interruptChatTurn(assistant.id, chatID)) }
     }
 
     func setPermissionMode(_ mode: PermissionMode, for id: WorkspaceID) {

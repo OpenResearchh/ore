@@ -444,7 +444,13 @@ public actor WorkspaceEngine {
             // The assistant's ORE tools never prompt at the CLI layer: the
             // real gate is ORE's own action policy, and a second prompt on
             // top of it is what makes an assistant feel like paperwork.
-            allowedTools: record.workspaceKind == .assistant ? ["mcp__ore"] : []
+            allowedTools: record.workspaceKind == .assistant ? ["mcp__ore"] : [],
+            // …and the assistant runs without a shell or an editor: its job is
+            // to route work to the agent that owns the repository, not to open
+            // one itself. See `AssistantActionPolicy.disallowedHarnessTools`.
+            disallowedTools: record.workspaceKind == .assistant
+                ? AssistantActionPolicy.disallowedHarnessTools
+                : []
         )
 
         let session = try await harness.makeSession(configuration)

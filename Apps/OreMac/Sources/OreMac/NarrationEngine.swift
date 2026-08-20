@@ -25,6 +25,34 @@ final class NarrationEngine {
     private(set) var speakingChatID: ChatID?
     /// The utterance currently being spoken, for the assistant HUD.
     private(set) var currentSpokenText: String?
+    /// How much of it has actually been voiced, in characters. Reported by the
+    /// voice — exactly by the system one's word boundaries, closely by the
+    /// neural one's playback clock.
+    private(set) var spokenCharacterCount = 0
+
+    /// The part of the current utterance already spoken, cut back to a whole
+    /// word. The HUD streams this: the pill shows what the assistant is saying
+    /// as it says it, the same way it shows what it is hearing.
+    var spokenPrefix: String {
+        guard let currentSpokenText else { return "" }
+        return Self.wholeWords(of: currentSpokenText, upTo: spokenCharacterCount)
+    }
+
+    /// `characters` counts UTF-16 units, since that is what
+    /// `AVSpeechSynthesizer` reports its word boundaries in.
+    nonisolated static func wholeWords(of text: String, upTo characters: Int) -> String {
+        guard characters > 0 else { return "" }
+        let utf16 = text.utf16.count
+        guard characters < utf16 else { return text }
+        guard let cut = String.Index(String.Index(utf16Offset: characters, in: text), within: text)
+        else { return text }
+        // Mid-word cuts happen with the neural voice's estimate; the system
+        // voice lands on boundaries already. Either way, never show half a word
+        // — and part-way into the first one, there is no whole word yet.
+        guard cut < text.endIndex, !text[cut].isWhitespace else { return String(text[..<cut]) }
+        guard let lastBreak = text[..<cut].lastIndex(where: \.isWhitespace) else { return "" }
+        return String(text[..<lastBreak])
+    }
 
     /// Both voices are held, not one: the neural voice may still be
     /// downloading, and every utterance until it is ready falls back to the
@@ -92,6 +120,8 @@ final class NarrationEngine {
         enabledChats = Set(saved.map(ChatID.init(rawValue:)))
         systemVoice.onEnd = { [weak self] in self?.utteranceEnded() }
         neuralVoice.onEnd = { [weak self] in self?.utteranceEnded() }
+        systemVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
+        neuralVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
         // Weights already fetched on a previous run load in the background, so
         // the first narrated turn doesn't fall back to the system voice.
         if voiceKind == .neural, neuralVoice.wasInstalledPreviously {
@@ -592,15 +622,27 @@ final class NarrationEngine {
         currentUtterance = utterance
         speakingChatID = utterance.chatID
         currentSpokenText = utterance.text
+        spokenCharacterCount = 0
         // What was just said grounds the next digest so it doesn't repeat.
         digests[utterance.chatID]?.noteSpoken(utterance.text)
         voice.speak(utterance.text, priority: utterance.priority)
+    }
+
+    /// Both voices report into this, and the stale one can still be draining a
+    /// preempted line — so progress only ever moves forward within an
+    /// utterance, and a late callback from the previous one is ignored.
+    private func noteSpokenProgress(_ characters: Int, of text: String) {
+        guard let currentSpokenText, text == currentSpokenText,
+              characters > spokenCharacterCount
+        else { return }
+        spokenCharacterCount = min(characters, currentSpokenText.utf16.count)
     }
 
     private func utteranceEnded() {
         currentUtterance = nil
         speakingChatID = nil
         currentSpokenText = nil
+        spokenCharacterCount = 0
         lastUtteranceEndedAt = Date()
         pump()
         flushQuietWaitersIfIdle()

@@ -304,7 +304,10 @@ struct ChatPane: View {
                     .padding(.horizontal, OreTheme.Space.md)
                     .padding(.top, OreTheme.Space.sm)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if let limit = chat.rateLimit, limit.status == .warning || limit.status == .exhausted {
+            // `applies()` again, not just `chat.rateLimit != nil`: the state's
+            // expiry timer is the thing that redraws this, but a report that
+            // went stale while the view was off screen shouldn't flash back.
+            } else if let limit = chat.rateLimit, limit.applies() {
                 composerRateLimitBanner(limit)
             }
 
@@ -429,7 +432,10 @@ struct ChatPane: View {
             case .toggle: toggleVoice()
             case .start: if !voice.isActive { startVoice() }
             case .stop: finishVoice(.send)
-            case .commit: finishVoice(.commitToDraft)
+            // Cancel is only ever published for the assistant, so this is
+            // unreachable today; parking the draft is the safe reading of
+            // "stop" if it ever isn't.
+            case .commit, .cancel: finishVoice(.commitToDraft)
             }
         }
         .onDisappear {

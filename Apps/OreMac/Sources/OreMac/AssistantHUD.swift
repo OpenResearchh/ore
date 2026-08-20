@@ -99,18 +99,19 @@ private struct AssistantHUDView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
 
-            WaveformBars(
-                level: micIsOpen ? controller.audioLevel : nil
-            )
-            .frame(width: 34, height: 20)
+            WaveformBars(mode: waveform)
+                .frame(width: 34, height: 20)
 
-            Text(label)
-                .font(.system(size: 13, weight: .medium))
+            StreamingTranscript(text: transcript, placeholder: placeholder)
                 .foregroundStyle(micIsOpen ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-                .lineLimit(1)
-                .truncationMode(.head)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .contentTransition(.opacity)
+
+            // Only promised when the key can actually be seen: without
+            // Accessibility the monitors are blind outside ORE, and the pill's
+            // whole point is being somewhere else.
+            if controller.canInterrupt, VoiceHotkeyMonitor.shared.isGlobal {
+                InterruptHint()
+            }
         }
         .padding(.horizontal, 16)
         .frame(width: 380 - 16, height: 44)
@@ -119,47 +120,128 @@ private struct AssistantHUDView: View {
         .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
         .frame(width: 380, height: 56)
         .animation(.easeOut(duration: 0.2), value: controller.phase)
-        .animation(.easeOut(duration: 0.2), value: controller.spokenTail)
     }
 
     private var micIsOpen: Bool {
         controller.phase == .listening || controller.phase == .answering
     }
 
-    private var label: String {
+    private var waveform: WaveformBars.Mode {
         switch controller.phase {
-        case .listening:
-            let transcript = controller.liveTranscript
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return transcript.isEmpty ? "Listening…" : tail(of: transcript)
-        case .answering:
-            let transcript = controller.liveTranscript
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return transcript.isEmpty ? "Yes or no?" : tail(of: transcript)
-        case .thinking:
-            return "Thinking…"
-        case .speaking:
-            let spoken = controller.spokenTail.trimmingCharacters(in: .whitespacesAndNewlines)
-            return spoken.isEmpty ? "Speaking…" : tail(of: spoken)
-        case .idle:
-            return ""
+        case .listening, .answering: .listening(controller.audioLevel)
+        case .speaking: .speaking
+        case .thinking, .idle: .thinking
         }
     }
 
-    /// The last few words only: the pill shows "what it's hearing right now",
-    /// the Assistant window keeps the full record.
-    private func tail(of transcript: String, words: Int = 9) -> String {
-        let parts = transcript.split(separator: " ")
-        guard parts.count > words else { return transcript }
-        return "…" + parts.suffix(words).joined(separator: " ")
+    /// The line the pill streams. Listening and speaking are the same shape —
+    /// words arriving one at a time — which is the point: the user sees the
+    /// assistant talk exactly the way they see it listen.
+    private var transcript: String {
+        switch controller.phase {
+        case .listening, .answering:
+            controller.liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .speaking:
+            controller.spokenSoFar.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .thinking, .idle:
+            ""
+        }
+    }
+
+    private var placeholder: String {
+        switch controller.phase {
+        case .listening: "Listening…"
+        case .answering: "Yes or no?"
+        case .thinking: "Thinking…"
+        case .speaking: "Speaking…"
+        case .idle: ""
+        }
     }
 }
 
-/// Five bars that breathe with the microphone while listening, and settle
-/// into a slow synchronized pulse while the assistant works.
+/// The transcript, revealed a word at a time and scrolled to keep the newest
+/// word in view.
+///
+/// Replaces a static "…last nine words", which showed a finished sentence with
+/// an ellipsis bolted on and looked identical whether the assistant was
+/// mid-word or done. The scroll is programmatic only — the panel ignores mouse
+/// events, so there is nothing for a user to drag.
+private struct StreamingTranscript: View {
+    var text: String
+    var placeholder: String
+
+    /// A trailing anchor rather than the last word: scrolling to the word
+    /// itself would stop as soon as it fit, leaving the tail hard against the
+    /// edge mid-animation.
+    private static let tailID = "tail"
+
+    private var words: [(id: Int, text: String)] {
+        // Any whitespace, not just spaces: a recognizer's partial results and a
+        // narration line can both carry a newline, and one long "word" the
+        // width of the pill would freeze the scroll.
+        text.split(whereSeparator: \.isWhitespace)
+            .enumerated().map { ($0.offset, String($0.element)) }
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    if words.isEmpty {
+                        Text(placeholder)
+                    } else {
+                        ForEach(words, id: \.id) { word in
+                            Text(word.text).transition(.opacity)
+                        }
+                    }
+                    Color.clear.frame(width: 1, height: 1).id(Self.tailID)
+                }
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .animation(.easeOut(duration: 0.18), value: text)
+            }
+            // No `scrollDisabled`: the panel already ignores mouse events, so
+            // there is no gesture to suppress — and the modifier has a habit of
+            // taking `scrollTo` down with it.
+            .frame(height: 18)
+            .onChange(of: text) { _, _ in
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo(Self.tailID, anchor: .trailing)
+                }
+            }
+        }
+    }
+}
+
+/// "esc" as a key cap, shown only while there is a turn or an utterance to
+/// stop — an affordance the user can't otherwise discover, since the pill is
+/// the only thing on screen.
+private struct InterruptHint: View {
+    var body: some View {
+        Text("esc")
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.primary.opacity(0.08)))
+            .overlay(Capsule().stroke(Color.primary.opacity(0.10), lineWidth: 1))
+            .transition(.opacity)
+    }
+}
+
+/// Five bars that breathe with the microphone while listening, ride a steady
+/// wave while the assistant speaks, and settle into a slow pulse while it
+/// works.
 private struct WaveformBars: View {
-    /// 0…1 microphone loudness, or nil when not listening (thinking pulse).
-    var level: Double?
+    enum Mode: Equatable {
+        /// 0…1 microphone loudness.
+        case listening(Double)
+        case thinking
+        case speaking
+    }
+
+    var mode: Mode
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
@@ -176,15 +258,22 @@ private struct WaveformBars: View {
     }
 
     private func height(bar index: Int, time: TimeInterval) -> CGFloat {
-        if let level {
+        switch mode {
+        case .listening(let level):
             // Each bar rides its own phase of the same wave; loudness scales
             // the whole figure so silence reads as a flat quiet line.
             let wave = sin(time * 9 + Double(index) * 1.7) * 0.5 + 0.5
             let energy = 0.15 + min(max(level, 0), 1) * 0.85
             return 4 + CGFloat(wave * energy) * 16
+        case .speaking:
+            // No output meter to ride, so a steady mid-tempo wave stands in:
+            // busier than thinking, calmer than a voice hitting the mic.
+            let wave = sin(time * 6 + Double(index) * 1.3) * 0.5 + 0.5
+            return 4 + CGFloat(wave) * 11
+        case .thinking:
+            // One slow, gentle swell — alive, but clearly not hearing.
+            let swell = sin(time * 2.4 + Double(index) * 0.35) * 0.5 + 0.5
+            return 4 + CGFloat(swell) * 5
         }
-        // Thinking: one slow, gentle swell — alive, but clearly not hearing.
-        let swell = sin(time * 2.4 + Double(index) * 0.35) * 0.5 + 0.5
-        return 4 + CGFloat(swell) * 5
     }
 }

@@ -143,6 +143,7 @@ struct ProtocolBoundaryTests {
             )),
             .switchChatHarness(workspaceID, chatID, harness: .claudeCode, model: "opus"),
             .setChatModel(workspaceID, chatID, model: "sonnet"),
+            .setChatEffort(workspaceID, chatID, .high),
             .renameChat(workspaceID, chatID, title: "Broken Symmetry", userInitiated: true),
             .setChatDraft(workspaceID, chatID, text: "draft"),
             .resolveChatPermission(workspaceID, chatID, "permission", .allow),
@@ -179,6 +180,44 @@ struct ProtocolBoundaryTests {
         #expect(models.first?.id == "gpt-example")
         #expect(models.first?.supportedReasoningEfforts == ["low", "high"])
         #expect(models.first?.supportedServiceTiers == ["fast"])
+    }
+
+    @Test func discoveredModelsWinOverStaleCuratedFallbacks() {
+        let curated = [
+            AgentModel(
+                id: "gpt-5.5",
+                displayName: "GPT-5.5",
+                isDefault: true,
+                // Stale: older ORE builds advertised max, which Codex rejects.
+                supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+                supportedServiceTiers: ["fast"]
+            ),
+            AgentModel(
+                id: "gpt-5.6-sol",
+                displayName: "GPT-5.6 Sol",
+                supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"]
+            ),
+        ]
+        let discovered = [
+            AgentModel(
+                id: "gpt-5.5",
+                displayName: "GPT-5.5",
+                isDefault: true,
+                supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+                supportedServiceTiers: ["priority"]
+            ),
+        ]
+
+        let merged = AgentModelCatalog.merge(curated: curated, discovered: discovered)
+        #expect(merged.map(\.id) == ["gpt-5.5", "gpt-5.6-sol"])
+        #expect(merged.first?.supportedReasoningEfforts == ["low", "medium", "high", "xhigh"])
+        #expect(merged.first?.supportedServiceTiers == ["priority"])
+        #expect(!merged.first!.supportedReasoningEfforts.contains("max"))
+    }
+
+    @Test func emptyDiscoveryKeepsTheCuratedFallback() {
+        let curated = [AgentModel(id: "gpt-5.5", displayName: "GPT-5.5", isDefault: true)]
+        #expect(AgentModelCatalog.merge(curated: curated, discovered: []) == curated)
     }
 
     @Test func cursorAgentDoesNotAdvertiseReasoningEffort() {

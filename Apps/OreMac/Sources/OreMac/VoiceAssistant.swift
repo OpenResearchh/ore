@@ -23,6 +23,9 @@ final class VoiceAssistantController {
         /// A short open mic right after a narrated confirmation, so "yes"
         /// doesn't need another chord.
         case answering
+        /// TTS is playing — the HUD stays up so the user can see the assistant
+        /// speaking the same way they see it listening.
+        case speaking
     }
 
     private(set) var phase: Phase = .idle {
@@ -37,6 +40,10 @@ final class VoiceAssistantController {
     /// `@Observable` — so the HUD animates without any forwarding.
     var liveTranscript: String { voice.transcript }
     var audioLevel: Double { voice.audioLevel }
+    /// Tail of the utterance currently being spoken, for the HUD.
+    var spokenTail: String {
+        model?.narration.currentSpokenText ?? ""
+    }
 
     weak var model: AppModel?
 
@@ -148,8 +155,14 @@ final class VoiceAssistantController {
             if let chatID = model.assistantChatID {
                 let ack = if case .allow = decision { "Okay, going ahead." }
                     else { "Okay, I won't." }
-                model.narration.speakAssistant(ack, chatID: chatID)
+                speakKeepingHUD(ack, chatID: chatID)
             }
+            return
+        }
+
+        if let needs = model.tabNeedsYou.first,
+           let decision = Self.confirmationDecision(from: spoken) {
+            resolveNeedsYou(needs, decision: decision)
             return
         }
 
@@ -161,8 +174,7 @@ final class VoiceAssistantController {
         phase = .thinking
         model.send(spoken, to: assistant.id)
         if let chatID = model.assistantChatID {
-            // Instant feedback that the words landed; the real answer follows.
-            model.narration.speakAssistant("On it.", chatID: chatID)
+            speakKeepingHUD("On it.", chatID: chatID, resume: .thinking)
         }
         scheduleStillWorkingNudge()
     }
@@ -177,6 +189,11 @@ final class VoiceAssistantController {
                   let model = self.model, let chatID = model.assistantChatID
             else { return }
             model.narration.speakAssistant("Still on it — a moment.", chatID: chatID)
+            phase = .speaking
+            model.narration.notifyWhenQuiet { [weak self] in
+                guard let self, self.phase == .speaking, self.awaitingSpokenReply else { return }
+                self.phase = .thinking
+            }
         }
     }
 
@@ -198,22 +215,27 @@ final class VoiceAssistantController {
             lastMilestone = phrase
             lastMilestoneAt = Date()
             model.narration.speakAssistant(phrase, chatID: chatID, priority: .progress)
+            if phase == .thinking {
+                phase = .speaking
+                model.narration.notifyWhenQuiet { [weak self] in
+                    guard let self, self.phase == .speaking, self.awaitingSpokenReply else { return }
+                    self.phase = .thinking
+                }
+            }
 
         case .turnCompleted(let result):
             guard awaitingSpokenReply else { return }
             awaitingSpokenReply = false
             stillWorkingTask?.cancel()
-            if phase == .thinking { phase = .idle }
             let line = NarrationPhraser.spokenNarration(result.narration)
                 ?? "Done — the details are in the assistant window."
-            model.narration.speakAssistant(line, chatID: chatID)
+            speakKeepingHUD(line, chatID: chatID)
 
         case .sessionError(let error):
             guard awaitingSpokenReply else { return }
             awaitingSpokenReply = false
             stillWorkingTask?.cancel()
-            if phase == .thinking { phase = .idle }
-            model.narration.speakAssistant(
+            speakKeepingHUD(
                 "Something went wrong: \(error.message)", chatID: chatID
             )
 
@@ -237,17 +259,50 @@ final class VoiceAssistantController {
                 + "task, or no.",
             chatID: chatID
         )
-        // Only once the question has actually finished playing: opening the
-        // mic ducks narration, which would cut the question off mid-word.
+        phase = .speaking
         model.narration.notifyWhenQuiet { [weak self] in
             self?.openAnswerWindow(for: confirmation.id)
+        }
+    }
+
+    func needsYouArrived(_ item: TabNeedsYou) {
+        guard let model, let chatID = model.assistantChatID else { return }
+        let recentVoice = lastVoiceInteraction.map {
+            Date().timeIntervalSince($0) < Self.voiceSessionWindow
+        } ?? false
+        guard awaitingSpokenReply || recentVoice || !NSApp.isActive else { return }
+        lastVoiceInteraction = Date()
+        let offer = " Yes to allow, no to deny, or always to auto-allow this tab."
+        model.narration.speakAssistant(
+            "Quick check — \(item.spokenSummary)\(offer)",
+            chatID: chatID
+        )
+        phase = .speaking
+        model.narration.notifyWhenQuiet { [weak self] in
+            self?.openNeedsYouWindow(for: item.id)
+        }
+    }
+
+    /// Speak while keeping the HUD up as `.speaking`, then return to `resume`
+    /// (or idle) once TTS finishes.
+    private func speakKeepingHUD(
+        _ text: String,
+        chatID: ChatID,
+        resume: Phase = .idle
+    ) {
+        guard let model else { return }
+        model.narration.speakAssistant(text, chatID: chatID)
+        phase = .speaking
+        model.narration.notifyWhenQuiet { [weak self] in
+            guard let self, self.phase == .speaking else { return }
+            self.phase = self.awaitingSpokenReply ? .thinking : resume
         }
     }
 
     // MARK: - Hands-free answers
 
     private func openAnswerWindow(for confirmationID: String) {
-        guard let model, phase == .idle, !voice.isActive,
+        guard let model, (phase == .idle || phase == .speaking), !voice.isActive,
               model.assistantConfirmations.contains(where: { $0.id == confirmationID })
         else { return }
         voice.vocabulary = []
@@ -284,11 +339,95 @@ final class VoiceAssistantController {
                 if let chatID = model.assistantChatID {
                     let ack = if case .allow = settled { "Okay, going ahead." }
                         else { "Okay, I won't." }
-                    model.narration.speakAssistant(ack, chatID: chatID)
+                    self.speakKeepingHUD(ack, chatID: chatID)
                 }
                 return
             }
             self?.closeAnswerWindow()
+        }
+    }
+
+    private func openNeedsYouWindow(for itemID: String) {
+        guard let model, (phase == .idle || phase == .speaking), !voice.isActive,
+              model.tabNeedsYou.contains(where: { $0.id == itemID })
+        else { return }
+        voice.vocabulary = []
+        phase = .answering
+        model.narration.setMicActive(true)
+        voice.start()
+
+        answerWindowTask?.cancel()
+        answerWindowTask = Task { @MainActor [weak self] in
+            let deadline = ContinuousClock.now.advanced(by: Self.answerWindow)
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, self.phase == .answering, let model = self.model else { return }
+                guard let item = model.tabNeedsYou.first(where: { $0.id == itemID }) else {
+                    self.closeAnswerWindow()
+                    return
+                }
+                guard Self.confirmationDecision(from: self.voice.transcript) != nil else {
+                    continue
+                }
+                try? await Task.sleep(for: .milliseconds(700))
+                guard !Task.isCancelled, self.phase == .answering else { return }
+                let settled = Self.confirmationDecision(from: self.voice.transcript)
+                self.closeAnswerWindow()
+                guard let settled else { return }
+                self.lastVoiceInteraction = Date()
+                self.resolveNeedsYou(item, decision: settled)
+                return
+            }
+            self?.closeAnswerWindow()
+        }
+    }
+
+    private func resolveNeedsYou(
+        _ item: TabNeedsYou,
+        decision: AssistantConfirmationDecision
+    ) {
+        guard let model else { return }
+        phase = .idle
+        switch (item, decision) {
+        case (.permission(let payload), .allow(.always)):
+            model.autoAllowTab(
+                workspaceID: payload.workspaceID,
+                chatID: payload.chatID,
+                permissionID: payload.request.id
+            )
+        case (.permission(let payload), .allow):
+            model.resolvePermission(
+                payload.request.id, decision: .allow,
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        case (.permission(let payload), .deny):
+            model.resolvePermission(
+                payload.request.id,
+                decision: .deny(reason: "The user denied this by voice."),
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        case (.question(let payload), .deny):
+            model.answerQuestion(
+                payload.question.id,
+                answer: "The user declined to answer.",
+                for: payload.workspaceID,
+                chatID: payload.chatID
+            )
+        case (.question(let payload), .allow):
+            let answer = payload.question.options.first?.label ?? "yes"
+            model.answerQuestion(
+                payload.question.id,
+                answer: answer,
+                for: payload.workspaceID,
+                chatID: payload.chatID
+            )
+        }
+        if let chatID = model.assistantChatID {
+            let ack: String
+            if case .deny = decision { ack = "Okay, I won't." }
+            else if case .allow(.always) = decision { ack = "Okay — auto-allowing that tab." }
+            else { ack = "Okay, going ahead." }
+            speakKeepingHUD(ack, chatID: chatID)
         }
     }
 
@@ -321,6 +460,11 @@ final class VoiceAssistantController {
         case "Push": "Pushing."
         case "CreatePullRequest": "Opening the pull request."
         case "ArchiveWorkspace": "Archiving."
+        case "GetAppState": "Checking what's on screen."
+        case "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort":
+            "Updating the tab."
+        case "ResolveChatPermission": "Handling the permission."
+        case "ListMemory", "ReadMemory", "WriteMemory": "Updating my notes."
         default: nil
         }
     }

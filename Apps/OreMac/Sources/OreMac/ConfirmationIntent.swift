@@ -36,7 +36,7 @@ enum ConfirmationIntent {
                 index += 1
                 continue
             }
-            if word == "always" {
+            if word == "always" || word == "auto" {
                 always = true
                 index += 1
                 continue
@@ -125,6 +125,7 @@ enum ConfirmationIntent {
     private static let fillers: Set<String> = [
         "um", "uh", "er", "ah", "hmm", "please", "just", "that", "this",
         "it", "the", "a", "to", "for", "me", "you", "and", "then",
+        "tab", "chat", "everything", "all",
     ]
 
     // MARK: - Tokenizing

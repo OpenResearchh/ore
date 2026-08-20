@@ -33,6 +33,10 @@ struct VoiceAssistantDecisionTests {
             VoiceAssistantController.confirmationDecision(from: "yes, always allow that")
                 == .allow(.always)
         )
+        #expect(
+            VoiceAssistantController.confirmationDecision(from: "auto allow this tab")
+                == .allow(.always)
+        )
         // "always" without an assent is not a confirmation.
         #expect(VoiceAssistantController.confirmationDecision(from: "I always want that") == nil)
     }

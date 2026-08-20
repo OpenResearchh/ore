@@ -1,4 +1,5 @@
 import Foundation
+import OreCore
 import OreGit
 import OrePersistence
 import OreProtocol
@@ -21,7 +22,8 @@ func runMCPServer(options: CommandLineOptions) async {
     let directory = options.workingDirectory
     let assistant = AssistantToolServer(
         enabled: options.flag("--assistant"),
-        databaseURL: options.databaseURL
+        databaseURL: options.databaseURL,
+        homeURL: directory
     )
     while let line = readLine() {
         guard let data = line.data(using: .utf8),
@@ -170,20 +172,26 @@ private func postDiffComment(arguments: [String: Any], directory: URL) -> String
 private final class AssistantToolServer {
     private let enabled: Bool
     private let databaseURL: URL
+    private let homeURL: URL
     private var store: OreStore?
 
     private static let readToolNames: Set<String> = [
         "ListWorkspaces", "ListChats", "WorkspaceStatus",
         "SearchTranscripts", "GetTranscriptTail",
+        "ListMemory", "ReadMemory", "WriteMemory",
     ]
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
+        "GetAppState", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
+        "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
+        "ResolveChatPermission", "AnswerChatQuestion",
     ]
 
-    init(enabled: Bool, databaseURL: URL) {
+    init(enabled: Bool, databaseURL: URL, homeURL: URL) {
         self.enabled = enabled
         self.databaseURL = databaseURL
+        self.homeURL = homeURL
     }
 
     func handles(_ name: String) -> Bool {
@@ -250,6 +258,33 @@ private final class AssistantToolServer {
                 ],
             ],
             [
+                "name": "ListMemory",
+                "description": "List your memory files (MEMORY.md index and memory/*.md). Call this or ReadMemory rather than guessing paths.",
+                "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "ReadMemory",
+                "description": "Read one memory file. Path must be MEMORY.md or memory/<file>.md.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": ["path": ["type": "string"]],
+                    "required": ["path"],
+                ],
+            ],
+            [
+                "name": "WriteMemory",
+                "description": "Write a memory file (replace or append) and keep MEMORY.md's index current. Path must be MEMORY.md or memory/<file>.md. Use this the same turn the user states a durable fact.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string"],
+                        "contents": ["type": "string"],
+                        "mode": ["type": "string", "description": "replace (default) or append"],
+                    ],
+                    "required": ["path", "contents"],
+                ],
+            ],
+            [
                 "name": "CreateWorkspace",
                 "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults.",
                 "inputSchema": [
@@ -260,6 +295,9 @@ private final class AssistantToolServer {
                         "prompt": ["type": "string", "description": "Initial task for the workspace's agent."],
                         "harness": ["type": "string", "description": "claude | codex | cursor — must be ready per ListHarnesses. Omit for the default."],
                         "model": ["type": "string", "description": "A model id from ListHarnesses for the chosen harness. Omit for its default."],
+                        "seed": ["type": "string", "description": "default | branch | workspace | issue | pr. Omit for the default branch."],
+                        "seedRef": ["type": "string", "description": "Branch name, parent workspace id, or GitHub issue/PR number — required for non-default seeds."],
+                        "branchPrefix": ["type": "string"],
                     ],
                 ],
             ],
@@ -272,6 +310,11 @@ private final class AssistantToolServer {
                         "workspaceID": ["type": "string"],
                         "title": ["type": "string"],
                         "prompt": ["type": "string"],
+                        "harness": ["type": "string"],
+                        "model": ["type": "string"],
+                        "permissionMode": ["type": "string", "description": "default | acceptEdits | plan | bypassPermissions"],
+                        "forkFrom": ["type": "string", "description": "Chat id to fork from."],
+                        "effort": ["type": "string", "description": "none | low | medium | high | xhigh | max | adaptive"],
                     ],
                     "required": ["workspaceID"],
                 ],
@@ -285,7 +328,8 @@ private final class AssistantToolServer {
                         "workspaceID": ["type": "string"],
                         "text": ["type": "string", "description": "A complete brief for the project agent, richer than the user's spoken request but inventing nothing."],
                         "chatID": ["type": "string", "description": "The tab already carrying this work (find it via ListChats + GetTranscriptTail); omit only for the workspace's main chat."],
-                        "effort": ["type": "string", "description": "Reasoning depth for this one turn: low | medium | high. Reserve high for genuinely hard work."],
+                        "effort": ["type": "string", "description": "Reasoning depth for this one turn: none | low | medium | high | xhigh | max | adaptive."],
+                        "serviceTier": ["type": "string", "description": "Optional processing tier, e.g. fast for Codex."],
                     ],
                     "required": ["workspaceID", "text"],
                 ],
@@ -294,6 +338,142 @@ private final class AssistantToolServer {
                 "name": "ListHarnesses",
                 "description": "Which agent CLIs are installed, signed in, and what models each offers. Consult before choosing a harness/model for CreateWorkspace, or when a provider seems rate-limited or broken.",
                 "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "GetAppState",
+                "description": "Live app state: focused workspace and tab, open tabs with harness/model/mode/effort/status, git dirt, and anything waiting on the user. Prefer the hidden snapshot on each turn; call this to refresh.",
+                "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "SetChatModel",
+                "description": "Change the model on a chat tab. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "model": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "SwitchChatHarness",
+                "description": "Switch a chat tab to a different agent CLI (and optional model). Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "harness": ["type": "string"],
+                        "model": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID", "harness"],
+                ],
+            ],
+            [
+                "name": "SetChatPermissionMode",
+                "description": "Set a tab's permission mode: default (Ask), acceptEdits, plan, or bypassPermissions (auto-allow everything). Bypass is confirmed with the user.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "mode": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID", "mode"],
+                ],
+            ],
+            [
+                "name": "SetChatEffort",
+                "description": "Persist the reasoning-effort chip for a tab so later sends use it. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "effort": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "RenameChat",
+                "description": "Rename a chat tab. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "title": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID", "title"],
+                ],
+            ],
+            [
+                "name": "CloseChat",
+                "description": "Close a chat tab (reopenable). Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "ReopenChat",
+                "description": "Reopen a closed chat tab. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "InterruptChatTurn",
+                "description": "Stop the in-flight turn on a tab. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "ResolveChatPermission",
+                "description": "Allow or deny a project tab's pending tool permission. Confirmed unless the tab already has auto-allow. Pass allow=true/false.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "permissionID": ["type": "string"],
+                        "allow": ["type": "boolean"],
+                        "reason": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID", "permissionID"],
+                ],
+            ],
+            [
+                "name": "AnswerChatQuestion",
+                "description": "Answer a project tab's pending question. Runs without confirmation — only use when the user told you the answer.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "questionID": ["type": "string"],
+                        "answer": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID", "questionID", "answer"],
+                ],
             ],
             [
                 "name": "OpenWorkspace",
@@ -338,6 +518,7 @@ private final class AssistantToolServer {
                         "title": ["type": "string"],
                         "body": ["type": "string"],
                         "draft": ["type": "boolean"],
+                        "base": ["type": "string", "description": "Base branch. Omit for the workspace default."],
                     ],
                     "required": ["workspaceID", "title"],
                 ],
@@ -501,6 +682,8 @@ private final class AssistantToolServer {
                     "hasUnread": chat.hasUnread,
                 ]
                 entry["model"] = chat.model
+                entry["permissionMode"] = chat.permissionMode
+                entry["reasoningEffort"] = chat.reasoningEffort
                 entry["lastActivityAt"] = chat.lastActivityAt.map(iso)
                 return entry
             })
@@ -570,6 +753,26 @@ private final class AssistantToolServer {
             }
             return try await store.handoffContext(chatID: chatID)
                 ?? "That chat has no turns yet."
+
+        case "ListMemory":
+            return AssistantMemory.listingText(home: homeURL)
+
+        case "ReadMemory":
+            guard let path = arguments["path"] as? String, !path.isEmpty else {
+                return "ReadMemory needs a path (MEMORY.md or memory/<file>.md)."
+            }
+            return try AssistantMemory.read(home: homeURL, path: path)
+
+        case "WriteMemory":
+            guard let path = arguments["path"] as? String, !path.isEmpty else {
+                return "WriteMemory needs a path."
+            }
+            guard let contents = arguments["contents"] as? String else {
+                return "WriteMemory needs contents."
+            }
+            let append = (arguments["mode"] as? String)?.lowercased() == "append"
+            try AssistantMemory.write(home: homeURL, path: path, contents: contents, append: append)
+            return append ? "Appended \(path)." : "Wrote \(path)."
 
         default:
             return "Unknown assistant tool: \(name)"

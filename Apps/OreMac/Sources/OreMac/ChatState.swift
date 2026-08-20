@@ -389,17 +389,22 @@ final class ChatState {
     func appendUserMessage(
         _ text: String,
         attachments: [Attachment] = [],
-        comments: [DiffCommentReference]
+        comments: [DiffCommentReference],
+        origin: MessageOrigin = .user,
+        submissionID: String = UUID().uuidString,
+        isQueued: Bool? = nil
     ) {
         // The engine queues whenever a turn is open, so predicting the same
-        // thing here is what keeps the row the user sees honest.
-        let willQueue = willQueueNextMessage
+        // thing here is what keeps the row the user sees honest. A prompt the
+        // engine already ruled on brings its own answer and skips the guess.
+        let willQueue = isQueued ?? willQueueNextMessage
         rows.append(TranscriptRow(
-            id: "user-\(UUID().uuidString)",
+            id: Self.promptRowID(submissionID),
             turnID: currentTurnID ?? TurnID(rawValue: "pending"),
             kind: .userMessage,
             text: text,
             isQueued: willQueue,
+            origin: origin,
             attachedComments: comments,
             attachments: attachments
         ))
@@ -423,6 +428,31 @@ final class ChatState {
         // its own awaits: a second message typed in the gap before `.turnStarted`
         // must be judged against this turn, not the absence of one.
         isTurnActive = true
+    }
+
+    /// Row identity for a prompt, shared by the optimistic draw and the engine's
+    /// echo of the same submission. Matching on it is what lets the transcript
+    /// accept prompts from anywhere without ever showing one twice.
+    static func promptRowID(_ submissionID: String) -> String { "prompt-\(submissionID)" }
+
+    /// A prompt the engine accepted, which this window may or may not have sent.
+    ///
+    /// The composer draws its own message the instant the user presses send, so
+    /// the echo of that submission is dropped here. What survives is everything
+    /// the window could not have known about — the assistant's prompts, and the
+    /// opening prompt of a workspace created from a sheet — which is exactly
+    /// the set that used to leave a tab working on something invisible.
+    func applyPromptSubmission(_ submission: PromptSubmission) {
+        let id = Self.promptRowID(submission.submissionID)
+        guard !rows.contains(where: { $0.id == id }) else { return }
+        appendUserMessage(
+            submission.text,
+            attachments: submission.attachments,
+            comments: [],
+            origin: submission.origin,
+            submissionID: submission.submissionID,
+            isQueued: submission.isQueued
+        )
     }
 
     /// A queued row becomes a real one when the turn it was waiting for starts.
@@ -645,6 +675,11 @@ struct TranscriptRow: Identifiable, Sendable {
     /// queue behind an open turn. Drawn as pending, and cleared when a turn
     /// starts and claims it.
     var isQueued = false
+    /// Who asked for this, on `.userMessage` rows. A prompt the assistant sent
+    /// on the user's behalf is drawn on the same side of the transcript — it is
+    /// still a prompt — but labelled, so scrolling back never leaves the user
+    /// wondering which of these they wrote.
+    var origin: MessageOrigin = .user
     var toolName: String?
     var toolCallID: ToolCallID?
     /// The subagent (Task) tool call this row belongs to, when it was produced

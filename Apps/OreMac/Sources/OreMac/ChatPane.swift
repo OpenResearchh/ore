@@ -454,15 +454,21 @@ struct ChatPane: View {
         }
         .task(id: chatSummary?.id) {
             let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
-            if let raw = UserDefaults.standard.string(forKey: key),
+            if let stored = chatSummary?.reasoningEffort {
+                reasoningEffort = stored
+            } else if let raw = UserDefaults.standard.string(forKey: key),
                let effort = ReasoningEffort(rawValue: raw) { reasoningEffort = effort }
             if let tab = chatSummary { clampEffort(to: tab) }
             let fastKey = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
             fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
         }
         .onChange(of: reasoningEffort) { _, effort in
-            let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
-            UserDefaults.standard.set(effort.rawValue, forKey: key)
+            persistEffort(effort)
+        }
+        .task(id: chatSummary?.reasoningEffort) {
+            if let effort = chatSummary?.reasoningEffort, effort != reasoningEffort {
+                reasoningEffort = effort
+            }
         }
         .onChange(of: fastModeEnabled) { _, enabled in
             let key = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
@@ -470,13 +476,7 @@ struct ChatPane: View {
         }
         .task(id: workspace.id) {
             workspaceFileIndex = Self.flattenFiles(await model.workspaceFiles(for: workspace))
-            // Pre-tokenized once here, not on every partial transcript: spoken
-            // file matching runs 5×/second while dictating.
-            voiceFileMatcher = VoiceFileMatcher(
-                files: workspaceFileIndex
-                    .filter { !$0.isDirectory }
-                    .map { (name: $0.name, path: $0.path) }
-            )
+            voiceFileMatcher = makeVoiceFileMatcher()
         }
         .confirmationDialog(
             "Revert chat and workspace?",
@@ -1100,8 +1100,15 @@ struct ChatPane: View {
     private func supportsFastMode(_ tab: ChatSummary) -> Bool {
         guard tab.harness == .codex else { return false }
         let choices = model.knownModels(for: tab.harness)
-        let selected = tab.model.flatMap { id in choices.first { $0.id == id } }
-            ?? choices.first(where: \.isDefault)
+        // Same rule as effort: an unknown/remapped model id must not inherit
+        // the default model's tiers.
+        let selected: AgentModel?
+        if let id = tab.model {
+            selected = choices.first { $0.id == id }
+            if selected == nil { return false }
+        } else {
+            selected = choices.first(where: \.isDefault) ?? choices.first
+        }
         return selected?.supportedServiceTiers.contains("fast") == true
     }
 
@@ -1353,8 +1360,17 @@ struct ChatPane: View {
         let kind = harness ?? tab.harness
         guard kind.supportsReasoningEffort else { return [] }
         let choices = model.knownModels(for: kind)
-        let selected = (modelID ?? tab.model).flatMap { id in choices.first { $0.id == id } }
-            ?? choices.first(where: \.isDefault)
+        let requestedID = modelID ?? tab.model
+        let selected: AgentModel?
+        if let requestedID {
+            selected = choices.first { $0.id == requestedID }
+            // An unknown id (provider remaps like `gpt-5.5-codex-…`) must not
+            // inherit the default model's ladder — that is how Max was sent to
+            // a model that only accepts none…xhigh.
+            if selected == nil { return [] }
+        } else {
+            selected = choices.first(where: \.isDefault) ?? choices.first
+        }
         let advertised = Set(selected?.supportedReasoningEfforts ?? [])
         guard !advertised.isEmpty else { return [] }
         return ReasoningEffort.allCases.filter { advertised.contains($0.rawValue) }
@@ -1378,6 +1394,22 @@ struct ChatPane: View {
         guard !efforts.isEmpty else { return }
         if efforts.contains(reasoningEffort) { return }
         reasoningEffort = preferredEffort(in: efforts)
+    }
+
+    private func persistEffort(_ effort: ReasoningEffort) {
+        let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
+        UserDefaults.standard.set(effort.rawValue, forKey: key)
+        if let tab = chatSummary, tab.reasoningEffort != effort {
+            model.setEffort(effort, for: tab)
+        }
+    }
+
+    private func makeVoiceFileMatcher() -> VoiceFileMatcher {
+        VoiceFileMatcher(
+            files: workspaceFileIndex
+                .filter { !$0.isDirectory }
+                .map { (name: $0.name, path: $0.path) }
+        )
     }
 
     private func preferredEffort(in efforts: [ReasoningEffort]) -> ReasoningEffort {
@@ -3775,7 +3807,7 @@ private struct TranscriptHost: View, Equatable {
         _ = chat.plan
         return TranscriptDisplay.rows(
             from: chat.rows,
-            isBusy: chat.isBusy,
+            keepLiveTurnExpanded: chat.isTurnActive,
             expanded: expandedActivityGroups,
             memo: memo,
             hidingPlanTurnID: {

@@ -16,15 +16,27 @@ enum AssistantActionPolicy {
         case deny(String)
     }
 
-    static func tier(forTool tool: String) -> Tier {
+    static func tier(forTool tool: String, arguments: JSONValue = .null) -> Tier {
         switch tool {
         // Reversible, contained, and usually the very thing the user just
         // asked for. Prompting on these is how an assistant becomes paperwork.
-        // ListHarnesses is a pure read that happens to need the app process —
-        // probe results and rate limits live there, not in the database.
+        // ListHarnesses / GetAppState are pure reads that happen to need the
+        // app process. Memory writes stay in the MCP process.
         case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
-             "ListHarnesses":
+             "ListHarnesses", "GetAppState",
+             "SetChatModel", "SwitchChatHarness", "SetChatEffort",
+             "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
+             "AnswerChatQuestion":
             return .auto
+
+        case "SetChatPermissionMode":
+            if arguments["mode"]?.stringValue == PermissionMode.bypassPermissions.rawValue {
+                return .confirm(.autoAllowTab)
+            }
+            return .auto
+
+        case "ResolveChatPermission":
+            return .confirm(.autoAllowTab)
 
         // Consequential: they publish or remove things. Confirm — once.
         case "Commit": return .confirm(.commit)
@@ -40,6 +52,9 @@ enum AssistantActionPolicy {
     static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
+        "GetAppState", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
+        "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
+        "ResolveChatPermission", "AnswerChatQuestion",
     ]
 
     /// How long a "for this task" grant lasts, sliding on use. Long enough to
@@ -94,7 +109,7 @@ extension InProcessCoreClient {
     func handleAssistantRequest(_ request: AssistantBridgeRequest) async -> AssistantBridgeResponse {
         let summary = await assistantActionSummary(request)
 
-        switch AssistantActionPolicy.tier(forTool: request.tool) {
+        switch AssistantActionPolicy.tier(forTool: request.tool, arguments: request.arguments) {
         case .deny(let reason):
             await audit(request, summary: summary, decision: "denied")
             return AssistantBridgeResponse(id: request.id, ok: false, error: reason)
@@ -104,7 +119,9 @@ extension InProcessCoreClient {
 
         case .confirm(let actionClass):
             if let standing = await standingGrant(
-                for: actionClass, workspaceID: requestWorkspaceID(request)
+                for: actionClass,
+                workspaceID: requestWorkspaceID(request),
+                chatID: requestChatID(request)
             ) {
                 return await performAudited(request, summary: summary, decision: standing)
             }
@@ -113,6 +130,7 @@ extension InProcessCoreClient {
                 id: request.id,
                 actionClass: actionClass,
                 workspaceID: requestWorkspaceID(request),
+                chatID: requestChatID(request),
                 summary: summary
             )))
             let resolution = await awaitAssistantResolution(id: request.id)
@@ -121,7 +139,10 @@ extension InProcessCoreClient {
             switch resolution {
             case .allowed(let scope):
                 await applyAssistantGrant(
-                    scope, to: actionClass, workspaceID: requestWorkspaceID(request)
+                    scope,
+                    to: actionClass,
+                    workspaceID: requestWorkspaceID(request),
+                    chatID: requestChatID(request)
                 )
                 return await performAudited(
                     request, summary: summary, decision: "allowed:\(scope.rawValue)"
@@ -150,13 +171,20 @@ extension InProcessCoreClient {
     /// for this workspace (which slides on use) or a persistent "always allow".
     private func standingGrant(
         for actionClass: AssistantActionClass,
-        workspaceID: WorkspaceID?
+        workspaceID: WorkspaceID?,
+        chatID: ChatID? = nil
     ) async -> String? {
-        let key = AssistantTaskGrantKey(actionClass: actionClass, workspaceID: workspaceID)
+        let key = AssistantTaskGrantKey(
+            actionClass: actionClass, workspaceID: workspaceID, chatID: chatID
+        )
         if let expiry = assistantTaskGrants[key], expiry > Date() {
             assistantTaskGrants[key] = Date()
                 .addingTimeInterval(AssistantActionPolicy.taskGrantWindow)
             return "granted:task"
+        }
+        if actionClass == .autoAllowTab, let chatID,
+           ((try? await store.hasAssistantTabGrant(chatID)) ?? false) {
+            return "granted:always"
         }
         if assistantAlwaysGrants.contains(actionClass) {
             return "granted:always"
@@ -171,24 +199,36 @@ extension InProcessCoreClient {
     private func applyAssistantGrant(
         _ scope: AssistantGrantScope,
         to actionClass: AssistantActionClass,
-        workspaceID: WorkspaceID?
+        workspaceID: WorkspaceID?,
+        chatID: ChatID? = nil
     ) async {
         switch scope {
         case .once:
             break
         case .task:
             assistantTaskGrants[AssistantTaskGrantKey(
-                actionClass: actionClass, workspaceID: workspaceID
+                actionClass: actionClass, workspaceID: workspaceID, chatID: chatID
             )] = Date().addingTimeInterval(AssistantActionPolicy.taskGrantWindow)
         case .always:
-            assistantAlwaysGrants.insert(actionClass)
-            do {
-                try await store.saveAssistantGrant(actionClass.rawValue)
-            } catch {
-                continuation.yield(.commandFailed(CommandFailure(
-                    message: "Could not remember the always-allow grant.",
-                    detail: String(describing: error)
-                )))
+            if actionClass == .autoAllowTab, let chatID {
+                do {
+                    try await store.saveAssistantTabGrant(chatID)
+                } catch {
+                    continuation.yield(.commandFailed(CommandFailure(
+                        message: "Could not remember the tab auto-allow.",
+                        detail: String(describing: error)
+                    )))
+                }
+            } else {
+                assistantAlwaysGrants.insert(actionClass)
+                do {
+                    try await store.saveAssistantGrant(actionClass.rawValue)
+                } catch {
+                    continuation.yield(.commandFailed(CommandFailure(
+                        message: "Could not remember the always-allow grant.",
+                        detail: String(describing: error)
+                    )))
+                }
             }
         }
     }
@@ -247,9 +287,12 @@ extension InProcessCoreClient {
             let record = try await createWorkspace(CreateWorkspaceRequest(
                 repositoryPath: repository.path,
                 name: arguments["name"]?.stringValue ?? "",
+                seed: try resolveSeed(arguments),
                 harness: harness ?? .claudeCode,
                 model: arguments["model"]?.stringValue,
-                initialPrompt: arguments["prompt"]?.stringValue
+                initialPrompt: arguments["prompt"]?.stringValue,
+                promptOrigin: .agent,
+                branchPrefix: arguments["branchPrefix"]?.stringValue
             ))
             return "Created workspace \"\(record.name)\" (id \(record.id)) "
                 + "on branch \(record.branch) in \(repository.name)."
@@ -258,14 +301,23 @@ extension InProcessCoreClient {
 
         case "CreateChat":
             let workspaceID = try requireWorkspace(arguments)
+            let harness = try resolveHarness(arguments["harness"]?.stringValue)
+            let mode = arguments["permissionMode"]?.stringValue
+                .flatMap(PermissionMode.init(rawValue:)) ?? .default
             let chat = try await engine(for: workspaceID).createChat(CreateChatRequest(
                 workspaceID: workspaceID,
-                title: arguments["title"]?.stringValue
+                title: arguments["title"]?.stringValue,
+                harness: harness,
+                model: arguments["model"]?.stringValue,
+                permissionMode: mode,
+                forkFrom: arguments["forkFrom"]?.stringValue.map(ChatID.init(rawValue:)),
+                reasoningEffort: arguments["effort"]?.stringValue
+                    .flatMap(ReasoningEffort.init(rawValue:))
             ))
             continuation.yield(.chatAdded(chat))
             if let prompt = arguments["prompt"]?.stringValue, !prompt.isEmpty {
                 _ = try await engine(for: workspaceID).send(SendMessageRequest(
-                    workspaceID: workspaceID, chatID: chat.id, text: prompt
+                    workspaceID: workspaceID, chatID: chat.id, text: prompt, origin: .agent
                 ))
             }
             return "Created chat \"\(chat.title)\" (id \(chat.id.rawValue))."
@@ -282,7 +334,9 @@ extension InProcessCoreClient {
                 workspaceID: workspaceID,
                 chatID: chatID,
                 text: text,
-                reasoningEffort: effort
+                reasoningEffort: effort,
+                serviceTier: arguments["serviceTier"]?.stringValue,
+                origin: .agent
             ))
             return sent
                 ? "Sent. The project's agent is working on it."
@@ -290,6 +344,118 @@ extension InProcessCoreClient {
 
         case "ListHarnesses":
             return harnessCatalogText()
+
+        case "GetAppState":
+            return await assistantAppStateText()
+
+        case "SetChatModel":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            let chat = try await engine(for: workspaceID).setModel(
+                chatID: chatID, model: arguments["model"]?.stringValue
+            )
+            return "Model on \"\(chat.title)\" is now \(chat.model ?? "the default")."
+
+        case "SwitchChatHarness":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            let harness = try resolveHarness(arguments["harness"]?.stringValue)
+            guard let harness else {
+                throw AssistantActionError.badRequest("SwitchChatHarness needs a harness.")
+            }
+            let chat = try await engine(for: workspaceID).switchHarness(
+                chatID: chatID, harness: harness, model: arguments["model"]?.stringValue
+            )
+            return "\"\(chat.title)\" is on \(chat.harness.displayName)"
+                + (chat.model.map { " / \($0)" } ?? "") + "."
+
+        case "SetChatPermissionMode":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            guard let raw = arguments["mode"]?.stringValue,
+                  let mode = PermissionMode(rawValue: raw)
+            else {
+                throw AssistantActionError.badRequest(
+                    "mode must be default, acceptEdits, plan, or bypassPermissions."
+                )
+            }
+            try await engine(for: workspaceID).setPermissionMode(mode, chatID: chatID)
+            if mode == .bypassPermissions {
+                try? await store.saveAssistantTabGrant(chatID)
+            }
+            return "Permission mode on that tab is now \(mode.displayName)."
+
+        case "SetChatEffort":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            let effort = arguments["effort"]?.stringValue
+                .flatMap(ReasoningEffort.init(rawValue:))
+            let chat = try await engine(for: workspaceID).setEffort(chatID: chatID, effort: effort)
+            return "Effort on \"\(chat.title)\" is now "
+                + (effort?.displayName ?? "the default") + "."
+
+        case "RenameChat":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            guard let title = arguments["title"]?.stringValue, !title.isEmpty else {
+                throw AssistantActionError.badRequest("RenameChat needs a title.")
+            }
+            let chat = try await engine(for: workspaceID).renameChat(
+                chatID, title: title, userInitiated: true
+            )
+            return "Renamed the tab to \"\(chat.title)\"."
+
+        case "CloseChat":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            let chat = try await engine(for: workspaceID).closeChat(chatID)
+            return "Closed \"\(chat.title)\"."
+
+        case "ReopenChat":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            let chat = try await engine(for: workspaceID).closeChat(chatID, closed: false)
+            return "Reopened \"\(chat.title)\"."
+
+        case "InterruptChatTurn":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            try await engine(for: workspaceID).interrupt(chatID: chatID)
+            return "Interrupted the turn."
+
+        case "ResolveChatPermission":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            guard let rawID = arguments["permissionID"]?.stringValue, !rawID.isEmpty else {
+                throw AssistantActionError.badRequest("ResolveChatPermission needs permissionID.")
+            }
+            let allowed = arguments["allow"]?.boolValue ?? true
+            let decision: PermissionDecision = allowed
+                ? .allow
+                : .deny(reason: arguments["reason"]?.stringValue
+                    ?? "The user denied this via the assistant.")
+            try await engine(for: workspaceID).resolvePermission(
+                PermissionRequestID(rawValue: rawID), with: decision, chatID: chatID
+            )
+            if allowed, (try? await store.hasAssistantTabGrant(chatID)) == true {
+                try? await engine(for: workspaceID)
+                    .setPermissionMode(.bypassPermissions, chatID: chatID)
+            }
+            return allowed ? "Allowed." : "Denied."
+
+        case "AnswerChatQuestion":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            guard let rawID = arguments["questionID"]?.stringValue, !rawID.isEmpty else {
+                throw AssistantActionError.badRequest("AnswerChatQuestion needs questionID.")
+            }
+            guard let answer = arguments["answer"]?.stringValue, !answer.isEmpty else {
+                throw AssistantActionError.badRequest("AnswerChatQuestion needs an answer.")
+            }
+            try await engine(for: workspaceID).answerQuestion(
+                QuestionID(rawValue: rawID), answer: answer, chatID: chatID
+            )
+            return "Answered."
 
         case "OpenWorkspace":
             let workspaceID = try requireWorkspace(arguments)
@@ -319,7 +485,7 @@ extension InProcessCoreClient {
                 workspaceID,
                 title: arguments["title"]?.stringValue ?? "",
                 body: arguments["body"]?.stringValue ?? "",
-                base: "",
+                base: arguments["base"]?.stringValue ?? "",
                 draft: arguments["draft"]?.boolValue ?? false
             )
             return "Opened pull request: \(url)"
@@ -343,6 +509,60 @@ extension InProcessCoreClient {
             )
         }
         return WorkspaceID(rawValue: raw)
+    }
+
+    private func requireChat(_ arguments: JSONValue) throws -> ChatID {
+        guard let raw = arguments["chatID"]?.stringValue, !raw.isEmpty else {
+            throw AssistantActionError.badRequest(
+                "chatID is required — get one from ListChats or the app-state snapshot."
+            )
+        }
+        return ChatID(rawValue: raw)
+    }
+
+    private func requestWorkspaceID(_ request: AssistantBridgeRequest) -> WorkspaceID? {
+        request.arguments["workspaceID"]?.stringValue.map(WorkspaceID.init(rawValue:))
+    }
+
+    private func requestChatID(_ request: AssistantBridgeRequest) -> ChatID? {
+        request.arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:))
+    }
+
+    private func resolveSeed(_ arguments: JSONValue) throws -> CreateWorkspaceRequest.Seed {
+        switch arguments["seed"]?.stringValue?.lowercased() {
+        case nil, "", "default", "defaultbranch":
+            return .defaultBranch
+        case "branch":
+            guard let name = arguments["seedRef"]?.stringValue, !name.isEmpty else {
+                throw AssistantActionError.badRequest("seed=branch needs seedRef as the branch name.")
+            }
+            return .branch(name)
+        case "workspace":
+            guard let raw = arguments["seedRef"]?.stringValue, !raw.isEmpty else {
+                throw AssistantActionError.badRequest(
+                    "seed=workspace needs seedRef as the parent workspace id."
+                )
+            }
+            return .workspace(WorkspaceID(rawValue: raw))
+        case "issue", "githubissue":
+            guard let number = arguments["seedRef"]?.stringValue.flatMap(Int.init)
+                    ?? arguments["seedRef"]?.intValue
+            else {
+                throw AssistantActionError.badRequest("seed=issue needs seedRef as the issue number.")
+            }
+            return .githubIssue(number: number)
+        case "pr", "pull", "githubpullrequest":
+            guard let number = arguments["seedRef"]?.stringValue.flatMap(Int.init)
+                    ?? arguments["seedRef"]?.intValue
+            else {
+                throw AssistantActionError.badRequest("seed=pr needs seedRef as the PR number.")
+            }
+            return .githubPullRequest(number: number)
+        default:
+            throw AssistantActionError.badRequest(
+                "seed must be default, branch, workspace, issue, or pr."
+            )
+        }
     }
 
     /// Accepts a repository by name or path; with exactly one repository
@@ -370,10 +590,6 @@ extension InProcessCoreClient {
             "No repository named \"\(reference)\". Registered: "
                 + repositories.map(\.name).joined(separator: ", ")
         )
-    }
-
-    private func requestWorkspaceID(_ request: AssistantBridgeRequest) -> WorkspaceID? {
-        request.arguments["workspaceID"]?.stringValue.map(WorkspaceID.init(rawValue:))
     }
 
     /// A harness by name, but only if this machine can actually run it —
@@ -504,6 +720,21 @@ extension InProcessCoreClient {
         case "CreateChat": return "Open a new chat tab\(place)"
         case "SendPromptToProject": return "Send a prompt to the agent\(place)"
         case "OpenWorkspace": return "Show\(place.isEmpty ? " a workspace" : place) on screen"
+        case "GetAppState": return "Read the live app state"
+        case "SetChatModel": return "Change the model\(place)"
+        case "SwitchChatHarness": return "Switch the harness\(place)"
+        case "SetChatPermissionMode":
+            if request.arguments["mode"]?.stringValue == PermissionMode.bypassPermissions.rawValue {
+                return "Auto-allow everything this tab asks\(place)"
+            }
+            return "Change the permission mode\(place)"
+        case "SetChatEffort": return "Change reasoning effort\(place)"
+        case "RenameChat": return "Rename a chat tab\(place)"
+        case "CloseChat": return "Close a chat tab\(place)"
+        case "ReopenChat": return "Reopen a chat tab\(place)"
+        case "InterruptChatTurn": return "Stop the agent\(place)"
+        case "ResolveChatPermission": return "Allow or deny a tool\(place)"
+        case "AnswerChatQuestion": return "Answer a question\(place)"
         case "Commit": return "Commit changes\(place)"
         case "Push": return "Push the branch\(place)"
         case "CreatePullRequest": return "Open a pull request\(place)"
@@ -538,8 +769,23 @@ extension InProcessCoreClient {
         try await store.assistantGrants()
     }
 
+    public func assistantTabGrantIDs() async throws -> [ChatID] {
+        try await store.assistantTabGrants()
+    }
+
     public func revokeAssistantGrant(_ actionClass: String) async throws {
         try await store.deleteAssistantGrant(actionClass)
+        if let parsed = AssistantActionClass(rawValue: actionClass) {
+            assistantAlwaysGrants.remove(parsed)
+        }
+    }
+
+    public func revokeAssistantTabGrant(_ chatID: ChatID) async throws {
+        try await store.deleteAssistantTabGrant(chatID)
+    }
+
+    public func grantTabAutoAllow(_ chatID: ChatID) async throws {
+        try await store.saveAssistantTabGrant(chatID)
     }
 }
 
@@ -556,4 +802,5 @@ enum AssistantActionError: Error, CustomStringConvertible {
 struct AssistantTaskGrantKey: Hashable, Sendable {
     var actionClass: AssistantActionClass
     var workspaceID: WorkspaceID?
+    var chatID: ChatID?
 }

@@ -196,6 +196,10 @@ public actor InProcessCoreClient: CoreClient {
         case .setChatPermissionMode(let id, let chatID, let mode):
             try await engine(for: id).setPermissionMode(mode, chatID: chatID)
 
+        case .setChatEffort(let id, let chatID, let effort):
+            let chat = try await engine(for: id).setEffort(chatID: chatID, effort: effort)
+            continuation.yield(.chatUpdated(chat))
+
         case .resolvePermission(let id, let requestID, let decision):
             try await engine(for: id).resolvePermission(requestID, with: decision)
 
@@ -483,7 +487,10 @@ public actor InProcessCoreClient: CoreClient {
         }
         if let initialPrompt, !initialPrompt.isEmpty {
             _ = try? await engine.send(SendMessageRequest(
-                workspaceID: record.workspaceID, text: initialPrompt, queueIfBusy: false
+                workspaceID: record.workspaceID,
+                text: initialPrompt,
+                queueIfBusy: false,
+                origin: request.promptOrigin
             ))
         }
         return record
@@ -724,9 +731,9 @@ public actor InProcessCoreClient: CoreClient {
         )
         engines[record.workspaceID] = engine
 
-        // Each engine's two streams are tagged with the workspace and merged
-        // into one ordered feed, so the client has a single source of truth
-        // rather than N it has to reconcile.
+        // Each engine's streams are tagged with the workspace and merged into
+        // one ordered feed, so the client has a single source of truth rather
+        // than N it has to reconcile.
         let id = record.workspaceID
         let agentTask = Task { [weak self, continuation] in
             for await routed in engine.events {
@@ -746,7 +753,13 @@ public actor InProcessCoreClient: CoreClient {
                 continuation.yield(.chatUpdated(chat))
             }
         }
-        engineTasks[id] = [agentTask, summaryTask, chatTask]
+        let promptTask = Task { [weak self, continuation] in
+            for await routed in await engine.promptSubmissions() {
+                guard self != nil else { return }
+                continuation.yield(.promptSubmitted(id, routed.chatID, routed.submission))
+            }
+        }
+        engineTasks[id] = [agentTask, summaryTask, chatTask, promptTask]
 
         await engine.start()
         return engine
@@ -948,6 +961,55 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).setFocused(focused, chatID: chatID)
     }
 
+    /// Compact live fleet state for the assistant: focused tab, open chats,
+    /// chips, git dirt, and anything waiting on the user.
+    public func assistantAppStateText() async -> String {
+        var focusedLine = "focused: none"
+        var blocks: [String] = []
+        for (id, engine) in engines {
+            let summary = await engine.summary()
+            if summary.isAssistant { continue }
+            let chats = (try? await engine.chatSummaries(includeClosed: false)) ?? []
+            let focused = await engine.focusedChatIDValue()
+            if let focused {
+                let title = chats.first { $0.id == focused }?.title ?? focused.rawValue
+                focusedLine = "focused: \(summary.name) / \(title) "
+                    + "(workspaceID \(id.rawValue), chatID \(focused.rawValue))"
+            }
+            let git = await engine.gitStatusValue()
+            var lines: [String] = [
+                "workspace \(summary.name) (\(id.rawValue)) branch \(summary.branch) "
+                    + "status \(summary.status.rawValue)"
+                    + (git.hasUncommittedChanges
+                        ? " dirty \(git.changedFileCount) files"
+                        : "")
+            ]
+            for chat in chats {
+                var chip = "  tab \"\(chat.title)\" (\(chat.id.rawValue)) "
+                    + "\(chat.harness.rawValue)"
+                    + (chat.model.map { "/\($0)" } ?? "")
+                    + " mode=\(chat.permissionMode.rawValue)"
+                    + (chat.reasoningEffort.map { " effort=\($0.rawValue)" } ?? "")
+                    + " status=\(chat.status.rawValue)"
+                if chat.queuedMessageCount > 0 {
+                    chip += " queued=\(chat.queuedMessageCount)"
+                }
+                if focused == chat.id { chip += " [focused]" }
+                lines.append(chip)
+            }
+            for pending in await engine.pendingInput() {
+                lines.append(
+                    "  pending \(pending.kind) on \"\(pending.title)\": \(pending.summary)"
+                )
+            }
+            blocks.append(lines.joined(separator: "\n"))
+        }
+        if blocks.isEmpty {
+            return "[ORE app state]\n\(focusedLine)\nNo project workspaces."
+        }
+        return "[ORE app state]\n\(focusedLine)\n" + blocks.joined(separator: "\n")
+    }
+
     public func transcript(workspaceID: WorkspaceID) async throws -> [TurnRecord] {
         let engine = try await engine(for: workspaceID)
         guard let chat = try await engine.chatSummaries().first else { return [] }
@@ -1055,6 +1117,7 @@ private extension CoreCommand {
              .switchChatHarness(let id, _, _, _), .setChatModel(let id, _, _),
              .setChatDraft(let id, _, _), .interruptChatTurn(let id, _),
              .setChatPermissionMode(let id, _, _),
+             .setChatEffort(let id, _, _),
              .startChatSession(let id, _, _), .stopChatSession(let id, _):
             return id
         case .resolveChatPermission(let id, _, _, _),

@@ -15,6 +15,12 @@ public enum CoreEvent: Sendable, Codable {
     case chatUpdated(ChatSummary)
     case chatRemoved(WorkspaceID, ChatID)
     case chatsListed(WorkspaceID, [ChatSummary])
+    /// A prompt reached a chat. Emitted for every send, including the ones a
+    /// client never saw: the assistant's, and the opening prompt of a freshly
+    /// created workspace. Without it those prompts stay invisible until the
+    /// transcript is reloaded from disk, and a tab appears to be working on
+    /// nothing.
+    case promptSubmitted(WorkspaceID, ChatID, PromptSubmission)
     /// A harness event, tagged with both owners so concurrent tabs can never
     /// cross-attribute streamed output.
     case agent(WorkspaceID, ChatID, AgentEvent)
@@ -29,6 +35,37 @@ public enum CoreEvent: Sendable, Codable {
     case assistantConfirmationRequested(AssistantConfirmation)
     case assistantConfirmationResolved(String)
     case assistantUIAction(AssistantUIAction)
+}
+
+/// A prompt handed to a chat, described well enough for a client to draw it
+/// without having asked for it.
+public struct PromptSubmission: Sendable, Codable, Hashable {
+    /// Matches `SendMessageRequest.submissionID`, so a client that already drew
+    /// this prompt recognises the echo rather than duplicating it.
+    public var submissionID: String
+    public var text: String
+    public var attachments: [Attachment]
+    public var origin: MessageOrigin
+    /// The engine parked it behind an open turn instead of sending it. The row
+    /// reads as waiting rather than as one more message the agent ignored.
+    public var isQueued: Bool
+    public var submittedAt: Date
+
+    public init(
+        submissionID: String,
+        text: String,
+        attachments: [Attachment] = [],
+        origin: MessageOrigin = .user,
+        isQueued: Bool = false,
+        submittedAt: Date = Date()
+    ) {
+        self.submissionID = submissionID
+        self.text = text
+        self.attachments = attachments
+        self.origin = origin
+        self.isQueued = isQueued
+        self.submittedAt = submittedAt
+    }
 }
 
 public struct CoreSnapshot: Sendable, Codable {
@@ -74,6 +111,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
     public var contextUsage: UsageReport?
     public var createdAt: Date
     public var lastActivity: Date?
+    public var reasoningEffort: ReasoningEffort?
 
     public init(
         id: ChatID,
@@ -91,7 +129,8 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         isTurnActive: Bool = false,
         contextUsage: UsageReport? = nil,
         createdAt: Date = Date(),
-        lastActivity: Date? = nil
+        lastActivity: Date? = nil,
+        reasoningEffort: ReasoningEffort? = nil
     ) {
         self.id = id
         self.workspaceID = workspaceID
@@ -109,6 +148,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         self.contextUsage = contextUsage
         self.createdAt = createdAt
         self.lastActivity = lastActivity
+        self.reasoningEffort = reasoningEffort
     }
 }
 

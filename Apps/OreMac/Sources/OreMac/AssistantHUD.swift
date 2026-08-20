@@ -95,7 +95,7 @@ private struct AssistantHUDView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "sparkles")
+            Image(systemName: controller.phase == .speaking ? "speaker.wave.2.fill" : "sparkles")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
 
@@ -119,6 +119,7 @@ private struct AssistantHUDView: View {
         .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
         .frame(width: 380, height: 56)
         .animation(.easeOut(duration: 0.2), value: controller.phase)
+        .animation(.easeOut(duration: 0.2), value: controller.spokenTail)
     }
 
     private var micIsOpen: Bool {
@@ -137,6 +138,9 @@ private struct AssistantHUDView: View {
             return transcript.isEmpty ? "Yes or no?" : tail(of: transcript)
         case .thinking:
             return "Thinking…"
+        case .speaking:
+            let spoken = controller.spokenTail.trimmingCharacters(in: .whitespacesAndNewlines)
+            return spoken.isEmpty ? "Speaking…" : tail(of: spoken)
         case .idle:
             return ""
         }

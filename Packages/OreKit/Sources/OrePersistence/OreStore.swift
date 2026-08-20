@@ -614,6 +614,30 @@ public actor OreStore {
         }
     }
 
+    public func saveAssistantTabGrant(_ chatID: ChatID) throws {
+        try writer.write { db in
+            try AssistantTabGrantRecord(chatID: chatID).save(db)
+        }
+    }
+
+    public func assistantTabGrants() throws -> [ChatID] {
+        try writer.read { db in
+            try AssistantTabGrantRecord.fetchAll(db).map(\.id)
+        }
+    }
+
+    public func hasAssistantTabGrant(_ chatID: ChatID) throws -> Bool {
+        try writer.read { db in
+            try AssistantTabGrantRecord.fetchOne(db, key: chatID.rawValue) != nil
+        }
+    }
+
+    public func deleteAssistantTabGrant(_ chatID: ChatID) throws {
+        _ = try writer.write { db in
+            try AssistantTabGrantRecord.deleteOne(db, key: chatID.rawValue)
+        }
+    }
+
     // MARK: - Message queue
 
     public func enqueueMessage(_ record: QueuedMessageRecord) throws {

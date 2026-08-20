@@ -27,6 +27,9 @@ final class AppModel {
     /// as cards in the Assistant window; the core times them out (denying)
     /// after two minutes.
     private(set) var assistantConfirmations: [AssistantConfirmation] = []
+    /// Project tabs blocked on a permission or question, for the HUD / menu bar
+    /// when the user is in another app.
+    private(set) var tabNeedsYou: [TabNeedsYou] = []
     private(set) var harnesses: [HarnessProbeResult] = []
     private(set) var modelCatalog: [HarnessKind: [AgentModel]] = [:]
     private(set) var repositories: [String] = []
@@ -293,6 +296,14 @@ final class AppModel {
         (try? await client.assistantActions()) ?? []
     }
 
+    func assistantAlwaysGrantNames() async throws -> [String] {
+        try await client.assistantAlwaysGrants()
+    }
+
+    func assistantTabGrantIDs() async throws -> [ChatID] {
+        try await client.assistantTabGrantIDs()
+    }
+
     // MARK: - Ask (App Intents / Siri / Spotlight)
 
     private var assistantReplyWaiters: [UUID: CheckedContinuation<String, Never>] = [:]
@@ -504,6 +515,7 @@ final class AppModel {
                     turnID: turnID,
                     kind: .userMessage,
                     text: prompt,
+                    origin: turn.origin,
                     isComplete: true,
                     attachments: turn.attachments,
                     createdAt: turn.startedAt
@@ -698,8 +710,18 @@ final class AppModel {
             summary.draftText = ""
             upsertChat(summary)
         }
-        state.appendUserMessage(text, attachments: attachments, comments: comments)
+        // One id for the row drawn now and the engine's echo of the same send,
+        // so this message is not drawn a second time when the echo arrives.
+        let submissionID = UUID().uuidString
+        state.appendUserMessage(
+            text,
+            attachments: attachments,
+            comments: comments,
+            submissionID: submissionID
+        )
+        let isAssistant = assistantWorkspace?.id == id
         Task {
+            let hidden = isAssistant ? await client.assistantAppStateText() : nil
             await client.send(.sendMessage(SendMessageRequest(
                 workspaceID: id,
                 chatID: chatID,
@@ -707,7 +729,10 @@ final class AppModel {
                 attachments: attachments,
                 diffComments: comments,
                 reasoningEffort: effort,
-                serviceTier: serviceTier
+                serviceTier: serviceTier,
+                origin: .user,
+                submissionID: submissionID,
+                hiddenContext: hidden
             )))
         }
     }
@@ -722,14 +747,24 @@ final class AppModel {
         Task { await client.send(.setChatPermissionMode(id, chatID, mode)) }
     }
 
+    func setEffort(_ effort: ReasoningEffort?, for chat: ChatSummary) {
+        Task { await client.send(.setChatEffort(chat.workspaceID, chat.id, effort)) }
+    }
+
     func resolvePermission(
         _ requestID: PermissionRequestID,
         decision: PermissionDecision,
-        for id: WorkspaceID
+        for id: WorkspaceID,
+        chatID: ChatID? = nil
     ) {
-        guard let chatID = activeChat(for: id)?.id else { return }
-        chat(for: chatID).resolvePermission(requestID)
-        Task { await client.send(.resolveChatPermission(id, chatID, requestID, decision)) }
+        let resolvedChatID = chatID ?? activeChat(for: id)?.id
+        guard let resolvedChatID else { return }
+        chat(for: resolvedChatID).resolvePermission(requestID)
+        tabNeedsYou.removeAll {
+            if case .permission(let item) = $0, item.request.id == requestID { return true }
+            return false
+        }
+        Task { await client.send(.resolveChatPermission(id, resolvedChatID, requestID, decision)) }
     }
 
     /// The Allow/Deny card currently on screen, if the generic buttons own it.
@@ -757,10 +792,20 @@ final class AppModel {
         )
     }
 
-    func answerQuestion(_ questionID: QuestionID, answer: String, for id: WorkspaceID) {
-        guard let chatID = activeChat(for: id)?.id else { return }
-        chat(for: chatID).resolveQuestion(questionID)
-        Task { await client.send(.answerChatQuestion(id, chatID, questionID, answer: answer)) }
+    func answerQuestion(
+        _ questionID: QuestionID,
+        answer: String,
+        for id: WorkspaceID,
+        chatID: ChatID? = nil
+    ) {
+        let resolvedChatID = chatID ?? activeChat(for: id)?.id
+        guard let resolvedChatID else { return }
+        chat(for: resolvedChatID).resolveQuestion(questionID)
+        tabNeedsYou.removeAll {
+            if case .question(let item) = $0, item.question.id == questionID { return true }
+            return false
+        }
+        Task { await client.send(.answerChatQuestion(id, resolvedChatID, questionID, answer: answer)) }
     }
 
     /// Answer a permission-gated question (Claude's AskUserQuestion) by returning
@@ -2037,6 +2082,10 @@ final class AppModel {
             }
             NSApp.activate(ignoringOtherApps: true)
 
+        case .promptSubmitted(let id, let chatID, let submission):
+            chatOwners[chatID] = id
+            chat(for: chatID).applyPromptSubmission(submission)
+
         case .agent(let id, let chatID, let agentEvent):
             chatOwners[chatID] = id
             // Deltas are buffered; everything else flushes them first so a
@@ -2123,6 +2172,9 @@ final class AppModel {
     }
 
     func knownModels(for harness: HarnessKind) -> [AgentModel] {
+        // Hoisted out of the `.codex` branch below: this is a switch
+        // *expression*, and a branch of one may only be an expression.
+        let codexEfforts = ["none", "low", "medium", "high", "xhigh"]
         let curated: [AgentModel] = switch harness {
         case .claudeCode:
             [
@@ -2137,12 +2189,17 @@ final class AppModel {
                 AgentModel(id: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5", description: "Fastest Claude model"),
             ]
         case .codex:
+            // Codex rejects `max` for current ChatGPT models — supported values
+            // are none/low/medium/high/xhigh. Keep this ladder aligned with
+            // `codex app-server` `model/list` so a stale fallback cannot ship an
+            // effort the provider will 400 on.
             [
-                AgentModel(id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier capability for complex coding", isDefault: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"], supportedServiceTiers: ["fast"]),
-                AgentModel(id: "gpt-5.6-terra", displayName: "GPT-5.6 Terra", description: "Balanced intelligence, speed, and cost", supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"], supportedServiceTiers: ["fast"]),
-                AgentModel(id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", description: "Fast, efficient agent work", supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"], supportedServiceTiers: ["fast"]),
-                AgentModel(id: "gpt-5.5", displayName: "GPT-5.5", description: "Previous frontier generation", supportedServiceTiers: ["fast"]),
-                AgentModel(id: "gpt-5.4", displayName: "GPT-5.4", description: "Compatible prior generation", supportedServiceTiers: ["fast"]),
+                AgentModel(id: "gpt-5.5", displayName: "GPT-5.5", description: "Frontier coding model", isDefault: true, supportedReasoningEfforts: codexEfforts, supportedServiceTiers: ["priority", "fast"]),
+                AgentModel(id: "gpt-5.4", displayName: "GPT-5.4", description: "Previous frontier generation", supportedReasoningEfforts: codexEfforts, supportedServiceTiers: ["priority", "fast"]),
+                AgentModel(id: "gpt-5.4-mini", displayName: "GPT-5.4-Mini", description: "Faster, lighter coding", supportedReasoningEfforts: codexEfforts),
+                AgentModel(id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier capability for complex coding", supportedReasoningEfforts: codexEfforts, supportedServiceTiers: ["fast", "priority"]),
+                AgentModel(id: "gpt-5.6-terra", displayName: "GPT-5.6 Terra", description: "Balanced intelligence, speed, and cost", supportedReasoningEfforts: codexEfforts, supportedServiceTiers: ["fast", "priority"]),
+                AgentModel(id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", description: "Fast, efficient agent work", supportedReasoningEfforts: codexEfforts, supportedServiceTiers: ["fast", "priority"]),
             ]
         case .cursorAgent:
             // Fallback only — the full catalogue comes from the CLI via
@@ -2155,9 +2212,10 @@ final class AppModel {
                 AgentModel(id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5"),
             ]
         }
-        let discovered = modelCatalog[harness] ?? []
-        var seen: Set<String> = []
-        return (curated + discovered).filter { seen.insert($0.id).inserted }
+        return AgentModelCatalog.merge(
+            curated: curated,
+            discovered: modelCatalog[harness] ?? []
+        )
     }
 
     /// UserDefaults key for a harness's user-chosen default model.
@@ -2275,10 +2333,33 @@ final class AppModel {
         }
         collectWatchEvent(event, workspaceID: workspaceID, chatID: chatID)
         let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
-        // Narration is the audio sibling of the background notifications
-        // below: same funnel, same origin, so both name the same place.
         narration.observe(event: event, chatID: chatID, origin: origin)
-        guard origin.isBackground else { return }
+        switch event {
+        case .permissionRequest(let request):
+            noteTabNeedsYou(.permission(TabNeedsYou.Permission(
+                workspaceID: workspaceID, chatID: chatID, request: request
+            )))
+        case .question(let question):
+            noteTabNeedsYou(.question(TabNeedsYou.Question(
+                workspaceID: workspaceID, chatID: chatID, question: question
+            )))
+        case .permissionResolved(let resolution):
+            tabNeedsYou.removeAll {
+                if case .permission(let item) = $0, item.request.id == resolution.id { return true }
+                return false
+            }
+        case .turnCompleted:
+            tabNeedsYou.removeAll {
+                switch $0 {
+                case .permission(let item): return item.chatID == chatID
+                case .question(let item): return item.chatID == chatID
+                }
+            }
+        default:
+            break
+        }
+        let appInactive = !NSApp.isActive
+        guard origin.isBackground || appInactive else { return }
         let place = origin.displayLabel ?? workspaceName(workspaceID)
         switch event {
         case .permissionRequest(let request):
@@ -2310,6 +2391,58 @@ final class AppModel {
         default:
             break
         }
+    }
+
+    private func noteTabNeedsYou(_ item: TabNeedsYou) {
+        tabNeedsYou.removeAll { $0.id == item.id }
+        tabNeedsYou.append(item)
+        voiceAssistant.needsYouArrived(item)
+        informAssistantOfNeedsYou(item)
+    }
+
+    /// Immediate, unlike the watch digest: the assistant may offer auto-allow
+    /// but must not duplicate the HUD confirmation.
+    private func informAssistantOfNeedsYou(_ item: TabNeedsYou) {
+        guard proactiveWatchEnabled, let assistant = assistantWorkspace else { return }
+        send(
+            """
+            [ORE needs you] \(item.spokenSummary)
+            The user is being asked via the HUD / a notification. Do not call \
+            ResolveChatPermission or AnswerChatQuestion unless they tell you \
+            to in this conversation. You MAY offer auto-allow for this tab.
+            """,
+            to: assistant.id
+        )
+    }
+
+    func autoAllowTab(workspaceID: WorkspaceID, chatID: ChatID, permissionID: PermissionRequestID?) {
+        tabNeedsYou.removeAll {
+            if case .permission(let item) = $0, item.chatID == chatID { return true }
+            return false
+        }
+        Task { @MainActor in
+            let proven = await Self.authenticateStandingGrant()
+            if let permissionID {
+                chat(for: chatID).resolvePermission(permissionID)
+                await client.send(.resolveChatPermission(
+                    workspaceID, chatID, permissionID, .allow
+                ))
+            }
+            if proven {
+                await client.send(.setChatPermissionMode(
+                    workspaceID, chatID, .bypassPermissions
+                ))
+                try? await client.grantTabAutoAllow(chatID)
+            }
+        }
+    }
+
+    func revokeTabAutoAllow(_ chatID: ChatID) {
+        Task { try? await client.revokeAssistantTabGrant(chatID) }
+    }
+
+    func revokeAssistantAlwaysGrant(_ actionClass: String) {
+        Task { try? await client.revokeAssistantGrant(actionClass) }
     }
 
     /// Where a chat sits relative to what's on screen. "Background" covers two

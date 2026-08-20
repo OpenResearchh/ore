@@ -28,6 +28,31 @@ struct HarnessCLIUpdaterTests {
         #expect(plan == .npm(package: "@openai/codex"))
     }
 
+    @Test func installedCodexPrefersSelfUpdate() {
+        let plan = HarnessCLIUpdater.plan(
+            for: .codex,
+            executablePath: "/usr/local/bin/codex"
+        )
+        #expect(plan == .selfUpdate(executablePath: "/usr/local/bin/codex"))
+        #expect(HarnessCLIUpdater.script(for: plan) == "'/usr/local/bin/codex' update")
+    }
+
+    @Test func permissionDeniedNpmOutputBecomesActionable() {
+        let raw = """
+        npm error code EACCES
+        npm error Error: EACCES: permission denied, rename '/usr/local/lib/node_modules/@openai/codex'
+        """
+        let error = HarnessCLIUpdater.UpdateError.commandFailed(
+            command: "npm install -g '@openai/codex'@latest",
+            exitCode: 1,
+            output: raw
+        )
+        let message = error.errorDescription ?? ""
+        #expect(message.contains("not writable by your user"))
+        #expect(message.contains("brew install codex"))
+        #expect(!message.contains("npm error"))
+    }
+
     @Test func cursorWithoutAKnownPathUsesTheVendorInstaller() {
         let plan = HarnessCLIUpdater.plan(for: .cursorAgent, executablePath: nil)
         guard case .nativeInstaller(let url) = plan else {

@@ -32,7 +32,7 @@ enum TranscriptDisplay {
         fileprivate struct CacheKey: Equatable {
             var revision: Int
             var sourceCount: Int
-            var isBusy: Bool
+            var keepLiveTurnExpanded: Bool
             var expanded: Set<String>
             var hidingPlanTurnID: TurnID?
         }
@@ -44,9 +44,14 @@ enum TranscriptDisplay {
     /// - Parameter revision: `ChatState.rowsRevision`, or `nil` to opt out of the
     ///   whole-result cache. Callers that mutate `source` directly (tests) must
     ///   pass `nil`, since without a revision there is no way to notice.
+    /// - Parameter keepLiveTurnExpanded: When true, the newest turn stays fully
+    ///   visible (no activity-group fold). Pass `ChatState.isTurnActive`, not
+    ///   `isBusy` — a turn blocked on a permission is not "busy" for the
+    ///   composer, but collapsing its thinking behind a permission card is what
+    ///   made the transcript jump.
     static func rows(
         from source: [TranscriptRow],
-        isBusy: Bool,
+        keepLiveTurnExpanded: Bool,
         expanded: Set<String>,
         memo: Memo,
         hidingPlanTurnID: TurnID? = nil,
@@ -61,7 +66,7 @@ enum TranscriptDisplay {
             Memo.CacheKey(
                 revision: $0,
                 sourceCount: source.count,
-                isBusy: isBusy,
+                keepLiveTurnExpanded: keepLiveTurnExpanded,
                 expanded: expanded,
                 hidingPlanTurnID: hidingPlanTurnID
             )
@@ -69,7 +74,7 @@ enum TranscriptDisplay {
         if let key, key == memo.lastKey { return memo.lastOutput }
 
         let visible = source.compactMap { prepared($0, expanded: expanded, hidingPlanTurnID: hidingPlanTurnID) }
-        let activeTurn: TurnID? = isBusy ? visible.last?.turnID : nil
+        let activeTurn: TurnID? = keepLiveTurnExpanded ? visible.last?.turnID : nil
 
         var result: [TranscriptRow] = []
         result.reserveCapacity(visible.count + 8)

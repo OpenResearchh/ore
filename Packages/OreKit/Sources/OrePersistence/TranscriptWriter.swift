@@ -23,6 +23,7 @@ public actor TranscriptWriter {
         var startedAt: Date
         var prompt: String?
         var promptAttachments: [Attachment]
+        var promptOrigin: MessageOrigin
         var usage: UsageReport?
     }
 
@@ -41,13 +42,19 @@ public actor TranscriptWriter {
     /// Records the prompt that opens the next turn. Called on send, before the
     /// harness has told us anything, so the user's own message is never the
     /// thing that goes missing.
-    public func recordPrompt(_ text: String, attachments: [Attachment] = []) {
+    public func recordPrompt(
+        _ text: String,
+        attachments: [Attachment] = [],
+        origin: MessageOrigin = .user
+    ) {
         pendingPrompt = text
         pendingAttachments = attachments
+        pendingOrigin = origin
     }
 
     private var pendingPrompt: String?
     private var pendingAttachments: [Attachment] = []
+    private var pendingOrigin: MessageOrigin = .user
 
     public func handle(_ event: AgentEvent) async {
         do {
@@ -91,10 +98,12 @@ public actor TranscriptWriter {
                 nextBlockOrdinal: 0,
                 startedAt: Date(),
                 prompt: pendingPrompt,
-                promptAttachments: pendingAttachments
+                promptAttachments: pendingAttachments,
+                promptOrigin: pendingOrigin
             )
             pendingPrompt = nil
             pendingAttachments = []
+            pendingOrigin = .user
             currentTurn = state
             try await store.saveTurn(TurnRecord(
                 id: state.id,
@@ -104,6 +113,7 @@ public actor TranscriptWriter {
                 checkpointCommit: pendingCheckpointCommit,
                 checkpointProviderSessionID: pendingCheckpointSessionID,
                 attachments: state.promptAttachments,
+                origin: state.promptOrigin,
                 startedAt: state.startedAt
             ))
             pendingCheckpointCommit = nil
@@ -236,6 +246,10 @@ public actor TranscriptWriter {
                 checkpointProviderSessionID:
                     try await store.turn(result.turnID)?.checkpointProviderSessionID,
                 attachments: turn.promptAttachments,
+                // The completed turn is written as a whole record, so the origin
+                // has to be carried across or finishing a turn would relabel an
+                // assistant-sent prompt as the user's.
+                origin: turn.promptOrigin,
                 startedAt: turn.startedAt,
                 endedAt: Date()
             ))

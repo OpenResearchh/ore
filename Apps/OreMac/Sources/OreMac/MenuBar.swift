@@ -19,6 +19,10 @@ struct MenuBarDashboard: View {
                 confirmations
                 Divider()
             }
+            if !model.tabNeedsYou.isEmpty {
+                tabNeedsYou
+                Divider()
+            }
             if model.sortedWorkspaces.isEmpty {
                 Text("No workspaces yet")
                     .foregroundStyle(.secondary)
@@ -49,6 +53,7 @@ struct MenuBarDashboard: View {
         switch model.voiceAssistant.phase {
         case .listening, .answering: "Listening…"
         case .thinking: "Thinking…"
+        case .speaking: "Speaking…"
         case .idle: "Hold ⇧⌥ to talk"
         }
     }
@@ -89,6 +94,77 @@ struct MenuBarDashboard: View {
             }
         }
         .padding(OreTheme.Space.sm)
+    }
+
+    private var tabNeedsYou: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            ForEach(model.tabNeedsYou) { item in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(item.spokenSummary)
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                        .lineLimit(2)
+                    HStack(spacing: OreTheme.Space.sm) {
+                        Button("Deny") { deny(item) }
+                            .controlSize(.small)
+                        Spacer()
+                        Button("Allow") { allow(item) }
+                            .controlSize(.small)
+                            .buttonStyle(.borderedProminent)
+                        if case .permission = item {
+                            Button("Always") { alwaysAllow(item) }
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .padding(OreTheme.Space.sm)
+                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .padding(OreTheme.Space.sm)
+    }
+
+    private func allow(_ item: TabNeedsYou) {
+        switch item {
+        case .permission(let payload):
+            model.resolvePermission(
+                payload.request.id, decision: .allow,
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        case .question(let payload):
+            model.answerQuestion(
+                payload.question.id,
+                answer: payload.question.options.first?.label ?? "yes",
+                for: payload.workspaceID,
+                chatID: payload.chatID
+            )
+        }
+    }
+
+    private func deny(_ item: TabNeedsYou) {
+        switch item {
+        case .permission(let payload):
+            model.resolvePermission(
+                payload.request.id,
+                decision: .deny(reason: "The user denied this from the menu bar."),
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        case .question(let payload):
+            model.answerQuestion(
+                payload.question.id,
+                answer: "The user declined to answer.",
+                for: payload.workspaceID,
+                chatID: payload.chatID
+            )
+        }
+    }
+
+    private func alwaysAllow(_ item: TabNeedsYou) {
+        guard case .permission(let payload) = item else { return }
+        model.autoAllowTab(
+            workspaceID: payload.workspaceID,
+            chatID: payload.chatID,
+            permissionID: payload.request.id
+        )
     }
 
     private var workspaceList: some View {

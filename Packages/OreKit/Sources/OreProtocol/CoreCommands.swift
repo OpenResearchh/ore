@@ -62,6 +62,9 @@ public enum CoreCommand: Sendable, Codable {
     case interruptChatTurn(WorkspaceID, ChatID)
     case setPermissionMode(WorkspaceID, PermissionMode)
     case setChatPermissionMode(WorkspaceID, ChatID, PermissionMode)
+    /// Persist the effort chip for a chat so later sends (user or assistant)
+    /// use the same depth.
+    case setChatEffort(WorkspaceID, ChatID, ReasoningEffort?)
     case resolvePermission(WorkspaceID, PermissionRequestID, PermissionDecision)
     case resolveChatPermission(WorkspaceID, ChatID, PermissionRequestID, PermissionDecision)
     case answerQuestion(WorkspaceID, QuestionID, answer: String)
@@ -105,6 +108,10 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
     public var harness: HarnessKind
     public var model: String?
     public var initialPrompt: String?
+    /// Who wrote `initialPrompt`. Carried separately from the text because a
+    /// workspace the assistant opens on the user's behalf must not present its
+    /// opening prompt as something the user typed.
+    public var promptOrigin: MessageOrigin
     public var branchPrefix: String?
 
     public init(
@@ -114,6 +121,7 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
         harness: HarnessKind = .claudeCode,
         model: String? = nil,
         initialPrompt: String? = nil,
+        promptOrigin: MessageOrigin = .user,
         branchPrefix: String? = nil
     ) {
         self.repositoryPath = repositoryPath
@@ -122,8 +130,21 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
         self.harness = harness
         self.model = model
         self.initialPrompt = initialPrompt
+        self.promptOrigin = promptOrigin
         self.branchPrefix = branchPrefix
     }
+}
+
+/// Who asked for a prompt to be sent.
+///
+/// The transcript draws both the same way — a prompt is a prompt — but it says
+/// which is which. A user scrolling back has to be able to tell the work they
+/// asked for from the work the assistant started for them.
+public enum MessageOrigin: String, Sendable, Codable, Hashable, CaseIterable {
+    /// Typed by the person, in a composer.
+    case user
+    /// Sent by the ORE assistant acting on the user's behalf.
+    case agent
 }
 
 public struct SendMessageRequest: Sendable, Codable {
@@ -145,6 +166,19 @@ public struct SendMessageRequest: Sendable, Codable {
     /// Optional catalog-provided processing tier. Codex calls its accelerated
     /// tier `fast`; unsupported harnesses simply receive nil.
     public var serviceTier: String?
+    /// Who asked for this. Prompts the assistant sends arrive here the same way
+    /// a typed one does, so without this the transcript cannot tell them apart.
+    public var origin: MessageOrigin
+    /// Stable identity for this submission, echoed back on `promptSubmitted`.
+    ///
+    /// A client that drew the prompt optimistically the moment the user pressed
+    /// send matches the echo against this id and skips it, so the same message
+    /// never lands in the transcript twice.
+    public var submissionID: String
+    /// Prepended for the model only — omitted from the transcript. How the
+    /// assistant receives a live app-state snapshot without cluttering the
+    /// Assistant window with it.
+    public var hiddenContext: String?
 
     public init(
         workspaceID: WorkspaceID,
@@ -154,7 +188,10 @@ public struct SendMessageRequest: Sendable, Codable {
         diffComments: [DiffCommentReference] = [],
         queueIfBusy: Bool = true,
         reasoningEffort: ReasoningEffort? = nil,
-        serviceTier: String? = nil
+        serviceTier: String? = nil,
+        origin: MessageOrigin = .user,
+        submissionID: String = UUID().uuidString,
+        hiddenContext: String? = nil
     ) {
         self.workspaceID = workspaceID
         self.chatID = chatID
@@ -164,6 +201,9 @@ public struct SendMessageRequest: Sendable, Codable {
         self.queueIfBusy = queueIfBusy
         self.reasoningEffort = reasoningEffort
         self.serviceTier = serviceTier
+        self.origin = origin
+        self.submissionID = submissionID
+        self.hiddenContext = hiddenContext
     }
 }
 
@@ -189,11 +229,8 @@ public struct CreateChatRequest: Sendable, Codable {
     public var harness: HarnessKind?
     public var model: String?
     public var permissionMode: PermissionMode
-    /// Start the new chat from another chat's provider session, branching it
-    /// rather than continuing it. The source conversation is untouched, so the
-    /// user can try a second direction from the same point without losing the
-    /// first. Ignored when the harness cannot fork (`supportsSessionFork`).
     public var forkFrom: ChatID?
+    public var reasoningEffort: ReasoningEffort?
 
     public init(
         workspaceID: WorkspaceID,
@@ -201,7 +238,8 @@ public struct CreateChatRequest: Sendable, Codable {
         harness: HarnessKind? = nil,
         model: String? = nil,
         permissionMode: PermissionMode = .default,
-        forkFrom: ChatID? = nil
+        forkFrom: ChatID? = nil,
+        reasoningEffort: ReasoningEffort? = nil
     ) {
         self.workspaceID = workspaceID
         self.title = title
@@ -209,6 +247,7 @@ public struct CreateChatRequest: Sendable, Codable {
         self.model = model
         self.permissionMode = permissionMode
         self.forkFrom = forkFrom
+        self.reasoningEffort = reasoningEffort
     }
 }
 

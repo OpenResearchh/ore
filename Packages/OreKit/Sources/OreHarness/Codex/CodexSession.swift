@@ -247,7 +247,11 @@ public actor CodexSession: AgentSession {
             parameters["approvalPolicy"] = .string(approvalPolicy())
         }
         if let effort = message.reasoningEffort {
-            parameters["effort"] = .string(effort.rawValue)
+            // Current ChatGPT Codex models reject `max` (supported: none…xhigh).
+            // Map a leftover Max from an older catalog/UI default onto xhigh so a
+            // turn is not rejected after a model remap.
+            let value = effort == .max ? ReasoningEffort.xhigh.rawValue : effort.rawValue
+            parameters["effort"] = .string(value)
         }
         // App-server v2 keeps the tier on the thread for this and subsequent
         // turns. Sending an explicit null when Fast is off clears a previous

@@ -318,6 +318,15 @@ actor CoreEventPrinter {
         case .agent(_, _, let agentEvent):
             render(agentEvent)
 
+        case .promptSubmitted(_, _, let submission):
+            // Only prompts the assistant sent are echoed. A prompt this
+            // terminal was given on the command line is already on screen
+            // directly above, and printing it back reads as a stutter.
+            guard submission.origin == .agent else { break }
+            endLine()
+            let state = submission.isQueued ? "queued" : "sent"
+            print("↳ ORE \(state) a prompt: \(submission.text)")
+
         case .chatAdded(let chat), .chatUpdated(let chat):
             endLine()
             print("· chat \(chat.title)  \(chat.id.rawValue.prefix(8))")

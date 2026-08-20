@@ -7,9 +7,10 @@ import OreSupport
 /// ORE never vendors these binaries — it drives whatever the user already has
 /// on PATH — so a model that "requires a newer version of Codex" is a prompt
 /// to upgrade *their* install, not ours. Detection follows the path: Homebrew
-/// prefixes go through `brew upgrade`, node version-manager trees through
-/// `npm install -g`, and native `~/.local/bin` installs through the CLI's own
-/// updater or the vendor's install script.
+/// prefixes go through `brew upgrade`, Codex always prefers its own
+/// `codex update`, node version-manager trees through `npm install -g`, and
+/// native `~/.local/bin` installs through the CLI's own updater or the vendor's
+/// install script.
 public enum HarnessCLIUpdater {
     public enum Plan: Equatable, Sendable {
         case brew(formula: String)
@@ -26,35 +27,69 @@ public enum HarnessCLIUpdater {
             switch self {
             case .commandFailed(_, let code, let output):
                 let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let friendly = Self.permissionDeniedMessage(in: detail) {
+                    return friendly
+                }
                 if detail.isEmpty { return "CLI update failed (exit \(code))." }
                 return detail
             case .timedOut:
                 return "CLI update timed out. Try again, or update it in a terminal."
             }
         }
+
+        /// npm's EACCES dump is useless in the composer; translate it into the
+        /// action the user actually needs.
+        static func permissionDeniedMessage(in detail: String) -> String? {
+            let lower = detail.lowercased()
+            guard lower.contains("eacces")
+                || lower.contains("permission denied")
+                || lower.contains("operation not permitted")
+            else { return nil }
+            return """
+            Could not update the CLI: this install is not writable by your user \
+            (often a root-owned `/usr/local` npm package). Reinstall with \
+            Homebrew (`brew install codex`) or fix ownership of the global npm \
+            prefix, then try again.
+            """
+        }
     }
 
     public static func plan(for kind: HarnessKind, executablePath: String?) -> Plan {
-        if let path = executablePath, isHomebrewPath(path), let formula = kind.brewFormula {
+        // Keep the PATH entry the user actually runs in the update script.
+        // Classification helpers resolve symlinks themselves when needed.
+        let original = executablePath
+
+        if let original, isHomebrewPath(original), let formula = kind.brewFormula {
             return .brew(formula: formula)
         }
-        if let path = executablePath, isNodeManagedPath(path), let package = kind.npmPackage {
-            return .npm(package: package)
-        }
-        if let path = executablePath, isNativeUserBin(path) {
-            switch kind {
-            case .claudeCode:
-                return .selfUpdate(executablePath: path)
-            case .codex:
-                return .npm(package: kind.npmPackage ?? "@openai/codex")
-            case .cursorAgent:
-                return .nativeInstaller(url: Self.cursorInstallURL)
+
+        switch kind {
+        case .codex:
+            // Codex ships `codex update` for every install flavor. Prefer it
+            // over a blind `npm install -g`, which fails with a raw EACCES
+            // stack on root-owned `/usr/local` installs.
+            if let original {
+                return .selfUpdate(executablePath: original)
             }
+            return .npm(package: kind.npmPackage ?? "@openai/codex")
+
+        case .claudeCode:
+            // A `~/.local/bin/claude` shim that happens to symlink into
+            // node_modules is still a native user install — prefer self-update.
+            if let original, isNativeUserBin(original) {
+                return .selfUpdate(executablePath: original)
+            }
+            if let original, isNodeManagedPath(original), let package = kind.npmPackage {
+                return .npm(package: package)
+            }
+            if let package = kind.npmPackage {
+                return .npm(package: package)
+            }
+            return .nativeInstaller(url: Self.cursorInstallURL)
+
+        case .cursorAgent:
+            return .nativeInstaller(url: Self.cursorInstallURL)
         }
-        if let package = kind.npmPackage {
-            return .npm(package: package)
-        }
-        return .nativeInstaller(url: Self.cursorInstallURL)
     }
 
     /// Runs the update on the user's login-shell PATH so nvm/brew/fnm resolve.
@@ -113,16 +148,32 @@ public enum HarnessCLIUpdater {
         }
     }
 
+    /// Follows one level of symlink so `/usr/local/bin/codex` →
+    /// `…/node_modules/@openai/codex/…` is classified correctly.
+    static func resolvingSymlinks(_ path: String) -> String {
+        var current = path
+        for _ in 0..<6 {
+            guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: current)
+            else { return current }
+            if destination.hasPrefix("/") {
+                current = destination
+            } else {
+                let parent = (current as NSString).deletingLastPathComponent
+                current = (parent as NSString).appendingPathComponent(destination)
+            }
+        }
+        return current
+    }
+
     static func isHomebrewPath(_ path: String) -> Bool {
         let lower = path.lowercased()
         if lower.contains("/homebrew/") || lower.contains("/linuxbrew/") || lower.contains("/cellar/") {
             return true
         }
-        if let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: path) {
-            let resolved = destination.lowercased()
-            return resolved.contains("/cellar/") || resolved.contains("/homebrew/")
-        }
-        return false
+        let resolved = resolvingSymlinks(path).lowercased()
+        return resolved.contains("/homebrew/")
+            || resolved.contains("/linuxbrew/")
+            || resolved.contains("/cellar/")
     }
 
     static func isNodeManagedPath(_ path: String) -> Bool {
@@ -132,7 +183,9 @@ public enum HarnessCLIUpdater {
             "/.volta/", "/volta/", "/.nodenv/", "/nodenv/",
             "/node_modules/", "/.npm/", "/npm-global/", "/.asdf/",
         ]
-        return markers.contains { lower.contains($0) }
+        if markers.contains(where: { lower.contains($0) }) { return true }
+        let resolved = resolvingSymlinks(path).lowercased()
+        return markers.contains { resolved.contains($0) }
     }
 
     static func isNativeUserBin(_ path: String) -> Bool {

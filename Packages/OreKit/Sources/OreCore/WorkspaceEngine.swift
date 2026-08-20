@@ -212,7 +212,9 @@ public actor WorkspaceEngine {
             harness: harness,
             model: request.model ?? source?.record.model ?? defaultRuntime.record.model,
             permissionMode: request.permissionMode,
-            sortIndex: index
+            sortIndex: index,
+            reasoningEffort: request.reasoningEffort
+                ?? source?.record.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
         )
         try await store.saveChat(chat)
         let runtime = ChatRuntime(record: chat)
@@ -347,6 +349,16 @@ public actor WorkspaceEngine {
         let result = try await summary(for: runtime)
         scheduleQueueDrain(runtime: runtime)
         return result
+    }
+
+    public func setEffort(chatID: ChatID, effort: ReasoningEffort?) async throws -> ChatSummary {
+        let runtime = try await runtime(for: chatID)
+        let raw = effort?.rawValue
+        guard runtime.record.reasoningEffort != raw else { return try await summary(for: runtime) }
+        runtime.record.reasoningEffort = raw
+        try await store.saveChat(runtime.record)
+        publishChatChange(runtime)
+        return try await summary(for: runtime)
     }
 
     private func summary(for runtime: ChatRuntime) async throws -> ChatSummary {
@@ -630,12 +642,20 @@ public actor WorkspaceEngine {
                 chatID: runtime.record.chatID,
                 text: text,
                 attachmentPaths: request.attachments.map(\.relativePath),
-                serviceTier: request.serviceTier
+                serviceTier: request.serviceTier,
+                origin: request.origin,
+                submissionID: request.submissionID
             ))
             runtime.queuedMessageCount += 1
+            publishPromptSubmission(request, runtime: runtime, isQueued: true)
             publishChatChange(runtime)
             return false
         }
+        // Announced before the session is ensured, which can take seconds while
+        // a CLI boots. A prompt the client didn't originate — the assistant's,
+        // or a new workspace's opening instruction — has to appear in the
+        // transcript at the moment it is accepted, not once the harness answers.
+        publishPromptSubmission(request, runtime: runtime, isQueued: false)
 
         // Claim the turn before the first suspension point, not after the last.
         //
@@ -648,7 +668,11 @@ public actor WorkspaceEngine {
         runtime.isTurnActive = true
         do {
             let harnessKind = HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-            let requestedEffort = harnessKind.supportsReasoningEffort ? request.reasoningEffort : nil
+            let storedEffort = runtime.record.reasoningEffort
+                .flatMap(ReasoningEffort.init(rawValue:))
+            let requestedEffort = harnessKind.supportsReasoningEffort
+                ? (request.reasoningEffort ?? storedEffort)
+                : nil
             if harnessKind == .claudeCode,
                runtime.session != nil,
                let requestedEffort,
@@ -666,9 +690,18 @@ public actor WorkspaceEngine {
                 reasoningEffort: requestedEffort
             )
             try await captureCheckpoint(runtime: runtime)
-            await runtime.transcript?.recordPrompt(text, attachments: request.attachments)
+            await runtime.transcript?.recordPrompt(
+                text,
+                attachments: request.attachments,
+                origin: request.origin
+            )
+            var modelText = text
+            if let hidden = request.hiddenContext?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !hidden.isEmpty {
+                modelText = "\(hidden)\n\n\(text)"
+            }
             try await session.send(UserMessage(
-                text: text,
+                text: modelText,
                 attachmentPaths: request.attachments.map(\.relativePath),
                 reasoningEffort: requestedEffort,
                 serviceTier: request.serviceTier
@@ -907,7 +940,16 @@ public actor WorkspaceEngine {
                 Attachment(relativePath: $0, displayName: FilePath.lastComponent($0))
             },
             queueIfBusy: false,
-            serviceTier: next.serviceTier
+            serviceTier: next.serviceTier,
+            origin: next.messageOrigin,
+            // Reusing the id the message was queued under is what stops the
+            // client from drawing it twice: once as the queued row it already
+            // has, and again when the queue finally lets it through. Rows
+            // queued before this column existed carry no id, and a shared empty
+            // string would make every one of them look like the same message.
+            submissionID: next.submissionID.isEmpty
+                ? UUID().uuidString
+                : next.submissionID
         ))
         // `send` doesn't publish on its success path, and the drain can run
         // after the caller's own publish, so the count the queue card watches
@@ -1571,6 +1613,14 @@ public actor WorkspaceEngine {
             // this is the only chance anything queued behind it gets sent.
             scheduleQueueDrain(runtime: runtime)
 
+        case .contextCompacted:
+            if record.workspaceKind == .assistant {
+                runtime.pendingContextNotes.append(
+                    "Your context window was compacted. Re-read MEMORY.md with ReadMemory. "
+                        + "Persist anything that must survive and is not already in memory/."
+                )
+            }
+
         default:
             break
         }
@@ -1620,6 +1670,33 @@ public actor WorkspaceEngine {
         } else if chatID == nil || focusedChatID == chatID {
             focusedChatID = nil
         }
+    }
+
+    public func focusedChatIDValue() -> ChatID? { focusedChatID }
+
+    public func gitStatusValue() -> GitStatusSummary { gitStatus }
+
+    public func pendingInput() -> [(chatID: ChatID, title: String, kind: String, summary: String)] {
+        var rows: [(ChatID, String, String, String)] = []
+        for runtime in chats.values {
+            for permission in runtime.pendingPermissions.values {
+                rows.append((
+                    runtime.record.chatID,
+                    runtime.record.title,
+                    "permission",
+                    permission.summary.map { "\(permission.toolName): \($0)" } ?? permission.toolName
+                ))
+            }
+            for question in runtime.pendingQuestions.values {
+                rows.append((
+                    runtime.record.chatID,
+                    runtime.record.title,
+                    "question",
+                    String(question.prompt.prefix(160))
+                ))
+            }
+        }
+        return rows
     }
 
     private func persistRecord() async throws {
@@ -1679,6 +1756,50 @@ public actor WorkspaceEngine {
         chatContinuation = continuation
         for runtime in chats.values { publishChatChange(runtime) }
         return stream
+    }
+
+    private var promptContinuation: AsyncStream<RoutedPromptSubmission>.Continuation?
+
+    /// Every prompt the engine accepts, so a client can show one it didn't send
+    /// itself. Unbuffered dropping is not an option here — a lost submission is
+    /// a prompt the user never learns about — so this stream is unbounded.
+    public func promptSubmissions() -> AsyncStream<RoutedPromptSubmission> {
+        let (stream, continuation) = AsyncStream<RoutedPromptSubmission>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        promptContinuation = continuation
+        return stream
+    }
+
+    private func publishPromptSubmission(
+        _ request: SendMessageRequest,
+        runtime: ChatRuntime,
+        isQueued: Bool
+    ) {
+        promptContinuation?.yield(RoutedPromptSubmission(
+            chatID: runtime.record.chatID,
+            submission: PromptSubmission(
+                submissionID: request.submissionID,
+                // `request.text` rather than the composed message: workspace
+                // notes and diff-comment context are machinery the transcript
+                // renders its own way, and repeating them in the bubble is not
+                // what the user or the assistant actually said.
+                text: request.text,
+                attachments: request.attachments,
+                origin: request.origin,
+                isQueued: isQueued
+            )
+        ))
+    }
+}
+
+public struct RoutedPromptSubmission: Sendable {
+    public var chatID: ChatID
+    public var submission: PromptSubmission
+
+    public init(chatID: ChatID, submission: PromptSubmission) {
+        self.chatID = chatID
+        self.submission = submission
     }
 }
 

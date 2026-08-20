@@ -289,6 +289,118 @@ struct AssistantBridgeTests {
         #expect(!response.ok)
         #expect(response.error?.contains("isn't ready") == true)
     }
+
+    @Test func setChatModelRunsWithoutConfirmation() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "model-test")
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let chatID = try #require(chats.first?.chatID)
+
+        let response = try harness.callBridge(
+            tool: "SetChatModel",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+                "model": .string("claude-opus-4-6"),
+            ]
+        )
+        #expect(response.ok)
+        #expect(response.result?.contains("claude-opus-4-6") == true)
+
+        let audit = try await harness.store.assistantActions()
+        #expect(audit.first?.tool == "SetChatModel")
+        #expect(audit.first?.decision == "auto")
+    }
+
+    @Test func createChatPassesModelModeAndEffort() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "chat-config")
+        let response = try harness.callBridge(
+            tool: "CreateChat",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "title": .string("Plan pass"),
+                "permissionMode": .string("plan"),
+                "effort": .string("high"),
+            ]
+        )
+        #expect(response.ok)
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let created = try #require(chats.first { $0.title == "Plan pass" })
+        #expect(created.permissionMode == PermissionMode.plan.rawValue)
+        #expect(created.reasoningEffort == ReasoningEffort.high.rawValue)
+    }
+
+    @Test func getAppStateRunsWithoutConfirmation() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        _ = try await harness.makeWorkspace(named: "state-test")
+        let response = try harness.callBridge(tool: "GetAppState", arguments: [:])
+        #expect(response.ok)
+        #expect(response.result?.contains("[ORE app state]") == true)
+        #expect(response.result?.contains("state-test") == true)
+    }
+
+    @Test func bypassModeAsksForConfirmation() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "bypass-test")
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let chatID = try #require(chats.first?.chatID)
+
+        async let call = harness.callBridgeAsync(
+            tool: "SetChatPermissionMode",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+                "mode": .string("bypassPermissions"),
+            ]
+        )
+        guard case .assistantConfirmationRequested(let confirmation)? =
+            await harness.recorder.waitFor(matching: {
+                if case .assistantConfirmationRequested = $0 { return true }
+                return false
+            })
+        else {
+            Issue.record("no confirmation was requested")
+            return
+        }
+        #expect(confirmation.actionClass == .autoAllowTab)
+        #expect(confirmation.chatID == chatID)
+        await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+        let response = try await call
+        #expect(!response.ok)
+    }
+
+    @Test func acceptEditsModeDoesNotAsk() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "edits-test")
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let chatID = try #require(chats.first?.chatID)
+
+        let response = try harness.callBridge(
+            tool: "SetChatPermissionMode",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+                "mode": .string("acceptEdits"),
+            ]
+        )
+        #expect(response.ok)
+    }
 }
 
 /// A running core with its bridge up, plus a raw socket client — the same

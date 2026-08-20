@@ -338,6 +338,40 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v8.promptOrigin") { db in
+            // Who asked for a prompt is not recoverable from the text, and the
+            // transcript has to keep saying "the assistant started this" after a
+            // restart. Existing rows predate the assistant sending anything on
+            // its own, so defaulting them to the user is accurate.
+            try db.alter(table: "turn") { table in
+                table.add(column: "promptOrigin", .text).notNull().defaults(to: "user")
+            }
+            // A queued prompt is re-sent from this row when the turn ahead of it
+            // finishes, so the origin has to survive the wait — and the id with
+            // it, or the client draws the drained message a second time next to
+            // the queued row it already has.
+            try db.alter(table: "queuedMessage") { table in
+                table.add(column: "origin", .text).notNull().defaults(to: "user")
+                table.add(column: "submissionID", .text).notNull().defaults(to: "")
+            }
+        }
+
+        migrator.registerMigration("v9.chatEffortAndTabGrants") { db in
+            // Last requested reasoning effort is a chat property, so the
+            // assistant and the composer chip agree after a restart.
+            try db.alter(table: "chat") { table in
+                table.add(column: "reasoningEffort", .text)
+            }
+            // Per-tab "auto-allow everything this chat asks". Distinct from
+            // the global assistantGrant table, which is one row per action
+            // class (commit/push/…) rather than per chat.
+            try db.create(table: "assistantTabGrant") { table in
+                table.primaryKey("chatID", .text)
+                    .references("chat", onDelete: .cascade)
+                table.column("createdAt", .datetime).notNull()
+            }
+        }
+
         return migrator
     }
 }

@@ -88,7 +88,7 @@ struct AssistantActivityView: View {
                 TranscriptView(
                     rows: TranscriptDisplay.rows(
                         from: state.rows,
-                        isBusy: state.isBusy,
+                        keepLiveTurnExpanded: state.isTurnActive,
                         expanded: expandedActivityGroups,
                         memo: memo,
                         hidingPlanTurnID: nil,
@@ -260,8 +260,55 @@ struct AssistantActivityView: View {
 private struct AssistantAuditView: View {
     @Environment(AppModel.self) private var model
     @State private var actions: [AssistantActionRecord] = []
+    @State private var alwaysGrants: [String] = []
+    @State private var tabGrantIDs: [ChatID] = []
 
     var body: some View {
+        VStack(spacing: 0) {
+            if !alwaysGrants.isEmpty || !tabGrantIDs.isEmpty {
+                grants
+                Divider()
+            }
+            auditList
+        }
+        .task { await reload() }
+        .onChange(of: model.assistantConfirmations.count) { _, _ in
+            Task { await reload() }
+        }
+    }
+
+    private var grants: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            Text("Standing permissions")
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .foregroundStyle(.secondary)
+            ForEach(alwaysGrants, id: \.self) { grant in
+                HStack {
+                    Text(AssistantActionClass(rawValue: grant)?.displayName ?? grant)
+                    Spacer()
+                    Button("Revoke") {
+                        model.revokeAssistantAlwaysGrant(grant)
+                        Task { await reload() }
+                    }
+                    .controlSize(.small)
+                }
+            }
+            ForEach(tabGrantIDs, id: \.rawValue) { chatID in
+                HStack {
+                    Text(tabGrantLabel(chatID))
+                    Spacer()
+                    Button("Revoke") {
+                        model.revokeTabAutoAllow(chatID)
+                        Task { await reload() }
+                    }
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(OreTheme.Space.md)
+    }
+
+    private var auditList: some View {
         Group {
             if actions.isEmpty {
                 ContentUnavailableView(
@@ -290,11 +337,19 @@ private struct AssistantAuditView: View {
                 .listStyle(.inset)
             }
         }
-        .task { actions = await model.assistantAuditActions() }
-        // A confirmation resolving means a row just landed.
-        .onChange(of: model.assistantConfirmations.count) { _, _ in
-            Task { actions = await model.assistantAuditActions() }
+    }
+
+    private func reload() async {
+        actions = await model.assistantAuditActions()
+        alwaysGrants = (try? await model.assistantAlwaysGrantNames()) ?? []
+        tabGrantIDs = (try? await model.assistantTabGrantIDs()) ?? []
+    }
+
+    private func tabGrantLabel(_ chatID: ChatID) -> String {
+        if let chat = model.chatSummaries.first(where: { $0.id == chatID }) {
+            return "Auto-allow “\(chat.title)”"
         }
+        return "Auto-allow a tab"
     }
 
     private func symbol(for decision: String) -> String {

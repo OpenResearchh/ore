@@ -23,6 +23,8 @@ final class NarrationEngine {
     private(set) var enabledChats: Set<ChatID>
     /// Which chat's words are coming out of the speakers, for the UI pulse.
     private(set) var speakingChatID: ChatID?
+    /// The utterance currently being spoken, for the assistant HUD.
+    private(set) var currentSpokenText: String?
 
     /// Both voices are held, not one: the neural voice may still be
     /// downloading, and every utterance until it is ready falls back to the
@@ -589,6 +591,7 @@ final class NarrationEngine {
     private func speak(_ utterance: SpokenUtterance) {
         currentUtterance = utterance
         speakingChatID = utterance.chatID
+        currentSpokenText = utterance.text
         // What was just said grounds the next digest so it doesn't repeat.
         digests[utterance.chatID]?.noteSpoken(utterance.text)
         voice.speak(utterance.text, priority: utterance.priority)
@@ -597,6 +600,7 @@ final class NarrationEngine {
     private func utteranceEnded() {
         currentUtterance = nil
         speakingChatID = nil
+        currentSpokenText = nil
         lastUtteranceEndedAt = Date()
         pump()
         flushQuietWaitersIfIdle()

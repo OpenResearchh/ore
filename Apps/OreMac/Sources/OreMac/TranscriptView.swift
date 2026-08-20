@@ -1158,7 +1158,14 @@ final class TranscriptCell: NSTableCellView {
                 with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading]
             ).width + 20
-            userWidthConstraint.constant = min(max(120, ceil(natural)), 620)
+            // The bubble is sized from its text, but the badge sits inside it
+            // and is not part of that measurement. A one-word prompt from the
+            // assistant is narrower than its own label, so the badge decides the
+            // floor — otherwise it runs off the edge of the bubble it labels.
+            let badgeFloor = badgeString.isEmpty
+                ? 0
+                : ceil(badge.intrinsicContentSize.width) + 20
+            userWidthConstraint.constant = min(max(120, max(ceil(natural), badgeFloor)), 620)
         }
 
         let attributedText = Self.attributedText(for: row, worktreePath: worktreePath)
@@ -1630,10 +1637,18 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
-    private static func badgeText(for row: TranscriptRow) -> String {
+    static func badgeText(for row: TranscriptRow) -> String {
         // A message the engine queued behind an open turn has not reached the
         // agent yet. Saying so on the row is the difference between "waiting its
         // turn" and "sent, and ignored".
+        // A prompt the assistant sent is the one place the styling genuinely
+        // can't carry the meaning: it sits in the user's own position in the
+        // conversation, and nothing about a bubble says who wrote it. Saying so
+        // is the difference between "I asked for this" and "ORE started this
+        // for me".
+        if row.kind == .userMessage, row.origin == .agent {
+            return row.isQueued ? "SENT BY ORE · QUEUED" : "SENT BY ORE"
+        }
         if row.isQueued { return "QUEUED" }
         switch row.kind {
         // The visual treatment already says who is talking — a tinted block for
@@ -1676,10 +1691,17 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
-    private static func background(for row: TranscriptRow) -> NSColor {
+    static func background(for row: TranscriptRow) -> NSColor {
         // A queued message is drawn as a faint outline of the bubble it will
         // become, so it reads as waiting rather than as one more sent message
         // the agent has silently skipped over.
+        // The accent colour is the user's own voice in this transcript, and it
+        // follows whatever they picked in System Settings. A prompt they didn't
+        // write gets a fixed teal instead, so the two never converge on the same
+        // bubble no matter which accent is set.
+        if row.kind == .userMessage, row.origin == .agent {
+            return .systemTeal.withAlphaComponent(row.isQueued ? 0.05 : 0.12)
+        }
         if row.isQueued { return .controlAccentColor.withAlphaComponent(0.04) }
         switch row.kind {
         case .userMessage: return .controlAccentColor.withAlphaComponent(0.10)

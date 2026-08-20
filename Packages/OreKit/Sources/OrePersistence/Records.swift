@@ -196,6 +196,9 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
     /// The user typed this title. When set, the first message's auto-titling
     /// leaves it alone.
     public var isTitleUserSet: Bool
+    /// Last requested reasoning depth for this chat. Nil means the composer
+    /// (or the harness default) decides per send.
+    public var reasoningEffort: String?
 
     public init(
         id: ChatID,
@@ -210,7 +213,8 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         sortIndex: Int = 0,
         createdAt: Date = Date(),
         lastActivityAt: Date? = nil,
-        isTitleUserSet: Bool = false
+        isTitleUserSet: Bool = false,
+        reasoningEffort: ReasoningEffort? = nil
     ) {
         self.id = id.rawValue
         self.workspaceID = workspaceID.rawValue
@@ -225,6 +229,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         self.createdAt = createdAt
         self.lastActivityAt = lastActivityAt
         self.isTitleUserSet = isTitleUserSet
+        self.reasoningEffort = reasoningEffort?.rawValue
     }
 
     public var chatID: ChatID { ChatID(rawValue: id) }
@@ -253,7 +258,8 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
             isTurnActive: isTurnActive,
             contextUsage: contextUsage,
             createdAt: createdAt,
-            lastActivity: lastActivityAt
+            lastActivity: lastActivityAt,
+            reasoningEffort: reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
         )
     }
 }
@@ -312,6 +318,7 @@ public struct TurnRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
     public var checkpointCommit: String?
     public var checkpointProviderSessionID: String?
     public var promptAttachments: String = "[]"
+    public var promptOrigin: String = MessageOrigin.user.rawValue
     public var startedAt: Date
     public var endedAt: Date?
 
@@ -330,6 +337,7 @@ public struct TurnRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         checkpointCommit: String? = nil,
         checkpointProviderSessionID: String? = nil,
         attachments: [Attachment] = [],
+        origin: MessageOrigin = .user,
         startedAt: Date = Date(),
         endedAt: Date? = nil
     ) {
@@ -347,12 +355,19 @@ public struct TurnRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         self.checkpointCommit = checkpointCommit
         self.checkpointProviderSessionID = checkpointProviderSessionID
         self.promptAttachments = Self.encodeAttachments(attachments)
+        self.promptOrigin = origin.rawValue
         self.startedAt = startedAt
         self.endedAt = endedAt
     }
 
     public var attachments: [Attachment] {
         Self.decodeAttachments(promptAttachments)
+    }
+
+    /// Falls back to the user rather than refusing to render: an unreadable
+    /// origin should cost a badge, not the prompt itself.
+    public var origin: MessageOrigin {
+        MessageOrigin(rawValue: promptOrigin) ?? .user
     }
 
     private static func encodeAttachments(_ attachments: [Attachment]) -> String {
@@ -569,6 +584,20 @@ public struct AssistantGrantRecord: Codable, FetchableRecord, PersistableRecord,
     }
 }
 
+public struct AssistantTabGrantRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "assistantTabGrant"
+
+    public var chatID: String
+    public var createdAt: Date
+
+    public init(chatID: ChatID, createdAt: Date = Date()) {
+        self.chatID = chatID.rawValue
+        self.createdAt = createdAt
+    }
+
+    public var id: ChatID { ChatID(rawValue: chatID) }
+}
+
 public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable, Hashable {
     public static let databaseTableName = "queuedMessage"
 
@@ -578,6 +607,10 @@ public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableR
     public var text: String
     public var attachmentPaths: String
     public var serviceTier: String?
+    public var origin: String = MessageOrigin.user.rawValue
+    /// Carried through the wait so the client that already drew this message as
+    /// queued recognises it when the engine finally sends it.
+    public var submissionID: String = ""
     public var createdAt: Date
 
     public init(
@@ -587,6 +620,8 @@ public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableR
         text: String,
         attachmentPaths: [String] = [],
         serviceTier: String? = nil,
+        origin: MessageOrigin = .user,
+        submissionID: String = "",
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -596,11 +631,17 @@ public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableR
         self.attachmentPaths = (try? JSONEncoder().encode(attachmentPaths))
             .map { String(decoding: $0, as: UTF8.self) } ?? "[]"
         self.serviceTier = serviceTier
+        self.origin = origin.rawValue
+        self.submissionID = submissionID
         self.createdAt = createdAt
     }
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
+    }
+
+    public var messageOrigin: MessageOrigin {
+        MessageOrigin(rawValue: origin) ?? .user
     }
 
     public var paths: [String] {

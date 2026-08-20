@@ -41,6 +41,8 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     case push
     case createPullRequest
     case archiveWorkspace
+    /// Resolve a project tab's permission, or switch that tab to Bypass.
+    case autoAllowTab
 
     public var displayName: String {
         switch self {
@@ -48,6 +50,7 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
         case .push: "Push"
         case .createPullRequest: "Create pull requests"
         case .archiveWorkspace: "Archive workspaces"
+        case .autoAllowTab: "Auto-allow a tab"
         }
     }
 }
@@ -75,6 +78,7 @@ public struct AssistantConfirmation: Sendable, Codable, Hashable, Identifiable {
     public var id: String
     public var actionClass: AssistantActionClass
     public var workspaceID: WorkspaceID?
+    public var chatID: ChatID?
     /// Human-readable, e.g. "Push branch ore/foo in kailash".
     public var summary: String
 
@@ -82,11 +86,13 @@ public struct AssistantConfirmation: Sendable, Codable, Hashable, Identifiable {
         id: String,
         actionClass: AssistantActionClass,
         workspaceID: WorkspaceID? = nil,
+        chatID: ChatID? = nil,
         summary: String
     ) {
         self.id = id
         self.actionClass = actionClass
         self.workspaceID = workspaceID
+        self.chatID = chatID
         self.summary = summary
     }
 }

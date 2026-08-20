@@ -87,6 +87,20 @@ public struct AgentModel: Sendable, Codable, Hashable, Identifiable {
     }
 }
 
+/// Merges a hand-maintained fallback catalogue with whatever the installed
+/// CLI just advertised.
+///
+/// Discovery wins on id collision. Curated rows used to come first, which meant
+/// a stale ORE fallback could advertise `max` (or blank efforts) for a model
+/// the live CLI had already corrected — and Codex would reject the turn.
+public enum AgentModelCatalog {
+    public static func merge(curated: [AgentModel], discovered: [AgentModel]) -> [AgentModel] {
+        if discovered.isEmpty { return curated }
+        var seen: Set<String> = []
+        return (discovered + curated).filter { seen.insert($0.id).inserted }
+    }
+}
+
 /// What a given harness can actually do.
 ///
 /// The UI reads this to degrade gracefully — a missing capability greys out a

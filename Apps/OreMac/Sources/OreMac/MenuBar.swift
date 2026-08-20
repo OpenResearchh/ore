@@ -10,6 +10,7 @@ import SwiftUI
 struct MenuBarDashboard: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @State private var questionDrafts: [String: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -28,7 +29,9 @@ struct MenuBarDashboard: View {
                     .foregroundStyle(.secondary)
                     .padding(OreTheme.Space.md)
             } else {
-                workspaceList
+                TimelineView(.periodic(from: Date(), by: 30)) { context in
+                    workspaceList(at: context.date)
+                }
             }
             Divider()
             footer
@@ -99,21 +102,12 @@ struct MenuBarDashboard: View {
     private var tabNeedsYou: some View {
         VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
             ForEach(model.tabNeedsYou) { item in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(item.spokenSummary)
-                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                        .lineLimit(2)
-                    HStack(spacing: OreTheme.Space.sm) {
-                        Button("Deny") { deny(item) }
-                            .controlSize(.small)
-                        Spacer()
-                        Button("Allow") { allow(item) }
-                            .controlSize(.small)
-                            .buttonStyle(.borderedProminent)
-                        if case .permission = item {
-                            Button("Always") { alwaysAllow(item) }
-                                .controlSize(.small)
-                        }
+                Group {
+                    switch item {
+                    case .permission:
+                        permissionCard(item)
+                    case .question(let payload):
+                        questionCard(item, payload: payload)
                     }
                 }
                 .padding(OreTheme.Space.sm)
@@ -123,39 +117,105 @@ struct MenuBarDashboard: View {
         .padding(OreTheme.Space.sm)
     }
 
-    private func allow(_ item: TabNeedsYou) {
-        switch item {
-        case .permission(let payload):
+    private func permissionCard(_ item: TabNeedsYou) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(item.spokenSummary)
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .lineLimit(2)
+            HStack(spacing: OreTheme.Space.sm) {
+                Button("Deny") { denyPermission(item) }
+                    .controlSize(.small)
+                Spacer()
+                Button("Allow") { allowPermission(item) }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                Button("Always") { alwaysAllow(item) }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func questionCard(
+        _ item: TabNeedsYou,
+        payload: TabNeedsYou.Question
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(payload.question.prompt)
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .lineLimit(3)
+            if !payload.question.options.isEmpty {
+                HStack(spacing: OreTheme.Space.xs) {
+                    ForEach(payload.question.options, id: \.label) { option in
+                        Button(option.label) {
+                            answer(item, text: option.label)
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+            if payload.question.allowsFreeform {
+                HStack(spacing: OreTheme.Space.xs) {
+                    TextField("Your answer…", text: questionDraft(for: item.id))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { submitQuestion(item) }
+                    Button {
+                        submitQuestion(item)
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(questionText(for: item.id).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func allowPermission(_ item: TabNeedsYou) {
+        if case .permission(let payload) = item {
             model.resolvePermission(
                 payload.request.id, decision: .allow,
                 for: payload.workspaceID, chatID: payload.chatID
             )
-        case .question(let payload):
-            model.answerQuestion(
-                payload.question.id,
-                answer: payload.question.options.first?.label ?? "yes",
-                for: payload.workspaceID,
-                chatID: payload.chatID
-            )
         }
     }
 
-    private func deny(_ item: TabNeedsYou) {
-        switch item {
-        case .permission(let payload):
+    private func denyPermission(_ item: TabNeedsYou) {
+        if case .permission(let payload) = item {
             model.resolvePermission(
                 payload.request.id,
                 decision: .deny(reason: "The user denied this from the menu bar."),
                 for: payload.workspaceID, chatID: payload.chatID
             )
-        case .question(let payload):
-            model.answerQuestion(
-                payload.question.id,
-                answer: "The user declined to answer.",
-                for: payload.workspaceID,
-                chatID: payload.chatID
-            )
         }
+    }
+
+    private func answer(_ item: TabNeedsYou, text: String) {
+        guard case .question(let payload) = item else { return }
+        model.answerQuestion(
+            payload.question.id,
+            answer: text,
+            for: payload.workspaceID,
+            chatID: payload.chatID
+        )
+        questionDrafts.removeValue(forKey: item.id)
+    }
+
+    private func submitQuestion(_ item: TabNeedsYou) {
+        let text = questionText(for: item.id)
+        guard !text.isEmpty else { return }
+        answer(item, text: text)
+    }
+
+    private func questionDraft(for id: String) -> Binding<String> {
+        Binding(
+            get: { questionDrafts[id, default: ""] },
+            set: { questionDrafts[id] = $0 }
+        )
+    }
+
+    private func questionText(for id: String) -> String {
+        questionDrafts[id, default: ""]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func alwaysAllow(_ item: TabNeedsYou) {
@@ -167,31 +227,44 @@ struct MenuBarDashboard: View {
         )
     }
 
-    private var workspaceList: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(model.sortedWorkspaces.prefix(9)) { workspace in
-                Button {
-                    reveal(workspace)
-                } label: {
-                    HStack(spacing: OreTheme.Space.sm) {
-                        Circle()
-                            .fill(statusColor(for: workspace))
-                            .frame(width: 7, height: 7)
-                        Text(workspace.name)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(statusLabel(for: workspace))
-                            .font(.system(size: OreTheme.Font.caption))
-                            .foregroundStyle(.secondary)
+    @ViewBuilder
+    private func workspaceList(at now: Date) -> some View {
+        let visible = MenuBarWorkspaceVisibility.visible(
+            model.sortedWorkspaces,
+            needsYouWorkspaceIDs: Set(model.tabNeedsYou.map(\.workspaceID)),
+            now: now
+        )
+        if visible.isEmpty {
+            Text("No active agents")
+                .font(.system(size: OreTheme.Font.caption))
+                .foregroundStyle(.secondary)
+                .padding(OreTheme.Space.md)
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(visible.prefix(9)) { workspace in
+                    Button {
+                        reveal(workspace)
+                    } label: {
+                        HStack(spacing: OreTheme.Space.sm) {
+                            Circle()
+                                .fill(statusColor(for: workspace))
+                                .frame(width: 7, height: 7)
+                            Text(workspace.name)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(statusLabel(for: workspace))
+                                .font(.system(size: OreTheme.Font.caption))
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, OreTheme.Space.md)
+                    .frame(height: 26)
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, OreTheme.Space.md)
-                .frame(height: 26)
             }
+            .padding(.vertical, OreTheme.Space.xs)
         }
-        .padding(.vertical, OreTheme.Space.xs)
     }
 
     private var footer: some View {
@@ -238,7 +311,42 @@ struct MenuBarDashboard: View {
         case .awaitingInput: return "needs you"
         case .failed: return "failed"
         case .interrupted: return "stopped"
-        case .idle: return ""
+        case .idle: return "finished"
+        }
+    }
+}
+
+/// The menu bar is an exception list, not a second sidebar. Finished agents
+/// remain for a short handoff window; inert historical workspaces stay in the
+/// main window where they do not compete with work happening now.
+enum MenuBarWorkspaceVisibility {
+    static let recentCompletionWindow: TimeInterval = 10 * 60
+
+    static func visible(
+        _ workspaces: [WorkspaceSummary],
+        needsYouWorkspaceIDs: Set<WorkspaceID>,
+        now: Date = Date()
+    ) -> [WorkspaceSummary] {
+        workspaces.filter {
+            shouldShow($0, needsYouWorkspaceIDs: needsYouWorkspaceIDs, now: now)
+        }
+    }
+
+    static func shouldShow(
+        _ workspace: WorkspaceSummary,
+        needsYouWorkspaceIDs: Set<WorkspaceID>,
+        now: Date = Date()
+    ) -> Bool {
+        if needsYouWorkspaceIDs.contains(workspace.id) { return true }
+        switch workspace.status {
+        case .requesting, .thinking, .runningTool, .awaitingInput, .failed:
+            return true
+        case .idle:
+            guard let lastActivity = workspace.lastActivity else { return false }
+            let age = now.timeIntervalSince(lastActivity)
+            return age >= 0 && age <= recentCompletionWindow
+        case .interrupted:
+            return false
         }
     }
 }

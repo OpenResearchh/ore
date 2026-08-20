@@ -49,6 +49,18 @@ public actor WorkspaceEngine {
         var isGeneratingTitle = false
         var handoffContext: String?
         var queuedMessageCount = 0
+        /// Turns the person had here, fleet digests excluded. Counted forward
+        /// from one query at load rather than re-counted per turn: the summary
+        /// is rebuilt on every publish, and a transcript join on that path is
+        /// the sort of thing that only hurts once the fleet is busy.
+        var userTurnCount = 0
+        /// Who asked for the turn in flight, so `.turnCompleted` — which sees
+        /// only the result — knows whether it was conversation or a digest.
+        var currentTurnOrigin: MessageOrigin = .user
+        /// Set while `compactChat` is retiring this conversation, so a turn
+        /// completing behind it cannot start a second compaction of the same
+        /// chat while the first is still summarizing.
+        var isCompacting = false
         /// Workspace-level facts the agent must learn on its next real turn
         /// (e.g. "your PR merged; you're on a fresh branch now"). Prepended to
         /// the next outgoing message and cleared — a note in the database
@@ -146,6 +158,9 @@ public actor WorkspaceEngine {
         for record in records where chats[record.chatID] == nil {
             let runtime = ChatRuntime(record: record)
             runtime.queuedMessageCount = try await store.queuedMessages(chatID: record.chatID).count
+            runtime.userTurnCount = try await store.turnCount(
+                chatID: record.chatID, excludingOrigins: [.watch]
+            )
             chats[record.chatID] = runtime
             publishChatChange(runtime)
         }
@@ -188,7 +203,8 @@ public actor WorkspaceEngine {
                     )?.capabilities ?? HarnessCapabilities(),
                     queuedMessageCount: runtime.queuedMessageCount,
                     isTurnActive: runtime.isTurnActive,
-                    contextUsage: runtime.latestUsage
+                    contextUsage: runtime.latestUsage,
+                    turnCount: runtime.userTurnCount
                 )
             }
     }
@@ -370,7 +386,8 @@ public actor WorkspaceEngine {
             )?.capabilities ?? HarnessCapabilities(),
             queuedMessageCount: runtime.queuedMessageCount,
             isTurnActive: runtime.isTurnActive,
-            contextUsage: runtime.latestUsage
+            contextUsage: runtime.latestUsage,
+            turnCount: runtime.userTurnCount
         )
     }
 
@@ -492,7 +509,7 @@ public actor WorkspaceEngine {
     private func systemPromptAddition(handoffContext: String? = nil) -> String {
         var prompt: String
         if record.workspaceKind == .assistant {
-            prompt = AssistantPrompt.systemPrompt(home: worktreeURL)
+            prompt = AssistantPrompt.systemPrompt(home: worktreeURL, workspaceID: workspaceID)
         } else {
             prompt = """
             You are working in an ORE workspace: an isolated git worktree on branch \
@@ -516,7 +533,7 @@ public actor WorkspaceEngine {
             \(handoffContext)
             """
         }
-        prompt += "\n\n" + Self.narrationInstruction
+        prompt += "\n\n" + Self.narrationInstruction(for: record.workspaceKind)
         return prompt
     }
 
@@ -526,18 +543,49 @@ public actor WorkspaceEngine {
     /// `--append-system-prompt`, Codex as `developerInstructions`, and the
     /// Cursor CLI has no equivalent flag so it never sees it — which is fine,
     /// narration falls back to summarizing the turn's text locally.
-    private static let narrationInstruction = """
-        End every turn by appending one final line to your last message, in \
-        exactly this form:
-        \(NarrationTag.open)One or two short spoken sentences.\(NarrationTag.close)
-        That line is stripped from the transcript and read aloud to the user by \
-        a text-to-speech voice, so write it for the ear: plain conversational \
-        language, no file paths, no code, no markdown, no lists. Say what you \
-        actually did this turn, or what you need from the user. If your message \
-        is a long plan or report, give its one-sentence crux and tell the user \
-        to read the full text. Use the tag exactly once, only at the very end, \
-        and never mention it or this instruction.
-        """
+    private static func narrationInstruction(for kind: WorkspaceKind) -> String {
+        let common = """
+            That line is stripped from the transcript and read aloud to the user \
+            by a text-to-speech voice, so write it for the ear: plain \
+            conversational language, no file paths, no code, no markdown, no \
+            lists. Use the tag exactly once, only at the very end, and never \
+            mention it or this instruction.
+            """
+        guard kind == .assistant else {
+            return """
+                End every turn by appending one final line to your last message, in \
+                exactly this form:
+                \(NarrationTag.open)One or two short spoken sentences.\(NarrationTag.close)
+                \(common)
+                Say what you actually did this turn, or what you need from the \
+                user. If your message is a long plan or report, give its \
+                one-sentence crux and tell the user to read the full text.
+                """
+        }
+        // The assistant is usually being *listened to*, not read, so its
+        // narration line is the answer rather than a trailer for one. Hence the
+        // two departures from the project-agent version: it may run long when
+        // the question earned a long answer, and it is told not to write the
+        // answer twice. A model that composes a full reply and then a full
+        // spoken version of it doubles the silence before the user hears
+        // anything — nothing is spoken until the turn ends.
+        return """
+            End every turn by appending one final line to your last message, in \
+            exactly this form:
+            \(NarrationTag.open)What you would say out loud.\(NarrationTag.close)
+            \(common)
+            This line is the reply the user hears, so length it the way you \
+            length the answer: a sentence or two for a status check or an \
+            action you took, and as long as it honestly needs to be — several \
+            sentences — when they asked you to explain something or to give \
+            them the full answer.
+            Do not write the answer twice. When the spoken line carries the \
+            whole answer, the message above it can be a short written recap; \
+            when the answer is genuinely something to read — a list, a table, \
+            anything with names to check — put it in the message and let the \
+            spoken line give its crux and point at the Assistant window.
+            """
+    }
 
     private func oreMCPServer() -> SessionConfiguration.MCPServer? {
         let current = URL(fileURLWithPath: CommandLine.arguments[0])
@@ -606,7 +654,12 @@ public actor WorkspaceEngine {
         let currentTitle = runtime.record.title
         // A title the user typed is never a placeholder — the whole point of
         // the flag is that a rename made before the first turn survives it.
+        // A fleet digest is the first thing to reach a freshly compacted
+        // assistant conversation as often as not, and naming a conversation
+        // "ORE Watch Cross-Workspace Events" tells the user nothing about what
+        // they were talking about.
         let isPlaceholderTitle = !runtime.record.isTitleUserSet
+            && request.origin != .watch
             && (currentTitle.isEmpty
                 || currentTitle.hasPrefix("Chat ")
                 || currentTitle == record.name
@@ -672,6 +725,7 @@ public actor WorkspaceEngine {
         // prompt: cursor-agent rejects that outright, and the message is lost.
         // Claiming first makes the queue gate cover the whole send.
         runtime.isTurnActive = true
+        runtime.currentTurnOrigin = request.origin
         do {
             let harnessKind = HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
             let storedEffort = runtime.record.reasoningEffort
@@ -701,17 +755,42 @@ public actor WorkspaceEngine {
                 attachments: request.attachments,
                 origin: request.origin
             )
-            var modelText = text
+            // One ORE preamble, not three. The app's app-state snapshot already
+            // scales with the size of the user's fleet, and stacking further
+            // blocks in front of the user's words pushes what they actually
+            // said further from where the model starts reading.
+            var preamble: [String] = []
             if let hidden = request.hiddenContext?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !hidden.isEmpty {
-                modelText = "\(hidden)\n\n\(text)"
+                preamble.append(hidden)
             }
+            // Read before the seed is consumed below — it is what tells the
+            // model this conversation continues an earlier one.
+            if record.workspaceKind == .assistant, request.origin != .watch {
+                preamble.append(conversationStateNote(runtime))
+            }
+            let seed = runtime.record.seedContext?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+            if let seed { preamble.append(seed) }
+
+            let modelText = preamble.isEmpty
+                ? text
+                : (preamble + [text]).joined(separator: "\n\n")
             try await session.send(UserMessage(
                 text: modelText,
                 attachmentPaths: request.attachments.map(\.relativePath),
                 reasoningEffort: requestedEffort,
                 serviceTier: request.serviceTier
             ))
+            if seed != nil {
+                // Cleared only now that the provider has it. A send that throws
+                // is one the user retries, and a summary spent on a turn that
+                // never started is gone — the session that could rebuild it was
+                // stopped when the old conversation was retired.
+                runtime.record.seedContext = nil
+                try? await store.saveChat(runtime.record)
+            }
         } catch {
             // The turn never started. Releasing the claim keeps the composer, and
             // anything queued behind it, from waiting on a completion that can
@@ -786,21 +865,45 @@ public actor WorkspaceEngine {
         harness harnessKind: HarnessKind,
         model: String?
     ) async -> String? {
+        let generated = await generateText(
+            prompt: """
+                Name this software task from the user's request below. Return only a clear, specific title of 2–6 words. Do not quote it, explain it, or end it with punctuation.
+
+                User request:
+                \(userPrompt.prefix(4_000))
+                """,
+            harness: harnessKind,
+            instruction: "Do not use tools. Return only the requested short title.",
+            timeout: .seconds(30)
+        )
+        return generated.flatMap(Self.cleanGeneratedTitle)
+    }
+
+    /// One throwaway turn on a cheap model of the chat's own harness, for work
+    /// ORE needs done *about* a conversation rather than in it — naming one,
+    /// summarizing one.
+    ///
+    /// Same harness because it is the one already installed and signed in;
+    /// cheapest model because none of these are the user's actual question.
+    /// Returns nil rather than throwing: every caller has a fallback, and none
+    /// of them is worth failing a user's turn over.
+    private func generateText(
+        prompt: String,
+        harness harnessKind: HarnessKind,
+        instruction: String,
+        timeout: Duration
+    ) async -> String? {
         guard let harness = harnessRegistry.harness(for: harnessKind),
               harness.supportsAuxiliarySessions
         else { return nil }
-        // Name with the cheapest model of the chat's own (already authenticated)
-        // harness rather than whatever expensive model the user picked — Haiku
-        // for Claude, the harness default elsewhere. Keeping the same harness
-        // avoids assuming another one is installed/signed in.
-        let namingModel: String? = harnessKind == .claudeCode
+        let auxiliaryModel: String? = harnessKind == .claudeCode
             ? "claude-haiku-4-5-20251001"
             : nil
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
-            model: namingModel,
+            model: auxiliaryModel,
             permissionMode: .plan,
-            appendSystemPrompt: "Do not use tools. Return only the requested short title.",
+            appendSystemPrompt: instruction,
             environmentOverrides: harnessKind == .claudeCode
                 ? ["CLAUDE_CODE_EFFORT_LEVEL": ReasoningEffort.low.rawValue]
                 : [:],
@@ -810,15 +913,7 @@ public actor WorkspaceEngine {
         guard let session = try? await harness.makeSession(configuration) else { return nil }
         do {
             try await session.start()
-            try await session.send(UserMessage(
-                text: """
-                Name this software task from the user's request below. Return only a clear, specific title of 2–6 words. Do not quote it, explain it, or end it with punctuation.
-
-                User request:
-                \(userPrompt.prefix(4_000))
-                """,
-                reasoningEffort: .low
-            ))
+            try await session.send(UserMessage(text: prompt, reasoningEffort: .low))
         } catch {
             await session.stop()
             return nil
@@ -835,11 +930,11 @@ public actor WorkspaceEngine {
                     case .blockCompleted(let block) where block.kind == .text:
                         completedBlocks.append(block.text)
                     case .turnCompleted(let result):
-                        // A failed naming turn still produces prose — a usage
-                        // limit notice, a provider error — and that prose is
-                        // shaped exactly like a title. Adopting it is how a
-                        // workspace ended up called "You've hit your session
-                        // limit". Nothing a failed turn said is a name.
+                        // A failed auxiliary turn still produces prose — a
+                        // usage limit notice, a provider error — shaped exactly
+                        // like the answer. Adopting it is how a workspace ended
+                        // up called "You've hit your session limit". Nothing a
+                        // failed turn said is an answer.
                         guard result.outcome == .completed else { return nil }
                         return completedBlocks.last ?? streamed
                     case .sessionError, .sessionEnded:
@@ -851,7 +946,7 @@ public actor WorkspaceEngine {
                 return completedBlocks.last ?? (streamed.isEmpty ? nil : streamed)
             }
             group.addTask {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: timeout)
                 return nil
             }
             let first = await group.next() ?? nil
@@ -859,7 +954,7 @@ public actor WorkspaceEngine {
             return first
         }
         await session.stop()
-        return result.flatMap(Self.cleanGeneratedTitle)
+        return result?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     private static func cleanGeneratedTitle(_ raw: String) -> String? {
@@ -893,6 +988,164 @@ public actor WorkspaceEngine {
             "unable to", "error", "failed to", "no response",
         ]
         return markers.contains { value.contains($0) }
+    }
+
+    // MARK: - Assistant conversation management
+
+    /// What the assistant is told about the conversation it is standing in.
+    ///
+    /// The model cannot see how far into a conversation it is, how much window
+    /// is left, or whether what it "remembers" of turn three is the transcript
+    /// or somebody's summary of it. Without that it does the two things a
+    /// concierge must not: re-asks something the user answered twenty turns
+    /// ago, and states a detail from a summary as though it were recall.
+    private func conversationStateNote(_ runtime: ChatRuntime) -> String {
+        var parts = ["turn \(runtime.userTurnCount + 1)"]
+        if let fraction = AssistantCompaction.contextFraction(runtime.latestUsage) {
+            parts.append("\(Int(fraction * 100))% of your context used")
+        }
+        if runtime.record.seedContext?.isEmpty == false {
+            parts.append(
+                "this conversation continues an earlier one you can no longer see — "
+                    + "the summary below is all of it you have"
+            )
+        } else if AssistantCompaction.isNearingCompaction(
+            userTurnCount: runtime.userTurnCount, usage: runtime.latestUsage
+        ) {
+            parts.append(
+                "ORE will soon compact this conversation — anything durable belongs "
+                    + "in memory/ now"
+            )
+        }
+        return "[ORE conversation state] \(parts.joined(separator: "; "))."
+    }
+
+    /// Retires an over-long assistant conversation between turns.
+    ///
+    /// Called from `.turnCompleted` rather than before a send, because a seam
+    /// that lands mid-answer would strand the reply the user is waiting on in
+    /// a conversation they were just moved out of.
+    private func compactAssistantIfOutgrown(_ runtime: ChatRuntime) async {
+        guard record.workspaceKind == .assistant,
+              !runtime.isCompacting,
+              !runtime.record.isClosed,
+              // `drainQueue` just ran, and it re-enters `send`, which claims
+              // the turn before returning. So "a turn completed" is not yet
+              // "this conversation is idle" — without this the user's queued
+              // question gets answered into a conversation they have left.
+              !runtime.isTurnActive,
+              runtime.queuedMessageCount == 0,
+              AssistantCompaction.shouldCompact(
+                  userTurnCount: runtime.userTurnCount, usage: runtime.latestUsage
+              )
+        else { return }
+        _ = try? await compactAssistantConversation(chatID: runtime.record.chatID)
+    }
+
+    /// Summarizes a conversation, retires it, and opens a fresh one carrying
+    /// the summary. The old transcript stays exactly where it was — this adds
+    /// a conversation, it never deletes one.
+    @discardableResult
+    public func compactAssistantConversation(chatID: ChatID) async throws -> ChatSummary? {
+        let source = try await runtime(for: chatID)
+        guard !source.isCompacting else { return nil }
+        source.isCompacting = true
+        defer { source.isCompacting = false }
+
+        let harnessKind = HarnessKind(rawValue: source.record.harness) ?? .claudeCode
+        guard let digest = await conversationDigest(for: source, harness: harnessKind) else {
+            return nil
+        }
+        // Summarizing costs a round trip to a CLI, and the user is free to type
+        // during it. A conversation they have just added to is one they are
+        // still having, so the seam waits for the next quiet moment.
+        guard !source.isTurnActive, source.queuedMessageCount == 0 else { return nil }
+
+        // The provider incarnation holding the context is the whole point of
+        // the exercise. The rows stay readable, and typing into the retired
+        // conversation resumes it — this sheds the window, not the history.
+        await stopSession(chatID: chatID)
+
+        let successor = try await createChat(CreateChatRequest(
+            workspaceID: workspaceID,
+            harness: harnessKind,
+            model: source.record.model,
+            permissionMode: PermissionMode(rawValue: source.record.permissionMode) ?? .default,
+            reasoningEffort: source.record.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+        ))
+        guard let successorRuntime = chats[successor.id] else { return nil }
+        // Left deliberately auto-titleable: the successor should be named after
+        // whatever the user asks next, which is what makes a list of past
+        // conversations worth reading. Titling it "<old title> (continued)"
+        // produces "(continued) (continued)" by the third compaction.
+        successorRuntime.record.seedContext = """
+            [ORE conversation summary] This conversation continues an earlier one that \
+            grew too long to keep whole. You do not have its transcript — only this:
+
+            \(digest)
+
+            Treat it as notes, not as memory. If the user refers to something it does \
+            not cover, say you have the gist but not the detail and ask, rather than \
+            inventing it. Anything here that must outlive the next compaction belongs \
+            in memory/ via WriteMemory now.
+            """
+        try await store.saveChat(successorRuntime.record)
+
+        for (chat, kind) in [(chatID, ChatTransition.Kind.compacted),
+                             (successor.id, .continuedFromCompaction)] {
+            try? await store.saveChatTransition(ChatTransition(chatID: chat, kind: kind))
+        }
+        publishChatChange(successorRuntime)
+        compactionContinuation?.yield(CompactedConversation(from: chatID, to: successor.id))
+        return try await summary(for: successorRuntime)
+    }
+
+    /// Asks a cheap model to compress the conversation, falling back to the
+    /// locally assembled handoff text.
+    ///
+    /// The fallback matters: `supportsAuxiliarySessions` is false for
+    /// cursor-agent, and a harness that cannot summarize must still be able to
+    /// compact — otherwise the one conversation that most needs it, on the
+    /// harness with the least headroom, is the one that never gets it.
+    private func conversationDigest(
+        for runtime: ChatRuntime,
+        harness harnessKind: HarnessKind
+    ) async -> String? {
+        let fallback = try? await store.handoffContext(
+            chatID: runtime.record.chatID, transcriptTailLimit: 4
+        )
+        guard let transcript = try? await store.conversationTranscript(
+            chatID: runtime.record.chatID, excludingOrigins: [.watch]
+        ) else { return fallback }
+
+        let summarized = await generateText(
+            prompt: """
+                Below is a conversation between a user and their assistant inside ORE, \
+                an app for running coding agents. It has grown too long to keep, and \
+                you are writing the notes its replacement will start from.
+
+                Write at most 400 words, as plain prose under these headings — omit a \
+                heading with nothing under it, and never invent an entry to fill one:
+
+                What the user is working on:
+                Decisions and preferences they stated:
+                Open threads and what they are waiting on:
+                What was already explained, so it need not be asked again:
+
+                Record only what was actually said. Names of repositories, workspaces, \
+                branches and people matter more than narrative — keep them verbatim. \
+                Do not address the user, do not summarize the summary, and do not \
+                mention that you were asked to do this.
+
+                Conversation:
+                \(transcript.suffix(60_000))
+                """,
+            harness: harnessKind,
+            instruction: "Do not use tools. Return only the notes.",
+            timeout: .seconds(90)
+        )
+        guard let summarized, !Self.isRefusalOrError(summarized) else { return fallback }
+        return summarized
     }
 
     /// Folds diff comments into the prompt with enough anchoring that the agent
@@ -1012,7 +1265,7 @@ public actor WorkspaceEngine {
         chatID: ChatID? = nil
     ) async throws {
         let runtime = try await runtime(for: chatID)
-        runtime.pendingPermissions.removeValue(forKey: id)
+        guard let session = runtime.session else { throw HarnessError.sessionEnded }
 
         // The CLI applies a `setMode` suggestion in the permission reply
         // itself. Mirror it into the stored mode so the composer chip — which
@@ -1025,7 +1278,7 @@ public actor WorkspaceEngine {
             publishChatChange(runtime)
         }
 
-        try await runtime.session?.resolvePermission(id, with: decision)
+        try await session.resolvePermission(id, with: decision)
     }
 
     public func answerQuestion(
@@ -1034,9 +1287,32 @@ public actor WorkspaceEngine {
         chatID: ChatID? = nil
     ) async throws {
         let runtime = try await runtime(for: chatID)
+        guard let question = runtime.pendingQuestions[id] else {
+            throw OreCoreError.questionNotPending(id, runtime.record.chatID)
+        }
+        guard let session = runtime.session else { throw HarnessError.sessionEnded }
+
         runtime.pendingQuestions.removeValue(forKey: id)
+        // Claude's AskUserQuestion is also gated by a can_use_tool request.
+        // Its answer must be returned through that request; sending an
+        // ordinary message leaves the tool blocked while falsely reporting
+        // success to the assistant.
+        if let toolCallID = question.toolCallID,
+           let permission = runtime.pendingPermissions.values.first(where: {
+               $0.toolCallID == toolCallID && $0.toolName == "AskUserQuestion"
+           }) {
+            let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = trimmed.isEmpty
+                ? "The user dismissed the question without choosing; continue."
+                : "The user answered your question: \"\(trimmed)\". Continue with this answer in mind."
+            try await session.resolvePermission(
+                permission.id, with: .deny(reason: message)
+            )
+            return
+        }
+
         resumeTurnAfterInput(runtime: runtime)
-        try await runtime.session?.answerQuestion(id, answer: answer)
+        try await session.answerQuestion(id, answer: answer)
     }
 
     // MARK: - Checkpoints
@@ -1596,6 +1872,7 @@ public actor WorkspaceEngine {
         case .turnCompleted:
             runtime.isTurnActive = false
             runtime.currentTurnID = nil
+            if runtime.currentTurnOrigin != .watch { runtime.userTurnCount += 1 }
             await markUnread(runtime)
             runtime.record.lastActivityAt = Date()
             record.lastActivityAt = Date()
@@ -1605,6 +1882,7 @@ public actor WorkspaceEngine {
             // both interesting and stable.
             await statusWatcher?.refreshNow()
             await drainQueue(runtime: runtime)
+            await compactAssistantIfOutgrown(runtime)
 
         case .sessionError(let error):
             if !error.isRecoverable { setStatus(.failed, runtime: runtime) }
@@ -1682,23 +1960,41 @@ public actor WorkspaceEngine {
 
     public func gitStatusValue() -> GitStatusSummary { gitStatus }
 
-    public func pendingInput() -> [(chatID: ChatID, title: String, kind: String, summary: String)] {
-        var rows: [(ChatID, String, String, String)] = []
+    public struct PendingInput: Sendable, Equatable {
+        public var chatID: ChatID
+        public var title: String
+        public var kind: String
+        public var id: String
+        public var summary: String
+        public var options: [String]
+        public var allowsFreeform: Bool
+    }
+
+    public func pendingInput() -> [PendingInput] {
+        var rows: [PendingInput] = []
         for runtime in chats.values {
             for permission in runtime.pendingPermissions.values {
-                rows.append((
-                    runtime.record.chatID,
-                    runtime.record.title,
-                    "permission",
-                    permission.summary.map { "\(permission.toolName): \($0)" } ?? permission.toolName
+                rows.append(PendingInput(
+                    chatID: runtime.record.chatID,
+                    title: runtime.record.title,
+                    kind: "permission",
+                    id: permission.id.rawValue,
+                    summary: permission.summary.map {
+                        "\(permission.toolName): \($0)"
+                    } ?? permission.toolName,
+                    options: [],
+                    allowsFreeform: false
                 ))
             }
             for question in runtime.pendingQuestions.values {
-                rows.append((
-                    runtime.record.chatID,
-                    runtime.record.title,
-                    "question",
-                    String(question.prompt.prefix(160))
+                rows.append(PendingInput(
+                    chatID: runtime.record.chatID,
+                    title: runtime.record.title,
+                    kind: "question",
+                    id: question.id.rawValue,
+                    summary: String(question.prompt.prefix(160)),
+                    options: question.options.map(\.label),
+                    allowsFreeform: question.allowsFreeform
                 ))
             }
         }
@@ -1738,7 +2034,8 @@ public actor WorkspaceEngine {
             )?.capabilities ?? HarnessCapabilities(),
             queuedMessageCount: runtime.queuedMessageCount,
             isTurnActive: runtime.isTurnActive,
-            contextUsage: runtime.latestUsage
+            contextUsage: runtime.latestUsage,
+            turnCount: runtime.userTurnCount
         ))
     }
 
@@ -1761,6 +2058,18 @@ public actor WorkspaceEngine {
         )
         chatContinuation = continuation
         for runtime in chats.values { publishChatChange(runtime) }
+        return stream
+    }
+
+    private var compactionContinuation: AsyncStream<CompactedConversation>.Continuation?
+
+    /// Unbounded for the same reason as `promptSubmissions`: a dropped seam
+    /// leaves the user typing into the conversation ORE has already retired.
+    public func conversationCompactions() -> AsyncStream<CompactedConversation> {
+        let (stream, continuation) = AsyncStream<CompactedConversation>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        compactionContinuation = continuation
         return stream
     }
 
@@ -1796,6 +2105,19 @@ public actor WorkspaceEngine {
                 isQueued: isQueued
             )
         ))
+    }
+}
+
+/// One assistant conversation retired into another. Carried on its own stream
+/// because the client's response — move the user — must happen exactly once,
+/// and only for a conversation ORE itself retired.
+public struct CompactedConversation: Sendable {
+    public var from: ChatID
+    public var to: ChatID
+
+    public init(from: ChatID, to: ChatID) {
+        self.from = from
+        self.to = to
     }
 }
 
@@ -1849,6 +2171,7 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case pullRequestNotMerged(String)
     case conflictHunkMissing(String, Int)
     case assistantWorkspaceProtected
+    case questionNotPending(QuestionID, ChatID)
 
     public var description: String {
         switch self {
@@ -1869,6 +2192,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "No conflict hunk at \(path):\(line)."
         case .assistantWorkspaceProtected:
             return "The assistant workspace belongs to ORE and can't be archived or deleted."
+        case .questionNotPending(let id, let chatID):
+            return "Question \(id.rawValue) is not pending on chat \(chatID.rawValue). Refresh app state and use the current IDs."
         }
     }
 }

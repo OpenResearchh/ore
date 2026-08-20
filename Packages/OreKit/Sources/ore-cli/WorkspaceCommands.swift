@@ -349,6 +349,10 @@ actor CoreEventPrinter {
             endLine()
             print("? assistant asks: \(confirmation.summary)")
 
+        case .assistantConversationCompacted(_, _, let successor):
+            endLine()
+            print("· assistant conversation compacted → \(successor.rawValue.prefix(8))")
+
         case .assistantConfirmationResolved, .assistantUIAction:
             break
         }

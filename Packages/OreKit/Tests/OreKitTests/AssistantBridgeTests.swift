@@ -401,6 +401,41 @@ struct AssistantBridgeTests {
         )
         #expect(response.ok)
     }
+
+    @Test func aStalePermissionIDCannotReportFalseSuccess() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "permission-test")
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let chatID = try #require(chats.first?.chatID)
+        async let call = harness.callBridgeAsync(
+            tool: "ResolveChatPermission",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+                "permissionID": .string("stale-permission"),
+                "allow": .bool(true),
+            ]
+        )
+        guard case .assistantConfirmationRequested(let confirmation)? =
+            await harness.recorder.waitFor(matching: {
+                if case .assistantConfirmationRequested = $0 { return true }
+                return false
+            })
+        else {
+            Issue.record("no confirmation was requested")
+            return
+        }
+        await harness.client.send(
+            .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+        )
+
+        let response = try await call
+        #expect(!response.ok)
+        #expect(response.error?.contains("not pending") == true)
+    }
 }
 
 /// A running core with its bridge up, plus a raw socket client — the same

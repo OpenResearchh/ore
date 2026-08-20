@@ -310,10 +310,15 @@ final class AppModel {
     // MARK: - Ask (App Intents / Siri / Spotlight)
 
     private var assistantReplyWaiters: [UUID: CheckedContinuation<String, Never>] = [:]
+    /// Which conversation the question went to, captured at send time. The
+    /// active one can change while the answer is being written — a compaction,
+    /// or the user switching conversations — and the reply belongs to the
+    /// conversation that was asked.
+    private var askAssistantChatID: ChatID?
 
     /// Sends a request to the assistant and waits for its answer — the
     /// synchronous shape Siri, Shortcuts, and Spotlight need. The reply is
-    /// the turn's narration line: already written to be one breath long.
+    /// the turn's narration line, which for the assistant is the answer itself.
     func askAssistant(_ text: String, timeout: Duration = .seconds(90)) async -> String {
         guard assistantWorkspace != nil else {
             return "ORE is still starting up — try again in a moment."
@@ -321,7 +326,7 @@ final class AppModel {
         guard let assistant = assistantWorkspace else {
             return "The assistant isn't available."
         }
-        send(text, to: assistant.id)
+        askAssistantChatID = send(text, to: assistant.id)
         let token = UUID()
         return await withCheckedContinuation { continuation in
             assistantReplyWaiters[token] = continuation
@@ -349,7 +354,9 @@ final class AppModel {
     private var watchBuffer: [String] = []
     private var watchFlushTask: Task<Void, Never>?
     private var lastWatchDigestAt: Date = .distantPast
-    private var awaitingWatchReply = false
+    /// The conversation the outstanding digest is being judged in, or nil when
+    /// none is. Doubles as the "one at a time" gate the bool used to be.
+    private var watchDigestChatID: ChatID?
     var assistantRateLimitHandled = false
 
     /// Coalesce a burst of activity into one digest…
@@ -418,7 +425,7 @@ final class AppModel {
         }
         // One digest at a time, and never at a chattier cadence than the gap —
         // whatever backed up simply rides the next digest.
-        guard !awaitingWatchReply,
+        guard watchDigestChatID == nil,
               Date().timeIntervalSince(lastWatchDigestAt) >= Self.watchMinimumGap
         else {
             scheduleWatchFlush()
@@ -427,8 +434,7 @@ final class AppModel {
         let lines = watchBuffer.suffix(12)
         watchBuffer.removeAll()
         lastWatchDigestAt = Date()
-        awaitingWatchReply = true
-        send(
+        watchDigestChatID = send(
             """
             [ORE watch] Cross-workspace events since the last digest:
             \(lines.map { "- \($0)" }.joined(separator: "\n"))
@@ -438,6 +444,10 @@ final class AppModel {
             one or two spoken-style sentences (they will be spoken aloud and \
             shown as a notification). Take no actions.
             """,
+            // Not `.user`: a digest is ORE talking to the assistant on a timer,
+            // and counting it as conversation would have the assistant
+            // compacting itself overnight with nobody at the keyboard.
+            origin: .watch,
             to: assistant.id
         )
     }
@@ -682,15 +692,30 @@ final class AppModel {
         return true
     }
 
+    /// Returns the chat the message actually went to, which the assistant's
+    /// callers need: with several assistant conversations, "the active one"
+    /// can change between asking and being answered, and a reply spoken into
+    /// the wrong conversation is worse than one not spoken at all.
+    @discardableResult
     func send(
         _ text: String,
         attachments: [Attachment] = [],
         effort: ReasoningEffort? = nil,
         serviceTier: String? = nil,
+        origin: MessageOrigin = .user,
         to id: WorkspaceID
-    ) {
-        guard let chatID = activeChat(for: id)?.id else { return }
-        send(text, attachments: attachments, effort: effort, serviceTier: serviceTier, to: id, chatID: chatID)
+    ) -> ChatID? {
+        guard let chatID = activeChat(for: id)?.id else { return nil }
+        send(
+            text,
+            attachments: attachments,
+            effort: effort,
+            serviceTier: serviceTier,
+            origin: origin,
+            to: id,
+            chatID: chatID
+        )
+        return chatID
     }
 
     private func send(
@@ -698,6 +723,7 @@ final class AppModel {
         attachments: [Attachment] = [],
         effort: ReasoningEffort? = nil,
         serviceTier: String? = nil,
+        origin: MessageOrigin = .user,
         to id: WorkspaceID,
         chatID: ChatID
     ) {
@@ -733,7 +759,7 @@ final class AppModel {
                 diffComments: comments,
                 reasoningEffort: effort,
                 serviceTier: serviceTier,
-                origin: .user,
+                origin: origin,
                 submissionID: submissionID,
                 hiddenContext: hidden
             )))
@@ -749,8 +775,13 @@ final class AppModel {
     /// through `assistantChatID` rather than `interrupt(_:)`: the assistant's
     /// workspace is routed off `workspaces`, so it has no "active chat" in the
     /// sense the sidebar means.
-    func interruptAssistant() {
-        guard let assistant = assistantWorkspace, let chatID = assistantChatID else { return }
+    /// `chatID` names the conversation to stop. It defaults to the visible one,
+    /// but a caller waiting on a specific answer passes the conversation it
+    /// asked — the user can switch conversations while a turn is running, and
+    /// stopping the one they happen to be looking at is not what they meant.
+    func interruptAssistant(chatID: ChatID? = nil) {
+        guard let assistant = assistantWorkspace,
+              let chatID = chatID ?? assistantChatID else { return }
         Task { await client.send(.interruptChatTurn(assistant.id, chatID)) }
     }
 
@@ -771,6 +802,11 @@ final class AppModel {
     ) {
         let resolvedChatID = chatID ?? activeChat(for: id)?.id
         guard let resolvedChatID else { return }
+        // Optimistic and exact: the click is authoritative locally, so do not
+        // wait for the provider's round trip while a now-obsolete prompt keeps
+        // talking or opens its hands-free answer microphone.
+        voiceAssistant.permissionResolved(requestID)
+        narration.cancelPermissionPrompt(requestID)
         chat(for: resolvedChatID).resolvePermission(requestID)
         tabNeedsYou.removeAll {
             if case .permission(let item) = $0, item.request.id == requestID { return true }
@@ -906,6 +942,37 @@ final class AppModel {
             model: source.model,
             permissionMode: source.permissionMode,
             forkFrom: source.id
+        ))) }
+    }
+
+    /// Assistant workspaces whose next new conversation the user asked for and
+    /// should therefore be moved to. See the `chatAdded` handler.
+    private var assistantConversationsAwaitingFocus: Set<WorkspaceID> = []
+
+    /// A fresh assistant conversation, keeping the current one intact and
+    /// readable.
+    ///
+    /// Not `createChat(in:)`: that one names tabs after scientists and reads
+    /// its defaults out of `workspaces`, which the assistant is deliberately
+    /// routed out of. And not the workspace record's harness either — that is
+    /// never updated when the assistant is moved off a rate-limited or missing
+    /// CLI, so on a machine without Claude Code it would name one that cannot
+    /// start. The live conversation is the only honest source for what runs
+    /// here.
+    func createAssistantConversation() {
+        guard let assistant = assistantWorkspace,
+              let current = activeChat(for: assistant.id)
+                  ?? chats(for: assistant.id, includeClosed: true).last,
+              chatCreationsInFlight.insert(assistant.id).inserted
+        else { return }
+        assistantConversationsAwaitingFocus.insert(assistant.id)
+        let used = Set(chats(for: assistant.id, includeClosed: true).map(\.title))
+        Task { await client.send(.createChat(CreateChatRequest(
+            workspaceID: assistant.id,
+            title: ResearchIdentity.unique("Conversation", excluding: used),
+            harness: current.harness,
+            model: current.model,
+            permissionMode: current.permissionMode
         ))) }
     }
 
@@ -2120,7 +2187,14 @@ final class AppModel {
             chatOwners[chat.id] = chat.workspaceID
             upsertChat(chat)
             adoptResearchChatTitles(in: chat.workspaceID)
-            selectChat(chat.id, in: chat.workspaceID)
+            // The assistant opens side chats for itself mid-answer (see its
+            // prompt), and following one would move the window — and the voice
+            // — off the conversation the user is being answered in. It is moved
+            // deliberately instead: by New Conversation, or by a compaction.
+            if chat.workspaceID != assistantWorkspace?.id
+                || assistantConversationsAwaitingFocus.remove(chat.workspaceID) != nil {
+                selectChat(chat.id, in: chat.workspaceID)
+            }
             if var pending = pendingNewChatMessages[chat.workspaceID], !pending.isEmpty {
                 let message = pending.removeFirst()
                 pendingNewChatMessages[chat.workspaceID] = pending.isEmpty ? nil : pending
@@ -2149,6 +2223,12 @@ final class AppModel {
             if let replacement {
                 selectChat(replacement, in: chat.workspaceID)
             }
+
+        case .assistantConversationCompacted(let id, _, let successor):
+            // ORE retired the conversation the user was in, so following it is
+            // the whole point — unlike `chatAdded`, this event only ever fires
+            // for a seam ORE made itself.
+            selectChat(successor, in: id)
 
         case .chatRemoved(_, let chatID):
             forget(chatID)
@@ -2315,15 +2395,22 @@ final class AppModel {
         // aloud by the controller, and everything else stays quiet.
         guard assistantWorkspace?.id != workspaceID else {
             if case .turnCompleted(let result) = event {
-                if !assistantReplyWaiters.isEmpty {
+                // Matched against the conversation each request was sent to,
+                // not just "the assistant answered something". With more than
+                // one assistant conversation a watch digest can be running in
+                // one while the user's spoken question runs in another, and
+                // whichever finishes first would otherwise be taken for both.
+                if !assistantReplyWaiters.isEmpty, askAssistantChatID == chatID {
                     // Someone is waiting synchronously — Siri, Shortcuts, or
                     // Spotlight via an App Intent.
+                    askAssistantChatID = nil
                     flushAssistantReplyWaiters(
-                        with: NarrationPhraser.spokenNarration(result.narration)
-                            ?? "Done — the details are in ORE's Assistant window."
+                        with: NarrationPhraser.spokenNarration(
+                            result.narration, limit: NarrationPolicy.assistantAnswerLimit
+                        ) ?? "Done — the details are in ORE's Assistant window."
                     )
-                } else if awaitingWatchReply {
-                    awaitingWatchReply = false
+                } else if watchDigestChatID == chatID {
+                    watchDigestChatID = nil
                     deliverWatchVerdict(result)
                 }
                 assistantRateLimitHandled = false
@@ -2340,22 +2427,34 @@ final class AppModel {
                     chatID: chatID
                 )
             }
-            voiceAssistant.observe(event)
+            voiceAssistant.observe(event, chatID: chatID)
             return
         }
         collectWatchEvent(event, workspaceID: workspaceID, chatID: chatID)
         let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
-        narration.observe(event: event, chatID: chatID, origin: origin)
+        // Needs-you events have two possible voice owners: ambient tab
+        // narration, or the hands-free assistant flow that opens the mic for
+        // the answer. Pick exactly one before either starts speaking; letting
+        // both consume the event produced two back-to-back "quick checks".
+        let assistantOwnsNarration: Bool
         switch event {
         case .permissionRequest(let request):
-            noteTabNeedsYou(.permission(TabNeedsYou.Permission(
+            assistantOwnsNarration = noteTabNeedsYou(.permission(TabNeedsYou.Permission(
                 workspaceID: workspaceID, chatID: chatID, request: request
             )))
         case .question(let question):
-            noteTabNeedsYou(.question(TabNeedsYou.Question(
+            assistantOwnsNarration = noteTabNeedsYou(.question(TabNeedsYou.Question(
                 workspaceID: workspaceID, chatID: chatID, question: question
             )))
+        default:
+            assistantOwnsNarration = false
+        }
+        if !assistantOwnsNarration {
+            narration.observe(event: event, chatID: chatID, origin: origin)
+        }
+        switch event {
         case .permissionResolved(let resolution):
+            voiceAssistant.permissionResolved(resolution.id)
             tabNeedsYou.removeAll {
                 if case .permission(let item) = $0, item.request.id == resolution.id { return true }
                 return false
@@ -2405,11 +2504,13 @@ final class AppModel {
         }
     }
 
-    private func noteTabNeedsYou(_ item: TabNeedsYou) {
+    @discardableResult
+    private func noteTabNeedsYou(_ item: TabNeedsYou) -> Bool {
         tabNeedsYou.removeAll { $0.id == item.id }
         tabNeedsYou.append(item)
-        voiceAssistant.needsYouArrived(item)
+        let spokenByAssistant = voiceAssistant.needsYouArrived(item)
         informAssistantOfNeedsYou(item)
+        return spokenByAssistant
     }
 
     /// Immediate, unlike the watch digest: the assistant may offer auto-allow
@@ -2432,10 +2533,17 @@ final class AppModel {
             if case .permission(let item) = $0, item.chatID == chatID { return true }
             return false
         }
+        if let permissionID {
+            // Authentication may take a moment; the user's click has already
+            // answered this prompt, so silence it and retire the local card
+            // before proving the standing grant.
+            voiceAssistant.permissionResolved(permissionID)
+            narration.cancelPermissionPrompt(permissionID)
+            chat(for: chatID).resolvePermission(permissionID)
+        }
         Task { @MainActor in
             let proven = await Self.authenticateStandingGrant()
             if let permissionID {
-                chat(for: chatID).resolvePermission(permissionID)
                 await client.send(.resolveChatPermission(
                     workspaceID, chatID, permissionID, .allow
                 ))
@@ -2590,15 +2698,13 @@ final class AppModel {
                   let permissionID = info["permissionID"]
                       .map(PermissionRequestID.init(rawValue:))
             else { return }
-            chat(for: chatID).resolvePermission(permissionID)
             let decision: PermissionDecision = action == NotificationAction.allowPermission
                 ? .allow
                 : .deny(reason: "The user denied this from a notification.")
-            Task {
-                await client.send(.resolveChatPermission(
-                    workspaceID, chatID, permissionID, decision
-                ))
-            }
+            resolvePermission(
+                permissionID, decision: decision,
+                for: workspaceID, chatID: chatID
+            )
 
         default:
             break

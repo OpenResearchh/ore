@@ -363,6 +363,69 @@ public actor OreStore {
         }
     }
 
+    /// How long a conversation is, without materialising it — `turns(chatID:)`
+    /// loads every row and then every text block behind it, which is far too
+    /// much to do on the path a turn completes through.
+    ///
+    /// `excludingOrigins` is what makes the number mean "turns the person
+    /// had". The assistant's chat also carries ORE's own fleet digests, and a
+    /// conversation length that counts those describes the fleet, not the user.
+    public func turnCount(chatID: ChatID, excludingOrigins: Set<MessageOrigin> = []) throws -> Int {
+        try writer.read { db in
+            var sql = """
+                SELECT COUNT(*)
+                FROM turn
+                JOIN session ON session.id = turn.sessionID
+                WHERE session.chatID = ?
+                """
+            var arguments: [DatabaseValueConvertible] = [chatID.rawValue]
+            if !excludingOrigins.isEmpty {
+                let holes = excludingOrigins.map { _ in "?" }.joined(separator: ", ")
+                sql += " AND turn.promptOrigin NOT IN (\(holes))"
+                arguments += excludingOrigins.map(\.rawValue)
+            }
+            return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(arguments)) ?? 0
+        }
+    }
+
+    /// The conversation as prose, for a model that is about to summarize it.
+    ///
+    /// Deliberately not `handoffContext`: that one hands a *successor session*
+    /// enough to keep going and is near-verbatim by design. This is raw
+    /// material to be compressed, so it reaches further back and clips each
+    /// turn hard — breadth matters more than fidelity when the next step is a
+    /// summary, and an unbounded transcript is exactly what compaction exists
+    /// to escape.
+    public func conversationTranscript(
+        chatID: ChatID,
+        excludingOrigins: Set<MessageOrigin> = [],
+        turnLimit: Int = 60,
+        charactersPerTurn: Int = 700
+    ) throws -> String? {
+        let turns = try turns(chatID: chatID)
+            .filter { !excludingOrigins.contains(MessageOrigin(rawValue: $0.promptOrigin) ?? .user) }
+            .suffix(turnLimit)
+        guard !turns.isEmpty else { return nil }
+
+        let exchanges = turns.compactMap { turn -> String? in
+            var parts: [String] = []
+            if let prompt = turn.prompt, !prompt.isEmpty {
+                parts.append("User: \(String(prompt.prefix(charactersPerTurn)))")
+            }
+            // The stored summary is the reply's own text, so it saves loading
+            // every block for turns whose blocks would only be re-clipped.
+            let reply = turn.summary ?? (try? blocks(turnID: turn.turnID))?
+                .filter { $0.blockKind == .text }
+                .map(\.text)
+                .joined(separator: "\n")
+            if let reply, !reply.isEmpty {
+                parts.append("Assistant: \(String(reply.prefix(charactersPerTurn)))")
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: "\n")
+        }
+        return exchanges.isEmpty ? nil : exchanges.joined(separator: "\n\n")
+    }
+
     public func handoffContext(chatID: ChatID, transcriptTailLimit: Int = 8) throws -> String? {
         let turns = try turns(chatID: chatID)
         guard !turns.isEmpty else { return nil }

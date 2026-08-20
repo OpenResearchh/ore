@@ -457,6 +457,72 @@ struct WorkspaceEngineTests {
         #expect(await !harness.engine.summary().hasUnread)
     }
 
+    @Test func pendingInputCarriesTheIDsAndQuestionChoicesTheAssistantNeeds() async throws {
+        let harness = try await makeEngine()
+        _ = try await harness.engine.ensureSession()
+        let session = try #require(harness.harness.latestSession)
+        let turnID = TurnID(rawValue: "turn")
+
+        session.emit(.permissionRequest(PermissionRequest(
+            turnID: turnID,
+            id: PermissionRequestID(rawValue: "permission-7"),
+            toolName: "Bash",
+            summary: "git status",
+            input: .object([:])
+        )))
+        session.emit(.question(AgentQuestion(
+            turnID: turnID,
+            id: QuestionID(rawValue: "question-9"),
+            prompt: "Which branch?",
+            options: [.init(label: "main"), .init(label: "develop")],
+            allowsFreeform: true
+        )))
+        #expect(await waitUntil { await harness.engine.pendingInput().count == 2 })
+
+        let pending = await harness.engine.pendingInput()
+        let permission = try #require(pending.first { $0.kind == "permission" })
+        #expect(permission.id == "permission-7")
+        #expect(permission.chatID == ChatID(rawValue: harness.workspaceID.rawValue))
+        let question = try #require(pending.first { $0.kind == "question" })
+        #expect(question.id == "question-9")
+        #expect(question.options == ["main", "develop"])
+        #expect(question.allowsFreeform)
+    }
+
+    @Test func answeringAClaudeQuestionResolvesItsPermissionGate() async throws {
+        let harness = try await makeEngine()
+        _ = try await harness.engine.ensureSession()
+        let session = try #require(harness.harness.latestSession)
+        let turnID = TurnID(rawValue: "turn")
+        let toolCallID = ToolCallID(rawValue: "ask-tool")
+        let permissionID = PermissionRequestID(rawValue: "permission")
+        let questionID = QuestionID(rawValue: "question")
+
+        session.emit(.question(AgentQuestion(
+            turnID: turnID,
+            id: questionID,
+            toolCallID: toolCallID,
+            prompt: "Which branch?",
+            options: [.init(label: "main"), .init(label: "develop")]
+        )))
+        session.emit(.permissionRequest(PermissionRequest(
+            turnID: turnID,
+            id: permissionID,
+            toolCallID: toolCallID,
+            toolName: "AskUserQuestion",
+            input: .object([:])
+        )))
+        #expect(await waitUntil { await harness.engine.pendingInput().count == 2 })
+
+        try await harness.engine.answerQuestion(questionID, answer: "develop")
+        let decision = await session.permissionDecisions[permissionID]
+        guard case .deny(let reason)? = decision else {
+            Issue.record("the question did not resolve through its permission request")
+            return
+        }
+        #expect(reason.contains("develop"))
+    }
+
     @Test func backgroundChatUnreadStateIsIndependentFromTheVisibleTab() async throws {
         let harness = try await makeEngine()
         let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)

@@ -202,6 +202,42 @@ private final class SpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {
 
 // MARK: - Neural voice
 
+/// One reproducible synthesis identity for every neural utterance.
+///
+/// FluidAudio otherwise uses Pocket TTS's 0.7 temperature and chooses a new
+/// random seed for every call. That is expressive in a demo, but in an app it
+/// lets the same conditioned voice land with noticeably different prosody —
+/// sometimes perceived as a different accent — from one status line to the
+/// next. A slightly tighter temperature plus a fixed seed keeps Alba's voice
+/// centered while leaving the wording corpus responsible for variety.
+enum NeuralNarrationSynthesis {
+    static let voice = "alba"
+    static let temperature: Float = 0.55
+    static let seed: UInt64 = 0x4F_52_45_5F_56_4F_49_43
+    static let cacheVersion = "pocket-tts-2-english-alba-t055-stable"
+
+    /// Pocket TTS is autoregressive, so voice characteristics can wander over
+    /// a long generation even with stable conditioning. Starting a fresh,
+    /// identically seeded session at natural sentence boundaries reasserts
+    /// both the speaker prompt and the sampling profile. Punctuation remains
+    /// attached so each segment keeps its intended cadence.
+    static func segments(_ text: String) -> [String] {
+        var result: [String] = []
+        text.enumerateSubstrings(
+            in: text.startIndex..<text.endIndex,
+            options: [.bySentences, .substringNotRequired]
+        ) { _, range, _, _ in
+            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty { result.append(sentence) }
+        }
+        if result.isEmpty {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { result.append(trimmed) }
+        }
+        return result
+    }
+}
+
 /// Kyutai's Pocket TTS (100M parameters, CC-BY-4.0) running on this Mac
 /// through FluidAudio's CoreML port.
 ///
@@ -236,7 +272,10 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// outright on this model version ("`functionName` must be nil unless the
     /// model type is ML Program"). The Neural Engine looks like the obvious
     /// home for this and isn't; don't switch without re-measuring.
-    @ObservationIgnored private let manager = PocketTtsManager(placement: .gpu)
+    @ObservationIgnored private let manager = PocketTtsManager(
+        defaultVoice: NeuralNarrationSynthesis.voice,
+        placement: .gpu
+    )
     /// Lines already spoken, so a repeat costs a buffer copy instead of a
     /// second pass through the model. See `NarrationPhraseCache`.
     @ObservationIgnored private let phraseCache = NarrationPhraseCache()
@@ -251,6 +290,11 @@ final class NeuralNarrationVoice: NarrationVoice {
 
     @ObservationIgnored private var speakTask: Task<Void, Never>?
     @ObservationIgnored private var installTask: Task<Void, Never>?
+    /// Fills the persistent phrase cache only while narration is otherwise
+    /// idle. Foreground speech cancels this immediately; a later quiet period
+    /// resumes at the first uncached phrase.
+    @ObservationIgnored private var corpusWarmupTask: Task<Void, Never>?
+    @ObservationIgnored private var corpusWarmupCompleted = false
     /// Ahead-of-need synthesis for the next queued utterance (see `prepare`).
     /// Keyed by exact text, so a prepared waveform survives everything except
     /// the line itself being replaced.
@@ -355,6 +399,7 @@ final class NeuralNarrationVoice: NarrationVoice {
                 try await self.manager.initialize()
                 self.readiness = .ready
                 UserDefaults.standard.set(true, forKey: Self.installedKey)
+                self.scheduleCorpusWarmup()
             } catch {
                 self.readiness = .failed(error.localizedDescription)
             }
@@ -370,6 +415,8 @@ final class NeuralNarrationVoice: NarrationVoice {
             reportEnd()
             return
         }
+        corpusWarmupTask?.cancel()
+        corpusWarmupTask = nil
         cancelCurrent()
         generation += 1
         let generation = generation
@@ -436,6 +483,8 @@ final class NeuralNarrationVoice: NarrationVoice {
               text != preparedText,
               phraseCache.cachedInMemory(text) == nil
         else { return }
+        corpusWarmupTask?.cancel()
+        corpusWarmupTask = nil
         prepareTask?.cancel()
         preparedSamples = nil
         preparedText = text
@@ -473,10 +522,15 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// The whole line as one waveform, no playback until it's finished.
     private func synthesizeAll(_ text: String) async throws -> [Float] {
         var recorded: [Float] = []
-        let frames = try await manager.synthesizeStreaming(text: text)
-        for try await frame in frames {
-            try Task.checkCancellation()
-            recorded.append(contentsOf: frame.samples)
+        for segment in NeuralNarrationSynthesis.segments(text) {
+            let session = try await stableSession(for: segment)
+            for try await frame in session.frames {
+                if Task.isCancelled {
+                    await session.cancel()
+                    throw CancellationError()
+                }
+                recorded.append(contentsOf: frame.samples)
+            }
         }
         return recorded
     }
@@ -497,17 +551,76 @@ final class NeuralNarrationVoice: NarrationVoice {
     private func synthesize(_ text: String, generation: Int) async throws {
         let worthKeeping = NarrationPhraseCache.isCacheable(text)
         var recorded: [Float] = []
-        let frames = try await manager.synthesizeStreaming(text: text)
-        for try await frame in frames {
-            if Task.isCancelled { break }
-            if worthKeeping { recorded.append(contentsOf: frame.samples) }
-            accept(frame.samples, generation: generation)
+        for segment in NeuralNarrationSynthesis.segments(text) {
+            let session = try await stableSession(for: segment)
+            for try await frame in session.frames {
+                if Task.isCancelled {
+                    await session.cancel()
+                    throw CancellationError()
+                }
+                if worthKeeping { recorded.append(contentsOf: frame.samples) }
+                accept(frame.samples, generation: generation)
+            }
         }
         // Only a line that ran to completion is worth remembering. A preempted
         // one is half a sentence, and replaying half a sentence later would be
         // worse than regenerating the whole one.
         guard worthKeeping, !Task.isCancelled, generation == self.generation else { return }
         phraseCache.store(recorded, for: text)
+    }
+
+    /// FluidAudio's streaming convenience API does not expose its seed and
+    /// therefore chooses a random one internally. The session API does, so a
+    /// short-lived session is the narrowest way to make every line use the
+    /// exact same voice conditioning and sampling profile.
+    private func stableSession(for text: String) async throws -> PocketTtsSession {
+        let session = try await manager.makeSession(
+            voice: NeuralNarrationSynthesis.voice,
+            temperature: NeuralNarrationSynthesis.temperature,
+            seed: NeuralNarrationSynthesis.seed
+        )
+        session.enqueue(text)
+        session.finish()
+        return session
+    }
+
+    // MARK: Common phrase warmup
+
+    /// Renders the reusable, context-free corpus once and lets the existing
+    /// bounded LRU disk tier carry those PCM bytes across launches. Shipping
+    /// the bytes in the app would add a large opaque asset and go stale when
+    /// the model or voice changes; versioned lazy generation gets the same
+    /// repeat-call savings without either problem.
+    private func scheduleCorpusWarmup() {
+        guard readiness == .ready, !corpusWarmupCompleted,
+              corpusWarmupTask == nil
+        else { return }
+        corpusWarmupTask = Task(priority: .background) { [weak self] in
+            // Model loading and the user's first line take precedence over a
+            // cache optimization they cannot see.
+            try? await Task.sleep(for: .seconds(5))
+            guard let self, !Task.isCancelled else { return }
+
+            for phrase in NarrationPhraser.neuralCacheCorpus {
+                guard !Task.isCancelled, !self.isSpeaking,
+                      self.prepareTask == nil
+                else {
+                    self.corpusWarmupTask = nil
+                    return
+                }
+                if await self.rememberedAudio(for: phrase) != nil { continue }
+                guard let samples = try? await self.synthesizeAll(phrase),
+                      !Task.isCancelled
+                else {
+                    self.corpusWarmupTask = nil
+                    return
+                }
+                self.phraseCache.store(samples, for: phrase)
+                await Task.yield()
+            }
+            self.corpusWarmupCompleted = true
+            self.corpusWarmupTask = nil
+        }
     }
 
     /// Memory first, then disk — the disk read is a few hundred kilobytes and
@@ -693,6 +806,7 @@ final class NeuralNarrationVoice: NarrationVoice {
         // that starved carries its count into the next line's cushion.
         recentUnderruns = underrunsThisUtterance
         reportEnd()
+        scheduleCorpusWarmup()
     }
 }
 

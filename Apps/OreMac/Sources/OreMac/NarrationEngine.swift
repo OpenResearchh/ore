@@ -109,6 +109,13 @@ final class NarrationEngine {
         systemVoice.isSpeaking || neuralVoice.isSpeaking
     }
 
+    /// The observable truth used by the voice HUD. `currentUtterance` is book-
+    /// keeping and can survive a synthesizer that failed before delivering its
+    /// end callback; actual playback or a queued line cannot.
+    var hasAudibleOrQueuedSpeech: Bool {
+        isVoiceSpeaking || queue.peek != nil
+    }
+
     /// Stops whichever voice is mid-utterance, for the same reason.
     private func stopSpeaking(immediate: Bool) {
         systemVoice.stop(immediate: immediate)
@@ -203,6 +210,7 @@ final class NarrationEngine {
     func stopAll() {
         queue.removeAll()
         stopSpeaking(immediate: true)
+        flushQuietWaitersIfIdle()
     }
 
     /// Whether some dictation currently owns the audio. The assistant's
@@ -221,15 +229,30 @@ final class NarrationEngine {
     func speakAssistant(
         _ text: String,
         chatID: ChatID,
-        priority: NarrationPriority = .interrupt
+        priority: NarrationPriority = .interrupt,
+        limit: Int = NarrationPolicy.utteranceLimit,
+        kind: SpokenUtterance.Kind? = nil
     ) {
-        guard let spoken = NarrationPhraser.spokenNarration(text) else { return }
+        // The limit has to be passed all the way down: this sanitizes a second
+        // time, so a line already cleared at the assistant's longer limit would
+        // otherwise be re-clipped back to 280 here.
+        guard let spoken = NarrationPhraser.spokenNarration(text, limit: limit) else { return }
         enqueue(SpokenUtterance(
             chatID: chatID,
             priority: priority,
-            kind: priority == .progress ? .toolActivity : .turnCompleted,
+            kind: kind ?? (priority == .progress ? .toolActivity : .turnCompleted),
             text: spoken
         ))
+    }
+
+    /// A permission was answered while its prompt was queued or speaking.
+    /// Invalidate only that request: unrelated assistant speech must continue.
+    /// The synthesizer stops at its nearest safe boundary and its normal end
+    /// callback pumps whatever remains in the queue.
+    func cancelPermissionPrompt(_ id: PermissionRequestID) {
+        queue.invalidatePermission(id)
+        guard case .permission(id) = currentUtterance?.kind else { return }
+        stopSpeaking(immediate: false)
     }
 
     /// Runs `handler` once nothing is speaking and nothing is waiting to be —
@@ -237,7 +260,7 @@ final class NarrationEngine {
     /// opens the microphone for the answer (opening it earlier would cut the
     /// question off; see `setMicActive`).
     func notifyWhenQuiet(_ handler: @escaping @MainActor () -> Void) {
-        if currentUtterance == nil, queue.peek == nil {
+        if !hasAudibleOrQueuedSpeech {
             handler()
             return
         }
@@ -247,7 +270,7 @@ final class NarrationEngine {
     private var quietWaiters: [@MainActor () -> Void] = []
 
     private func flushQuietWaitersIfIdle() {
-        guard !quietWaiters.isEmpty, currentUtterance == nil, queue.peek == nil else { return }
+        guard !quietWaiters.isEmpty, !hasAudibleOrQueuedSpeech else { return }
         let waiters = quietWaiters
         quietWaiters = []
         for waiter in waiters { waiter() }
@@ -299,11 +322,13 @@ final class NarrationEngine {
                 return
             }
             lastToolFailureAt[chatID] = now
+            let variant = phraseVariant[chatID] ?? 0
+            advanceVariant(for: chatID)
             enqueue(SpokenUtterance(
                 chatID: chatID,
                 priority: .milestone,
                 kind: .toolFailure,
-                text: NarrationPhraser.toolFailure()
+                text: NarrationPhraser.toolFailure(variant: variant)
             ))
 
         case .thinkingDelta(let delta), .textDelta(let delta):
@@ -349,12 +374,9 @@ final class NarrationEngine {
             ))
 
         case .permissionResolved(let resolution):
-            // The user clicked before we spoke; saying it now would narrate
-            // the past.
-            queue.invalidatePermission(resolution.id)
-            if case .permission(resolution.id) = currentUtterance?.kind {
-                stopSpeaking(immediate: false)
-            }
+            // The user clicked before or during the prompt; saying the rest
+            // would narrate a decision that has already happened.
+            cancelPermissionPrompt(resolution.id)
 
         case .question(let question):
             enqueue(SpokenUtterance(
@@ -389,11 +411,13 @@ final class NarrationEngine {
 
         case .contextCompacted:
             guard background == nil else { return }
+            let variant = phraseVariant[chatID] ?? 0
+            advanceVariant(for: chatID)
             enqueue(SpokenUtterance(
                 chatID: chatID,
                 priority: .milestone,
                 kind: .contextCompacted,
-                text: NarrationPhraser.contextCompacted()
+                text: NarrationPhraser.contextCompacted(variant: variant)
             ))
 
         case .rateLimit(let report):
@@ -454,9 +478,11 @@ final class NarrationEngine {
         case .interrupted:
             // The user pressed stop; in a background tab they know already.
             guard background == nil else { return }
+            let variant = phraseVariant[chatID] ?? 0
+            advanceVariant(for: chatID)
             enqueue(SpokenUtterance(
                 chatID: chatID, priority: .milestone, kind: .stopped,
-                text: NarrationPhraser.stopped()
+                text: NarrationPhraser.stopped(variant: variant)
             ))
         case .failed:
             enqueue(SpokenUtterance(
@@ -481,12 +507,14 @@ final class NarrationEngine {
     /// the plan card is already on screen either way. Timeout or absence
     /// falls back to the canned phrase.
     private func speakPlanProposal(_ markdown: String, chatID: ChatID, background: String?) {
+        let variant = phraseVariant[chatID] ?? 0
+        advanceVariant(for: chatID)
         guard summarizer.isAvailable, !markdown.isEmpty else {
             enqueue(SpokenUtterance(
                 chatID: chatID,
                 priority: .interrupt,
                 kind: .planProposal,
-                text: prefixed(NarrationPhraser.planProposal(), background)
+                text: prefixed(NarrationPhraser.planProposal(variant: variant), background)
             ))
             return
         }
@@ -496,8 +524,8 @@ final class NarrationEngine {
             let crux = await self.summarizer.planCrux(markdown)
             // A newer turn started while the model ran: its plan is history.
             guard self.digests[chatID]?.generation ?? 0 == generation else { return }
-            let line = crux.map { NarrationPhraser.planProposal(crux: $0) }
-                ?? NarrationPhraser.planProposal()
+            let line = crux.map { NarrationPhraser.planProposal(crux: $0, variant: variant) }
+                ?? NarrationPhraser.planProposal(variant: variant)
             self.enqueue(SpokenUtterance(
                 chatID: chatID,
                 priority: .interrupt,

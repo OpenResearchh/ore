@@ -1,4 +1,5 @@
 import Testing
+import OreProtocol
 
 @testable import OreMac
 
@@ -57,5 +58,73 @@ struct VoiceAssistantDecisionTests {
             from: "yes and after that create a new workspace for the parser and push it"
         ) == nil)
         #expect(VoiceAssistantController.confirmationDecision(from: "what's happening") == nil)
+    }
+}
+
+struct VoiceAssistantQuestionTests {
+    private let question = AgentQuestion(
+        turnID: TurnID(rawValue: "turn"),
+        id: QuestionID(rawValue: "question"),
+        prompt: "Which branch should I target?",
+        options: [
+            .init(label: "main"),
+            .init(label: "develop"),
+        ],
+        allowsFreeform: true
+    )
+
+    @Test func exactAndOrdinalChoicesReturnProviderLabels() {
+        #expect(VoiceAssistantController.questionAnswer(
+            from: "Develop", question: question
+        ) == "develop")
+        #expect(VoiceAssistantController.questionAnswer(
+            from: "the second option", question: question
+        ) == "develop")
+    }
+
+    @Test func freeformAnswersAreNotCollapsedToTheFirstOption() {
+        #expect(VoiceAssistantController.questionAnswer(
+            from: "Use the release branch instead", question: question
+        ) == "Use the release branch instead")
+    }
+
+    @Test func aQuestionPromptReadsChoicesAndOffersFreeform() {
+        let item = TabNeedsYou.question(.init(
+            workspaceID: WorkspaceID(rawValue: "workspace"),
+            chatID: ChatID(rawValue: "chat"),
+            question: question
+        ))
+        #expect(item.spokenPrompt.contains("main, or develop"))
+        #expect(item.spokenPrompt.contains("say your own answer"))
+    }
+
+    @Test func aClosedChoiceRejectsUnlistedSpeech() {
+        var closed = question
+        closed.allowsFreeform = false
+        #expect(VoiceAssistantController.questionAnswer(
+            from: "release", question: closed
+        ) == nil)
+    }
+}
+
+struct VoiceAssistantPermissionPromptTests {
+    @Test func spokenPermissionKeepsTheRequestIdentity() {
+        let id = PermissionRequestID(rawValue: "permission-42")
+        let request = PermissionRequest(
+            turnID: TurnID(rawValue: "turn"),
+            id: id,
+            toolName: "Bash",
+            displayName: "Run command",
+            summary: "run the tests",
+            input: .null
+        )
+        let item = TabNeedsYou.permission(.init(
+            workspaceID: WorkspaceID(rawValue: "workspace"),
+            chatID: ChatID(rawValue: "chat"),
+            request: request
+        ))
+
+        #expect(item.narrationKind == .permission(id))
+        #expect(item.id == "permission-permission-42")
     }
 }

@@ -60,14 +60,37 @@ enum UsageLimitReset {
         return date
     }
 
-    static func format(_ date: Date, timeZone: TimeZone = .current) -> String {
+    /// A reset timestamp with enough calendar context to be unambiguous.
+    ///
+    /// Providers often send tomorrow's reset while the clock time is earlier
+    /// than it is now. Showing only "4:30 PM" at 7:57 PM makes a valid future
+    /// reset look stale, so name the day whenever it is not today.
+    static func format(
+        _ date: Date,
+        timeZone: TimeZone = .current,
+        now: Date = Date()
+    ) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+
         let formatter = DateFormatter()
         formatter.timeZone = timeZone
-        formatter.dateStyle = .none
         formatter.timeStyle = .short
         let time = formatter.string(from: date)
+
+        let day: String
+        if calendar.isDate(date, inSameDayAs: now) {
+            day = "Today at "
+        } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+                  calendar.isDate(date, inSameDayAs: tomorrow) {
+            day = "Tomorrow at "
+        } else {
+            formatter.dateStyle = .medium
+            formatter.timeStyle = .none
+            day = "\(formatter.string(from: date)) at "
+        }
         let identifier = timeZone.identifier
-        return "\(time) (\(identifier))"
+        return "\(day)\(time) (\(identifier))"
     }
 
     static func relativeLabel(until date: Date, now: Date = Date()) -> String {

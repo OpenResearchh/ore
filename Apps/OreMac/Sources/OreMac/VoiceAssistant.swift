@@ -29,7 +29,10 @@ final class VoiceAssistantController {
     }
 
     private(set) var phase: Phase = .idle {
-        didSet { AssistantVoiceHUD.shared.phaseChanged(self) }
+        didSet {
+            AssistantVoiceHUD.shared.phaseChanged(self)
+            updateSpeechWatchdog()
+        }
     }
 
     /// Whether the assistant's microphone is open.
@@ -40,6 +43,7 @@ final class VoiceAssistantController {
     /// `@Observable` — so the HUD animates without any forwarding.
     var liveTranscript: String { voice.transcript }
     var audioLevel: Double { voice.audioLevel }
+    private(set) var answerPlaceholder = "Yes or no?"
     /// How much of the utterance being spoken has actually been voiced, for the
     /// HUD to stream.
     var spokenSoFar: String {
@@ -58,10 +62,20 @@ final class VoiceAssistantController {
     private var startTask: Task<Void, Never>?
     private var stillWorkingTask: Task<Void, Never>?
     private var answerWindowTask: Task<Void, Never>?
-    /// The user asked something by voice and hasn't heard back yet — the next
-    /// assistant turn completion is spoken no matter what the ambient
+    private var speechWatchdogTask: Task<Void, Never>?
+    /// The needs-you prompt currently being spoken or answered. Its stable ID
+    /// lets a click elsewhere dismiss the voice flow immediately rather than
+    /// opening the answer microphone after the prompt is cancelled.
+    private var activeNeedsYouID: String?
+    /// The conversation the user's spoken question went to, held until it is
+    /// answered — that turn's completion is spoken no matter what the ambient
     /// narration settings say.
-    private var awaitingSpokenReply = false
+    ///
+    /// A chat rather than a flag: the assistant has several conversations now,
+    /// and a fleet digest finishing in one must not be taken for the answer to
+    /// a question asked in another.
+    private var awaitingSpokenReplyFrom: ChatID?
+    private var awaitingSpokenReply: Bool { awaitingSpokenReplyFrom != nil }
     private var lastVoiceInteraction: Date?
     /// Milestone throttling: the last phrase spoken and when, so a burst of
     /// tool calls narrates as a beat, not a commentary track.
@@ -88,6 +102,22 @@ final class VoiceAssistantController {
     /// How long the hands-free answer mic stays open before giving up and
     /// leaving the confirmation to the window, the notification, or a chord.
     private static let answerWindow: Duration = .seconds(7)
+
+    /// AVSpeechSynthesizer can occasionally decline an utterance without
+    /// delivering either delegate ending. Do not let that missing callback
+    /// pin the global pill on "Speaking…" forever.
+    private func updateSpeechWatchdog() {
+        speechWatchdogTask?.cancel()
+        speechWatchdogTask = nil
+        guard phase == .speaking else { return }
+        speechWatchdogTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self, self.phase == .speaking,
+                  self.model?.narration.hasAudibleOrQueuedSpeech == false
+            else { return }
+            self.phase = self.awaitingSpokenReply ? .thinking : .idle
+        }
+    }
 
     func handle(_ command: VoiceCommand) {
         guard command.target == .assistant else { return }
@@ -127,12 +157,12 @@ final class VoiceAssistantController {
             model?.narration.setMicActive(false)
             phase = .idle
         case .thinking, .speaking:
-            let wasWaiting = awaitingSpokenReply
-            awaitingSpokenReply = false
+            let waitingOn = awaitingSpokenReplyFrom
+            awaitingSpokenReplyFrom = nil
             model?.narration.stopAll()
             // Only a turn we're actually waiting on: cutting off "Okay, going
             // ahead." shouldn't kill a turn the user didn't start by voice.
-            if wasWaiting { model?.interruptAssistant() }
+            if let waitingOn { model?.interruptAssistant(chatID: waitingOn) }
             phase = .idle
         case .idle:
             break
@@ -213,20 +243,30 @@ final class VoiceAssistantController {
             return
         }
 
-        if let needs = model.tabNeedsYou.first,
-           let decision = Self.confirmationDecision(from: spoken) {
-            resolveNeedsYou(needs, decision: decision)
-            return
+        if let needs = model.tabNeedsYou.first {
+            switch needs {
+            case .permission:
+                if let decision = Self.confirmationDecision(from: spoken) {
+                    resolvePermissionNeed(needs, decision: decision)
+                    return
+                }
+            case .question(let payload):
+                if let answer = Self.questionAnswer(from: spoken, question: payload.question) {
+                    resolveQuestionNeed(needs, answer: answer)
+                    return
+                }
+            }
         }
 
         guard let assistant = model.assistantWorkspace else {
             phase = .idle
             return
         }
-        awaitingSpokenReply = true
         phase = .thinking
-        model.send(spoken, to: assistant.id)
-        if let chatID = model.assistantChatID {
+        // The chat the message actually reached, rather than whichever is
+        // active by the time the answer arrives.
+        awaitingSpokenReplyFrom = model.send(spoken, to: assistant.id)
+        if let chatID = awaitingSpokenReplyFrom {
             speakKeepingHUD("On it.", chatID: chatID, resume: .thinking)
         }
         scheduleStillWorkingNudge()
@@ -256,8 +296,11 @@ final class VoiceAssistantController {
     // MARK: - Assistant events
 
     /// Assistant-chat agent events, forwarded from the model's intake.
-    func observe(_ event: AgentEvent) {
-        guard let model, let chatID = model.assistantChatID else { return }
+    ///
+    /// Tagged with the conversation they came from: only the one the user's
+    /// question went to may answer it out loud.
+    func observe(_ event: AgentEvent, chatID: ChatID) {
+        guard let model, awaitingSpokenReplyFrom == chatID else { return }
         switch event {
         case .toolCall(let call):
             // Mid-turn milestones, only for turns the user is waiting on by
@@ -283,16 +326,18 @@ final class VoiceAssistantController {
             }
 
         case .turnCompleted(let result):
-            guard awaitingSpokenReply else { return }
-            awaitingSpokenReply = false
+            awaitingSpokenReplyFrom = nil
             stillWorkingTask?.cancel()
-            let line = NarrationPhraser.spokenNarration(result.narration)
-                ?? "Done — the details are in the assistant window."
-            speakKeepingHUD(line, chatID: chatID)
+            // The assistant's limit, not the ambient one: this line is the
+            // answer to a question the user asked out loud, and how long it
+            // runs is the question's business.
+            let line = NarrationPhraser.spokenNarration(
+                result.narration, limit: NarrationPolicy.assistantAnswerLimit
+            ) ?? "Done — the details are in the assistant window."
+            speakKeepingHUD(line, chatID: chatID, limit: NarrationPolicy.assistantAnswerLimit)
 
         case .sessionError(let error):
-            guard awaitingSpokenReply else { return }
-            awaitingSpokenReply = false
+            awaitingSpokenReplyFrom = nil
             stillWorkingTask?.cancel()
             speakKeepingHUD(
                 "Something went wrong: \(error.message)", chatID: chatID
@@ -326,23 +371,47 @@ final class VoiceAssistantController {
         }
     }
 
-    func needsYouArrived(_ item: TabNeedsYou) {
-        guard let model, let chatID = model.assistantChatID else { return }
+    @discardableResult
+    func needsYouArrived(_ item: TabNeedsYou) -> Bool {
+        guard let model, let chatID = model.assistantChatID else { return false }
         let recentVoice = lastVoiceInteraction.map {
             Date().timeIntervalSince($0) < Self.voiceSessionWindow
         } ?? false
-        guard awaitingSpokenReply || recentVoice || !NSApp.isActive else { return }
+        guard awaitingSpokenReply || recentVoice || !NSApp.isActive else { return false }
         lastVoiceInteraction = Date()
-        let offer = " Yes to allow, no to deny, or always to auto-allow this tab."
+        activeNeedsYouID = item.id
         model.narration.speakAssistant(
-            "Quick check — \(item.spokenSummary)\(offer)",
-            chatID: chatID
+            item.spokenPrompt,
+            chatID: chatID,
+            kind: item.narrationKind
         )
         phase = .speaking
         let token = cancelToken
         model.narration.notifyWhenQuiet { [weak self] in
             guard let self, self.cancelToken == token else { return }
             self.openNeedsYouWindow(for: item.id)
+        }
+        return true
+    }
+
+    /// The permission was answered by a button, notification, assistant tool,
+    /// or voice. Cancel the continuation that would open the answer mic and
+    /// make the HUD reflect that there is no longer anything to answer.
+    func permissionResolved(_ id: PermissionRequestID) {
+        guard activeNeedsYouID == "permission-\(id.rawValue)" else { return }
+        activeNeedsYouID = nil
+        cancelToken += 1
+        answerWindowTask?.cancel()
+        answerWindowTask = nil
+        if phase == .answering {
+            if voice.isActive { voice.stop() }
+            model?.narration.setMicActive(false)
+        }
+        if phase == .speaking || phase == .answering {
+            // A permission can interrupt an assistant answer already in
+            // flight. Return to waiting for that answer instead of making the
+            // whole voice exchange look finished.
+            phase = awaitingSpokenReply ? .thinking : .idle
         }
     }
 
@@ -351,10 +420,11 @@ final class VoiceAssistantController {
     private func speakKeepingHUD(
         _ text: String,
         chatID: ChatID,
-        resume: Phase = .idle
+        resume: Phase = .idle,
+        limit: Int = NarrationPolicy.utteranceLimit
     ) {
         guard let model else { return }
-        model.narration.speakAssistant(text, chatID: chatID)
+        model.narration.speakAssistant(text, chatID: chatID, limit: limit)
         phase = .speaking
         let token = cancelToken
         model.narration.notifyWhenQuiet { [weak self] in
@@ -366,10 +436,11 @@ final class VoiceAssistantController {
     // MARK: - Hands-free answers
 
     private func openAnswerWindow(for confirmationID: String) {
-        guard let model, (phase == .idle || phase == .speaking), !voice.isActive,
+        guard let model, phase != .listening && phase != .answering, !voice.isActive,
               model.assistantConfirmations.contains(where: { $0.id == confirmationID })
         else { return }
-        voice.vocabulary = []
+        answerPlaceholder = "Yes or no?"
+        voice.vocabulary = ["yes", "no"]
         phase = .answering
         model.narration.setMicActive(true)
         voice.start()
@@ -412,10 +483,21 @@ final class VoiceAssistantController {
     }
 
     private func openNeedsYouWindow(for itemID: String) {
-        guard let model, (phase == .idle || phase == .speaking), !voice.isActive,
-              model.tabNeedsYou.contains(where: { $0.id == itemID })
+        guard let model, phase != .listening && phase != .answering, !voice.isActive,
+              let item = model.tabNeedsYou.first(where: { $0.id == itemID })
         else { return }
-        voice.vocabulary = []
+        switch item {
+        case .permission:
+            openPermissionWindow(for: item)
+        case .question(let payload):
+            openQuestionWindow(for: item, question: payload.question)
+        }
+    }
+
+    private func openPermissionWindow(for item: TabNeedsYou) {
+        guard let model else { return }
+        answerPlaceholder = "Yes, no, or always?"
+        voice.vocabulary = ["yes", "no", "always", "auto-allow"]
         phase = .answering
         model.narration.setMicActive(true)
         voice.start()
@@ -426,7 +508,7 @@ final class VoiceAssistantController {
             while !Task.isCancelled, ContinuousClock.now < deadline {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard let self, self.phase == .answering, let model = self.model else { return }
-                guard let item = model.tabNeedsYou.first(where: { $0.id == itemID }) else {
+                guard model.tabNeedsYou.contains(where: { $0.id == item.id }) else {
                     self.closeAnswerWindow()
                     return
                 }
@@ -439,18 +521,62 @@ final class VoiceAssistantController {
                 self.closeAnswerWindow()
                 guard let settled else { return }
                 self.lastVoiceInteraction = Date()
-                self.resolveNeedsYou(item, decision: settled)
+                self.resolvePermissionNeed(item, decision: settled)
                 return
             }
             self?.closeAnswerWindow()
         }
     }
 
-    private func resolveNeedsYou(
+    private func openQuestionWindow(for item: TabNeedsYou, question: AgentQuestion) {
+        guard let model else { return }
+        answerPlaceholder = "Say your answer…"
+        voice.vocabulary = question.options.map(\.label)
+        phase = .answering
+        model.narration.setMicActive(true)
+        voice.start()
+
+        answerWindowTask?.cancel()
+        answerWindowTask = Task { @MainActor [weak self] in
+            let deadline = ContinuousClock.now.advanced(by: Self.answerWindow)
+            var lastTranscript = ""
+            var unchangedSince = ContinuousClock.now
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard let self, self.phase == .answering, let model = self.model else { return }
+                guard model.tabNeedsYou.contains(where: { $0.id == item.id }) else {
+                    self.closeAnswerWindow()
+                    return
+                }
+                let transcript = self.voice.transcript
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if transcript != lastTranscript {
+                    lastTranscript = transcript
+                    unchangedSince = ContinuousClock.now
+                    continue
+                }
+                // Unlike yes/no, an arbitrary answer has no keyword that says
+                // it is complete. A short quiet settle is the speech equivalent
+                // of releasing Return in a text field.
+                guard !transcript.isEmpty,
+                      ContinuousClock.now - unchangedSince >= .milliseconds(800),
+                      let answer = Self.questionAnswer(from: transcript, question: question)
+                else { continue }
+                self.closeAnswerWindow()
+                self.lastVoiceInteraction = Date()
+                self.resolveQuestionNeed(item, answer: answer)
+                return
+            }
+            self?.closeAnswerWindow()
+        }
+    }
+
+    private func resolvePermissionNeed(
         _ item: TabNeedsYou,
         decision: AssistantConfirmationDecision
     ) {
         guard let model else { return }
+        activeNeedsYouID = nil
         phase = .idle
         switch (item, decision) {
         case (.permission(let payload), .allow(.always)):
@@ -470,21 +596,8 @@ final class VoiceAssistantController {
                 decision: .deny(reason: "The user denied this by voice."),
                 for: payload.workspaceID, chatID: payload.chatID
             )
-        case (.question(let payload), .deny):
-            model.answerQuestion(
-                payload.question.id,
-                answer: "The user declined to answer.",
-                for: payload.workspaceID,
-                chatID: payload.chatID
-            )
-        case (.question(let payload), .allow):
-            let answer = payload.question.options.first?.label ?? "yes"
-            model.answerQuestion(
-                payload.question.id,
-                answer: answer,
-                for: payload.workspaceID,
-                chatID: payload.chatID
-            )
+        case (.question, _):
+            return
         }
         if let chatID = model.assistantChatID {
             let ack: String
@@ -495,12 +608,28 @@ final class VoiceAssistantController {
         }
     }
 
+    private func resolveQuestionNeed(_ item: TabNeedsYou, answer: String) {
+        guard let model, case .question(let payload) = item else { return }
+        activeNeedsYouID = nil
+        phase = .idle
+        model.answerQuestion(
+            payload.question.id,
+            answer: answer,
+            for: payload.workspaceID,
+            chatID: payload.chatID
+        )
+        if let chatID = model.assistantChatID {
+            speakKeepingHUD("Got it — I passed that answer along.", chatID: chatID)
+        }
+    }
+
     private func closeAnswerWindow() {
         answerWindowTask?.cancel()
         answerWindowTask = nil
         guard phase == .answering else { return }
         if voice.isActive { voice.stop() }
         model?.narration.setMicActive(false)
+        answerPlaceholder = "Yes or no?"
         phase = .idle
     }
 
@@ -539,5 +668,36 @@ final class VoiceAssistantController {
         from transcript: String
     ) -> AssistantConfirmationDecision? {
         ConfirmationIntent.decision(from: transcript)
+    }
+
+    /// Resolves a spoken question answer to the provider's exact option label
+    /// when possible. Otherwise the user's words are preserved as freeform
+    /// rather than silently selecting the first choice.
+    nonisolated static func questionAnswer(
+        from transcript: String,
+        question: AgentQuestion
+    ) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalized = normalizedAnswer(trimmed)
+        if let option = question.options.first(where: {
+            normalizedAnswer($0.label) == normalized
+                || normalized == "option " + normalizedAnswer($0.label)
+        }) {
+            return option.label
+        }
+
+        let ordinals = ["first": 0, "one": 0, "second": 1, "two": 1,
+                        "third": 2, "three": 2, "fourth": 3, "four": 3]
+        for (word, index) in ordinals where normalized.split(separator: " ").contains(Substring(word)) {
+            if question.options.indices.contains(index) { return question.options[index].label }
+        }
+        return question.allowsFreeform ? trimmed : nil
+    }
+
+    private nonisolated static func normalizedAnswer(_ text: String) -> String {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .joined(separator: " ")
     }
 }

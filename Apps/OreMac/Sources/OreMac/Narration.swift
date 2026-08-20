@@ -130,6 +130,11 @@ enum NarrationPolicy {
     static let toolFailureCooldown: TimeInterval = 30
     /// Hard cap on any single utterance; freshness beats completeness.
     static let utteranceLimit = 280
+    /// The assistant answering a question the user asked out loud is not an
+    /// ambient interjection — it is the reply, and clipping it at 280
+    /// characters is what made every answer feel evasive. Still capped, because
+    /// a runaway line can only be stopped, never skipped.
+    static let assistantAnswerLimit = 900
 }
 
 // MARK: - Tool classification
@@ -419,36 +424,66 @@ enum NarrationPhraser {
         "Now it's reading {}.",
         "It's looking through {}.",
         "It's going through {}.",
+        "It's checking {} now.",
+        "It's taking a closer look at {}.",
+        "Now it's reviewing {}.",
     ]
     private static let editFrames = [
         "Now it's editing {}.",
         "It's making changes to {}.",
         "It's reworking {}.",
+        "It's updating {} now.",
+        "Now it's refining {}.",
+        "It's adjusting {}.",
     ]
     private static let writeFrames = [
         "It's writing {}.",
         "Now it's creating {}.",
+        "It's putting together {}.",
+        "Now it's adding {}.",
+        "It's building out {}.",
     ]
     private static let deleteFrames = [
         "It's deleting {}.",
         "Now it's removing {}.",
+        "It's clearing out {}.",
+        "Now it's taking out {}.",
     ]
     private static let searchFrames = [
         "It's searching the codebase.",
         "Now it's digging through the code.",
         "It's hunting around the codebase.",
+        "It's looking for the relevant code.",
+        "Now it's tracing where that lives.",
+        "It's scanning the project for that.",
     ]
     private static let fetchFrames = [
         "It's fetching something from the web.",
         "Now it's pulling something from the web.",
+        "It's checking an external source.",
+        "Now it's looking that up online.",
+        "It's gathering the outside information it needs.",
     ]
     private static let runFrames = [
         "Now it's running {}.",
         "It's kicking off {}.",
+        "It's trying {} now.",
+        "Now it's checking with {}.",
+        "It's putting {} through its paces.",
+    ]
+    private static let genericRunFrames = [
+        "It's running a few commands.",
+        "Now it's trying a few commands.",
+        "It's checking things from the command line.",
+        "Now it's running the next checks.",
+        "It's putting a few commands to work.",
     ]
     private static let subagentFrames = [
         "It's launching a subagent to {}",
         "Now it's handing off to a subagent to {}",
+        "It's asking another agent to {}",
+        "Now it's bringing in another agent to {}",
+        "It's delegating a focused pass to {}",
     ]
 
     /// One phrase for a batch of same-class activities.
@@ -466,7 +501,7 @@ enum NarrationPhraser {
         case .search: return pick(searchFrames, variant)
         case .fetch: return pick(fetchFrames, variant)
         case .run:
-            guard subjects.count == 1 else { return "It's running a few commands." }
+            guard subjects.count == 1 else { return pick(genericRunFrames, variant) }
             return framed(runFrames, subjects[0], variant)
         case .subagent:
             guard let description = subjects.first else { return "It's launching a subagent." }
@@ -512,28 +547,49 @@ enum NarrationPhraser {
             .ensuringTerminalPunctuation()
     }
 
-    static func planProposal() -> String {
-        "It's got a plan ready for you to look at."
+    static func planProposal(variant: Int = 0) -> String {
+        pick([
+            "It's got a plan ready for you to look at.",
+            "There's a plan ready for your review.",
+            "It has mapped out the approach for you.",
+            "The proposed plan is ready when you are.",
+            "It has an approach ready for you to check.",
+        ], variant)
     }
 
     /// The plan interrupt with its crux attached — what the plan would do,
     /// then the nudge to go read the full text. Falls back to the plain line
     /// when the crux sanitizes away to nothing.
-    static func planProposal(crux: String) -> String {
+    static func planProposal(crux: String, variant: Int = 0) -> String {
         let spoken = sanitize(lowercasedLead(crux), limit: 200)
-        guard !spoken.isEmpty else { return planProposal() }
-        return "It's got a plan ready — \(spoken.ensuringTerminalPunctuation()) "
+        guard !spoken.isEmpty else { return planProposal(variant: variant) }
+        let lead = pick([
+            "It's got a plan ready",
+            "The proposed approach is ready",
+            "It has mapped out a plan",
+            "There's an approach ready to review",
+            "The plan is ready",
+        ], variant)
+        return "\(lead) — \(spoken.ensuringTerminalPunctuation()) "
             + "Have a look when you're ready."
     }
 
     /// The agent's own spoken line for the turn (see `NarrationTag`). Already
     /// written for the ear by instruction, so it only gets hygiene — the same
     /// sanitize-and-punctuate every other dynamic line gets.
-    static func spokenNarration(_ text: String?) -> String? {
+    static func spokenNarration(
+        _ text: String?,
+        limit: Int = NarrationPolicy.utteranceLimit
+    ) -> String? {
         guard let text else { return nil }
-        let spoken = sanitize(text)
+        let spoken = sanitize(text, limit: limit)
         guard !spoken.isEmpty else { return nil }
-        return spoken.ensuringTerminalPunctuation()
+        // `sanitize` marks a clip with an ellipsis, which is silent — the ear
+        // just hears an answer stop mid-thought, which is exactly what a long
+        // spoken answer must not do. Say that there is more instead.
+        guard spoken.hasSuffix("…") else { return spoken.ensuringTerminalPunctuation() }
+        return String(spoken.dropLast()).trimmingCharacters(in: .whitespaces)
+            + " — there's more in the Assistant window."
     }
 
     /// Only when the in-progress item actually changed; harnesses re-emit the
@@ -547,7 +603,14 @@ enum NarrationPhraser {
         guard let current, current != previousInProgress else {
             return (nil, current ?? previousInProgress)
         }
-        let frames = ["Next up, {}.", "Now it's moving on to {}.", "On to {} now."]
+        let frames = [
+            "Next up, {}.",
+            "Now it's moving on to {}.",
+            "On to {} now.",
+            "It's turning to {} next.",
+            "The next step is {}.",
+            "Now it's focusing on {}.",
+        ]
         let phrase = framed(frames, sanitize(lowercasedLead(current), limit: 120), variant)
         return (phrase, current)
     }
@@ -555,10 +618,23 @@ enum NarrationPhraser {
     /// Template fallback when the turn summary can't be spoken directly.
     static func completionFallback(duration: TimeInterval?, variant: Int = 0) -> String {
         guard let duration, duration >= 5 else {
-            return pick(["All done.", "That's done."], variant)
+            return pick([
+                "All done.",
+                "That's done.",
+                "Finished.",
+                "That one's wrapped up.",
+                "It's ready.",
+                "Done with that.",
+            ], variant)
         }
         return framed(
-            ["All done, that took about {}.", "Finished — about {}."],
+            [
+                "All done, that took about {}.",
+                "Finished — about {}.",
+                "That's wrapped up after about {}.",
+                "It's ready, that took around {}.",
+                "Done with that in about {}.",
+            ],
             spokenDuration(duration),
             variant
         )
@@ -584,8 +660,13 @@ enum NarrationPhraser {
             .ensuringTerminalPunctuation()
     }
 
-    static func contextCompacted() -> String {
-        "It just compacted the context to stay under the limit."
+    static func contextCompacted(variant: Int = 0) -> String {
+        pick([
+            "It just compacted the context to stay under the limit.",
+            "It condensed the conversation so it can keep going.",
+            "It made more context room and is continuing.",
+            "It summarized the earlier context to keep working.",
+        ], variant)
     }
 
     static func rateLimit(_ report: RateLimitReport) -> String? {
@@ -605,11 +686,54 @@ enum NarrationPhraser {
         }
     }
 
-    static func toolFailure() -> String {
-        "Something failed there, but it's handling it."
+    static func toolFailure(variant: Int = 0) -> String {
+        pick([
+            "Something failed there, but it's handling it.",
+            "That attempt didn't work, so it's adjusting.",
+            "It hit a snag and is working around it.",
+            "That step failed, but it's trying another route.",
+        ], variant)
     }
 
-    static func stopped() -> String { "Okay, stopped." }
+    static func stopped(variant: Int = 0) -> String {
+        pick([
+            "Okay, stopped.",
+            "Stopped there.",
+            "All right, it's stopped.",
+            "Okay, that run is stopped.",
+        ], variant)
+    }
+
+    /// Short, context-free lines worth rendering once after the neural model
+    /// loads. Dynamic lines still populate the same cache on demand; this set
+    /// only removes first-use latency from phrases that recur across projects.
+    /// Keeping the list derived from the public phrasing functions prevents a
+    /// bundled audio corpus from drifting away from what the UI can emit.
+    static var neuralCacheCorpus: [String] {
+        var result: [String] = []
+        func append(_ phrase: String?) {
+            guard let phrase, !result.contains(phrase) else { return }
+            result.append(phrase)
+        }
+
+        for variant in 0..<6 {
+            append(phrase(for: [ToolActivity(kind: .read, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .edit, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .write, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .delete, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .search, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .fetch, subject: nil)], variant: variant))
+            append(phrase(for: [ToolActivity(kind: .run, subject: nil)], variant: variant))
+            append(completionFallback(duration: nil, variant: variant))
+            append(toolFailure(variant: variant))
+            append(stopped(variant: variant))
+            append(contextCompacted(variant: variant))
+        }
+        for variant in 0..<5 { append(planProposal(variant: variant)) }
+        append("You're getting close to your usage limit.")
+        append("Usage limit reached.")
+        return result
+    }
 
     /// Background utterances say where they're coming from before what
     /// happened. A comma rather than a colon: the listener hears one sentence,

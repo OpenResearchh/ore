@@ -759,7 +759,15 @@ public actor InProcessCoreClient: CoreClient {
                 continuation.yield(.promptSubmitted(id, routed.chatID, routed.submission))
             }
         }
-        engineTasks[id] = [agentTask, summaryTask, chatTask, promptTask]
+        let compactionTask = Task { [weak self, continuation] in
+            for await seam in await engine.conversationCompactions() {
+                guard self != nil else { return }
+                continuation.yield(
+                    .assistantConversationCompacted(id, from: seam.from, to: seam.to)
+                )
+            }
+        }
+        engineTasks[id] = [agentTask, summaryTask, chatTask, promptTask, compactionTask]
 
         await engine.start()
         return engine
@@ -998,9 +1006,16 @@ public actor InProcessCoreClient: CoreClient {
                 lines.append(chip)
             }
             for pending in await engine.pendingInput() {
-                lines.append(
-                    "  pending \(pending.kind) on \"\(pending.title)\": \(pending.summary)"
-                )
+                var line = "  pending \(pending.kind) id=\(pending.id) "
+                    + "chatID=\(pending.chatID.rawValue) on \"\(pending.title)\": "
+                    + pending.summary
+                if !pending.options.isEmpty {
+                    line += " options=[\(pending.options.joined(separator: " | "))]"
+                }
+                if pending.kind == "question" {
+                    line += pending.allowsFreeform ? " freeform=allowed" : " freeform=not-allowed"
+                }
+                lines.append(line)
             }
             blocks.append(lines.joined(separator: "\n"))
         }

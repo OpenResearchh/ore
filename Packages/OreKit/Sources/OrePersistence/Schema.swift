@@ -372,6 +372,18 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v10.chatSeedContext") { db in
+            // The summary a compacted conversation hands its successor. Durable
+            // rather than in-memory because the compaction and the user's next
+            // question are not the same app run — quitting in between would
+            // leave the fresh conversation with no idea anything preceded it,
+            // and the summary is not reproducible once the provider session
+            // that wrote it is gone.
+            try db.alter(table: "chat") { table in
+                table.add(column: "seedContext", .text)
+            }
+        }
+
         return migrator
     }
 }

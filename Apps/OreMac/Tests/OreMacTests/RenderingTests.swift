@@ -865,8 +865,24 @@ struct UsageLimitResetTests {
     @Test func formatsResetTimesWithTheZone() {
         let date = Date(timeIntervalSince1970: 0)
         let zone = TimeZone(identifier: "UTC")!
-        let formatted = UsageLimitReset.format(date, timeZone: zone)
+        let formatted = UsageLimitReset.format(date, timeZone: zone, now: date)
+        #expect(formatted.hasPrefix("Today at "))
         #expect(formatted.contains(zone.identifier) || formatted.contains("GMT") || formatted.contains("UTC"))
+    }
+
+    @Test func aTomorrowResetCannotLookLikeAStaleTimeToday() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Kolkata")!
+        let now = calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 20, hour: 19, minute: 57
+        ))!
+        let reset = calendar.date(from: DateComponents(
+            year: 2026, month: 8, day: 21, hour: 16, minute: 30
+        ))!
+
+        let formatted = UsageLimitReset.format(reset, timeZone: calendar.timeZone, now: now)
+        #expect(formatted.hasPrefix("Tomorrow at "))
+        #expect(formatted.contains("4:30"))
     }
 }
 

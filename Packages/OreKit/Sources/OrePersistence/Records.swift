@@ -199,6 +199,10 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
     /// Last requested reasoning depth for this chat. Nil means the composer
     /// (or the harness default) decides per send.
     public var reasoningEffort: String?
+    /// A summary of the conversation this chat continues, staged for the model
+    /// and cleared once a message has actually carried it. Nil for every chat
+    /// that isn't the successor of a compaction.
+    public var seedContext: String?
 
     public init(
         id: ChatID,
@@ -214,7 +218,8 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         createdAt: Date = Date(),
         lastActivityAt: Date? = nil,
         isTitleUserSet: Bool = false,
-        reasoningEffort: ReasoningEffort? = nil
+        reasoningEffort: ReasoningEffort? = nil,
+        seedContext: String? = nil
     ) {
         self.id = id.rawValue
         self.workspaceID = workspaceID.rawValue
@@ -230,6 +235,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         self.lastActivityAt = lastActivityAt
         self.isTitleUserSet = isTitleUserSet
         self.reasoningEffort = reasoningEffort?.rawValue
+        self.seedContext = seedContext
     }
 
     public var chatID: ChatID { ChatID(rawValue: id) }
@@ -240,7 +246,8 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
         capabilities: HarnessCapabilities = HarnessCapabilities(),
         queuedMessageCount: Int = 0,
         isTurnActive: Bool = false,
-        contextUsage: UsageReport? = nil
+        contextUsage: UsageReport? = nil,
+        turnCount: Int = 0
     ) -> ChatSummary {
         ChatSummary(
             id: chatID,
@@ -257,6 +264,7 @@ public struct ChatRecord: Codable, FetchableRecord, PersistableRecord, Sendable,
             queuedMessageCount: queuedMessageCount,
             isTurnActive: isTurnActive,
             contextUsage: contextUsage,
+            turnCount: turnCount,
             createdAt: createdAt,
             lastActivity: lastActivityAt,
             reasoningEffort: reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))

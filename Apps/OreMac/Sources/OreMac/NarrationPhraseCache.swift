@@ -24,7 +24,10 @@ final class NarrationPhraseCache: @unchecked Sendable {
     /// Bumped whenever the voice model changes: cached waveforms belong to the
     /// model that produced them, and serving an old one after an upgrade would
     /// mean one voice for remembered lines and another for new ones.
-    private static let formatVersion = "pocket-tts-1"
+    // The synthesis profile is part of the audio format. Version two pins the
+    // Alba voice, temperature and random seed and resets conditioning at
+    // sentence boundaries; old stochastic waveforms must not leak back in.
+    private static let formatVersion = NeuralNarrationSynthesis.cacheVersion
 
     /// Long lines are the ones least likely to repeat and the most expensive to
     /// keep, so the cache deliberately only holds short ones. 160 characters

@@ -1,3 +1,4 @@
+import OreCore
 import OrePersistence
 import OreProtocol
 import SwiftUI
@@ -42,7 +43,7 @@ struct AssistantActivityView: View {
     private func content(assistant: WorkspaceSummary, chatID: ChatID) -> some View {
         let state = model.chat(for: chatID)
         return VStack(spacing: 0) {
-            header(state: state)
+            header(assistant: assistant, chatID: chatID, state: state)
             Divider()
             switch tab {
             case .activity:
@@ -53,20 +54,33 @@ struct AssistantActivityView: View {
                 AssistantMemoryView(homePath: assistant.worktreePath)
             }
         }
+        // Row caches belong to the conversation that built them. The draft
+        // deliberately survives: a compaction switches conversations without
+        // being asked, and destroying a half-typed question would be the user's
+        // loss for ORE's housekeeping.
+        .onChange(of: chatID) { _, _ in
+            memo = TranscriptDisplay.Memo()
+            expandedActivityGroups = []
+        }
     }
 
-    private func header(state: ChatState) -> some View {
-        HStack(spacing: OreTheme.Space.md) {
+    private func header(
+        assistant: WorkspaceSummary,
+        chatID: ChatID,
+        state: ChatState
+    ) -> some View {
+        let summary = model.chats(for: assistant.id).first { $0.id == chatID }
+        return HStack(spacing: OreTheme.Space.md) {
             Image(systemName: "sparkles")
                 .foregroundStyle(Color.accentColor)
-            Text("Assistant")
-                .font(.system(size: OreTheme.Font.body, weight: .semibold))
+            conversationMenu(assistant: assistant, chatID: chatID, current: summary)
             if state.status != .idle {
                 Text(state.status.rawValue)
                     .font(.system(size: OreTheme.Font.caption))
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if let summary { lengthIndicator(summary) }
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
@@ -76,6 +90,71 @@ struct AssistantActivityView: View {
         }
         .padding(.horizontal, OreTheme.Space.md)
         .frame(height: OreTheme.RowHeight.bar)
+    }
+
+    /// The title doubles as the conversation switcher. A window this narrow has
+    /// no room for a tab bar, and the assistant is one conversation at a time
+    /// by nature — the others are history, not parallel work.
+    private func conversationMenu(
+        assistant: WorkspaceSummary,
+        chatID: ChatID,
+        current: ChatSummary?
+    ) -> some View {
+        let open = model.chats(for: assistant.id)
+        let closed = model.chats(for: assistant.id, includeClosed: true).filter(\.isClosed)
+        return Menu {
+            Button("New Conversation") { model.createAssistantConversation() }
+            Divider()
+            ForEach(open) { conversation in
+                Button {
+                    model.selectChat(conversation.id, in: assistant.id)
+                } label: {
+                    Label(
+                        conversation.title,
+                        systemImage: conversation.id == chatID ? "checkmark" : "bubble.left"
+                    )
+                }
+            }
+            if !closed.isEmpty {
+                Section("Closed") {
+                    ForEach(closed) { conversation in
+                        Button(conversation.title) {
+                            model.reopenChat(conversation.id, in: assistant.id)
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(current?.title ?? "Assistant")
+                .font(.system(size: OreTheme.Font.body, weight: .semibold))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    /// How long this conversation has got, and whether ORE is about to retire
+    /// it. Shown before the seam rather than explained after it — a compaction
+    /// the user saw coming reads as ORE tidying up, and one that arrives
+    /// unannounced reads as ORE losing their conversation.
+    private func lengthIndicator(_ summary: ChatSummary) -> some View {
+        let nearing = AssistantCompaction.isNearingCompaction(
+            userTurnCount: summary.turnCount, usage: summary.contextUsage
+        )
+        let fraction = AssistantCompaction.contextFraction(summary.contextUsage)
+        return HStack(spacing: 4) {
+            Image(systemName: nearing ? "arrow.triangle.2.circlepath" : "bubble.left.and.bubble.right")
+                .font(.system(size: OreTheme.Font.caption))
+            Text(AssistantCompaction.lengthLabel(userTurnCount: summary.turnCount))
+                .font(.system(size: OreTheme.Font.caption, design: .rounded).monospacedDigit())
+        }
+        .foregroundStyle(nearing ? Color.orange : Color.secondary)
+        .help(
+            fraction.map {
+                "\(summary.turnCount) turns · \(Int($0 * 100))% of the model's context"
+                    + (nearing ? " — ORE will soon summarize this into a new conversation" : "")
+            }
+                ?? "\(summary.turnCount) turns in this conversation"
+        )
     }
 
     private func activity(

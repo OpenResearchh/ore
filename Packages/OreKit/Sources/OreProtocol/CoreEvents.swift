@@ -35,6 +35,12 @@ public enum CoreEvent: Sendable, Codable {
     case assistantConfirmationRequested(AssistantConfirmation)
     case assistantConfirmationResolved(String)
     case assistantUIAction(AssistantUIAction)
+    /// ORE retired an assistant conversation into a summary and opened the
+    /// successor. Announced explicitly rather than left to be inferred from
+    /// `chatAdded`, because the client has to move the user to the new
+    /// conversation and `chatAdded` also fires for side chats the assistant
+    /// opens for itself — following those would move the user mid-answer.
+    case assistantConversationCompacted(WorkspaceID, from: ChatID, to: ChatID)
 }
 
 /// A prompt handed to a chat, described well enough for a client to draw it
@@ -109,6 +115,11 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
     /// message the engine then quietly queued.
     public var isTurnActive: Bool
     public var contextUsage: UsageReport?
+    /// Turns the person actually had here — fleet digests excluded. Carried on
+    /// the summary like `queuedMessageCount` because the client cannot count
+    /// them without holding the whole transcript, and the Assistant window has
+    /// to be able to say how long a conversation has got.
+    public var turnCount: Int
     public var createdAt: Date
     public var lastActivity: Date?
     public var reasoningEffort: ReasoningEffort?
@@ -128,6 +139,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         queuedMessageCount: Int = 0,
         isTurnActive: Bool = false,
         contextUsage: UsageReport? = nil,
+        turnCount: Int = 0,
         createdAt: Date = Date(),
         lastActivity: Date? = nil,
         reasoningEffort: ReasoningEffort? = nil
@@ -146,6 +158,7 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
         self.queuedMessageCount = queuedMessageCount
         self.isTurnActive = isTurnActive
         self.contextUsage = contextUsage
+        self.turnCount = turnCount
         self.createdAt = createdAt
         self.lastActivity = lastActivity
         self.reasoningEffort = reasoningEffort

@@ -6,6 +6,15 @@ public struct ChatTransition: Sendable, Codable, Hashable, Identifiable {
     public enum Kind: String, Sendable, Codable {
         case harnessChanged
         case modelChanged
+        /// ORE retired this conversation into a summary and opened a fresh one
+        /// from it.
+        case compacted
+        /// The other side of a `compacted` seam. Two kinds rather than one
+        /// with a direction, because the two transcripts need opposite
+        /// sentences: the retired one has to say where the conversation went,
+        /// and the successor — which otherwise opens blank — has to say what
+        /// it continues.
+        case continuedFromCompaction
     }
 
     public var id: String
@@ -47,6 +56,10 @@ public extension ChatTransition {
             return "Switched from \(from) to \(to)"
         case .modelChanged:
             return "Model changed from \(fromModel ?? "default") to \(toModel ?? "default")"
+        case .compacted:
+            return "Conversation compacted — continued in a new conversation"
+        case .continuedFromCompaction:
+            return "Continued from an earlier conversation, summarized above"
         }
     }
 }

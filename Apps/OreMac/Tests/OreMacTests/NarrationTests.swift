@@ -178,6 +178,36 @@ struct ToolActivityCoalescerTests {
 }
 
 struct NarrationPhraserTests {
+    @Test func routineActivityHasAWideDeterministicPhraseRotation() {
+        let activities = [
+            ToolActivity(kind: .read, subject: "AppModel"),
+            ToolActivity(kind: .search, subject: nil),
+            ToolActivity(kind: .edit, subject: "ChatPane"),
+        ]
+        for activity in activities {
+            let phrases = (0..<6).compactMap {
+                NarrationPhraser.phrase(for: [activity], variant: $0)
+            }
+            #expect(Set(phrases).count >= 6)
+        }
+
+        let completions = (0..<6).map {
+            NarrationPhraser.completionFallback(duration: nil, variant: $0)
+        }
+        #expect(Set(completions).count == 6)
+
+        let plans = (0..<5).map { NarrationPhraser.planProposal(variant: $0) }
+        #expect(Set(plans).count == 5)
+    }
+
+    @Test func neuralCacheCorpusContainsOnlyReusableCacheableLines() {
+        let corpus = NarrationPhraser.neuralCacheCorpus
+        #expect(corpus.count >= 40)
+        #expect(Set(corpus).count == corpus.count)
+        #expect(corpus.allSatisfy(NarrationPhraseCache.isCacheable))
+        #expect(corpus.allSatisfy { !$0.contains("{}") })
+    }
+
     @Test func permissionPrefersSummaryOverDisplayNameOverToolName() {
         func request(summary: String?, displayName: String?) -> PermissionRequest {
             PermissionRequest(
@@ -279,6 +309,31 @@ struct NarrationPhraserTests {
             == "Renamed AppModel to ChatModel.")
         #expect(NarrationPhraser.spokenNarration(nil) == nil)
         #expect(NarrationPhraser.spokenNarration("  ") == nil)
+    }
+
+    /// A user who asks the assistant to walk them through something is asking
+    /// for a long answer. Clipping it at the ambient limit is what made every
+    /// spoken reply feel evasive regardless of the question.
+    @Test func anAnswerTheUserAskedForIsAllowedToRunLong() throws {
+        let answer = String(repeating: "This is a real explanation. ", count: 20)
+        let ambient = try #require(NarrationPhraser.spokenNarration(answer))
+        let asked = try #require(NarrationPhraser.spokenNarration(
+            answer, limit: NarrationPolicy.assistantAnswerLimit
+        ))
+        #expect(asked.count > ambient.count)
+        #expect(asked.count > NarrationPolicy.utteranceLimit)
+    }
+
+    /// An ellipsis is silent, so a clipped answer simply stops mid-thought and
+    /// the listener has no way to know there was more of it.
+    @Test func aClippedSpokenAnswerSaysThatItWasClipped() throws {
+        let long = String(repeating: "word ", count: 500)
+        let spoken = try #require(NarrationPhraser.spokenNarration(long))
+        #expect(!spoken.hasSuffix("…"))
+        #expect(spoken.hasSuffix("there's more in the Assistant window."))
+
+        // A line that fits is left exactly as the model wrote it.
+        #expect(NarrationPhraser.spokenNarration("All set") == "All set.")
     }
 
     @Test func planProposalWithCruxKeepsTheNudgeToRead() {
@@ -523,6 +578,26 @@ struct NarrationVoiceSelectionTests {
         for kind in NarrationVoiceKind.allCases {
             #expect(NarrationVoiceKind(rawValue: kind.rawValue) == kind)
         }
+    }
+
+    @Test func neuralSynthesisUsesOneStableVoiceIdentity() {
+        #expect(NeuralNarrationSynthesis.voice == "alba")
+        #expect(NeuralNarrationSynthesis.temperature < 0.7)
+        #expect(NeuralNarrationSynthesis.seed == 0x4F_52_45_5F_56_4F_49_43)
+        #expect(NeuralNarrationSynthesis.cacheVersion.contains("stable"))
+    }
+
+    @Test func neuralSynthesisReassertsConditioningAtSentenceBoundaries() {
+        let segments = NeuralNarrationSynthesis.segments(
+            "It finished the parser. The tests pass! Do you want the report?"
+        )
+        #expect(segments == [
+            "It finished the parser.",
+            "The tests pass!",
+            "Do you want the report?",
+        ])
+        #expect(NeuralNarrationSynthesis.segments("  All done.  ") == ["All done."])
+        #expect(NeuralNarrationSynthesis.segments("   ").isEmpty)
     }
 }
 

@@ -449,17 +449,25 @@ extension InProcessCoreClient {
             guard let rawID = arguments["permissionID"]?.stringValue, !rawID.isEmpty else {
                 throw AssistantActionError.badRequest("ResolveChatPermission needs permissionID.")
             }
+            let workspaceEngine = try await engine(for: workspaceID)
+            guard await workspaceEngine.pendingInput().contains(where: {
+                $0.chatID == chatID && $0.kind == "permission" && $0.id == rawID
+            }) else {
+                throw AssistantActionError.badRequest(
+                    "Permission \(rawID) is not pending on that tab. "
+                        + "Refresh app state and use the current permissionID and chatID."
+                )
+            }
             let allowed = arguments["allow"]?.boolValue ?? true
             let decision: PermissionDecision = allowed
                 ? .allow
                 : .deny(reason: arguments["reason"]?.stringValue
                     ?? "The user denied this via the assistant.")
-            try await engine(for: workspaceID).resolvePermission(
+            try await workspaceEngine.resolvePermission(
                 PermissionRequestID(rawValue: rawID), with: decision, chatID: chatID
             )
             if allowed, (try? await store.hasAssistantTabGrant(chatID)) == true {
-                try? await engine(for: workspaceID)
-                    .setPermissionMode(.bypassPermissions, chatID: chatID)
+                try? await workspaceEngine.setPermissionMode(.bypassPermissions, chatID: chatID)
             }
             return allowed ? "Allowed." : "Denied."
 
@@ -673,7 +681,14 @@ extension InProcessCoreClient {
     /// disappearing between launches, must not leave the assistant mute.
     func reconcileAssistantConfiguration() async {
         guard let assistant = try? await store.assistantWorkspace(),
-              let chat = try? await store.chats(workspaceID: assistant.workspaceID).first
+              let chats = try? await store.chats(workspaceID: assistant.workspaceID),
+              // The live conversation, not the first one ever opened. Once a
+              // compacted assistant has several, `.first` is a retired one, and
+              // moving only that off a dead harness leaves the user talking to
+              // nothing — the exact failure this function exists to prevent.
+              let chat = chats.filter({ !$0.isClosed }).max(by: {
+                  ($0.lastActivityAt ?? $0.createdAt) < ($1.lastActivityAt ?? $1.createdAt)
+              })
         else { return }
         let current = HarnessKind(rawValue: chat.harness)
         if let current, harnessProbes.first(where: { $0.kind == current })?.isReady ?? false {

@@ -151,7 +151,7 @@ private struct AssistantHUDView: View {
     private var placeholder: String {
         switch controller.phase {
         case .listening: "Listening…"
-        case .answering: "Yes or no?"
+        case .answering: controller.answerPlaceholder
         case .thinking: "Thinking…"
         case .speaking: "Speaking…"
         case .idle: ""

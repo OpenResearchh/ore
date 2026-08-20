@@ -145,6 +145,16 @@ public enum MessageOrigin: String, Sendable, Codable, Hashable, CaseIterable {
     case user
     /// Sent by the ORE assistant acting on the user's behalf.
     case agent
+    /// A fleet digest ORE hands the assistant to judge — machine to machine,
+    /// on a timer, whether or not anyone is at the keyboard.
+    ///
+    /// Distinguished from `.user` because the assistant's own conversation is
+    /// otherwise mostly this: one digest every couple of minutes for as long
+    /// as agents are running. Counted as conversation it would trigger a
+    /// compaction overnight with nobody there; summarized as conversation it
+    /// would bury what the user actually said under a wall of "finished a
+    /// turn" and "SKIP".
+    case watch
 }
 
 public struct SendMessageRequest: Sendable, Codable {

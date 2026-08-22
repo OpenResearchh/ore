@@ -440,6 +440,16 @@ struct CoreClientTests {
         assistantChat.model = "gpt-5.6-sol"
         assistantChat.reasoningEffort = ReasoningEffort.xhigh.rawValue
         try await store.saveChat(assistantChat)
+        let secondAssistantChatID = ChatID.generate()
+        try await store.saveChat(ChatRecord(
+            id: secondAssistantChatID,
+            workspaceID: assistant.workspaceID,
+            title: "Another open conversation",
+            harness: .codex,
+            model: "gpt-5.6-sol",
+            sortIndex: 1,
+            reasoningEffort: .xhigh
+        ))
 
         // A project chat can intentionally use Sol. Assistant reconciliation
         // must never turn a fleet-wide cost policy into a project-model change.
@@ -483,15 +493,21 @@ struct CoreClientTests {
 
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         var migrated: ChatRecord?
+        var secondMigrated: ChatRecord?
         while ContinuousClock.now < deadline {
             migrated = try await store.chat(assistantChat.chatID)
-            if migrated?.model == "gpt-5.6-luna" { break }
+            secondMigrated = try await store.chat(secondAssistantChatID)
+            if migrated?.model == "gpt-5.6-luna"
+                && secondMigrated?.model == "gpt-5.6-luna" { break }
             try? await Task.sleep(for: .milliseconds(25))
         }
 
         #expect(migrated?.harness == HarnessKind.codex.rawValue)
         #expect(migrated?.model == "gpt-5.6-luna")
         #expect(migrated?.reasoningEffort == ReasoningEffort.low.rawValue)
+        #expect(secondMigrated?.harness == HarnessKind.codex.rawValue)
+        #expect(secondMigrated?.model == "gpt-5.6-luna")
+        #expect(secondMigrated?.reasoningEffort == ReasoningEffort.low.rawValue)
         #expect(try await store.chat(projectChatID)?.model == "gpt-5.6-sol")
         let warning = await recorder.waitFor { event in
             if case .commandFailed(let failure) = event {

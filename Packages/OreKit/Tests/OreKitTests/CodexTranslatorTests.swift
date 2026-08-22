@@ -322,19 +322,28 @@ struct CodexTranslatorTests {
         #expect(!capabilities.supportsRuntimePermissionModeChange)
     }
 
-    @Test func assistantMCPAllowListUsesARequestCapableApprovalPolicy() {
+    @Test func assistantMCPAllowListPreapprovesOnlyTheOREServer() {
         #expect(CodexSession.approvalPolicy(
-            permissionMode: .acceptEdits,
-            allowedTools: ["mcp__ore"]
-        ) == "on-request")
-        #expect(CodexSession.approvalPolicy(
-            permissionMode: .acceptEdits,
-            allowedTools: []
+            permissionMode: .acceptEdits
         ) == "never")
         #expect(CodexSession.approvalPolicy(
-            permissionMode: .default,
-            allowedTools: []
+            permissionMode: .default
         ) == "on-request")
+
+        let mcp = SessionConfiguration.MCPServer(
+            command: "/Applications/ORE.app/Contents/MacOS/OREMCP",
+            arguments: ["--socket", "/tmp/ore.sock"]
+        )
+        let assistant = CodexSession.mcpServerConfiguration(
+            mcp,
+            allowedTools: ["mcp__ore"]
+        )
+        #expect(assistant["default_tools_approval_mode"]?.stringValue == "approve")
+        #expect(assistant["command"]?.stringValue == mcp.command)
+        #expect(assistant["args"]?.arrayValue?.map(\.stringValue) == mcp.arguments)
+
+        let project = CodexSession.mcpServerConfiguration(mcp, allowedTools: [])
+        #expect(project["default_tools_approval_mode"] == nil)
     }
 
     @Test func aDelegationToolLandsOnTheSubagentRow() {

@@ -220,17 +220,30 @@ public actor WorkspaceEngine {
         let harness = request.harness
             ?? source.flatMap { HarnessKind(rawValue: $0.record.harness) }
             ?? HarnessKind(rawValue: defaultRuntime.record.harness) ?? .claudeCode
+        let model: String?
+        let reasoningEffort: ReasoningEffort?
+        if record.workspaceKind == .assistant {
+            // New tabs and compaction successors are product-owned Assistant
+            // conversations. Never let a copied UI selection or a provider's
+            // frontier default silently move them off the lean profile.
+            let profile = AssistantManager.modelProfile(for: harness)
+            model = profile.model
+            reasoningEffort = profile.reasoningEffort
+        } else {
+            model = request.model ?? source?.record.model ?? defaultRuntime.record.model
+            reasoningEffort = request.reasoningEffort
+                ?? source?.record.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+        }
         let chat = ChatRecord(
             id: ChatID.generate(),
             workspaceID: workspaceID,
             title: request.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? "Chat \(index + 1)",
             harness: harness,
-            model: request.model ?? source?.record.model ?? defaultRuntime.record.model,
+            model: model,
             permissionMode: request.permissionMode,
             sortIndex: index,
-            reasoningEffort: request.reasoningEffort
-                ?? source?.record.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+            reasoningEffort: reasoningEffort
         )
         try await store.saveChat(chat)
         let runtime = ChatRuntime(record: chat)

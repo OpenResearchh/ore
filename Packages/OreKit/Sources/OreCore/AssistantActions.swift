@@ -682,62 +682,68 @@ extension InProcessCoreClient {
     func reconcileAssistantConfiguration() async {
         guard let assistant = try? await store.assistantWorkspace(),
               let chats = try? await store.chats(workspaceID: assistant.workspaceID),
-              // The live conversation, not the first one ever opened. Once a
-              // compacted assistant has several, `.first` is a retired one, and
-              // moving only that off a dead harness leaves the user talking to
-              // nothing — the exact failure this function exists to prevent.
-              let chat = chats.filter({ !$0.isClosed }).max(by: {
-                  ($0.lastActivityAt ?? $0.createdAt) < ($1.lastActivityAt ?? $1.createdAt)
-              })
+              !chats.isEmpty
         else { return }
-        let current = HarnessKind(rawValue: chat.harness)
-        var seen: Set<HarnessKind> = []
-        let candidates = ([current].compactMap { $0 }
-            + harnessProbes.filter(\.isReady).map(\.kind))
-            .filter { seen.insert($0).inserted }
-        let target = candidates.compactMap({ harness -> (
-            harness: HarnessKind, profile: AssistantManager.ModelProfile
-        )? in
-            guard harnessProbes.first(where: { $0.kind == harness })?.isReady ?? false,
-                  let profile = Self.assistantProfile(for: harness, catalog: self.modelCatalog)
-            else { return nil }
-            return (harness, profile)
-        }).first
+        var warnedProfiles: Set<String> = []
+        for chat in chats where !chat.isClosed {
+            let current = HarnessKind(rawValue: chat.harness)
+            var seen: Set<HarnessKind> = []
+            let candidates = ([current].compactMap { $0 }
+                + harnessProbes.filter(\.isReady).map(\.kind))
+                .filter { seen.insert($0).inserted }
+            let target = candidates.compactMap({ harness -> (
+                harness: HarnessKind, profile: AssistantManager.ModelProfile
+            )? in
+                guard harnessProbes.first(where: { $0.kind == harness })?.isReady ?? false,
+                      let profile = Self.assistantProfile(
+                          for: harness,
+                          catalog: self.modelCatalog
+                      )
+                else { return nil }
+                return (harness, profile)
+            }).first
 
-        guard let target else {
+            if let target {
+                let currentEffort = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+                guard current != target.harness
+                        || chat.model != target.profile.model
+                        || currentEffort != target.profile.reasoningEffort
+                else { continue }
+                await moveAssistant(
+                    to: target.harness,
+                    profile: target.profile,
+                    workspaceID: assistant.workspaceID,
+                    chatID: chat.chatID
+                )
+                continue
+            }
+
             // A stale CLI or restricted account may advertise only expensive
             // models. Pin the lean id anyway so the next turn fails loudly
             // instead of consuming the provider's implicit frontier default.
             guard let harness = candidates.first(where: { candidate in
                 harnessProbes.first(where: { $0.kind == candidate })?.isReady ?? false
-            }) else { return }
+            }) else { continue }
             let profile = AssistantManager.modelProfile(for: harness)
-            await moveAssistant(
-                to: harness,
-                profile: profile,
-                workspaceID: assistant.workspaceID,
-                chatID: chat.chatID
-            )
+            let currentEffort = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+            if current != harness || chat.model != profile.model
+                || currentEffort != profile.reasoningEffort {
+                await moveAssistant(
+                    to: harness,
+                    profile: profile,
+                    workspaceID: assistant.workspaceID,
+                    chatID: chat.chatID
+                )
+            }
+            let warningKey = "\(harness.rawValue):\(profile.model)"
+            guard warnedProfiles.insert(warningKey).inserted else { continue }
             continuation.yield(.commandFailed(CommandFailure(
                 workspaceID: assistant.workspaceID,
                 message: "The Assistant's lean model is unavailable.",
                 detail: "\(harness.displayName) did not advertise \(profile.model). ORE pinned "
                     + "that model rather than silently using a more expensive default."
             )))
-            return
         }
-
-        let currentEffort = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
-        guard current != target.harness
-                || chat.model != target.profile.model
-                || currentEffort != target.profile.reasoningEffort
-        else { return }
-        await moveAssistant(
-            to: target.harness,
-            profile: target.profile,
-            workspaceID: assistant.workspaceID,
-            chatID: chat.chatID
-        )
     }
 
     /// The assistant's own provider hit a hard limit; move it to another

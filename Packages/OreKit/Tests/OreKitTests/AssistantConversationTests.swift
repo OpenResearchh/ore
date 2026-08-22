@@ -132,6 +132,22 @@ struct AssistantConversationTests {
 
     // MARK: - The seam
 
+    @Test func everyNewAssistantConversationUsesTheLeanHarnessProfile() async throws {
+        let (store, engine, _, id) = try await makeAssistantEngine()
+        let chat = try await engine.createChat(CreateChatRequest(
+            workspaceID: id,
+            title: "Lean",
+            harness: .codex,
+            model: "gpt-5.6-sol",
+            reasoningEffort: .xhigh
+        ))
+        let record = try #require(try await store.chat(chat.id))
+
+        #expect(record.harness == HarnessKind.codex.rawValue)
+        #expect(record.model == "gpt-5.6-luna")
+        #expect(record.reasoningEffort == ReasoningEffort.low.rawValue)
+    }
+
     /// The whole feature end to end. `FakeHarness.supportsAuxiliarySessions` is
     /// false, so this also pins the fallback path: a harness that cannot be
     /// asked for a summary must still be able to compact, because it is the one

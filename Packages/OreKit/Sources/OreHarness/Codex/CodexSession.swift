@@ -126,10 +126,10 @@ public actor CodexSession: AgentSession {
         if let model = configuration.model { config["model"] = .string(model) }
         if let mcp = configuration.mcpServer {
             config["mcp_servers"] = .object([
-                "ore": .object([
-                    "command": .string(mcp.command),
-                    "args": .array(mcp.arguments.map(JSONValue.string)),
-                ]),
+                "ore": Self.mcpServerConfiguration(
+                    mcp,
+                    allowedTools: configuration.allowedTools
+                ),
             ])
         }
         if !config.isEmpty { params["config"] = .object(config) }
@@ -181,30 +181,34 @@ public actor CodexSession: AgentSession {
     }
 
     private func approvalPolicy() -> String {
-        Self.approvalPolicy(
-            permissionMode: permissionMode,
-            allowedTools: configuration.allowedTools
-        )
+        Self.approvalPolicy(permissionMode: permissionMode)
     }
 
-    /// Codex interprets `never` as "reject anything that would require an
-    /// approval", including MCP calls. The Assistant's ORE MCP server is
-    /// already gated by ORE's app-side action policy, so use Codex's
-    /// request-capable posture whenever the session carries that allow-list.
-    /// Ordinary project chats keep their existing permission mapping.
-    static func approvalPolicy(
-        permissionMode: PermissionMode,
-        allowedTools: [String]
-    ) -> String {
-        if allowedTools.contains(where: {
-            $0 == "mcp__ore" || $0.hasPrefix("mcp__ore__")
-        }) {
-            return "on-request"
-        }
+    static func approvalPolicy(permissionMode: PermissionMode) -> String {
         switch permissionMode {
         case .bypassPermissions, .acceptEdits: return "never"
         case .plan, .default: return "on-request"
         }
+    }
+
+    /// The Assistant may invoke its product-owned ORE server without a second
+    /// Codex approval. ORE still evaluates every requested action through its
+    /// own action policy, while shell/editor tools retain the chat's normal
+    /// approval posture.
+    static func mcpServerConfiguration(
+        _ mcp: SessionConfiguration.MCPServer,
+        allowedTools: [String]
+    ) -> JSONValue {
+        var server: [String: JSONValue] = [
+            "command": .string(mcp.command),
+            "args": .array(mcp.arguments.map(JSONValue.string)),
+        ]
+        if allowedTools.contains(where: {
+            $0 == "mcp__ore" || $0.hasPrefix("mcp__ore__")
+        }) {
+            server["default_tools_approval_mode"] = .string("approve")
+        }
+        return .object(server)
     }
 
     public func stop() async {

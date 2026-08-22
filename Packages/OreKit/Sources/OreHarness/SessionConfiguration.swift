@@ -34,8 +34,8 @@ public struct SessionConfiguration: Sendable {
     public var allowAPIKeyFallback: Bool
     public var mcpServer: MCPServer?
     /// Tool patterns the harness should run without asking. Claude Code maps
-    /// these to `--allowedTools`; Codex uses their presence to choose an MCP-
-    /// compatible approval posture. Used for the assistant's own MCP tools,
+    /// these to `--allowedTools`; Codex maps the ORE pattern to that MCP
+    /// server's static approval mode. Used for the assistant's own MCP tools,
     /// whose real safety gate is ORE's app-side policy — a CLI prompt on top
     /// of that is pure nagging.
     public var allowedTools: [String]

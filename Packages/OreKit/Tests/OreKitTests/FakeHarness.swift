@@ -12,6 +12,7 @@ import OreSupport
 final class FakeHarness: AgentHarness, @unchecked Sendable {
     let kind: HarnessKind
     var capabilities: HarnessCapabilities
+    let models: [AgentModel]
     let supportsAuxiliarySessions = false
 
     /// Sessions handed out so far, so a test can drive them.
@@ -31,10 +32,12 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
             supportsSessionFork: true,
             supportsRuntimePermissionModeChange: true,
             permissionModel: .interactiveCallback
-        )
+        ),
+        models: [AgentModel] = []
     ) {
         self.kind = kind
         self.capabilities = capabilities
+        self.models = models
     }
 
     func probe() async -> HarnessProbeResult {
@@ -43,6 +46,8 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
             version: "fake", authState: .authenticated
         )
     }
+
+    func discoverModels() async -> [AgentModel] { models }
 
     func makeSession(_ configuration: SessionConfiguration) async throws -> any AgentSession {
         let session = FakeSession(

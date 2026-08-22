@@ -637,6 +637,16 @@ public actor WorkspaceEngine {
         var text = composeMessage(request)
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
 
+        // The accepted message owns the text now. Clear the durable draft here,
+        // at the same boundary that accepts typed, voice, attachment-only, and
+        // queued sends. Clearing only the Mac app's local summary let the old
+        // database value return to the composer after switching tabs.
+        if !runtime.record.draftText.isEmpty {
+            runtime.record.draftText = ""
+            try await store.saveChat(runtime.record)
+            publishChatChange(runtime)
+        }
+
         if !runtime.pendingContextNotes.isEmpty {
             let notes = runtime.pendingContextNotes
                 .map { "[ORE workspace note] \($0)" }

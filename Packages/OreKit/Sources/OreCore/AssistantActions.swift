@@ -691,11 +691,53 @@ extension InProcessCoreClient {
               })
         else { return }
         let current = HarnessKind(rawValue: chat.harness)
-        if let current, harnessProbes.first(where: { $0.kind == current })?.isReady ?? false {
+        var seen: Set<HarnessKind> = []
+        let candidates = ([current].compactMap { $0 }
+            + harnessProbes.filter(\.isReady).map(\.kind))
+            .filter { seen.insert($0).inserted }
+        let target = candidates.compactMap({ harness -> (
+            harness: HarnessKind, profile: AssistantManager.ModelProfile
+        )? in
+            guard harnessProbes.first(where: { $0.kind == harness })?.isReady ?? false,
+                  let profile = Self.assistantProfile(for: harness, catalog: self.modelCatalog)
+            else { return nil }
+            return (harness, profile)
+        }).first
+
+        guard let target else {
+            // A stale CLI or restricted account may advertise only expensive
+            // models. Pin the lean id anyway so the next turn fails loudly
+            // instead of consuming the provider's implicit frontier default.
+            guard let harness = candidates.first(where: { candidate in
+                harnessProbes.first(where: { $0.kind == candidate })?.isReady ?? false
+            }) else { return }
+            let profile = AssistantManager.modelProfile(for: harness)
+            await moveAssistant(
+                to: harness,
+                profile: profile,
+                workspaceID: assistant.workspaceID,
+                chatID: chat.chatID
+            )
+            continuation.yield(.commandFailed(CommandFailure(
+                workspaceID: assistant.workspaceID,
+                message: "The Assistant's lean model is unavailable.",
+                detail: "\(harness.displayName) did not advertise \(profile.model). ORE pinned "
+                    + "that model rather than silently using a more expensive default."
+            )))
             return
         }
-        guard let fallback = harnessProbes.first(where: \.isReady)?.kind else { return }
-        await moveAssistant(to: fallback, workspaceID: assistant.workspaceID, chatID: chat.chatID)
+
+        let currentEffort = chat.reasoningEffort.flatMap(ReasoningEffort.init(rawValue:))
+        guard current != target.harness
+                || chat.model != target.profile.model
+                || currentEffort != target.profile.reasoningEffort
+        else { return }
+        await moveAssistant(
+            to: target.harness,
+            profile: target.profile,
+            workspaceID: assistant.workspaceID,
+            chatID: chat.chatID
+        )
     }
 
     /// The assistant's own provider hit a hard limit; move it to another
@@ -708,34 +750,53 @@ extension InProcessCoreClient {
               chat.workspaceID == assistant.id
         else { return }
         let current = HarnessKind(rawValue: chat.harness)
-        guard let alternate = harnessProbes.first(where: {
-            $0.isReady && $0.kind != current
-        })?.kind else { return }
-        await moveAssistant(to: alternate, workspaceID: assistant.workspaceID, chatID: chatID)
+        guard let alternate = harnessProbes.lazy.compactMap({ probe -> (
+            harness: HarnessKind, profile: AssistantManager.ModelProfile
+        )? in
+            guard probe.isReady, probe.kind != current,
+                  let profile = Self.assistantProfile(for: probe.kind, catalog: self.modelCatalog)
+            else { return nil }
+            return (probe.kind, profile)
+        }).first else { return }
+        await moveAssistant(
+            to: alternate.harness,
+            profile: alternate.profile,
+            workspaceID: assistant.workspaceID,
+            chatID: chatID
+        )
     }
 
     private func moveAssistant(
         to harness: HarnessKind,
+        profile: AssistantManager.ModelProfile,
         workspaceID: WorkspaceID,
         chatID: ChatID
     ) async {
-        guard let chat = try? await engine(for: workspaceID).switchHarness(
+        guard let engine = try? await engine(for: workspaceID),
+              let moved = try? await engine.switchHarness(
+                chatID: chatID,
+                harness: harness,
+                model: profile.model
+              )
+        else { return }
+        let configured = (try? await engine.setEffort(
             chatID: chatID,
-            harness: harness,
-            model: Self.assistantModel(for: harness, catalog: modelCatalog)
-        ) else { return }
-        continuation.yield(.chatUpdated(chat))
+            effort: profile.reasoningEffort
+        )) ?? moved
+        continuation.yield(.chatUpdated(configured))
     }
 
-    /// The cheapest sensible model per harness for the assistant's own turns:
-    /// haiku on Claude; elsewhere the catalog default (we don't know another
-    /// provider's price ladder, and guessing a model id breaks the session).
-    static func assistantModel(
+    /// The Assistant may use only the product-owned lean profile for a
+    /// harness. A nonempty live catalog is authoritative: if that account or
+    /// CLI does not advertise the lean model, skip the harness instead of
+    /// silently spending against its frontier default.
+    static func assistantProfile(
         for harness: HarnessKind,
         catalog: [HarnessKind: [AgentModel]]
-    ) -> String? {
-        if harness == .claudeCode { return AssistantManager.defaultModel }
-        return catalog[harness]?.first(where: \.isDefault)?.id
+    ) -> AssistantManager.ModelProfile? {
+        let profile = AssistantManager.modelProfile(for: harness)
+        guard let models = catalog[harness], !models.isEmpty else { return profile }
+        return models.contains(where: { $0.id == profile.model }) ? profile : nil
     }
 
     // MARK: - Audit

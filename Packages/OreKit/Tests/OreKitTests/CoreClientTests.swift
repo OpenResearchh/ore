@@ -399,6 +399,11 @@ struct CoreClientTests {
         // Present in the store, absent from the user's lists and pickers.
         let assistant = try #require(try await store.assistantWorkspace())
         #expect(assistant.workspaceKind == .assistant)
+        #expect(assistant.model == AssistantManager.defaultModel)
+        let assistantChat = try #require(
+            try await store.chats(workspaceID: assistant.workspaceID).first
+        )
+        #expect(assistantChat.model == AssistantManager.defaultModel)
         #expect(try await store.workspaces(includeArchived: true).isEmpty)
         #expect(try await store.repositories().isEmpty)
 
@@ -421,6 +426,122 @@ struct CoreClientTests {
         #expect(try await store.assistantWorkspace() != nil)
 
         await client.shutdown()
+    }
+
+    @Test func startupDownshiftsOnlyTheAssistantToTheLeanHarnessProfile() async throws {
+        let fixture = try await GitFixture.initialized()
+        let databasePath = fixture.root.appendingPathComponent("ore.sqlite")
+        let store = try OreStore(path: databasePath)
+        let assistant = try #require(try await AssistantManager.ensureAssistant(store: store))
+        var assistantChat = try #require(
+            try await store.chats(workspaceID: assistant.workspaceID).first
+        )
+        assistantChat.harness = HarnessKind.codex.rawValue
+        assistantChat.model = "gpt-5.6-sol"
+        assistantChat.reasoningEffort = ReasoningEffort.xhigh.rawValue
+        try await store.saveChat(assistantChat)
+
+        // A project chat can intentionally use Sol. Assistant reconciliation
+        // must never turn a fleet-wide cost policy into a project-model change.
+        try await store.addRepository(RepositoryRecord(
+            path: fixture.repository.path,
+            name: "project",
+            defaultBranch: "main"
+        ))
+        let projectID = WorkspaceID.generate()
+        try await store.saveWorkspace(WorkspaceRecord(
+            id: projectID,
+            name: "Project",
+            repositoryPath: fixture.repository.path,
+            worktreePath: fixture.repository.path,
+            branch: "main",
+            baseBranch: "main",
+            harness: .codex,
+            model: "gpt-5.6-sol"
+        ))
+        let projectChatID = ChatID(rawValue: projectID.rawValue)
+        try await store.saveChat(ChatRecord(
+            id: projectChatID,
+            workspaceID: projectID,
+            title: "Project",
+            harness: .codex,
+            model: "gpt-5.6-sol"
+        ))
+
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: [FakeHarness(
+                kind: .codex,
+                models: [AgentModel(
+                    id: "gpt-5.6-sol", displayName: "Sol", isDefault: true
+                )]
+            )]),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+        try await client.start()
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        var migrated: ChatRecord?
+        while ContinuousClock.now < deadline {
+            migrated = try await store.chat(assistantChat.chatID)
+            if migrated?.model == "gpt-5.6-luna" { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        #expect(migrated?.harness == HarnessKind.codex.rawValue)
+        #expect(migrated?.model == "gpt-5.6-luna")
+        #expect(migrated?.reasoningEffort == ReasoningEffort.low.rawValue)
+        #expect(try await store.chat(projectChatID)?.model == "gpt-5.6-sol")
+        let warning = await recorder.waitFor { event in
+            if case .commandFailed(let failure) = event {
+                return failure.message == "The Assistant's lean model is unavailable."
+            }
+            return false
+        }
+        #expect(warning != nil)
+
+        await client.shutdown()
+    }
+}
+
+struct AssistantModelPolicyTests {
+    @Test func everyHarnessHasAnExplicitLeanAssistantProfile() {
+        #expect(AssistantManager.modelProfile(for: .claudeCode) == .init(
+            model: "claude-haiku-4-5-20251001",
+            reasoningEffort: nil
+        ))
+        #expect(AssistantManager.modelProfile(for: .codex) == .init(
+            model: "gpt-5.6-luna",
+            reasoningEffort: .low
+        ))
+        #expect(AssistantManager.modelProfile(for: .cursorAgent) == .init(
+            model: "composer-2.5",
+            reasoningEffort: nil
+        ))
+    }
+
+    @Test func aLiveCatalogCannotSilentlyPromoteTheAssistantToItsDefault() {
+        let frontierOnly: [HarnessKind: [AgentModel]] = [
+            .codex: [AgentModel(
+                id: "gpt-5.6-sol", displayName: "Sol", isDefault: true
+            )],
+        ]
+        #expect(InProcessCoreClient.assistantProfile(
+            for: .codex,
+            catalog: frontierOnly
+        )?.model == nil)
+
+        let withLuna: [HarnessKind: [AgentModel]] = [
+            .codex: [
+                AgentModel(id: "gpt-5.6-sol", displayName: "Sol", isDefault: true),
+                AgentModel(id: "gpt-5.6-luna", displayName: "Luna"),
+            ],
+        ]
+        #expect(InProcessCoreClient.assistantProfile(
+            for: .codex,
+            catalog: withLuna
+        )?.model == "gpt-5.6-luna")
     }
 }
 

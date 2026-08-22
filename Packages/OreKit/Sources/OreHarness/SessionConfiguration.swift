@@ -33,15 +33,17 @@ public struct SessionConfiguration: Sendable {
     /// parent environment is scrubbed so a stray key never gets billed.
     public var allowAPIKeyFallback: Bool
     public var mcpServer: MCPServer?
-    /// Tool patterns the harness should run without asking (Claude Code's
-    /// `--allowedTools`). Used for the assistant's own MCP tools, whose real
-    /// safety gate is ORE's app-side policy — a CLI prompt on top of that is
-    /// pure nagging.
+    /// Tool patterns the harness should run without asking. Claude Code maps
+    /// these to `--allowedTools`; Codex uses their presence to choose an MCP-
+    /// compatible approval posture. Used for the assistant's own MCP tools,
+    /// whose real safety gate is ORE's app-side policy — a CLI prompt on top
+    /// of that is pure nagging.
     public var allowedTools: [String]
-    /// Tool patterns the harness must refuse outright (Claude Code's
-    /// `--disallowedTools`). Used for the assistant, whose job is to route work
-    /// to project agents — a prompt asking it not to run `git` is a suggestion,
-    /// a missing `Bash` tool is a fact.
+    /// Tool patterns the harness must refuse outright when it supports a
+    /// static deny list (Claude Code's `--disallowedTools`). Used for the
+    /// assistant, whose job is to route work to project agents — a prompt
+    /// asking it not to run `git` is a suggestion, a missing `Bash` tool is a
+    /// fact.
     public var disallowedTools: [String]
 
     public init(

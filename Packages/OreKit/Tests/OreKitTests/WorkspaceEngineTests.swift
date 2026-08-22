@@ -74,6 +74,23 @@ struct WorkspaceEngineTests {
         )
     }
 
+    @Test func sendingClearsThePersistedComposerDraft() async throws {
+        let harness = try await makeEngine()
+        let chatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.setDraft(chatID: chatID, text: "send this once")
+        #expect(try await harness.store.chat(chatID)?.draftText == "send this once")
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID,
+            chatID: chatID,
+            text: "send this once"
+        ))
+
+        #expect(try await harness.store.chat(chatID)?.draftText == "")
+        #expect(try await harness.engine.chatSummaries().first?.draftText == "")
+    }
+
     @Test func chatTabsOwnIndependentSessionsAndTranscripts() async throws {
         let harness = try await makeEngine()
         let second = try await harness.engine.createChat(CreateChatRequest(

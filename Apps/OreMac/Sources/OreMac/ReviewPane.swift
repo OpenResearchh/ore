@@ -137,7 +137,11 @@ struct ReviewPane: View {
             content
                 .frame(maxHeight: .infinity)
             stackStrip
+            // The panel owns workspace-specific async results in @State. Give
+            // each workspace a distinct identity so checks from the previously
+            // selected branch cannot remain visible while the new branch loads.
             ShipStatusPanel(workspace: workspace)
+                .id(workspace.id)
         }
         .background(OreTheme.Surface.chrome)
         .sheet(item: $reviewSetup) { _ in

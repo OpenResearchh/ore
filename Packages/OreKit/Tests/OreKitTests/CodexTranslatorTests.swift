@@ -322,6 +322,21 @@ struct CodexTranslatorTests {
         #expect(!capabilities.supportsRuntimePermissionModeChange)
     }
 
+    @Test func assistantMCPAllowListUsesARequestCapableApprovalPolicy() {
+        #expect(CodexSession.approvalPolicy(
+            permissionMode: .acceptEdits,
+            allowedTools: ["mcp__ore"]
+        ) == "on-request")
+        #expect(CodexSession.approvalPolicy(
+            permissionMode: .acceptEdits,
+            allowedTools: []
+        ) == "never")
+        #expect(CodexSession.approvalPolicy(
+            permissionMode: .default,
+            allowedTools: []
+        ) == "on-request")
+    }
+
     @Test func aDelegationToolLandsOnTheSubagentRow() {
         // codex app-server has no subagent item type, so a handoff can only
         // arrive as an MCP tool. Naming it `Task` and aliasing its arguments is
@@ -378,6 +393,38 @@ struct CodexTranslatorTests {
         #expect(call?.name == "search_docs")
         #expect(call?.displayName == "docs")
         #expect(call?.input["description"] == nil)
+    }
+
+    @Test func aStructuredMCPErrorIsNotHiddenByANullResult() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/completed",
+            params: .object(["item": .object([
+                "id": .string("i-error"),
+                "type": .string("mcpToolCall"),
+                "tool": .string("ListWorkspaces"),
+                "server": .string("ore"),
+                "arguments": .object([:]),
+                "status": .string("failed"),
+                "result": .null,
+                "error": .object([
+                    "message": .string(
+                        "MCP tool call requires approval, but approval policy is never"
+                    ),
+                ]),
+            ])])
+        ).events
+        let result = events.compactMap { event -> ToolResult? in
+            if case .toolResult(let result) = event { return result }
+            return nil
+        }.first
+
+        #expect(result?.isError == true)
+        #expect(result?.text == "MCP tool call requires approval, but approval policy is never")
+        #expect(result?.text != "null")
     }
 
     @Test func nestedJSONTurnErrorsUnwrapToTheHumanMessage() {

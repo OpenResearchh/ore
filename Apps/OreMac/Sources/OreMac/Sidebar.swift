@@ -45,7 +45,17 @@ struct Sidebar: View {
             // the one you're most likely coming back to. `sortedWorkspaces` is
             // already recency-ordered, so a group's latest activity is its first
             // workspace's.
-            .sorted { ($0.latestActivity ?? .distantPast) > ($1.latestActivity ?? .distantPast) }
+            .sorted { first, second in
+                let firstActivity = first.latestActivity ?? .distantPast
+                let secondActivity = second.latestActivity ?? .distantPast
+                if firstActivity != secondActivity { return firstActivity > secondActivity }
+
+                // Dictionary iteration order is deliberately unspecified. Most
+                // untouched repositories have no activity date, so without a
+                // tie-breaker every unrelated model update could swap those
+                // project sections even though neither project had changed.
+                return first.path < second.path
+            }
     }
 
     /// ⌘1–9 jumps to a workspace by its position in `sortedWorkspaces`. Mapping

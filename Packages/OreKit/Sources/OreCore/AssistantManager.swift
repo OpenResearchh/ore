@@ -11,10 +11,30 @@ import OreProtocol
 /// its memory files are its only durable memory, so re-seeding them would be
 /// amnesia, not repair.
 public enum AssistantManager {
+    struct ModelProfile: Sendable, Equatable {
+        var model: String
+        var reasoningEffort: ReasoningEffort?
+    }
+
     public static let workspaceName = "Assistant"
-    /// Haiku by default: the assistant routes, recalls and delegates — the
-    /// expensive thinking happens in the project agents it hands work to.
-    public static let defaultModel = "claude-haiku-4-5-20251001"
+    /// The Assistant routes, recalls and delegates; expensive repository work
+    /// belongs to the project agents it hands work to. Keep one explicit lean
+    /// profile per harness so a provider's frontier catalog default can never
+    /// become the Assistant's accidental default.
+    static func modelProfile(for harness: HarnessKind) -> ModelProfile {
+        switch harness {
+        case .claudeCode:
+            ModelProfile(model: "claude-haiku-4-5-20251001", reasoningEffort: nil)
+        case .codex:
+            ModelProfile(model: "gpt-5.6-luna", reasoningEffort: .low)
+        case .cursorAgent:
+            ModelProfile(model: "composer-2.5", reasoningEffort: nil)
+        }
+    }
+
+    /// Kept as the product's first-launch default for callers that do not yet
+    /// name a harness explicitly.
+    public static let defaultModel = modelProfile(for: .claudeCode).model
 
     @discardableResult
     public static func ensureAssistant(store: OreStore) async throws -> WorkspaceRecord? {
@@ -63,7 +83,8 @@ public enum AssistantManager {
             harness: .claudeCode,
             model: defaultModel,
             permissionMode: .acceptEdits,
-            isTitleUserSet: true
+            isTitleUserSet: true,
+            reasoningEffort: modelProfile(for: .claudeCode).reasoningEffort
         ))
         return record
     }

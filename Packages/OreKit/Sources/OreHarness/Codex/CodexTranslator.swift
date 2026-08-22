@@ -253,7 +253,7 @@ struct CodexTranslator {
                     ? SubagentBrief.label(from: input)
                     : (item["server"]?.stringValue ?? item["namespace"]?.stringValue),
                 input: input,
-                resultText: item["result"]?.description ?? item["error"]?.stringValue ?? "",
+                resultText: toolResultText(item),
                 isError: item["error"] != nil && item["error"]?.isNull == false,
                 to: &output
             )
@@ -363,6 +363,27 @@ struct CodexTranslator {
             cacheReadTokens: cachedInput,
             contextWindow: usage["modelContextWindow"]?.intValue
         )))
+    }
+
+    /// A failed MCP call commonly carries `result: null` beside a structured
+    /// `error` object. Rendering the null first hid the useful error as the
+    /// literal string "null"; prefer a non-null result, then unwrap the same
+    /// provider error shapes used for turn failures.
+    private func toolResultText(_ item: JSONValue) -> String {
+        if let result = item["result"], !result.isNull {
+            return result.stringValue ?? result.description
+        }
+        guard let error = item["error"], !error.isNull else { return "" }
+        if let message = error["message"]?.stringValue, !message.isEmpty {
+            return ProviderErrorCopy.unwrap(message)
+        }
+        if let nested = error["error"]?["message"]?.stringValue, !nested.isEmpty {
+            return ProviderErrorCopy.unwrap(nested)
+        }
+        if let message = error.stringValue, !message.isEmpty {
+            return ProviderErrorCopy.unwrap(message)
+        }
+        return ProviderErrorCopy.unwrap(error.description)
     }
 
     private mutating func applyRateLimits(_ limits: JSONValue?, to output: inout Output) {

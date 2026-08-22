@@ -181,6 +181,26 @@ public actor CodexSession: AgentSession {
     }
 
     private func approvalPolicy() -> String {
+        Self.approvalPolicy(
+            permissionMode: permissionMode,
+            allowedTools: configuration.allowedTools
+        )
+    }
+
+    /// Codex interprets `never` as "reject anything that would require an
+    /// approval", including MCP calls. The Assistant's ORE MCP server is
+    /// already gated by ORE's app-side action policy, so use Codex's
+    /// request-capable posture whenever the session carries that allow-list.
+    /// Ordinary project chats keep their existing permission mapping.
+    static func approvalPolicy(
+        permissionMode: PermissionMode,
+        allowedTools: [String]
+    ) -> String {
+        if allowedTools.contains(where: {
+            $0 == "mcp__ore" || $0.hasPrefix("mcp__ore__")
+        }) {
+            return "on-request"
+        }
         switch permissionMode {
         case .bypassPermissions, .acceptEdits: return "never"
         case .plan, .default: return "on-request"

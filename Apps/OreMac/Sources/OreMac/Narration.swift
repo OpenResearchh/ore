@@ -40,6 +40,9 @@ struct SpokenUtterance: Equatable, Sendable {
         case contextCompacted
         case rateLimit
         case sessionError
+        /// The fleet's own line — what changed about the workspaces rather
+        /// than inside one of them. See `FleetAwareness.swift`.
+        case fleetMilestone
 
         /// Same-kind replacement ignores associated values: a second
         /// permission request replaces an unspoken first one — the newer ask
@@ -59,6 +62,7 @@ struct SpokenUtterance: Equatable, Sendable {
             case .contextCompacted: "contextCompacted"
             case .rateLimit: "rateLimit"
             case .sessionError: "sessionError"
+            case .fleetMilestone: "fleetMilestone"
             }
         }
     }

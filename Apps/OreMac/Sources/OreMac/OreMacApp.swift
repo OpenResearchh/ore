@@ -194,6 +194,13 @@ struct OreMacApp: App {
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                     .disabled(model.actionablePermission == nil)
 
+                // ⇧⌘U walks everything in the fleet that is waiting on the
+                // user — blocked tabs first, then failed turns — so the
+                // sidebar's attention badge has a keyboard that answers it.
+                Button("Next Needs You") { model.focusNextNeedsYou() }
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
+                    .disabled(!model.hasNeedsYouStops)
+
                 Divider()
 
                 // ⌘1–9 jumps straight to a workspace, so switching between
@@ -702,6 +709,7 @@ private struct KeyboardShortcutsView: View {
         ("Send / queue", "⌘↩"),
         ("Allow / deny tool", "↩  Esc"),
         ("Allow / deny from composer", "⇧⌘A  ⇧⌘D"),
+        ("Next thing needing you", "⇧⌘U"),
         ("Dictate prompt", "⌥⌘M"), ("Dictate — tap to start/stop", "⇧⌥"),
         ("Talk to the assistant, anywhere", "hold ⇧⌥"),
         ("Narrate this tab", "⌥⌘S"),

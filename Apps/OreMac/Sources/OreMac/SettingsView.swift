@@ -259,7 +259,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Toggle("Announce every workspace's milestones", isOn: $fleetNarration)
                     .disabled(!narrationEnabled)
-                Text("Even without the speaker toggle, background agents say when they finish, fail, or need you — named by workspace, never their ambient progress.")
+                Text("Even without the speaker toggle, background agents say when they finish, fail, or need you — named by workspace, never their ambient progress. ORE also watches the worktrees themselves, and mentions a branch that starts conflicting, a base that ran away, or a tab you left waiting.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()

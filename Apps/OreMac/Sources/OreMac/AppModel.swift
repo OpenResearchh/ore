@@ -1294,6 +1294,20 @@ final class AppModel {
         }
     }
 
+    /// Put a workspace — optionally one of its tabs — in front of the user.
+    ///
+    /// Shared by the assistant's `OpenWorkspace` tool and the Assistant
+    /// window's "Open tab" affordance: both mean the same thing, and a user
+    /// who is looking at the Assistant window is by definition not looking at
+    /// the tab, so selecting it without activating would be a silent no-op.
+    /// The caller still opens the `main` window — that needs a SwiftUI
+    /// environment this model does not have.
+    func reveal(workspaceID: WorkspaceID, chatID: ChatID? = nil) {
+        selectedWorkspaceID = workspaceID
+        if let chatID { selectChat(chatID, in: workspaceID) }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     func closeChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
         // A closed chat can be reopened, so its draft is written rather than
         // dropped.
@@ -2456,12 +2470,10 @@ final class AppModel {
         case .assistantUIAction(let action):
             switch action {
             case .revealWorkspace(let id):
-                selectedWorkspaceID = id
+                reveal(workspaceID: id)
             case .revealChat(let id, let chatID):
-                selectedWorkspaceID = id
-                selectChat(chatID, in: id)
+                reveal(workspaceID: id, chatID: chatID)
             }
-            NSApp.activate(ignoringOtherApps: true)
 
         case .promptSubmitted(let id, let chatID, let submission):
             chatOwners[chatID] = id

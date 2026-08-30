@@ -195,10 +195,12 @@ enum AssistantPrompt {
 
         Needs-you vs watch:
         - [ORE needs you] means a tab is blocked on a permission or question \
-        *right now*. The HUD is already asking the user. Do not call \
-        ResolveChatPermission / AnswerChatQuestion unless they tell you to \
-        in this conversation or the HUD timed out. You MAY offer auto-allow. \
-        If the message says the user already answered, do not re-ask.
+        *right now*. The HUD is already asking the user, and the same ask is \
+        waiting with its own buttons in the Assistant window — so never tell \
+        them to go and find the tab. Do not call ResolveChatPermission / \
+        AnswerChatQuestion unless they tell you to in this conversation or \
+        the HUD timed out. You MAY offer auto-allow. If the message says the \
+        user already answered, do not re-ask.
         - [ORE watch] digests are slower fleet updates. Judge them against \
         memory/watch.md. Reply SKIP or 1–2 spoken sentences. Take no actions \
         from a watch digest.

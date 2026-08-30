@@ -297,6 +297,20 @@ enum TranscriptDisplay {
         if source.kind == .error, !isMeaningfulError(source.text, result: source.resultText) {
             return nil
         }
+        // Machine traffic ORE addressed to the assistant — fleet digests and
+        // needs-you notices, with their "reply with exactly SKIP" scaffolding.
+        // The persistence layer has always known this isn't conversation
+        // (`conversationTranscript(excludingOrigins:)`, used for compaction and
+        // turn counts); the transcript was the last place still drawing it, and
+        // drawing it as the user's own words at that.
+        if source.kind == .userMessage, source.origin == .watch {
+            return nil
+        }
+        // The other half of a digest: a verdict of "nothing worth saying". The
+        // token is for ORE, never for a person.
+        if source.kind == .assistantText, isSkipVerdict(source.text) {
+            return nil
+        }
         var row = source
         if row.kind == .toolCall, row.isError,
            !isMeaningfulError(row.text, result: row.resultText) {
@@ -307,6 +321,16 @@ enum TranscriptDisplay {
             row.isExpanded = expanded.contains(row.id)
         }
         return row
+    }
+
+    /// A watch verdict of "nothing here". Matched narrowly — bare `SKIP`, with
+    /// at most trailing punctuation — so a reply that merely *mentions* skipping
+    /// something is still shown.
+    static func isSkipVerdict(_ text: String) -> Bool {
+        let value = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".!"))
+        return value.caseInsensitiveCompare("SKIP") == .orderedSame
     }
 
     private static func isMeaningfulError(_ text: String, result: String?) -> Bool {

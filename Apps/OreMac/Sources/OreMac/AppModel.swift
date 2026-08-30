@@ -872,6 +872,11 @@ final class AppModel {
             text,
             attachments: attachments,
             comments: comments,
+            // Forwarded, not defaulted. The engine's echo carries the true
+            // origin but is dropped as a duplicate of this row, so whatever is
+            // set here is what the transcript believes forever — and a `.watch`
+            // digest drawn as `.user` is ORE putting words in the user's mouth.
+            origin: origin,
             submissionID: submissionID
         )
         let isAssistant = assistantWorkspace?.id == id
@@ -2830,6 +2835,11 @@ final class AppModel {
             ResolveChatPermission or AnswerChatQuestion unless they tell you \
             to in this conversation. You MAY offer auto-allow for this tab.
             """,
+            // Machine to machine, exactly like a digest: ORE wrote it, on an
+            // event the user did not trigger, whether or not they are at the
+            // keyboard. `.watch` keeps it out of the transcript, out of the
+            // turn count, and out of any compaction summary.
+            origin: .watch,
             to: assistant.id
         )
     }

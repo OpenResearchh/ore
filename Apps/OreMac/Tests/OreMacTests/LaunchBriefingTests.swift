@@ -90,6 +90,34 @@ struct LaunchBriefingTests {
         #expect(briefing.lines[0].text == "Ready when you are")
     }
 
+    @Test func standingConflictsGetTheirOwnAttentionLine() {
+        // `FleetWatcher` only announces a conflict that appears while the user
+        // is watching, so one that was already there at launch is the
+        // briefing's to report or nobody's.
+        let briefing = LaunchBriefing.compose(
+            workspaces: [
+                workspace("Kailash", status: .idle, conflicted: true, activity: now),
+                workspace("Zewail", status: .idle, conflicted: true, activity: now),
+            ],
+            lastSeenAt: nil,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines.map(\.id) == ["conflicted"])
+        #expect(briefing.lines[0].text == "2 workspaces conflict with their base branch")
+        #expect(briefing.lines[0].isAttention)
+    }
+
+    @Test func aSingleConflictIsNamed() {
+        let briefing = LaunchBriefing.compose(
+            workspaces: [workspace("Kailash", status: .idle, conflicted: true, activity: now)],
+            lastSeenAt: nil,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines[0].text == "Kailash conflicts with its base branch")
+    }
+
     @Test func firstNameExtraction() {
         #expect(LaunchBriefing.firstName(from: "Tushar Ojha") == "Tushar")
         #expect(LaunchBriefing.firstName(from: "") == nil)
@@ -109,6 +137,7 @@ struct LaunchBriefingTests {
         unread: Bool = false,
         uncommitted: Bool = false,
         archived: Bool = false,
+        conflicted: Bool = false,
         activity: Date? = nil
     ) -> WorkspaceSummary {
         WorkspaceSummary(
@@ -130,7 +159,8 @@ struct LaunchBriefingTests {
                 aheadOfBase: 0,
                 behindBase: 0
             ),
-            lastActivity: activity
+            lastActivity: activity,
+            baseSync: BaseSyncStatus(defaultBranch: "main", wouldConflict: conflicted)
         )
     }
 }

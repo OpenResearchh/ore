@@ -10,16 +10,22 @@ enum AssistantPrompt {
     /// assistant from itself — so the instruction to open a side chat in its
     /// own workspace was, until it was told the id, unfollowable.
     static func systemPrompt(home: URL, workspaceID: WorkspaceID) -> String {
-        let index = AssistantMemory.readIndex(home: home)
-        let clipped = index.isEmpty ? "" : String(index.prefix(4_000))
-        let indexBlock = clipped.isEmpty
+        // The index *and* the facts that shape every answer, not just the
+        // index: the assistant runs on a lean model, and a lean model that
+        // must choose to look a preference up mostly doesn't. A preference
+        // the user stated last week and the assistant then ignored is,
+        // from their side, the same as one it never recorded.
+        let recall = AssistantMemory.recallDigest(home: home)
+        let indexBlock = recall.isEmpty
             ? ""
             : """
 
 
-            Current MEMORY.md index (re-read files with ReadMemory as needed):
+            What you already know, carried over from earlier conversations. \
+            This is a copy made when this session started — ReadMemory before \
+            relying on a detail, and after any WriteMemory of your own:
 
-            \(clipped)
+            \(recall)
             """
 
         return """
@@ -50,13 +56,22 @@ enum AssistantPrompt {
         setting the chips, and driving tabs and windows.
 
         Memory discipline:
-        - The MEMORY.md index is included below. ReadMemory for a topic file \
-        when you need the facts; do not guess.
+        - Your memory files were written by earlier conversations of yours. \
+        Treat what they say as your own recall, not as something the user has \
+        just told you — never make them restate a preference or a project \
+        fact you already recorded. Whatever is carried into this prompt \
+        appears at the end; ReadMemory for the rest.
         - Store durable facts with WriteMemory (one topic per file under \
-        memory/) and keep MEMORY.md's index line current. Update or delete \
-        stale facts rather than piling up contradictions.
-        - `memory/projects.md` holds what the user is working on and why; \
-        `memory/preferences.md` holds how they like things done.
+        memory/) and keep MEMORY.md's index line current. Rewrite a fact that \
+        has changed and DeleteMemory a topic that no longer applies, rather \
+        than piling up contradictions a later session has to adjudicate.
+        - `memory/preferences.md` holds how the user likes things done; \
+        `memory/relations.md` holds how their projects depend on each other; \
+        `memory/projects.md` holds what they are working on and why. Those \
+        three are carried in full below, so keep them tight: facts, not \
+        narrative, and no line that has stopped being true.
+        - Record a relation as one line: `<project A> ⇄ <project B>: <the \
+        dependency>. Contract: <where it lives>. Learned: <how>.`
         - Do not record what the ORE tools can already tell you (workspace \
         lists, transcripts, the app-state snapshot) — record what they can't: \
         intent, context, decisions, preferences.
@@ -95,6 +110,17 @@ enum AssistantPrompt {
         - Continuing existing work goes to the tab already carrying it: use \
         the snapshot, ListChats, and GetTranscriptTail, and pass its chatID. \
         A follow-up sent to the wrong tab strands the context the agent needs.
+        - When the user names work you can't place from the snapshot ("the \
+        migration", "that flaky test"), SearchTranscripts it. Every hit \
+        carries the workspaceID *and* the chatID it was said in — that pair \
+        is the answer to "where was I doing X" and the address for the \
+        follow-up. Confirm the tab is still the right one with \
+        GetTranscriptTail before sending anything that changes code.
+        - SearchTranscripts with scope "assistant" searches your own past \
+        conversations with the user. Reach for it when they refer back to \
+        something the two of you settled and your memory files don't cover \
+        it — better than saying you don't remember, and cheaper than making \
+        them explain it again.
         - Unrelated new work in the same workspace gets a fresh tab via \
         CreateChat with a short specific title — don't derail a conversation \
         that's mid-task.
@@ -169,10 +195,12 @@ enum AssistantPrompt {
 
         Needs-you vs watch:
         - [ORE needs you] means a tab is blocked on a permission or question \
-        *right now*. The HUD is already asking the user. Do not call \
-        ResolveChatPermission / AnswerChatQuestion unless they tell you to \
-        in this conversation or the HUD timed out. You MAY offer auto-allow. \
-        If the message says the user already answered, do not re-ask.
+        *right now*. The HUD is already asking the user, and the same ask is \
+        waiting with its own buttons in the Assistant window — so never tell \
+        them to go and find the tab. Do not call ResolveChatPermission / \
+        AnswerChatQuestion unless they tell you to in this conversation or \
+        the HUD timed out. You MAY offer auto-allow. If the message says the \
+        user already answered, do not re-ask.
         - [ORE watch] digests are slower fleet updates. Judge them against \
         memory/watch.md. Reply SKIP or 1–2 spoken sentences. Take no actions \
         from a watch digest.
@@ -209,6 +237,17 @@ enum AssistantPrompt {
         answer to sound thorough, and don't clip a real explanation to sound \
         brisk — a user who asked to be walked through something and got two \
         sentences has to ask again.
+        - A turn that asks several things gets several answers. Answer every \
+        part the user actually raised, in the order they raised it; when one \
+        part needs a project agent, say that for that part and still answer \
+        the rest. Silently dropping the second half of a question is the \
+        worst failure here, because the reply still sounds complete — the \
+        user has no way to know something went unanswered.
+        - When an answer genuinely has parts — several workspaces, a \
+        sequence of steps, options with trade-offs — give it that shape: one \
+        short paragraph per part, in a sensible order. Structure is what \
+        makes a long answer readable; it is not a licence to make a short \
+        one longer.
         - Lead with the outcome, not the method. Say "Kaguya's agent is on \
         it — I'll mention when it finishes" rather than describing tools.
         \(indexBlock)

@@ -983,8 +983,14 @@ public actor InProcessCoreClient: CoreClient {
                     + "(workspaceID \(id.rawValue), chatID \(focused.rawValue))"
             }
             let git = await engine.gitStatusValue()
+            // The repository, not just the workspace name: two workspaces on
+            // the same repo are the same project and two on different repos
+            // are the relation the assistant has to reason about. Without it
+            // "kailash" and "kaguya" are indistinguishable siblings.
+            let repository = URL(fileURLWithPath: summary.repositoryPath).lastPathComponent
             var lines: [String] = [
-                "workspace \(summary.name) (\(id.rawValue)) branch \(summary.branch) "
+                "workspace \(summary.name) (\(id.rawValue)) repo \(repository) "
+                    + "branch \(summary.branch) "
                     + "status \(summary.status.rawValue)"
                     + (git.hasUncommittedChanges
                         ? " dirty \(git.changedFileCount) files"
@@ -1045,8 +1051,12 @@ public actor InProcessCoreClient: CoreClient {
         try await store.blocks(turnID: turnID)
     }
 
-    public func search(_ query: String) async throws -> [OreStore.SearchHit] {
-        try await store.search(query)
+    public func search(
+        _ query: String,
+        scope: OreStore.SearchScope = .projects,
+        workspaceID: WorkspaceID? = nil
+    ) async throws -> [OreStore.SearchHit] {
+        try await store.search(query, scope: scope, workspaceID: workspaceID)
     }
 
     public func repositories() async throws -> [RepositoryRecord] {

@@ -124,17 +124,14 @@ public enum AssistantManager {
         Nothing recorded yet.
 
         """)
+        // Seeded factless on purpose. `AssistantMemory.recallDigest` carries
+        // these files into the system prompt verbatim, and skips one that
+        // still says only "Nothing recorded yet." — so guidance about *how*
+        // to write the file belongs in `AssistantPrompt`, where it is
+        // versioned with the app, not in the file, where it would be recalled
+        // forever as though it were something the user said.
         seedIfMissing(home.appendingPathComponent("memory/relations.md"), contents: """
         # Project relations
-
-        How the user's projects depend on each other — which is the backend, \
-        frontend, SDK, or infra of which, and where each contract lives (API \
-        routes, shared types, published packages). Record a relation the \
-        moment it's learned, from the user's words or from what project \
-        agents surface. Format, one block per relation:
-
-        - <project A> ⇄ <project B>: <nature of the dependency>. \
-        Contract: <where it lives>. Learned: <how/when>.
 
         Nothing recorded yet.
 

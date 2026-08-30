@@ -163,6 +163,7 @@ final class AppModel {
             prepareLaunchBriefing()
         }
         restoreScheduledContinuations()
+        startFleetAwareness()
         NotificationCenter.default.addObserver(
             forName: .oreOpenFromNotification,
             object: nil,
@@ -243,6 +244,7 @@ final class AppModel {
         await flushPendingDraftsAwaitingWrites()
         eventTask?.cancel()
         flushTask?.cancel()
+        fleetTickTask?.cancel()
         for task in continuationTasks.values { task.cancel() }
         continuationTasks.removeAll()
         await client.shutdown()
@@ -598,6 +600,109 @@ final class AppModel {
         }
     }
 
+    // MARK: - Fleet awareness
+
+    /// What the fleet's workspaces — not their agents — have been doing. See
+    /// `FleetAwareness.swift`; everything interesting lives there, and this
+    /// side is only the wiring that feeds it snapshots and a clock.
+    private var fleetWatcher = FleetWatcher()
+    private var fleetTickTask: Task<Void, Never>?
+    /// The pseudo-chat the fleet's own line is spoken under, so its queue slot
+    /// replaces the previous fleet line rather than any real tab's narration.
+    private static let fleetMilestoneChatID = ChatID(rawValue: "fleet-milestones")
+
+    /// A coarse cadence on purpose: the two things this drives — a burst
+    /// settling, and a tab having waited ten minutes — are both measured in
+    /// minutes, and neither is worth a per-second wake-up.
+    private static let fleetTick: Duration = .seconds(30)
+
+    private func startFleetAwareness() {
+        guard fleetTickTask == nil else { return }
+        fleetTickTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.fleetTick)
+                guard let self, !Task.isCancelled else { return }
+                self.tickFleetAwareness()
+            }
+        }
+    }
+
+    private func tickFleetAwareness() {
+        let now = Date()
+        let waiting = tabNeedsYou.map {
+            FleetWatcher.BlockedTab(
+                id: $0.id,
+                workspaceID: $0.workspaceID,
+                name: workspaceName($0.workspaceID)
+            )
+        }
+        record(fleetMilestones: fleetWatcher.reconcileBlocked(waiting, now: now))
+        // Switched off mid-batch: drop what was waiting on the gap rather than
+        // hold it until the toggle comes back on and it speaks as history.
+        guard isFleetAwarenessEnabled else {
+            fleetWatcher.discardPending()
+            return
+        }
+        guard let line = fleetWatcher.flush(now: now) else { return }
+        narration.speakAssistant(
+            line,
+            chatID: Self.fleetMilestoneChatID,
+            priority: .milestone,
+            kind: .fleetMilestone
+        )
+    }
+
+    /// The fleet's voice rides the same switches its agent-event half does:
+    /// there is one "tell me about the rest of the fleet" idea, and one toggle.
+    private var isFleetAwarenessEnabled: Bool {
+        narration.isMasterEnabled && narration.isFleetEnabled
+    }
+
+    private func noteFleetChange(_ summary: WorkspaceSummary) {
+        record(fleetMilestones: fleetWatcher.observe(summary))
+    }
+
+    /// Milestones reach the assistant's watch buffer whether or not they will
+    /// ever be spoken: judging what the fleet is doing is the assistant's job,
+    /// and the narration toggle governs ORE's voice, not the assistant's eyes.
+    ///
+    /// The proactive guard comes first, as it does in `collectWatchEvent` —
+    /// buffering for a digest that will never be scheduled is how the buffer
+    /// grows for the whole session.
+    private func record(fleetMilestones: [FleetMilestone]) {
+        guard proactiveWatchEnabled, assistantWorkspace != nil else { return }
+        guard !fleetMilestones.isEmpty else { return }
+        for milestone in fleetMilestones { watchBuffer.append(milestone.writtenLine) }
+        scheduleWatchFlush()
+    }
+
+    // MARK: - Next needs you
+
+    /// Where ⌘⇧U left off, so repeated presses walk the fleet instead of
+    /// bouncing between the same two.
+    private var lastNeedsYouStop: NeedsYouCycle.Stop?
+
+    private var needsYouStops: [NeedsYouCycle.Stop] {
+        NeedsYouCycle.stops(needsYou: tabNeedsYou, workspaces: sortedWorkspaces)
+    }
+
+    var hasNeedsYouStops: Bool { !needsYouStops.isEmpty }
+
+    /// Jumps to the next thing waiting on the user, anywhere in the fleet.
+    /// Returns false when nothing is — the caller keeps the menu item disabled,
+    /// but a stale disabled state must not silently move the window.
+    @discardableResult
+    func focusNextNeedsYou() -> Bool {
+        guard let stop = NeedsYouCycle.next(after: lastNeedsYouStop, in: needsYouStops) else {
+            return false
+        }
+        lastNeedsYouStop = stop
+        selectedWorkspaceID = stop.workspaceID
+        if let chatID = stop.chatID { selectChat(chatID, in: stop.workspaceID) }
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+
     var selectedChat: ChatState? {
         selectedChatSummary.map { chat(for: $0.id) }
     }
@@ -872,6 +977,11 @@ final class AppModel {
             text,
             attachments: attachments,
             comments: comments,
+            // Forwarded, not defaulted. The engine's echo carries the true
+            // origin but is dropped as a duplicate of this row, so whatever is
+            // set here is what the transcript believes forever — and a `.watch`
+            // digest drawn as `.user` is ORE putting words in the user's mouth.
+            origin: origin,
             submissionID: submissionID
         )
         let isAssistant = assistantWorkspace?.id == id
@@ -1287,6 +1397,20 @@ final class AppModel {
             }
             try? await client.setFocused(workspaceID: workspaceID, chatID: chatID, focused: true)
         }
+    }
+
+    /// Put a workspace — optionally one of its tabs — in front of the user.
+    ///
+    /// Shared by the assistant's `OpenWorkspace` tool and the Assistant
+    /// window's "Open tab" affordance: both mean the same thing, and a user
+    /// who is looking at the Assistant window is by definition not looking at
+    /// the tab, so selecting it without activating would be a silent no-op.
+    /// The caller still opens the `main` window — that needs a SwiftUI
+    /// environment this model does not have.
+    func reveal(workspaceID: WorkspaceID, chatID: ChatID? = nil) {
+        selectedWorkspaceID = workspaceID
+        if let chatID { selectChat(chatID, in: workspaceID) }
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func closeChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
@@ -2376,6 +2500,10 @@ final class AppModel {
                 uniquingKeysWith: { _, last in last }
             )
             harnesses = snapshot.harnesses
+            // Priming, not observing: the fleet's state at launch is the
+            // briefing's story, and the watcher must not narrate a night's
+            // worth of drift as though it just happened.
+            for workspace in workspaces { fleetWatcher.observe(workspace) }
             restoreActiveChats()
             adoptResearchIdentities()
             if selectedWorkspaceID == nil {
@@ -2409,6 +2537,7 @@ final class AppModel {
 
         case .workspaceRemoved(let id):
             workspaces.removeAll { $0.id == id }
+            fleetWatcher.forget(id)
             let removed = chatSummaries.filter { $0.workspaceID == id }.map(\.id)
             chatSummaries.removeAll { $0.workspaceID == id }
             for chatID in removed { forget(chatID) }
@@ -2451,12 +2580,10 @@ final class AppModel {
         case .assistantUIAction(let action):
             switch action {
             case .revealWorkspace(let id):
-                selectedWorkspaceID = id
+                reveal(workspaceID: id)
             case .revealChat(let id, let chatID):
-                selectedWorkspaceID = id
-                selectChat(chatID, in: id)
+                reveal(workspaceID: id, chatID: chatID)
             }
-            NSApp.activate(ignoringOtherApps: true)
 
         case .promptSubmitted(let id, let chatID, let submission):
             chatOwners[chatID] = id
@@ -2830,6 +2957,11 @@ final class AppModel {
             ResolveChatPermission or AnswerChatQuestion unless they tell you \
             to in this conversation. You MAY offer auto-allow for this tab.
             """,
+            // Machine to machine, exactly like a digest: ORE wrote it, on an
+            // event the user did not trigger, whether or not they are at the
+            // keyboard. `.watch` keeps it out of the transcript, out of the
+            // turn count, and out of any compaction summary.
+            origin: .watch,
             to: assistant.id
         )
     }
@@ -3024,6 +3156,7 @@ final class AppModel {
         } else {
             workspaces.append(summary)
         }
+        noteFleetChange(summary)
         // Origin movement does not touch the worktree, so the git-action
         // cache would otherwise keep offering Merge while this branch now
         // conflicts with master.

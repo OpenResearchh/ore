@@ -56,6 +56,11 @@ struct LaunchBriefing: Equatable {
         let uncommitted = active.filter {
             $0.status == .idle && !$0.hasUnread && $0.gitStatus.hasUncommittedChanges
         }
+        // Standing conflicts are exactly what an interjection can't tell you:
+        // `FleetWatcher` only speaks a conflict that *appeared* while you were
+        // watching, so one that was already there at launch has this line or
+        // nothing. Attention, not alarm — the branch still needs a rebase.
+        let conflicted = active.filter { $0.baseSync?.wouldConflict == true }
 
         var lines: [Line] = []
         if !needsYou.isEmpty {
@@ -89,6 +94,16 @@ struct LaunchBriefing: Equatable {
                 text: uncommitted.count == 1
                     ? "\(names(of: uncommitted)) has changes ready to commit"
                     : "\(uncommitted.count) workspaces have changes ready to commit"
+            ))
+        }
+        if !conflicted.isEmpty {
+            lines.append(Line(
+                id: "conflicted",
+                icon: "arrow.triangle.branch",
+                text: conflicted.count == 1
+                    ? "\(names(of: conflicted)) conflicts with its base branch"
+                    : "\(conflicted.count) workspaces conflict with their base branch",
+                isAttention: true
             ))
         }
         if lines.isEmpty {

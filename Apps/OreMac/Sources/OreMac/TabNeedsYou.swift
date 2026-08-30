@@ -50,6 +50,30 @@ enum TabNeedsYou: Identifiable, Equatable {
         }
     }
 
+    /// The written form of the ask, for a row the user reads rather than
+    /// hears. Deliberately not `spokenSummary`: "A tab wants to run Bash." is
+    /// the right sentence out loud and the wrong one next to a button that
+    /// says Allow, where the tool and its argument are the whole point.
+    var headline: String {
+        switch self {
+        case .permission(let item):
+            let tool = item.request.displayName ?? item.request.toolName
+            guard let summary = item.request.summary, !summary.isEmpty else { return tool }
+            return "\(tool) — \(summary)"
+        case .question(let item):
+            return item.question.prompt
+        }
+    }
+
+    /// "workspace / tab", or the workspace alone when the tab can't be named.
+    /// The assistant's own answers name places this way, so a row the user
+    /// clicks reads like the sentence they just heard.
+    func placeLabel(workspace: String?, tab: String?) -> String {
+        let place = workspace ?? "another workspace"
+        guard let tab, !tab.isEmpty else { return place }
+        return "\(place) / \(tab)"
+    }
+
     var spokenSummary: String {
         switch self {
         case .permission(let item):

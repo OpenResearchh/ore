@@ -494,11 +494,19 @@ struct CoreClientTests {
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         var migrated: ChatRecord?
         var secondMigrated: ChatRecord?
+        // Wait for the effort too, not just the model. `moveAssistant` writes
+        // them with two separate engine calls — `switchHarness` then
+        // `setEffort` — so a loop that stops at the model can read the row in
+        // the gap between them and see the old effort. That is a race in this
+        // wait condition, not in the downshift.
         while ContinuousClock.now < deadline {
             migrated = try await store.chat(assistantChat.chatID)
             secondMigrated = try await store.chat(secondAssistantChatID)
-            if migrated?.model == "gpt-5.6-luna"
-                && secondMigrated?.model == "gpt-5.6-luna" { break }
+            let settled = [migrated, secondMigrated].allSatisfy {
+                $0?.model == "gpt-5.6-luna"
+                    && $0?.reasoningEffort == ReasoningEffort.low.rawValue
+            }
+            if settled { break }
             try? await Task.sleep(for: .milliseconds(25))
         }
 

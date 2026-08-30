@@ -542,20 +542,60 @@ public actor OreStore {
     public struct SearchHit: Sendable, Hashable {
         public var workspaceID: WorkspaceID
         public var workspaceName: String
+        /// The tab the hit is in. Optional only because `session.chatID` was
+        /// added by a migration; every session written since carries one.
+        public var chatID: ChatID?
+        public var chatTitle: String?
         public var turnID: TurnID
         public var blockID: String
         public var snippet: String
         public var createdAt: Date
     }
 
-    /// Full-text search across every transcript, newest first.
+    /// Which conversations a search is allowed to look at.
+    ///
+    /// The assistant's own conversations are a different kind of history from
+    /// a project's: they are what the *user and the assistant* said, not what
+    /// an agent did in a repository. Mixing them into every fleet-wide search
+    /// buries the project hit that was asked for, so the caller says which it
+    /// means rather than getting both by accident.
+    public enum SearchScope: String, Sendable, CaseIterable {
+        case projects
+        case assistant
+        case all
+
+        fileprivate var predicate: String {
+            switch self {
+            case .projects: "AND workspace.kind != 'assistant'"
+            case .assistant: "AND workspace.kind = 'assistant'"
+            case .all: ""
+            }
+        }
+    }
+
+    /// Full-text search across transcripts, newest first.
     ///
     /// This is what makes "which workspace was I doing the migration in?"
     /// answerable — with several agents running in parallel, the user's own
-    /// memory stops being a reliable index.
-    public func search(_ query: String, limit: Int = 50) throws -> [SearchHit] {
+    /// memory stops being a reliable index. Hits name the *tab*, not just the
+    /// workspace: the answer to "where was I doing X" is only useful if the
+    /// follow-up can be sent to the conversation that was already carrying it.
+    public func search(
+        _ query: String,
+        scope: SearchScope = .projects,
+        workspaceID: WorkspaceID? = nil,
+        limit: Int = 50
+    ) throws -> [SearchHit] {
         let pattern = FTS5Pattern(matchingAllPrefixesIn: query)
         guard let pattern else { return [] }
+
+        var arguments: [any DatabaseValueConvertible] = [pattern]
+        var workspaceClause = ""
+        if let workspaceID {
+            workspaceClause = "AND workspace.id = ?"
+            arguments.append(workspaceID.rawValue)
+        }
+        arguments.append(limit)
 
         return try writer.read { db in
             let rows = try Row.fetchAll(
@@ -564,6 +604,8 @@ public actor OreStore {
                 SELECT
                     workspace.id AS workspaceID,
                     workspace.name AS workspaceName,
+                    session.chatID AS chatID,
+                    chat.title AS chatTitle,
                     block.turnID AS turnID,
                     block.id AS blockID,
                     snippet(blockSearch, 0, '«', '»', '…', 12) AS snippet,
@@ -573,16 +615,19 @@ public actor OreStore {
                 JOIN turn ON turn.id = block.turnID
                 JOIN session ON session.id = turn.sessionID
                 JOIN workspace ON workspace.id = session.workspaceID
-                WHERE blockSearch MATCH ? AND workspace.kind != 'assistant'
+                LEFT JOIN chat ON chat.id = session.chatID
+                WHERE blockSearch MATCH ? \(scope.predicate) \(workspaceClause)
                 ORDER BY block.createdAt DESC
                 LIMIT ?
                 """,
-                arguments: [pattern, limit]
+                arguments: StatementArguments(arguments)
             )
             return rows.map { row in
                 SearchHit(
                     workspaceID: WorkspaceID(rawValue: row["workspaceID"]),
                     workspaceName: row["workspaceName"],
+                    chatID: (row["chatID"] as String?).map(ChatID.init(rawValue:)),
+                    chatTitle: row["chatTitle"],
                     turnID: TurnID(rawValue: row["turnID"]),
                     blockID: row["blockID"],
                     snippet: row["snippet"],

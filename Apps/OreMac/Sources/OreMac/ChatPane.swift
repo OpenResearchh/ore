@@ -4395,43 +4395,7 @@ private struct QuestionCard: View {
                 Spacer(minLength: 0)
             }
 
-            if !question.options.isEmpty {
-                VStack(spacing: 6) {
-                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
-                        Button { onAnswer(option.label) } label: {
-                            HStack(alignment: .top, spacing: 9) {
-                                Text("\(index + 1)")
-                                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                                    .foregroundStyle(Color.accentColor)
-                                    .frame(width: 22, height: 22)
-                                    .background(Color.accentColor.opacity(0.10), in: Circle())
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(option.label)
-                                        .font(.system(size: OreTheme.Font.body, weight: .semibold))
-                                        .foregroundStyle(.primary)
-                                    if let detail = option.detail, !detail.isEmpty {
-                                        Text(detail)
-                                            .font(.system(size: OreTheme.Font.caption))
-                                            .foregroundStyle(.secondary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                                Spacer(minLength: 0)
-                                Image(systemName: "arrow.right")
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10))
-                            .contentShape(RoundedRectangle(cornerRadius: 10))
-                        }
-                        .buttonStyle(OrePressableButtonStyle())
-                        .help(option.detail ?? "")
-                    }
-                }
-            }
+            QuestionOptionList(options: question.options, onAnswer: onAnswer)
 
             if question.allowsFreeform {
                 HStack(spacing: 8) {
@@ -4483,7 +4447,61 @@ private struct ComposerModeTag: View {
 
 /// Observes transcript rows without invalidating the composer or tab bar — and,
 /// via `Equatable`, without being invalidated *by* them.
-private struct TranscriptHost: View, Equatable {
+/// The choices of an agent question, as full-width rows.
+///
+/// Shared by the chat pane and the Assistant window. Rows rather than a row of
+/// buttons because option labels are written by the agent and are routinely
+/// long enough to run off a narrow window — and because the number of them is
+/// whatever the agent decided.
+struct QuestionOptionList: View {
+    let options: [AgentQuestion.Option]
+    let onAnswer: (String) -> Void
+
+    var body: some View {
+        if !options.isEmpty {
+            VStack(spacing: 6) {
+                ForEach(Array(options.enumerated()), id: \.offset) { index, option in
+                    Button { onAnswer(option.label) } label: {
+                        HStack(alignment: .top, spacing: 9) {
+                            Text("\(index + 1)")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundStyle(Color.accentColor)
+                                .frame(width: 22, height: 22)
+                                .background(Color.accentColor.opacity(0.10), in: Circle())
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(option.label)
+                                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                if let detail = option.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.system(size: OreTheme.Font.caption))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10))
+                        .contentShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(OrePressableButtonStyle())
+                    .help(option.detail ?? "")
+                }
+            }
+        }
+    }
+}
+
+/// Shared with the Assistant window, which needs the same equality discipline
+/// for the same reason: its composer is a sibling of the transcript, so without
+/// this every keystroke would re-derive and re-diff every row.
+struct TranscriptHost: View, Equatable {
     var chat: ChatState
     var worktreePath: String
     /// Short agent name ("Claude") for the transcript's turn headers.
@@ -4583,7 +4601,7 @@ private struct TranscriptHost: View, Equatable {
 /// keeps ⌘↓ out of the composer's way: with no button on screen there is no key
 /// equivalent to claim, so the keystroke falls through to the text view's own
 /// "move to end of document".
-private struct JumpToLatestButton: View {
+struct JumpToLatestButton: View {
     let action: () -> Void
 
     @State private var isHovered = false

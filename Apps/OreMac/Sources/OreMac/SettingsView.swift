@@ -31,6 +31,9 @@ struct SettingsView: View {
     @State private var selectedHarness: HarnessKind = .claudeCode
     @State private var authenticatingHarness: HarnessKind?
     @State private var authenticationNotice: String?
+    /// Mirrors the login-item state. See `refreshLaunchAtLogin` for why this is
+    /// cached rather than read live.
+    @State private var launchesAtLogin = false
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "General"
@@ -153,6 +156,13 @@ struct SettingsView: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(width: 950, height: 650)
+        // Two user-paced reads instead of one per display cycle: when Settings
+        // opens, and when they navigate to the pane the toggle is on — which is
+        // also when they'd be coming back from System Settings › Login Items.
+        .task { refreshLaunchAtLogin() }
+        .onChange(of: sectionRaw) { _, _ in
+            if section == .general { refreshLaunchAtLogin() }
+        }
     }
 
     @ViewBuilder
@@ -169,17 +179,36 @@ struct SettingsView: View {
 
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
-    /// Bound straight to `SMAppService` — the system is the source of truth,
-    /// so the toggle can never disagree with System Settings › Login Items.
+    /// The system is still the source of truth, but it is *read* at moments the
+    /// user creates, never from a view body.
+    ///
+    /// `SMAppService.status` is a synchronous XPC round trip to
+    /// `backgroundtaskmanagementd`. Reading it from a `Binding.get` that
+    /// `SettingsView.body` evaluates put that round trip inside
+    /// `CA::Transaction::commit()` — AppKit re-runs this body on every display
+    /// cycle to answer `NSHostingView.minSize()`, and the hosting view lives
+    /// for the whole process once Settings has been opened once. A sample of
+    /// the running app spent 27% of main-thread wall time in that one call,
+    /// with the daemon at ~11% CPU answering the flood. Every scroll, click
+    /// and keystroke in the entire app queued behind it, whether or not the
+    /// Settings window was even visible.
+    private func refreshLaunchAtLogin() {
+        launchesAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
     private var launchAtLogin: Binding<Bool> {
         Binding(
-            get: { SMAppService.mainApp.status == .enabled },
+            get: { launchesAtLogin },
             set: { enabled in
                 if enabled {
                     try? SMAppService.mainApp.register()
                 } else {
                     try? SMAppService.mainApp.unregister()
                 }
+                // Read back rather than trusting the write: registration can
+                // fail (an unapproved login item stays disabled), and a toggle
+                // that flips anyway would be lying about the system's state.
+                refreshLaunchAtLogin()
             }
         )
     }
@@ -230,7 +259,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Toggle("Announce every workspace's milestones", isOn: $fleetNarration)
                     .disabled(!narrationEnabled)
-                Text("Even without the speaker toggle, background agents say when they finish, fail, or need you — named by workspace, never their ambient progress.")
+                Text("Even without the speaker toggle, background agents say when they finish, fail, or need you — named by workspace, never their ambient progress. ORE also watches the worktrees themselves, and mentions a branch that starts conflicting, a base that ran away, or a tab you left waiting.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()

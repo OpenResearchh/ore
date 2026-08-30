@@ -10,16 +10,22 @@ enum AssistantPrompt {
     /// assistant from itself — so the instruction to open a side chat in its
     /// own workspace was, until it was told the id, unfollowable.
     static func systemPrompt(home: URL, workspaceID: WorkspaceID) -> String {
-        let index = AssistantMemory.readIndex(home: home)
-        let clipped = index.isEmpty ? "" : String(index.prefix(4_000))
-        let indexBlock = clipped.isEmpty
+        // The index *and* the facts that shape every answer, not just the
+        // index: the assistant runs on a lean model, and a lean model that
+        // must choose to look a preference up mostly doesn't. A preference
+        // the user stated last week and the assistant then ignored is,
+        // from their side, the same as one it never recorded.
+        let recall = AssistantMemory.recallDigest(home: home)
+        let indexBlock = recall.isEmpty
             ? ""
             : """
 
 
-            Current MEMORY.md index (re-read files with ReadMemory as needed):
+            What you already know, carried over from earlier conversations. \
+            This is a copy made when this session started — ReadMemory before \
+            relying on a detail, and after any WriteMemory of your own:
 
-            \(clipped)
+            \(recall)
             """
 
         return """
@@ -50,13 +56,22 @@ enum AssistantPrompt {
         setting the chips, and driving tabs and windows.
 
         Memory discipline:
-        - The MEMORY.md index is included below. ReadMemory for a topic file \
-        when you need the facts; do not guess.
+        - Your memory files were written by earlier conversations of yours. \
+        Treat what they say as your own recall, not as something the user has \
+        just told you — never make them restate a preference or a project \
+        fact you already recorded. Whatever is carried into this prompt \
+        appears at the end; ReadMemory for the rest.
         - Store durable facts with WriteMemory (one topic per file under \
-        memory/) and keep MEMORY.md's index line current. Update or delete \
-        stale facts rather than piling up contradictions.
-        - `memory/projects.md` holds what the user is working on and why; \
-        `memory/preferences.md` holds how they like things done.
+        memory/) and keep MEMORY.md's index line current. Rewrite a fact that \
+        has changed and DeleteMemory a topic that no longer applies, rather \
+        than piling up contradictions a later session has to adjudicate.
+        - `memory/preferences.md` holds how the user likes things done; \
+        `memory/relations.md` holds how their projects depend on each other; \
+        `memory/projects.md` holds what they are working on and why. Those \
+        three are carried in full below, so keep them tight: facts, not \
+        narrative, and no line that has stopped being true.
+        - Record a relation as one line: `<project A> ⇄ <project B>: <the \
+        dependency>. Contract: <where it lives>. Learned: <how>.`
         - Do not record what the ORE tools can already tell you (workspace \
         lists, transcripts, the app-state snapshot) — record what they can't: \
         intent, context, decisions, preferences.

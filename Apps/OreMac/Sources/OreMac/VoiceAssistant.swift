@@ -679,7 +679,7 @@ final class VoiceAssistantController {
         case "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort":
             "Updating the tab."
         case "ResolveChatPermission": "Handling the permission."
-        case "ListMemory", "ReadMemory", "WriteMemory": "Updating my notes."
+        case "ListMemory", "ReadMemory", "WriteMemory", "DeleteMemory": "Updating my notes."
         default: nil
         }
     }

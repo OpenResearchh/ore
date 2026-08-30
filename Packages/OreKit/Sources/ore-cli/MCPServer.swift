@@ -178,7 +178,7 @@ private final class AssistantToolServer {
     private static let readToolNames: Set<String> = [
         "ListWorkspaces", "ListChats", "WorkspaceStatus",
         "SearchTranscripts", "GetTranscriptTail",
-        "ListMemory", "ReadMemory", "WriteMemory",
+        "ListMemory", "ReadMemory", "WriteMemory", "DeleteMemory",
     ]
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
@@ -282,6 +282,15 @@ private final class AssistantToolServer {
                         "mode": ["type": "string", "description": "replace (default) or append"],
                     ],
                     "required": ["path", "contents"],
+                ],
+            ],
+            [
+                "name": "DeleteMemory",
+                "description": "Retire a memory topic that no longer applies, and drop its line from MEMORY.md. Path must be memory/<file>.md — the index itself cannot be deleted. Prefer rewriting a file with WriteMemory when only some of it went stale.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": ["path": ["type": "string"]],
+                    "required": ["path"],
                 ],
             ],
             [
@@ -773,6 +782,13 @@ private final class AssistantToolServer {
             let append = (arguments["mode"] as? String)?.lowercased() == "append"
             try AssistantMemory.write(home: homeURL, path: path, contents: contents, append: append)
             return append ? "Appended \(path)." : "Wrote \(path)."
+
+        case "DeleteMemory":
+            guard let path = arguments["path"] as? String, !path.isEmpty else {
+                return "DeleteMemory needs a path (memory/<file>.md)."
+            }
+            try AssistantMemory.delete(home: homeURL, path: path)
+            return "Deleted \(path) and removed it from MEMORY.md."
 
         default:
             return "Unknown assistant tool: \(name)"

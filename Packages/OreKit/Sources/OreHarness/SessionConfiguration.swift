@@ -26,6 +26,11 @@ public struct SessionConfiguration: Sendable {
     /// Additional environment for the child, merged over the sanitized login
     /// shell environment.
     public var environmentOverrides: [String: String]
+    /// Absolute paths that a workspace-write sandbox may mutate in addition to
+    /// the checkout. ORE uses this for the linked worktree's Git administrative
+    /// directory, which lives outside the checkout but is required by add,
+    /// commit, branch, and other ordinary Git operations.
+    public var additionalWritableRoots: [URL]
     /// Explicit path to the CLI, bypassing `PATH` lookup. Set from settings
     /// when a user's version manager puts the binary somewhere we can't find.
     public var executablePath: String?
@@ -54,6 +59,7 @@ public struct SessionConfiguration: Sendable {
         appendSystemPrompt: String? = nil,
         extraArguments: [String] = [],
         environmentOverrides: [String: String] = [:],
+        additionalWritableRoots: [URL] = [],
         executablePath: String? = nil,
         allowAPIKeyFallback: Bool = false,
         mcpServer: MCPServer? = nil,
@@ -67,6 +73,7 @@ public struct SessionConfiguration: Sendable {
         self.appendSystemPrompt = appendSystemPrompt
         self.extraArguments = extraArguments
         self.environmentOverrides = environmentOverrides
+        self.additionalWritableRoots = additionalWritableRoots
         self.executablePath = executablePath
         self.allowAPIKeyFallback = allowAPIKeyFallback
         self.mcpServer = mcpServer

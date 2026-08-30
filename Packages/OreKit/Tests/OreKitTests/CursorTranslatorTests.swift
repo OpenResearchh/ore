@@ -4,6 +4,13 @@ import Testing
 @testable import OreHarness
 @testable import OreProtocol
 
+@Suite struct CursorExecutableDetectionTests {
+    @Test func supportsCurrentAndLegacyCommandNames() {
+        #expect(HarnessKind.cursorAgent.defaultExecutableName == "agent")
+        #expect(CursorAgentHarness.executableNames == ["cursor-agent", "agent"])
+    }
+}
+
 /// cursor-agent's `stream-json` streams a *full* assistant message per chunk,
 /// puts reasoning and tools in top-level `thinking`/`tool_call` records, and
 /// ends with one non-timestamped assistant message plus a `result`. These tests

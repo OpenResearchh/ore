@@ -95,6 +95,61 @@ public actor WorkspaceEngine {
         self.continuation = continuation
     }
 
+    /// Resolves the writable Git state behind either a normal checkout or a
+    /// linked worktree. A linked worktree's `.git` is a pointer to an admin
+    /// directory outside the checkout, and that directory can in turn point at
+    /// the repository's shared object/ref store through `commondir`.
+    static func gitMetadataWritableRoots(for worktreeURL: URL) -> [URL] {
+        let fileManager = FileManager.default
+        let dotGit = worktreeURL.appendingPathComponent(".git")
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) else {
+            return []
+        }
+
+        let adminURL: URL
+        if isDirectory.boolValue {
+            adminURL = dotGit
+        } else {
+            guard let contents = try? String(contentsOf: dotGit, encoding: .utf8),
+                  let firstLine = contents.split(whereSeparator: \.isNewline).first
+            else { return [] }
+            let line = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("gitdir:") else { return [] }
+            let rawPath = line.dropFirst("gitdir:".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawPath.isEmpty else { return [] }
+            adminURL = rawPath.hasPrefix("/")
+                ? URL(fileURLWithPath: rawPath)
+                : worktreeURL.appendingPathComponent(rawPath)
+        }
+
+        let normalizedAdmin = adminURL.standardizedFileURL.resolvingSymlinksInPath()
+        var roots = [normalizedAdmin]
+        let commonPointer = normalizedAdmin.appendingPathComponent("commondir")
+        if let contents = try? String(contentsOf: commonPointer, encoding: .utf8),
+           let firstLine = contents.split(whereSeparator: \.isNewline).first {
+            let rawPath = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rawPath.isEmpty {
+                let common = (rawPath.hasPrefix("/")
+                    ? URL(fileURLWithPath: rawPath)
+                    : normalizedAdmin.appendingPathComponent(rawPath))
+                    .standardizedFileURL.resolvingSymlinksInPath()
+                roots.append(common)
+            }
+        }
+
+        var seen: Set<String> = []
+        let unique = roots.filter { seen.insert($0.path).inserted }
+        // If the worktree admin directory is already inside the common Git
+        // directory, one root is enough and communicates the true boundary.
+        return unique.filter { candidate in
+            !unique.contains { other in
+                other != candidate && candidate.path.hasPrefix(other.path + "/")
+            }
+        }
+    }
+
     // MARK: - Snapshot
 
     public func summary() -> WorkspaceSummary {
@@ -469,6 +524,7 @@ public actor WorkspaceEngine {
             resume: resume,
             appendSystemPrompt: systemPromptAddition(handoffContext: runtime.handoffContext),
             environmentOverrides: environmentOverrides,
+            additionalWritableRoots: Self.gitMetadataWritableRoots(for: worktreeURL),
             allowAPIKeyFallback: allowAPIKeyFallback,
             mcpServer: oreMCPServer(),
             // The assistant's ORE tools never prompt at the CLI layer: the
@@ -1834,9 +1890,15 @@ public actor WorkspaceEngine {
         let defaultBranch = await git.defaultBranch()
         try? await git.fetchRemoteBranch(defaultBranch, force: forceFetch)
         let origin = "origin/\(defaultBranch)"
-        let localBehind = await git.branchExists(defaultBranch)
+        let measuredBehind = await git.branchExists(defaultBranch)
             ? await git.commitCount(from: defaultBranch, to: origin)
             : await git.commitCount(from: "HEAD", to: origin)
+        let localBehind = await autoFastForwardedLocalBehind(
+            measuredBehind,
+            defaultBranch: defaultBranch,
+            origin: origin,
+            forceFetch: forceFetch
+        )
         let workspaceBehind = await git.commitCount(
             from: "HEAD", to: origin, in: worktreeURL
         )
@@ -1856,6 +1918,43 @@ public actor WorkspaceEngine {
         baseSync = next
         gitStatus.behindBase = workspaceBehind
         publishSummaryChange()
+    }
+
+    /// Keeps the local default branch fresh automatically: when origin moved
+    /// and the local ref merely trails it, fast-forward in place — the banner
+    /// asking the user to pull was busywork. Returns the behind-count that
+    /// remains after the attempt.
+    ///
+    /// Guarded twice: never move a branch some checkout is sitting on, and
+    /// `fastForwardLocalBranch` itself refuses a diverged (non-ancestor)
+    /// local default. Periodic refreshes only (`!forceFetch`): every engine's
+    /// initial refresh fires at once at startup, and piling more spawns onto
+    /// that burst buys nothing — the first periodic tick lands 45 seconds
+    /// later.
+    ///
+    /// Deliberately a separate function of sequential `guard`s, NOT a
+    /// multi-clause `if` with `try? await` in `refreshBaseSync`'s condition
+    /// list. The compact form miscompiled on the current toolchain: the
+    /// enclosing async frame corrupted intermittently, surfacing as SIGSEGV
+    /// in `URL._bridgeToObjectiveC` when a *later* call in the same function
+    /// spawned git — reproduced across full test runs, gone 5/5 with this
+    /// shape. Refactor with care.
+    private func autoFastForwardedLocalBehind(
+        _ measured: Int,
+        defaultBranch: String,
+        origin: String,
+        forceFetch: Bool
+    ) async -> Int {
+        guard !forceFetch, measured > 0 else { return measured }
+        guard await git.branchExists(defaultBranch) else { return measured }
+        let checkedOut = await git.isBranchCheckedOut(defaultBranch)
+        guard !checkedOut else { return measured }
+        do {
+            try await git.fastForwardLocalBranch(defaultBranch, to: origin)
+            return 0
+        } catch {
+            return measured
+        }
     }
 
     // MARK: - Event handling

@@ -2,6 +2,55 @@ import AppKit
 import OreProtocol
 import SwiftUI
 
+/// The one thing the fleet most wants from the user right now, resolved from
+/// workspace summaries alone. Ordered by urgency: blocked beats failed beats
+/// unread beats uncommitted. Internal so tests can pin the ladder.
+enum FleetSuggestionResolver {
+    struct Suggestion: Equatable {
+        var id: String
+        var icon: String
+        var title: String
+        var workspaceID: WorkspaceID
+        var startsCommitAgent = false
+    }
+
+    static func resolve(_ workspaces: [WorkspaceSummary]) -> Suggestion? {
+        let active = workspaces.filter { !$0.isArchived }
+        if let workspace = active.first(where: { $0.status == .awaitingInput }) {
+            return Suggestion(
+                id: "needs-you", icon: "exclamationmark.circle",
+                title: "\(workspace.name) is waiting on you",
+                workspaceID: workspace.id
+            )
+        }
+        if let workspace = active.first(where: { $0.status == .failed }) {
+            return Suggestion(
+                id: "failed", icon: "xmark.octagon",
+                title: "\(workspace.name) hit an error — take a look",
+                workspaceID: workspace.id
+            )
+        }
+        if let workspace = active.first(where: { $0.hasUnread && $0.status == .idle }) {
+            return Suggestion(
+                id: "catch-up", icon: "checkmark.circle",
+                title: "Catch up on \(workspace.name)",
+                workspaceID: workspace.id
+            )
+        }
+        if let workspace = active.first(where: {
+            $0.status == .idle && $0.gitStatus.hasUncommittedChanges
+        }) {
+            return Suggestion(
+                id: "commit", icon: "tray.and.arrow.down",
+                title: "Commit \(workspace.name)'s changes",
+                workspaceID: workspace.id,
+                startsCommitAgent: true
+            )
+        }
+        return nil
+    }
+}
+
 /// ORE's menu bar presence: the fleet at a glance, pending approvals
 /// answerable inline, and the assistant reachable — all of it alive whether
 /// or not a window is open. Closing the last window parks ORE here instead
@@ -16,6 +65,10 @@ struct MenuBarDashboard: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            if let suggestion = FleetSuggestionResolver.resolve(model.sortedWorkspaces) {
+                fleetSuggestionRow(suggestion)
+                Divider()
+            }
             if !model.assistantConfirmations.isEmpty {
                 confirmations
                 Divider()
@@ -280,6 +333,39 @@ struct MenuBarDashboard: View {
         }
         .controlSize(.small)
         .padding(OreTheme.Space.sm)
+    }
+
+    /// The fleet's one suggested next step, right under the header — the menu
+    /// bar's version of the composer's suggestion ladder. Clicking acts:
+    /// reveal the workspace, and for commit suggestions also spin up the
+    /// commit tab.
+    private func fleetSuggestionRow(_ suggestion: FleetSuggestionResolver.Suggestion) -> some View {
+        Button {
+            if let workspace = model.sortedWorkspaces.first(where: { $0.id == suggestion.workspaceID }) {
+                if suggestion.startsCommitAgent {
+                    model.startCommitAgent(in: workspace.id)
+                }
+                reveal(workspace)
+            }
+        } label: {
+            HStack(spacing: OreTheme.Space.sm) {
+                Image(systemName: suggestion.icon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 16)
+                Text(suggestion.title)
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    .lineLimit(1)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, OreTheme.Space.md)
+        .frame(height: 30)
     }
 
     private func reveal(_ workspace: WorkspaceSummary) {

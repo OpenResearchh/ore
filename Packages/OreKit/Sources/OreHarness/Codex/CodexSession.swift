@@ -117,13 +117,19 @@ public actor CodexSession: AgentSession {
     private func openThread(connection: JSONRPCConnection) async throws {
         var params: [String: JSONValue] = [
             "cwd": .string(configuration.workingDirectory.path),
-            // The sandbox is rooted at the worktree, which is what keeps N
-            // parallel agents from reaching into each other's checkouts.
+            // Source writes stay rooted at the worktree. The config below adds
+            // only its linked Git administrative root so ordinary Git commands
+            // can update the index, object store, and this worktree's ref.
             "sandbox": .string(sandboxMode()),
             "approvalPolicy": .string(approvalPolicy()),
         ]
         var config: [String: JSONValue] = [:]
         if let model = configuration.model { config["model"] = .string(model) }
+        if !configuration.additionalWritableRoots.isEmpty {
+            config["sandbox_workspace_write"] = Self.workspaceWriteConfiguration(
+                writableRoots: configuration.additionalWritableRoots
+            )
+        }
         if let mcp = configuration.mcpServer {
             config["mcp_servers"] = .object([
                 "ore": Self.mcpServerConfiguration(
@@ -173,10 +179,42 @@ public actor CodexSession: AgentSession {
     /// takes. `thread/start` names the sandbox by mode; a per-turn override
     /// names it by policy object.
     private func sandboxPolicy() -> JSONValue {
+        Self.sandboxPolicy(
+            permissionMode: permissionMode,
+            writableRoots: configuration.additionalWritableRoots
+        )
+    }
+
+    static func sandboxPolicy(
+        permissionMode: PermissionMode,
+        writableRoots: [URL]
+    ) -> JSONValue {
         switch permissionMode {
         case .plan: return .object(["type": .string("readOnly")])
         case .bypassPermissions: return .object(["type": .string("dangerFullAccess")])
-        case .default, .acceptEdits: return .object(["type": .string("workspaceWrite")])
+        case .default, .acceptEdits:
+            var policy: [String: JSONValue] = ["type": .string("workspaceWrite")]
+            if !writableRoots.isEmpty {
+                policy["writableRoots"] = .array(normalizedPaths(writableRoots).map(JSONValue.string))
+            }
+            return .object(policy)
+        }
+    }
+
+    /// App-server's thread config uses snake_case while per-turn sandbox
+    /// policies use camelCase. Keep both encodings beside each other so adding
+    /// a root at thread creation cannot be lost after a permission-mode change.
+    static func workspaceWriteConfiguration(writableRoots: [URL]) -> JSONValue {
+        .object([
+            "writable_roots": .array(normalizedPaths(writableRoots).map(JSONValue.string)),
+        ])
+    }
+
+    private static func normalizedPaths(_ roots: [URL]) -> [String] {
+        var seen: Set<String> = []
+        return roots.compactMap {
+            let path = $0.standardizedFileURL.resolvingSymlinksInPath().path
+            return seen.insert(path).inserted ? path : nil
         }
     }
 

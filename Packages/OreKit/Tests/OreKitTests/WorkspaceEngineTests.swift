@@ -74,6 +74,21 @@ struct WorkspaceEngineTests {
         )
     }
 
+    @Test func sessionsCanWriteTheLinkedWorktreeGitMetadata() async throws {
+        let harness = try await makeEngine()
+        let expected = harness.fixture.repository
+            .appendingPathComponent(".git")
+            .standardizedFileURL.resolvingSymlinksInPath()
+
+        #expect(WorkspaceEngine.gitMetadataWritableRoots(for: harness.worktree) == [expected])
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "commit the finished work"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        #expect(session.configuration.additionalWritableRoots == [expected])
+    }
+
     @Test func sendingClearsThePersistedComposerDraft() async throws {
         let harness = try await makeEngine()
         let chatID = ChatID(rawValue: harness.workspaceID.rawValue)

@@ -371,13 +371,33 @@ final class VoiceAssistantController {
         }
     }
 
+    /// The `AskUserQuestion` tool's spoken half: questions always earn the
+    /// voice treatment (speak the ask, chime, open the mic) — an agent asking
+    /// the user for a fact deserves an answer at the speed of speech, not a
+    /// trip to the keyboard. Off-switchable in Settings › Voice input.
+    static let voiceAskKey = "ore.voice.answerQuestions"
+
+    private var voiceAsksEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.voiceAskKey) as? Bool ?? true
+    }
+
+    /// A soft cue that the microphone just opened for an answer — quiet by
+    /// design: it marks a turn to speak, it doesn't demand one.
+    private func playMicChime() {
+        guard let sound = NSSound(named: "Tink") else { return }
+        sound.volume = 0.2
+        sound.play()
+    }
+
     @discardableResult
     func needsYouArrived(_ item: TabNeedsYou) -> Bool {
         guard let model, let chatID = model.assistantChatID else { return false }
         let recentVoice = lastVoiceInteraction.map {
             Date().timeIntervalSince($0) < Self.voiceSessionWindow
         } ?? false
-        guard awaitingSpokenReply || recentVoice || !NSApp.isActive else { return false }
+        let isQuestion = if case .question = item { true } else { false }
+        guard awaitingSpokenReply || recentVoice || !NSApp.isActive
+            || (isQuestion && voiceAsksEnabled) else { return false }
         lastVoiceInteraction = Date()
         activeNeedsYouID = item.id
         model.narration.speakAssistant(
@@ -499,6 +519,7 @@ final class VoiceAssistantController {
         answerPlaceholder = "Yes, no, or always?"
         voice.vocabulary = ["yes", "no", "always", "auto-allow"]
         phase = .answering
+        playMicChime()
         model.narration.setMicActive(true)
         voice.start()
 
@@ -533,6 +554,7 @@ final class VoiceAssistantController {
         answerPlaceholder = "Say your answer…"
         voice.vocabulary = question.options.map(\.label)
         phase = .answering
+        playMicChime()
         model.narration.setMicActive(true)
         voice.start()
 

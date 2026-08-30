@@ -28,9 +28,17 @@ final class TranscriptScrollAnchor {
     /// Whether the reader has scrolled away from the newest output.
     private(set) var isAwayFromBottom = false
 
+    /// Find-bar results: "3 of 12". Ordinal is 1-based, zero while nothing
+    /// is selected.
+    private(set) var searchMatchCount = 0
+    private(set) var searchMatchOrdinal = 0
+
     @ObservationIgnored fileprivate var jump: (() -> Void)?
+    @ObservationIgnored fileprivate var searchStep: ((Int) -> Void)?
 
     func jumpToBottom() { jump?() }
+    func findNext() { searchStep?(1) }
+    func findPrevious() { searchStep?(-1) }
 
     /// Edge-triggered: the scroll observer fires on every tick, and all but a
     /// couple of them leave this flag exactly where it was. Writing it
@@ -38,6 +46,11 @@ final class TranscriptScrollAnchor {
     fileprivate func report(isAwayFromBottom away: Bool) {
         guard away != isAwayFromBottom else { return }
         isAwayFromBottom = away
+    }
+
+    fileprivate func reportSearch(ordinal: Int, count: Int) {
+        if count != searchMatchCount { searchMatchCount = count }
+        if ordinal != searchMatchOrdinal { searchMatchOrdinal = ordinal }
     }
 }
 
@@ -54,6 +67,11 @@ struct TranscriptView: NSViewRepresentable {
     /// While the agent is working, skip per-move attachment hit-testing so
     /// mouseMoved events cannot starve clicks on the main thread.
     var isBusy: Bool = false
+    /// Short agent name ("Claude") for the turn header drawn above each turn's
+    /// first prose row — who wrote this, and when.
+    var agentName: String = ""
+    /// The find bar's live query; empty means no search is open.
+    var searchQuery: String = ""
     var worktreePath: String = ""
     var persistenceKey: String
     var onRevert: (TurnID) -> Void
@@ -160,7 +178,9 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.canFork = canFork
         context.coordinator.worktreePath = worktreePath
         context.coordinator.isBusy = isBusy
+        context.coordinator.agentName = agentName
         context.coordinator.bind(scrollAnchor: scrollAnchor)
+        context.coordinator.setSearchQuery(searchQuery)
         context.coordinator.update(rows: rows)
     }
 
@@ -182,9 +202,19 @@ struct TranscriptView: NSViewRepresentable {
         var canFork = false
         var worktreePath: String
         var isBusy = false
+        var agentName = ""
         let persistenceKey: String
 
         private var rows: [TranscriptRow] = []
+        /// Long, finished responses from earlier turns start folded — the
+        /// reference design's "Show full response" — so catching up on a chat
+        /// reads as a list of conclusions rather than a wall of prose. Pure
+        /// view state: collapsing is about reading, not about the transcript.
+        private var collapsedResponses: Set<String> = []
+        private var didSeedCollapsedResponses = false
+        /// The rows carrying the "Claude · 2:41 PM" turn header: the first
+        /// top-level prose row of each turn.
+        private var agentHeaderRowIDs: Set<String> = []
         /// Height per row id. Measuring a row means laying out its text, which
         /// is the single most expensive thing this view does, so it happens
         /// once per (row, width) rather than on every scroll tick.
@@ -256,13 +286,21 @@ struct TranscriptView: NSViewRepresentable {
 
             let previous = rows
             rows = newRows
+            seedCollapsedResponsesIfNeeded()
+            // A live search keeps up with streaming rows; free when no find
+            // bar is open.
+            if hasActiveSearch { recomputeSearchMatches(preserveCursor: true) }
+            // A row gaining or losing its turn header changes its height, so
+            // those rows are invalidated the same way structural changes are.
+            let headerChanges = recomputeAgentHeaders()
+            for index in headerChanges { heightCache.removeValue(forKey: rows[index].id) }
 
             // Streaming appends to the last row far more often than it adds
             // one. Reloading only what changed is what keeps a long transcript
             // responsive while text arrives.
             if previous.count == newRows.count {
-                var changed: IndexSet = []
-                var structural = false
+                var changed: IndexSet = headerChanges
+                var structural = !headerChanges.isEmpty
                 for index in newRows.indices {
                     let old = previous[index]
                     let new = newRows[index]
@@ -294,6 +332,21 @@ struct TranscriptView: NSViewRepresentable {
                 // Rows appended: insert rather than reload the whole table.
                 let added = IndexSet(previous.count..<newRows.count)
                 tableView.insertRows(at: added, withAnimation: [])
+                // An append can move a turn header onto a row that was already
+                // rendered (rare — a turn's first prose row arriving after its
+                // plan); those rows re-measure and redraw in place.
+                let priorHeaderChanges = headerChanges.filteredIndexSet { $0 < previous.count }
+                if !priorHeaderChanges.isEmpty {
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0
+                        context.allowsImplicitAnimation = false
+                        tableView.noteHeightOfRows(withIndexesChanged: priorHeaderChanges)
+                    }
+                    tableView.reloadData(
+                        forRowIndexes: priorHeaderChanges,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                }
             } else {
                 pendingTextReload.removeAll()
                 heightCache.removeAll()
@@ -493,6 +546,63 @@ struct TranscriptView: NSViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleInterval, execute: work)
         }
 
+        // MARK: - Collapsible responses & turn headers
+
+        /// On the first (history) load, long finished responses from every
+        /// turn but the last start collapsed. Never re-run afterwards: heights
+        /// changing under the reader mid-session is worse than an open row.
+        private func seedCollapsedResponsesIfNeeded() {
+            guard !didSeedCollapsedResponses, !rows.isEmpty else { return }
+            didSeedCollapsedResponses = true
+            guard let lastTurn = rows.last?.turnID else { return }
+            for row in rows
+            where row.turnID != lastTurn && TranscriptCell.isCollapsibleResponse(row) {
+                collapsedResponses.insert(row.id)
+            }
+        }
+
+        /// Recomputes which rows carry the turn header and returns the indexes
+        /// whose header state flipped (so callers can re-measure them).
+        private func recomputeAgentHeaders() -> IndexSet {
+            var ids = Set<String>()
+            var seenTurns = Set<TurnID>()
+            for row in rows where row.parentToolCallID == nil {
+                guard row.kind == .assistantText || row.kind == .plan else { continue }
+                if seenTurns.insert(row.turnID).inserted { ids.insert(row.id) }
+            }
+            guard ids != agentHeaderRowIDs else { return [] }
+            let changedIDs = ids.symmetricDifference(agentHeaderRowIDs)
+            agentHeaderRowIDs = ids
+            return IndexSet(rows.indices.filter { changedIDs.contains(rows[$0].id) })
+        }
+
+        private func responseCollapse(for row: TranscriptRow) -> TranscriptCell.ResponseCollapse {
+            guard TranscriptCell.isCollapsibleResponse(row) else { return .none }
+            return collapsedResponses.contains(row.id) ? .collapsed : .expanded
+        }
+
+        private func turnHeader(for row: TranscriptRow) -> String? {
+            guard agentHeaderRowIDs.contains(row.id) else { return nil }
+            let name = agentName.isEmpty ? "Agent" : agentName
+            let time = row.createdAt.formatted(date: .omitted, time: .shortened)
+            return "\(name) · \(time)"
+        }
+
+        private func toggleResponse(_ rowID: String) {
+            if !collapsedResponses.insert(rowID).inserted {
+                collapsedResponses.remove(rowID)
+            }
+            heightCache.removeValue(forKey: rowID)
+            guard let tableView,
+                  let index = rows.firstIndex(where: { $0.id == rowID }) else { return }
+            let indexes = IndexSet(integer: index)
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            }
+            tableView.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+        }
+
         // MARK: - Data source
 
         func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -512,7 +622,13 @@ struct TranscriptView: NSViewRepresentable {
             guard available > 1 else { return TranscriptCell.estimatedHeight(for: item) }
 
             let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
-            let height = TranscriptCell.height(for: item, width: width, worktreePath: worktreePath)
+            let height = TranscriptCell.height(
+                for: item,
+                width: width,
+                worktreePath: worktreePath,
+                responseCollapse: responseCollapse(for: item),
+                turnHeader: turnHeader(for: item)
+            )
             heightCache[item.id] = height
             return height
         }
@@ -526,15 +642,20 @@ struct TranscriptView: NSViewRepresentable {
             let identifier = NSUserInterfaceItemIdentifier("cell")
             let cell = tableView.makeView(withIdentifier: identifier, owner: self)
                 as? TranscriptCell ?? TranscriptCell(identifier: identifier)
+            let item = rows[row]
             cell.configure(
-                with: rows[row],
+                with: item,
                 worktreePath: worktreePath,
                 canFork: canFork,
                 skipHoverTracking: isBusy,
+                isSearchHighlighted: isSearchHighlighted(item),
+                responseCollapse: responseCollapse(for: item),
+                turnHeader: turnHeader(for: item),
                 onRevert: onRevert,
                 onToggleActivity: onToggleActivity,
                 onOpenFile: onOpenFile,
-                onTurnAction: onTurnAction
+                onTurnAction: onTurnAction,
+                onToggleResponse: { [weak self] in self?.toggleResponse(item.id) }
             )
             return cell
         }
@@ -691,10 +812,104 @@ struct TranscriptView: NSViewRepresentable {
         func bind(scrollAnchor: TranscriptScrollAnchor?) {
             guard scrollAnchor !== self.scrollAnchor else { return }
             self.scrollAnchor?.jump = nil
+            self.scrollAnchor?.searchStep = nil
             self.scrollAnchor = scrollAnchor
             scrollAnchor?.jump = { [weak self] in self?.jumpToBottom() }
+            scrollAnchor?.searchStep = { [weak self] delta in self?.stepSearch(delta) }
             lastReportedAway = nil
             reportFollowState()
+        }
+
+        // MARK: - Find in transcript
+
+        private var searchQuery = ""
+        private var searchMatches: [Int] = []
+        private var searchCursor: Int?
+        /// The row currently ringed as the active match, by id — indices move
+        /// as rows stream in.
+        private var searchHighlightID: String?
+
+        func setSearchQuery(_ query: String) {
+            let trimmed = query.trimmingCharacters(in: .whitespaces)
+            guard trimmed != searchQuery else { return }
+            searchQuery = trimmed
+            recomputeSearchMatches(preserveCursor: false)
+            // Land on the *newest* match — a transcript reads bottom-up, so
+            // the search walks latest → older, not top-down.
+            if searchCursor == nil, !searchMatches.isEmpty { stepSearch(-1) }
+        }
+
+        private func rowMatchesSearch(_ row: TranscriptRow) -> Bool {
+            func hit(_ text: String?) -> Bool {
+                text?.range(of: searchQuery, options: .caseInsensitive) != nil
+            }
+            if hit(row.text) || hit(row.resultText) { return true }
+            return row.groupedRows.contains { hit($0.text) || hit($0.resultText) }
+        }
+
+        /// Recomputed on query change and — while a search is open — on row
+        /// updates, so streaming output joins the results as it arrives.
+        fileprivate func recomputeSearchMatches(preserveCursor: Bool) {
+            guard !searchQuery.isEmpty else {
+                searchMatches = []
+                searchCursor = nil
+                setSearchHighlight(rowID: nil)
+                reportSearchState()
+                return
+            }
+            let keepID = preserveCursor ? searchHighlightID : nil
+            searchMatches = rows.indices.filter { rowMatchesSearch(rows[$0]) }
+            if let keepID,
+               let kept = searchMatches.firstIndex(where: { rows[$0].id == keepID }) {
+                searchCursor = kept
+            } else {
+                searchCursor = nil
+                if !preserveCursor { setSearchHighlight(rowID: nil) }
+            }
+            reportSearchState()
+        }
+
+        fileprivate var hasActiveSearch: Bool { !searchQuery.isEmpty }
+
+        private func stepSearch(_ delta: Int) {
+            guard !searchMatches.isEmpty else { return }
+            if let cursor = searchCursor {
+                let count = searchMatches.count
+                searchCursor = ((cursor + delta) % count + count) % count
+            } else {
+                searchCursor = delta >= 0 ? 0 : searchMatches.count - 1
+            }
+            guard let cursor = searchCursor, searchMatches.indices.contains(cursor) else { return }
+            let row = searchMatches[cursor]
+            setSearchHighlight(rowID: rows.indices.contains(row) ? rows[row].id : nil)
+            scroll(to: row)
+            reportSearchState()
+        }
+
+        private func setSearchHighlight(rowID: String?) {
+            guard rowID != searchHighlightID else { return }
+            let previous = searchHighlightID
+            searchHighlightID = rowID
+            guard let tableView else { return }
+            var reload = IndexSet()
+            for (index, row) in rows.enumerated()
+            where row.id == previous || row.id == rowID {
+                reload.insert(index)
+            }
+            guard !reload.isEmpty else { return }
+            tableView.reloadData(forRowIndexes: reload, columnIndexes: IndexSet(integer: 0))
+        }
+
+        fileprivate func isSearchHighlighted(_ row: TranscriptRow) -> Bool {
+            row.id == searchHighlightID
+        }
+
+        private func reportSearchState() {
+            // Counted from the bottom: "1 of 12" is the newest match.
+            scrollAnchor?.reportSearch(
+                ordinal: searchCursor.map { searchMatches.count - $0 } ?? 0,
+                count: searchMatches.count
+            )
         }
 
         /// The reader asked to catch up. This resumes following, so the agent's
@@ -932,6 +1147,18 @@ final class TranscriptCell: NSTableCellView {
     /// vertical guide drawn at the indent, mirroring a nested thread.
     static let subagentIndent: CGFloat = 22
 
+    /// How a long response row draws: `.none` for ordinary rows, `.collapsed`
+    /// for a folded preview with a "Show full response" control, `.expanded`
+    /// for the full text plus the matching "Hide" control.
+    ///
+    /// A collapsed row renders *truncated markdown* rather than clipping the
+    /// full text behind masks and height constraints: measure and draw share
+    /// the same string, so their heights cannot disagree — the class of bug
+    /// that left blank bands in the transcript.
+    enum ResponseCollapse { case none, collapsed, expanded }
+    /// Toggle control plus its spacing, shared by measure and layout.
+    private static let responseToggleBand: CGFloat = 22
+
     private let bubble = NSView()
     private let indentGuide = NSView()
     private let label = TranscriptTextView(frame: .zero)
@@ -945,6 +1172,11 @@ final class TranscriptCell: NSTableCellView {
     private var bubbleBottomConstraint: NSLayoutConstraint!
     private var preferredWidthConstraint: NSLayoutConstraint!
     private var userWidthConstraint: NSLayoutConstraint!
+    private var labelBottomConstraint: NSLayoutConstraint!
+    private var toggleTopConstraint: NSLayoutConstraint!
+    private var toggleBottomConstraint: NSLayoutConstraint!
+    private let responseToggle = NSButton()
+    private var responseToggleAction: (() -> Void)?
     private var revertAction: (() -> Void)?
     private var toggleActivityAction: (() -> Void)?
     private let copyButton = NSButton()
@@ -1031,10 +1263,35 @@ final class TranscriptCell: NSTableCellView {
         label.translatesAutoresizingMaskIntoConstraints = false
         bubble.addSubview(label)
 
+        // The reference design's "Show full response ▾" — a quiet caption-level
+        // control at the foot of a long response. A real button, because the
+        // row's text view owns clicks on the text itself.
+        responseToggle.isBordered = false
+        responseToggle.bezelStyle = .regularSquare
+        responseToggle.imagePosition = .noImage
+        responseToggle.target = self
+        responseToggle.action = #selector(toggleResponseCollapse)
+        responseToggle.translatesAutoresizingMaskIntoConstraints = false
+        responseToggle.isHidden = true
+        bubble.addSubview(responseToggle)
+
         badgeHeightZero = badge.heightAnchor.constraint(equalToConstant: 0)
         labelTrailingConstraint = label.trailingAnchor.constraint(
             equalTo: bubble.trailingAnchor, constant: -10
         )
+        labelBottomConstraint = label.bottomAnchor.constraint(
+            equalTo: bubble.bottomAnchor, constant: -8
+        )
+        toggleTopConstraint = responseToggle.topAnchor.constraint(
+            equalTo: label.bottomAnchor, constant: 4
+        )
+        toggleBottomConstraint = responseToggle.bottomAnchor.constraint(
+            equalTo: bubble.bottomAnchor, constant: -4
+        )
+        // 999, not required: a reused cell can briefly hold a row whose height
+        // the table has not re-derived yet, and a transient mismatch should
+        // degrade to a slightly-off layout, not unsatisfiable-constraint spam.
+        toggleBottomConstraint.priority = .init(999)
 
         // A left-aligned content column, not a centred bubble. A short "hi" used
         // to float as a tiny island in the middle of the pane; rows now begin at
@@ -1084,7 +1341,10 @@ final class TranscriptCell: NSTableCellView {
             label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
             labelTrailingConstraint,
             label.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 2),
-            label.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -8),
+            labelBottomConstraint,
+
+            responseToggle.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
+            responseToggle.heightAnchor.constraint(equalToConstant: 18),
 
             indentGuide.leadingAnchor.constraint(equalTo: contentGuide.leadingAnchor, constant: 8),
             indentGuide.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 3),
@@ -1111,10 +1371,14 @@ final class TranscriptCell: NSTableCellView {
         worktreePath: String = "",
         canFork: Bool = false,
         skipHoverTracking: Bool = false,
+        isSearchHighlighted: Bool = false,
+        responseCollapse: ResponseCollapse = .none,
+        turnHeader: String? = nil,
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
-        onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in }
+        onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in },
+        onToggleResponse: (() -> Void)? = nil
     ) {
         let isFooter = row.kind == .turnFooter
         menuButton.isHidden = !isFooter
@@ -1130,10 +1394,16 @@ final class TranscriptCell: NSTableCellView {
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
 
-        let badgeString = Self.badgeText(for: row)
+        // The turn header borrows the badge line: "Claude · 2:41 PM" above the
+        // turn's first prose row. A real badge (QUEUED, PLAN) still wins — it
+        // carries state the header doesn't.
+        let ownBadge = Self.badgeText(for: row)
+        let badgeString = ownBadge.isEmpty ? (turnHeader ?? "") : ownBadge
         badge.stringValue = badgeString
         badge.isHidden = badgeString.isEmpty
         badgeHeightZero.isActive = badgeString.isEmpty
+        responseToggleAction = onToggleResponse
+        applyResponseCollapse(responseCollapse)
 
         let isUser = row.kind == .userMessage
         copyableText = Self.copyableText(for: row)
@@ -1168,7 +1438,11 @@ final class TranscriptCell: NSTableCellView {
             userWidthConstraint.constant = min(max(120, max(ceil(natural), badgeFloor)), 620)
         }
 
-        let attributedText = Self.attributedText(for: row, worktreePath: worktreePath)
+        // A collapsed response swaps in its truncated render — the same string
+        // `height(for:)` measured, which is what keeps row height honest.
+        let attributedText = responseCollapse == .collapsed
+            ? Self.collapsedAttributedText(for: row)
+            : Self.attributedText(for: row, worktreePath: worktreePath)
         label.dismissAttachmentPreview()
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
@@ -1198,8 +1472,12 @@ final class TranscriptCell: NSTableCellView {
         // configure rather than set once in `init` — the transcript reloads on
         // an appearance change precisely so this runs again.
         bubble.layer?.backgroundColor = Self.background(for: row).cgColor
-        bubble.layer?.borderWidth = 0
-        bubble.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
+        // The find bar's active match wears an accent ring; everything else
+        // stays borderless as before.
+        bubble.layer?.borderWidth = isSearchHighlighted ? 1.5 : 0
+        bubble.layer?.borderColor = isSearchHighlighted
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.separatorColor.withAlphaComponent(0.22).cgColor
         indentGuide.layer?.backgroundColor = NSColor.separatorColor
             .withAlphaComponent(0.6).cgColor
         // Double-click reverts, but only on a user message — the gesture means
@@ -1217,6 +1495,82 @@ final class TranscriptCell: NSTableCellView {
         } else {
             toolTip = nil
         }
+    }
+
+    /// Swaps the label between its three bottoms: pinned to the bubble
+    /// (ordinary rows), clamped to the preview height above the toggle
+    /// (collapsed), or full height above the toggle (expanded).
+    private func applyResponseCollapse(_ state: ResponseCollapse) {
+        let showsToggle = state != .none
+        responseToggle.isHidden = !showsToggle
+        labelBottomConstraint.isActive = !showsToggle
+        toggleTopConstraint.isActive = showsToggle
+        toggleBottomConstraint.isActive = showsToggle
+
+        if showsToggle {
+            responseToggle.attributedTitle = NSAttributedString(
+                string: state == .collapsed ? "Show full response ▾" : "Hide full response ▴",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: OreTheme.Font.caption, weight: .medium),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            )
+            responseToggle.toolTip = state == .collapsed
+                ? "Show the whole response" : "Fold this response back down"
+        }
+    }
+
+    @objc private func toggleResponseCollapse() {
+        responseToggleAction?()
+    }
+
+    /// Whether this response is long enough to earn a fold. Cheap by design —
+    /// it runs during row diffs — so it counts bytes and lines, not layout.
+    static func isCollapsibleResponse(_ row: TranscriptRow) -> Bool {
+        guard row.kind == .assistantText, row.isComplete, row.parentToolCallID == nil
+        else { return false }
+        if row.text.utf8.count > 2200 { return true }
+        var newlines = 0
+        for byte in row.text.utf8 where byte == UInt8(ascii: "\n") {
+            newlines += 1
+            if newlines > 28 { return true }
+        }
+        return false
+    }
+
+    /// The folded render: the response's first lines as real markdown with a
+    /// trailing ellipsis. swift-markdown accepts incomplete CommonMark (it
+    /// renders streaming text the same way), so cutting mid-document is safe.
+    /// Cached per (row id, text length) — collapsed rows are complete, so the
+    /// text cannot change under the cache.
+    static func collapsedAttributedText(for row: TranscriptRow) -> NSAttributedString {
+        if let cached = collapsedRenderCache[row.id], cached.length == row.text.count {
+            return cached.value
+        }
+        let rendered = MarkdownRenderer(
+            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
+            textColor: .labelColor,
+            highlighter: SyntaxHighlighter.shared
+        ).render(truncatedMarkdown(row.text), highlighting: .all)
+        collapsedRenderCache[row.id] = (row.text.count, rendered)
+        return rendered
+    }
+
+    private nonisolated(unsafe) static var collapsedRenderCache:
+        [String: (length: Int, value: NSAttributedString)] = [:]
+
+    /// First ~14 lines / ~1000 characters, cut at a line boundary.
+    private static func truncatedMarkdown(_ text: String) -> String {
+        let maxLines = 14
+        let maxChars = 1000
+        var kept: [Substring] = []
+        var count = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if kept.count >= maxLines || count + line.count > maxChars { break }
+            kept.append(line)
+            count += line.count + 1
+        }
+        return kept.joined(separator: "\n") + "\n\n…"
     }
 
     /// A double-click on a user message reverts to it — the same gesture as
@@ -1351,9 +1705,19 @@ final class TranscriptCell: NSTableCellView {
         row.kind == .turnFooter ? 34 : 10
     }
 
-    static func height(for row: TranscriptRow, width: CGFloat, worktreePath: String = "") -> CGFloat {
+    static func height(
+        for row: TranscriptRow,
+        width: CGFloat,
+        worktreePath: String = "",
+        responseCollapse: ResponseCollapse = .none,
+        turnHeader: String? = nil
+    ) -> CGFloat {
         if row.kind == .divider { return 36 }
-        let attributed = attributedText(for: row, worktreePath: worktreePath)
+        // The collapsed variant measures the same truncated string the cell
+        // draws — never the full text clamped after the fact.
+        let attributed = responseCollapse == .collapsed
+            ? collapsedAttributedText(for: row)
+            : attributedText(for: row, worktreePath: worktreePath)
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
         let textWidth = max(1, bubbleWidth - 10 - trailingInset(for: row))
@@ -1363,8 +1727,11 @@ final class TranscriptCell: NSTableCellView {
         // its footer. Measuring through the same layout manager the cell uses
         // keeps those two numbers identical.
         let textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
-        let badgeLine: CGFloat = badgeText(for: row).isEmpty ? 0 : 14
-        return ceil(textHeight) + 16 + verticalInset(for: row) * 2 + badgeLine
+        let toggleBand: CGFloat = responseCollapse == .none ? 0 : responseToggleBand
+        let hasBadgeLine = !badgeText(for: row).isEmpty
+            || !(turnHeader ?? "").isEmpty
+        let badgeLine: CGFloat = hasBadgeLine ? 14 : 0
+        return ceil(textHeight) + 16 + verticalInset(for: row) * 2 + badgeLine + toggleBand
     }
 
     /// Placeholder used only before the table has a real width. Kind-specific
@@ -1713,7 +2080,11 @@ final class TranscriptCell: NSTableCellView {
         case .thinking: return .clear
         case .plan: return .systemPurple.withAlphaComponent(0.08)
         case .error: return .systemRed.withAlphaComponent(0.08)
-        case .assistantText: return .clear
+        // A whisper of a card behind the agent's prose — the reference
+        // design's message feel — while the transcript surface stays the
+        // reading background. Faint enough that code blocks and chips inside
+        // still dominate.
+        case .assistantText: return .labelColor.withAlphaComponent(0.03)
         case .divider: return .clear
         case .turnFooter: return .clear
         }
@@ -1884,12 +2255,24 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
+    /// Tool rows used to wear one candy tint per tool, and together they
+    /// outshone the agent's actual prose. Color now only means *state* —
+    /// red failed, green done, accent live — and every routine tool renders
+    /// in the same quiet gray as the thinking rows.
+    private static func mutedProcessTint(_ tint: NSColor) -> NSColor {
+        switch tint {
+        case .systemRed, .systemGreen, .controlAccentColor: tint
+        default: .secondaryLabelColor
+        }
+    }
+
     private static func processText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let item = processPresentation(for: row)
+        let tint = mutedProcessTint(item.tint)
         let result = NSMutableAttributedString()
         let processImage = NSImage(systemSymbolName: item.icon, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))?
-            .withSymbolConfiguration(.init(paletteColors: [item.tint]))
+            .withSymbolConfiguration(.init(paletteColors: [tint]))
         if let image = processImage {
             image.isTemplate = false
             let attachment = NSTextAttachment()
@@ -1902,7 +2285,7 @@ final class TranscriptCell: NSTableCellView {
             string: item.title,
             attributes: [
                 .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
-                .foregroundColor: item.tint,
+                .foregroundColor: tint,
             ]
         ))
         if let subject = item.subject, !subject.isEmpty {
@@ -1912,7 +2295,7 @@ final class TranscriptCell: NSTableCellView {
                 identity: item.fileIdentity,
                 text: compact(subject, limit: 64),
                 monospace: item.fileIdentity == nil,
-                tint: item.tint,
+                tint: tint,
                 insertions: item.insertions,
                 deletions: item.deletions
             )

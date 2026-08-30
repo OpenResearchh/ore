@@ -24,6 +24,7 @@ import OreSupport
 /// there is no channel to answer on.
 public struct CursorAgentHarness: AgentHarness {
     public let kind: HarnessKind = .cursorAgent
+    static let executableNames = ["cursor-agent", "agent"]
 
     public var capabilities: HarnessCapabilities {
         HarnessCapabilities(
@@ -139,7 +140,14 @@ public struct CursorAgentHarness: AgentHarness {
 
     private func resolveExecutablePath() -> String? {
         if let executablePathOverride { return executablePathOverride }
-        return ShellEnvironment.locate(kind.defaultExecutableName)
+        // Cursor renamed the primary command from `cursor-agent` to `agent`.
+        // Current installs commonly provide both symlinks, while older and
+        // minimal installs may provide only one. Prefer the unambiguous legacy
+        // name, then accept the current documented command.
+        for name in Self.executableNames {
+            if let path = ShellEnvironment.locate(name) { return path }
+        }
+        return nil
     }
 }
 

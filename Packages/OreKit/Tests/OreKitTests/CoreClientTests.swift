@@ -662,10 +662,8 @@ struct OreConfigurationTests {
 }
 
 struct HarnessRegistryTests {
-    @Test func experimentalHarnessesAreHiddenUnlessEnabled() {
-        // Shipping an unstable harness silently would mean a user's session
-        // failing in ways they can't attribute.
-        let disabled = HarnessRegistry.standard()
+    @Test func experimentalHarnessesCanStillBeDisabledByRegistryPolicy() {
+        let disabled = HarnessRegistry.standard(enabledExperimental: [])
         #expect(disabled.harness(for: .cursorAgent) == nil)
         #expect(disabled.available.allSatisfy { !$0.kind.isExperimental })
 
@@ -677,9 +675,28 @@ struct HarnessRegistryTests {
         #expect(enabled.available.count == 3)
     }
 
-    @Test func theStandardRegistryShipsClaudeAndCodex() {
+    @Test func theStandardRegistryShipsEverySupportedAgent() {
         let registry = HarnessRegistry.standard()
         #expect(registry.harness(for: .claudeCode) != nil)
         #expect(registry.harness(for: .codex) != nil)
+        #expect(registry.harness(for: .cursorAgent) != nil)
+    }
+
+    @Test func disabledExperimentalHarnessesAreDetectedButNotReady() async throws {
+        let cursor = FakeHarness(kind: .cursorAgent)
+        let disabled = HarnessRegistry(harnesses: [cursor])
+        let disabledProbe = try #require(await disabled.probeAll().first)
+
+        #expect(disabledProbe.isInstalled)
+        #expect(disabledProbe.isEnabled == false)
+        #expect(!disabledProbe.isReady)
+        #expect(disabled.harness(for: .cursorAgent) == nil)
+
+        let enabled = HarnessRegistry(
+            harnesses: [cursor], enabledExperimental: [.cursorAgent]
+        )
+        let enabledProbe = try #require(await enabled.probeAll().first)
+        #expect(enabledProbe.isEnabled == true)
+        #expect(enabledProbe.isReady)
     }
 }

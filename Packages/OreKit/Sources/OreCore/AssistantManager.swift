@@ -113,12 +113,28 @@ public enum AssistantManager {
         reading everything.
 
         - [Projects](memory/projects.md) — what the user is working on across workspaces
+        - [Relations](memory/relations.md) — how projects depend on each other, and where their contracts live
         - [Preferences](memory/preferences.md) — how the user likes things done
         - [Watch](memory/watch.md) — what deserves interrupting the user, and what to mute
 
         """)
         seedIfMissing(home.appendingPathComponent("memory/projects.md"), contents: """
         # Projects
+
+        Nothing recorded yet.
+
+        """)
+        seedIfMissing(home.appendingPathComponent("memory/relations.md"), contents: """
+        # Project relations
+
+        How the user's projects depend on each other — which is the backend, \
+        frontend, SDK, or infra of which, and where each contract lives (API \
+        routes, shared types, published packages). Record a relation the \
+        moment it's learned, from the user's words or from what project \
+        agents surface. Format, one block per relation:
+
+        - <project A> ⇄ <project B>: <nature of the dependency>. \
+        Contract: <where it lives>. Learned: <how/when>.
 
         Nothing recorded yet.
 

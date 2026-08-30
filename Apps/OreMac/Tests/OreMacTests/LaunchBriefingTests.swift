@@ -1,0 +1,136 @@
+import Foundation
+import OreProtocol
+import Testing
+
+@testable import OreMac
+
+struct LaunchBriefingTests {
+    private let now = Date(timeIntervalSince1970: 2_000_000_000)
+
+    @Test func greetingUsesFirstNameAndDaypart() {
+        let morning = date(hour: 9)
+        let briefing = LaunchBriefing.compose(
+            workspaces: [], lastSeenAt: nil, now: morning, userName: "Tushar"
+        )
+        #expect(briefing.greeting == "Good morning, Tushar.")
+        #expect(briefing.lines.map(\.id) == ["quiet"])
+        #expect(briefing.lines[0].text == "Ready when you are")
+    }
+
+    @Test func lateNightGetsItsOwnGreeting() {
+        let night = date(hour: 2)
+        let briefing = LaunchBriefing.compose(
+            workspaces: [], lastSeenAt: nil, now: night, userName: nil
+        )
+        #expect(briefing.greeting == "Working late.")
+    }
+
+    @Test func bucketsNeedsYouFinishedWorkingAndUncommitted() {
+        let lastSeen = now.addingTimeInterval(-3600)
+        let briefing = LaunchBriefing.compose(
+            workspaces: [
+                workspace("Kailash", status: .awaitingInput, activity: now),
+                workspace("Zewail", status: .idle, unread: true, activity: now),
+                workspace("Leloir", status: .runningTool, activity: now),
+                workspace("Seed", status: .idle, uncommitted: true, activity: now),
+            ],
+            lastSeenAt: lastSeen,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines.map(\.id) == ["needs-you", "finished", "working", "uncommitted"])
+        #expect(briefing.lines[0].text == "Kailash needs your attention")
+        #expect(briefing.lines[0].isAttention)
+        #expect(briefing.lines[1].text == "Zewail finished while you were away")
+        #expect(briefing.lines[2].text == "Leloir is still working")
+        #expect(briefing.lines[3].text == "Seed has changes ready to commit")
+        #expect(briefing.spoken.hasSuffix(
+            "Kailash needs your attention. Zewail finished while you were away. "
+                + "Leloir is still working. Seed has changes ready to commit."
+        ))
+    }
+
+    @Test func finishedBeforeTheAbsenceIsOldNews() {
+        let lastSeen = now.addingTimeInterval(-600)
+        let briefing = LaunchBriefing.compose(
+            workspaces: [
+                workspace(
+                    "Old", status: .idle, unread: true,
+                    activity: lastSeen.addingTimeInterval(-3600)
+                )
+            ],
+            lastSeenAt: lastSeen,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines.map(\.id) == ["quiet"])
+        #expect(briefing.lines[0].text == "All quiet — 1 workspace ready")
+    }
+
+    @Test func manyNamesCollapseToACount() {
+        let briefing = LaunchBriefing.compose(
+            workspaces: (1...5).map {
+                workspace("W\($0)", status: .awaitingInput, activity: now)
+            },
+            lastSeenAt: nil,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines[0].text == "W1, W2, and 3 others need your attention")
+    }
+
+    @Test func archivedWorkspacesAreInvisible() {
+        let briefing = LaunchBriefing.compose(
+            workspaces: [workspace("Gone", status: .awaitingInput, archived: true, activity: now)],
+            lastSeenAt: nil,
+            now: now,
+            userName: nil
+        )
+        #expect(briefing.lines.map(\.id) == ["quiet"])
+        #expect(briefing.lines[0].text == "Ready when you are")
+    }
+
+    @Test func firstNameExtraction() {
+        #expect(LaunchBriefing.firstName(from: "Tushar Ojha") == "Tushar")
+        #expect(LaunchBriefing.firstName(from: "") == nil)
+    }
+
+    // MARK: - Fixtures
+
+    private func date(hour: Int) -> Date {
+        Calendar.current.date(
+            bySettingHour: hour, minute: 0, second: 0, of: now
+        ) ?? now
+    }
+
+    private func workspace(
+        _ name: String,
+        status: AgentStatus,
+        unread: Bool = false,
+        uncommitted: Bool = false,
+        archived: Bool = false,
+        activity: Date? = nil
+    ) -> WorkspaceSummary {
+        WorkspaceSummary(
+            id: WorkspaceID(rawValue: name),
+            name: name,
+            repositoryPath: "/tmp/\(name)",
+            worktreePath: "/tmp/\(name)/wt",
+            branch: "ore/\(name)",
+            baseBranch: "main",
+            harness: .claudeCode,
+            status: status,
+            hasUnread: unread,
+            isArchived: archived,
+            gitStatus: GitStatusSummary(
+                changedFileCount: uncommitted ? 2 : 0,
+                insertions: 0,
+                deletions: 0,
+                hasUncommittedChanges: uncommitted,
+                aheadOfBase: 0,
+                behindBase: 0
+            ),
+            lastActivity: activity
+        )
+    }
+}

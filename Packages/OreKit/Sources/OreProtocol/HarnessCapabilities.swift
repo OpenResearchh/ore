@@ -20,7 +20,7 @@ public enum HarnessKind: String, Sendable, Codable, CaseIterable {
         switch self {
         case .claudeCode: return "claude"
         case .codex: return "codex"
-        case .cursorAgent: return "cursor-agent"
+        case .cursorAgent: return "agent"
         }
     }
 
@@ -168,23 +168,31 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
     public var executablePath: String?
     public var version: String?
     public var authState: AuthState
+    /// False when the CLI can be detected and diagnosed but the integration is
+    /// gated off. Optional keeps older serialized probe snapshots compatible;
+    /// nil means enabled, matching the behavior before this field existed.
+    public var isEnabled: Bool?
     /// Set when the CLI is present but something is wrong we can explain.
     public var diagnostic: String?
 
     public var isInstalled: Bool { executablePath != nil }
-    public var isReady: Bool { isInstalled && authState != .notAuthenticated }
+    public var isReady: Bool {
+        isEnabled != false && isInstalled && authState != .notAuthenticated
+    }
 
     public init(
         kind: HarnessKind,
         executablePath: String? = nil,
         version: String? = nil,
         authState: AuthState = .unknown,
+        isEnabled: Bool? = nil,
         diagnostic: String? = nil
     ) {
         self.kind = kind
         self.executablePath = executablePath
         self.version = version
         self.authState = authState
+        self.isEnabled = isEnabled
         self.diagnostic = diagnostic
     }
 }

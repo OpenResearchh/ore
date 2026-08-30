@@ -14,13 +14,16 @@ struct SettingsView: View {
     @AppStorage(AppModel.DefaultKey.reviewHarness) private var reviewHarnessRaw = ""
     @AppStorage(AppModel.DefaultKey.reviewModel) private var reviewModel = ""
     @AppStorage("ore.branchPrefix") private var branchPrefix = "ore"
-    @AppStorage("ore.cursorExperimental") private var cursorExperimental = false
     @AppStorage("ore.cursorAllowUnprompted") private var cursorAllowUnprompted = false
     @AppStorage("ore.apiKeyFallback") private var apiKeyFallback = false
     @AppStorage("ore.notifications.enabled") private var notifications = true
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
     @AppStorage("ore.notifications.sound") private var sound = true
     @AppStorage(NarrationEngine.masterSwitchKey) private var narrationEnabled = true
+    @AppStorage(AppModel.greetingEnabledKey) private var greetingEnabled = true
+    @AppStorage(AppModel.greetingVoiceKey) private var greetingVoice = true
+    @AppStorage(NarrationEngine.fleetSwitchKey) private var fleetNarration = true
+    @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
@@ -212,9 +215,22 @@ struct SettingsView: View {
                 Toggle("Play completion sounds", isOn: $sound)
                     .disabled(!notifications)
             }
+            SettingsCard(title: "Launch briefing", icon: "sunrise") {
+                Toggle("Greet me at launch", isOn: $greetingEnabled)
+                Toggle("Speak the briefing aloud", isOn: $greetingVoice)
+                    .disabled(!greetingEnabled || !narrationEnabled)
+                Text("When ORE opens, a short card sums up what happened while you were away — who finished, who needs you, what's still running. The voice only chimes in after a real absence, and only while narration is allowed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             SettingsCard(title: "Spoken narration", icon: "speaker.wave.2") {
                 Toggle("Allow spoken narration", isOn: $narrationEnabled)
                 Text("Tabs with the speaker toggled on narrate their agent's work aloud — what it's doing now, what needs you, and when it finishes. Summaries are generated on this Mac; nothing leaves it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Announce every workspace's milestones", isOn: $fleetNarration)
+                    .disabled(!narrationEnabled)
+                Text("Even without the speaker toggle, background agents say when they finish, fail, or need you — named by workspace, never their ambient progress.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()
@@ -229,6 +245,10 @@ struct SettingsView: View {
             }
             SettingsCard(title: "Voice input", icon: "mic") {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Open the mic when an agent asks a question", isOn: $voiceAsks)
+                Text("When an agent asks you something with options, ORE speaks the question, plays a soft chime, and listens for your answer — say an option or your own words.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()
@@ -399,7 +419,7 @@ struct SettingsView: View {
 
             SettingsCard(title: selectedHarness.displayName, harness: selectedHarness) {
                 HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: probe(for: selectedHarness)?.isReady == true ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    Image(systemName: agentStatusIcon)
                         .font(.system(size: 22))
                         .foregroundStyle(statusColor(probe(for: selectedHarness)))
                     VStack(alignment: .leading, spacing: 3) {
@@ -408,7 +428,7 @@ struct SettingsView: View {
                     }
                     Spacer()
                     if probe(for: selectedHarness)?.isInstalled == true,
-                       probe(for: selectedHarness)?.isReady != true {
+                       probe(for: selectedHarness)?.authState == .notAuthenticated {
                         Button {
                             beginHarnessAuthentication()
                         } label: {
@@ -445,17 +465,18 @@ struct SettingsView: View {
 
             SettingsCard(title: "Authentication", icon: "key") {
                 Label(
-                    probe(for: selectedHarness)?.isReady == true ? "CLI subscription connected" : "Provider sign-in needed",
-                    systemImage: probe(for: selectedHarness)?.isReady == true
-                        ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+                    authenticationStatusTitle,
+                    systemImage: authenticationStatusIcon
                 )
-                .foregroundStyle(probe(for: selectedHarness)?.isReady == true ? .green : .orange)
+                .foregroundStyle(authenticationStatusColor)
                 Text("ORE launches your installed CLI and leaves authentication with that provider. It never extracts your OAuth credentials.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Allow API-key fallback", isOn: $apiKeyFallback)
                 if selectedHarness == .cursorAgent {
-                    Toggle("Enable experimental Cursor Agent (restart required)", isOn: $cursorExperimental)
                     Toggle("Run tools unprompted in Bypass mode (restart required)", isOn: $cursorAllowUnprompted)
+                    Label("Cursor Agent support is experimental", systemImage: "flask")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     Text("Cursor's CLI has no approval channel. ORE normally lets Cursor's auto-review classifier decide each tool call; this runs every command instead, with no prompt, whenever the chat is in Bypass Permissions.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -526,17 +547,32 @@ struct SettingsView: View {
     private func probe(for kind: HarnessKind) -> HarnessProbeResult? { appModel.harnesses.first { $0.kind == kind } }
     private func statusColor(_ probe: HarnessProbeResult?) -> Color {
         guard let probe else { return .secondary }
+        if probe.isEnabled == false { return .secondary }
         return probe.isReady ? .green : (probe.isInstalled ? .orange : .red)
+    }
+    private var agentStatusIcon: String {
+        guard let probe = probe(for: selectedHarness) else { return "ellipsis.circle.fill" }
+        if probe.isEnabled == false { return "pause.circle.fill" }
+        return probe.isReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
     }
     private var agentStatusTitle: String {
         guard let probe = probe(for: selectedHarness) else { return "Checking installation…" }
-        if probe.isReady { return "Connected and ready" }
         if !probe.isInstalled { return "CLI not found" }
+        if probe.isEnabled == false { return "Installed · enable to use" }
+        if probe.isReady { return "Connected and ready" }
         return "Sign-in required"
     }
     private var agentStatusDetail: String {
-        probe(for: selectedHarness)?.diagnostic
-            ?? (probe(for: selectedHarness)?.isReady == true ? "Available to new and existing chats." : "Install or authenticate the CLI, then refresh.")
+        guard let probe = probe(for: selectedHarness) else {
+            return "Checking the login-shell PATH…"
+        }
+        if probe.isEnabled == false {
+            return "ORE detected the CLI, but this build has disabled the Cursor integration."
+        }
+        return probe.diagnostic
+            ?? (probe.isReady
+                ? "Available to new and existing chats."
+                : "Install or authenticate the CLI, then refresh.")
     }
     private var loginMethod: String {
         switch probe(for: selectedHarness)?.authState {
@@ -544,6 +580,21 @@ struct SettingsView: View {
         case .notAuthenticated: "Not signed in"
         case .unknown, .none: "Managed by CLI"
         }
+    }
+    private var authenticationStatusTitle: String {
+        guard let probe = probe(for: selectedHarness) else { return "Checking CLI authentication…" }
+        if probe.isEnabled == false { return "Integration disabled" }
+        return probe.isReady ? "CLI subscription connected" : "Provider sign-in needed"
+    }
+    private var authenticationStatusIcon: String {
+        guard let probe = probe(for: selectedHarness) else { return "ellipsis.circle.fill" }
+        if probe.isEnabled == false { return "pause.circle.fill" }
+        return probe.isReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+    }
+    private var authenticationStatusColor: Color {
+        guard let probe = probe(for: selectedHarness) else { return .secondary }
+        if probe.isEnabled == false { return .secondary }
+        return probe.isReady ? .green : .orange
     }
 
     private func beginHarnessAuthentication() {

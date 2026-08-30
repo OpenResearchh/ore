@@ -32,6 +32,22 @@ cp "$ORE_CLI_BIN" "$APP/Contents/MacOS/ore-cli"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Debug builds get their own bundle identity. TCC records permissions per
+# (bundle id, code signature); a dev build sharing `dev.ore.OreMac` with the
+# installed release app — but signed with a different certificate — makes the
+# system invalidate the grant every time the two alternate, which shows up as
+# the same "access your Documents folder" prompt on every debug run. A
+# distinct, stable id keeps both permission records intact. (Side effect: the
+# dev app keeps its own UserDefaults domain, so its layout/prefs are separate
+# from the installed app's — workspaces and chats come from the core database
+# and are shared as before.)
+if [[ "$CONFIGURATION" == "debug" ]]; then
+  /usr/libexec/PlistBuddy \
+    -c "Set :CFBundleIdentifier dev.ore.OreMac.debug" \
+    -c "Set :CFBundleName ORE Dev" \
+    "$APP/Contents/Info.plist"
+fi
+
 # App icon (referenced by CFBundleIconFile). Regenerate from the SVG on demand
 # so a fresh checkout still gets one.
 if [[ ! -f "$ROOT/Resources/AppIcon.icns" ]]; then

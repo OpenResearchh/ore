@@ -700,23 +700,27 @@ struct ReviewPane: View {
 
             SourceFileIcon(path: file.path, size: 16)
 
-            HStack(spacing: 0) {
+            // Filename leads, folder trails dimmed. Path-first rows truncated
+            // into "…c/Sources/OreMac/" soup and buried the one part that
+            // identifies the file.
+            HStack(spacing: 5) {
+                Text((file.path as NSString).lastPathComponent)
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .layoutPriority(1)
                 if showFolder {
                     let prefix = (file.path as NSString).deletingLastPathComponent
                     if !prefix.isEmpty {
-                        Text(prefix + "/")
+                        Text(prefix)
+                            .font(.system(size: OreTheme.Font.caption))
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
                             .truncationMode(.head)
                             .layoutPriority(0)
                     }
                 }
-                Text((file.path as NSString).lastPathComponent)
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .layoutPriority(1)
             }
-            .font(.system(size: OreTheme.Font.body))
             .opacity(viewedPaths.contains(file.path) ? 0.55 : 1)
 
             Spacer(minLength: 4)
@@ -1022,6 +1026,51 @@ private struct LineFramesKey: PreferenceKey {
 /// from the review list, the way a file opens in an editor rather than in a
 /// cramped side pane. Carries the review affordances that belong with the code:
 /// mark-viewed, and commenting (single line, or a dragged range).
+/// A read-only rendered-markdown document: the transcript's renderer pointed
+/// at a file. Selection works; editing goes through the Source segment.
+private struct MarkdownPreview: NSViewRepresentable {
+    let markdown: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 28, height: 24)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+
+        let scroll = NSScrollView()
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        return scroll
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var lastRendered: String?
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = scroll.documentView as? NSTextView else { return }
+        // Re-render only when the text itself moved — updateNSView also fires
+        // for unrelated SwiftUI churn, and markdown parsing isn't free.
+        guard context.coordinator.lastRendered != markdown else { return }
+        context.coordinator.lastRendered = markdown
+        let rendered = MarkdownRenderer(
+            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
+            textColor: .labelColor,
+            highlighter: SyntaxHighlighter.shared
+        ).render(markdown, highlighting: .all)
+        textView.textStorage?.setAttributedString(rendered)
+    }
+}
+
 struct DiffDocumentView: View {
     @Environment(AppModel.self) private var model
     let workspace: WorkspaceSummary
@@ -1061,7 +1110,9 @@ struct DiffDocumentView: View {
                 conflictBanner
             }
 
-            if mode == .source {
+            if mode == .preview, supportsPreview {
+                markdownPreview
+            } else if mode == .source {
                 sourceEditor
             } else if let file {
                 diffScroll(file)
@@ -1127,12 +1178,13 @@ struct DiffDocumentView: View {
             Spacer(minLength: OreTheme.Space.sm)
 
             Picker("View", selection: modeBinding) {
+                if supportsPreview { Text("Preview").tag(FilePresentationMode.preview) }
                 Text("Source").tag(FilePresentationMode.source)
                 if file != nil { Text("Diff").tag(FilePresentationMode.diff) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: file == nil ? 78 : 140)
+            .fixedSize()
 
             if mode == .source, sourceText != savedSourceText {
                 Button(isSaving ? "Saving…" : "Save") { Task { await save() } }
@@ -1187,6 +1239,29 @@ struct DiffDocumentView: View {
     private func setMode(_ value: FilePresentationMode) {
         mode = value
         model.setFilePresentationMode(value, path: path, in: workspace.id)
+    }
+
+    private var supportsPreview: Bool {
+        FilePresentationMode.supportsPreview(path: path)
+    }
+
+    /// The rendered document — how a markdown file (a plan, a README) opens
+    /// by default. Source and diff stay one segment away.
+    @ViewBuilder
+    private var markdownPreview: some View {
+        if isLoading && sourceText.isEmpty {
+            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let sourceError {
+            ContentUnavailableView(
+                "Can’t open this file",
+                systemImage: "doc.badge.ellipsis",
+                description: Text(sourceError)
+            )
+        } else {
+            MarkdownPreview(markdown: sourceText)
+                .accessibilityLabel("Preview of \((path as NSString).lastPathComponent)")
+                .clipped()
+        }
     }
 
     @ViewBuilder
@@ -1318,8 +1393,11 @@ struct DiffDocumentView: View {
         } else {
             sourceError = "ORE can only edit UTF-8 text files smaller than 2 MB."
         }
-        let requested = model.filePresentationModes[workspace.id]?[path] ?? .diff
-        mode = file == nil ? .source : requested
+        let requested = model.filePresentationModes[workspace.id]?[path]
+            ?? (supportsPreview ? .preview : .diff)
+        mode = file == nil && requested == .diff
+            ? FilePresentationMode.preferred(forPath: path)
+            : requested
         let stored = await model.loadViewedFiles(for: workspace.id)
         if let file { isViewed = stored[path] == contentHash(file) }
         conflictHunks = await model.loadConflictHunks(path: path, for: workspace.id)
@@ -1696,7 +1774,16 @@ private struct ShipStatusPanel: View {
 
     private func segment(_ title: String, count: Int?, target: ShipTab) -> some View {
         let isSelected = tab == target
-        return Button { tab = target } label: {
+        return Button {
+            // Commits is a verb here, not just a filter: with uncommitted work
+            // in the tree, clicking it spins up the temporary commit tab — an
+            // agent forked from the current conversation that stages and
+            // commits with real messages. With a clean tree it stays a tab.
+            if target == .commits, workspace.gitStatus.hasUncommittedChanges {
+                model.startCommitAgent(in: workspace.id)
+            }
+            tab = target
+        } label: {
             HStack(spacing: 5) {
                 Text(title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
@@ -2143,6 +2230,17 @@ struct GitActionToolbar: View {
                 .fixedSize()
                 .accessibilityLabel(title)
                 .accessibilityHint(actionHelp)
+                // The default click delegates commit / PR to an agent tab; the
+                // hand-written path survives here for the times the message
+                // matters more than the minutes.
+                .contextMenu {
+                    if case .commit = action {
+                        Button("Write Commit Message Manually…") { editor = .commit }
+                    }
+                    if case .createPullRequest = action {
+                        Button("Write PR Title and Body Manually…") { editor = .pullRequest }
+                    }
+                }
                 .popover(item: $editor) { kind in
                     gitEditor(kind)
                 }
@@ -2283,9 +2381,14 @@ struct GitActionToolbar: View {
         guard !model.isGitOpInFlight(workspace.id) else { return }
         switch action {
         case .commit:
-            editor = .commit
+            // No sheet, no questions: a temporary tab's agent stages and
+            // commits everything with real messages. The message editor
+            // remains reachable through the button's context menu.
+            model.startCommitAgent(in: workspace.id)
         case .createPullRequest:
-            editor = .pullRequest
+            // Same default flow for shipping: commit what's left, push, open
+            // the PR against the chosen base — one click, zero prompts.
+            model.startShipAgent(in: workspace.id, base: chosenBase)
         case .merge:
             editor = .merge
         default:

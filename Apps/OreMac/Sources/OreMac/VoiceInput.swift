@@ -308,6 +308,13 @@ final class VoiceInputController {
     /// post-pass correction instead.
     var vocabulary: [String] = []
 
+    init() {
+        // Start loading the on-device model the moment a composer exists, not
+        // when the mic button is pressed — the analyzer prepare is the seconds
+        // of "Preparing…" the button used to spend.
+        if #available(macOS 26.0, *) { DictationPrewarm.warm() }
+    }
+
     func toggle() {
         if isActive { stop() } else { start() }
     }
@@ -383,21 +390,33 @@ final class VoiceInputController {
 
     @available(macOS 26.0, *)
     private func runOnDeviceDictation() async throws {
-        let preferred = Locale(identifier: "en_US")
-        let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred)
-            ?? preferred
-        let transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
+        let transcriber: DictationTranscriber
+        let analyzer: SpeechAnalyzer
+        let bestFormat: AVAudioFormat?
 
-        status = .preparing
-        try await SpeechAssetKeeper.ensureInstalled(transcriber: transcriber, locale: locale) {
-            status = .downloadingModel
+        if let warmed = DictationPrewarm.take() {
+            // The model is already sitting in a prepared analyzer — listening
+            // starts as fast as the microphone does.
+            transcriber = warmed.transcriber
+            analyzer = warmed.analyzer
+            bestFormat = warmed.format
+        } else {
+            let preferred = Locale(identifier: "en_US")
+            let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred)
+                ?? preferred
+            transcriber = DictationTranscriber(locale: locale, preset: .progressiveLongDictation)
+
+            status = .preparing
+            try await SpeechAssetKeeper.ensureInstalled(transcriber: transcriber, locale: locale) {
+                status = .downloadingModel
+            }
+            guard !Task.isCancelled else { throw CancellationError() }
+            if status == .downloadingModel { status = .preparing }
+
+            analyzer = SpeechAnalyzer(modules: [transcriber])
+            bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+            try await analyzer.prepareToAnalyze(in: bestFormat)
         }
-        guard !Task.isCancelled else { throw CancellationError() }
-        if status == .downloadingModel { status = .preparing }
-
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
-        try await analyzer.prepareToAnalyze(in: bestFormat)
 
         // Starting AVAudioEngine is synchronous and slow the first time; on the
         // main actor it froze the window at the start of a dictation.
@@ -552,6 +571,9 @@ final class VoiceInputController {
             await analyzerStop()
             self.analyzerStop = nil
         }
+        // A finished analyzer is spent; line up the next one now, while nobody
+        // is waiting on it, so the next press is instant too.
+        if #available(macOS 26.0, *) { DictationPrewarm.warm() }
     }
 
     private static func userFacingMessage(for error: Error) -> String {
@@ -560,6 +582,63 @@ final class VoiceInputController {
             return "Speech recognition is busy. Try again in a moment."
         }
         return error.localizedDescription
+    }
+}
+
+/// A standby dictation pipeline, built ahead of the mic press.
+///
+/// `SpeechAnalyzer.prepareToAnalyze` is where the on-device model actually
+/// loads, and it is the seconds the mic button used to spend in "Preparing…".
+/// One prepared analyzer sits here waiting; `take()` hands it over one-shot
+/// (a finished analyzer is not reusable), and the session's teardown warms
+/// the next. Only the model is warmed — never the microphone: no capture
+/// runs until the person asks for it.
+@available(macOS 26.0, *)
+@MainActor
+enum DictationPrewarm {
+    struct Prepared {
+        let transcriber: DictationTranscriber
+        let analyzer: SpeechAnalyzer
+        let format: AVAudioFormat?
+    }
+
+    private static var prepared: Prepared?
+    private static var warmTask: Task<Void, Never>?
+
+    /// Best-effort and idempotent; failures just mean the press path builds
+    /// its own pipeline the old way.
+    static func warm() {
+        guard prepared == nil, warmTask == nil else { return }
+        warmTask = Task {
+            defer { warmTask = nil }
+            do {
+                let preferred = Locale(identifier: "en_US")
+                let locale = await DictationTranscriber.supportedLocale(equivalentTo: preferred)
+                    ?? preferred
+                let transcriber = DictationTranscriber(
+                    locale: locale, preset: .progressiveLongDictation
+                )
+                // Downloads quietly if the asset is missing — better at app
+                // start than labeled "Downloading…" under a pressed mic button.
+                try await SpeechAssetKeeper.ensureInstalled(
+                    transcriber: transcriber, locale: locale
+                ) {}
+                let analyzer = SpeechAnalyzer(modules: [transcriber])
+                let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+                    compatibleWith: [transcriber]
+                )
+                try await analyzer.prepareToAnalyze(in: format)
+                guard !Task.isCancelled else { return }
+                prepared = Prepared(transcriber: transcriber, analyzer: analyzer, format: format)
+            } catch {
+                // Nothing to surface: warming is invisible by design.
+            }
+        }
+    }
+
+    static func take() -> Prepared? {
+        defer { prepared = nil }
+        return prepared
     }
 }
 

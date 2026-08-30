@@ -137,6 +137,9 @@ final class AppModel {
         started = true
         AppModel.shared = self
         voiceAssistant.model = self
+        // The pill follows tabNeedsYou + the voice phase from here on, so a
+        // blocked tab is answerable from any app, not only from ORE's window.
+        AssistantVoiceHUD.shared.bind(model: self)
         // Direct callback, not a SwiftUI onChange: hold-to-talk must survive
         // every window being closed — the menu bar presence is enough.
         VoiceHotkeyMonitor.shared.onCommand = { [weak self] command in
@@ -155,6 +158,9 @@ final class AppModel {
             try? await client.start()
             await refreshRepositories()
             isLoaded = true
+            // A beat for the fleet snapshot to land, then say hello.
+            try? await Task.sleep(for: .milliseconds(800))
+            prepareLaunchBriefing()
         }
         restoreScheduledContinuations()
         NotificationCenter.default.addObserver(
@@ -228,6 +234,10 @@ final class AppModel {
     }
 
     func shutdown() async {
+        // Where "while you were away" starts counting from next launch.
+        UserDefaults.standard.set(
+            Date().timeIntervalSince1970, forKey: Self.lastSeenKey
+        )
         // Last chance to get an unsent draft to disk, and it has to complete
         // before the core below us shuts down.
         await flushPendingDraftsAwaitingWrites()
@@ -236,6 +246,122 @@ final class AppModel {
         for task in continuationTasks.values { task.cancel() }
         continuationTasks.removeAll()
         await client.shutdown()
+    }
+
+    // MARK: - Harness usage
+
+    /// What one harness is costing right now, aggregated across a workspace's
+    /// open chats — the presence strip's hover card: limit windows with reset
+    /// countdowns where the harness reported them, tokens and estimated
+    /// spend where it didn't.
+    struct HarnessUsageSnapshot: Identifiable {
+        var harness: HarnessKind
+        var rateLimit: RateLimitReport?
+        var totalTokens: Int
+        var costUSD: Double?
+        /// The fullest context among this harness's chats: (tab title, 0…1).
+        var topContextTitle: String?
+        var topContextFraction: Double?
+        var id: String { harness.rawValue }
+    }
+
+    func harnessUsage(in workspaceID: WorkspaceID) -> [HarnessUsageSnapshot] {
+        let open = chats(for: workspaceID).filter { !isEphemeralChat($0.id) }
+        var snapshots: [HarnessUsageSnapshot] = []
+        for harness in HarnessKind.allCases {
+            let members = open.filter { $0.harness == harness }
+            guard !members.isEmpty else { continue }
+            var tokens = 0
+            var cost: Double?
+            var topTitle: String?
+            var topFraction = 0.0
+            var limit: RateLimitReport?
+            for chat in members {
+                if let usage = chat.contextUsage {
+                    tokens += usage.totalContextTokens
+                    if let chatCost = usage.costUSD { cost = (cost ?? 0) + chatCost }
+                    if let window = usage.contextWindow, window > 0 {
+                        let fraction = Double(usage.totalContextTokens) / Double(window)
+                        if fraction > topFraction {
+                            topFraction = fraction
+                            topTitle = chat.title
+                        }
+                    }
+                }
+                // Loaded states only: forcing a ChatState into existence for a
+                // hover would drag full history loads behind a tooltip.
+                if let report = chatStates[chat.id]?.rateLimit {
+                    if report.applies() {
+                        limit = report
+                    } else if limit == nil {
+                        limit = report
+                    }
+                }
+            }
+            snapshots.append(HarnessUsageSnapshot(
+                harness: harness,
+                rateLimit: limit,
+                totalTokens: tokens,
+                costUSD: cost,
+                topContextTitle: topTitle,
+                topContextFraction: topTitle == nil ? nil : topFraction
+            ))
+        }
+        return snapshots
+    }
+
+    // MARK: - Launch briefing
+
+    static let lastSeenKey = "ore.lastSeenAt"
+    static let greetingEnabledKey = "ore.greeting.enabled"
+    static let greetingVoiceKey = "ore.greeting.voice"
+
+    /// The greeting card waiting to be shown, if this launch earned one.
+    private(set) var launchBriefing: LaunchBriefing?
+
+    /// Composes the "while you were away" card from the fleet snapshot and,
+    /// when the user has actually been gone a while, speaks it through the
+    /// narration engine. Called once per launch after the snapshot lands.
+    func prepareLaunchBriefing() {
+        guard launchBriefing == nil else { return }
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: Self.greetingEnabledKey) as? Bool ?? true else { return }
+
+        let lastSeen = defaults.double(forKey: Self.lastSeenKey)
+        let lastSeenAt = lastSeen > 0 ? Date(timeIntervalSince1970: lastSeen) : nil
+        let briefing = LaunchBriefing.compose(
+            workspaces: sortedWorkspaces,
+            lastSeenAt: lastSeenAt,
+            userName: LaunchBriefing.firstName(from: NSFullUserName())
+        )
+        launchBriefing = briefing
+
+        // Speak only when there was a real absence: a voice greeting on every
+        // quick relaunch is clingy, and the master narration switch always
+        // wins. Milestone priority — it defers to anything urgent.
+        let awayLongEnough = lastSeenAt.map {
+            Date().timeIntervalSince($0) > LaunchBriefing.spokenAwayThreshold
+        } ?? true
+        let voiceWanted = defaults.object(forKey: Self.greetingVoiceKey) as? Bool ?? true
+        if awayLongEnough, voiceWanted, narration.isMasterEnabled {
+            narration.speakAssistant(
+                briefing.spoken,
+                chatID: ChatID(rawValue: "launch-briefing"),
+                priority: .milestone,
+                // The greeting is a composed reply, not an ambient interjection
+                // — the 280-character ambient cap would clip it mid-sentence.
+                limit: NarrationPolicy.assistantAnswerLimit,
+                kind: .turnCompleted
+            )
+        }
+
+        // The delta is delivered; a relaunch five minutes from now should not
+        // replay it.
+        defaults.set(Date().timeIntervalSince1970, forKey: Self.lastSeenKey)
+    }
+
+    func dismissLaunchBriefing() {
+        launchBriefing = nil
     }
 
     // MARK: - Reading
@@ -945,6 +1071,173 @@ final class AppModel {
         ))) }
     }
 
+    /// The temporary "commit clerk" tab: forked from the active chat — so it
+    /// already knows what the work was about and can write honest messages —
+    /// named Commit, and immediately prompted to stage and commit everything.
+    /// The composer's suggestion chip offers closing the tab once the tree is
+    /// clean (see `composerSuggestion` in ChatPane).
+    func startCommitAgent(in workspaceID: WorkspaceID) {
+        guard let source = activeChat(for: workspaceID),
+              chatCreationsInFlight.insert(workspaceID).inserted else { return }
+        pendingNewChatMessages[workspaceID, default: []].append(Self.commitAgentPrompt)
+        showChatInCenter(workspaceID)
+        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
+        Task { await client.send(.createChat(CreateChatRequest(
+            workspaceID: workspaceID,
+            title: ResearchIdentity.unique("Commit", excluding: used),
+            harness: source.harness,
+            model: source.model,
+            permissionMode: source.permissionMode,
+            forkFrom: source.id
+        ))) }
+    }
+
+    static let commitAgentPrompt = """
+        Commit all outstanding work in this worktree. Review everything staged \
+        and unstaged, group related changes into one or more coherent commits, \
+        and write clear, conventional commit messages that explain the why. \
+        Include untracked files that belong to the work; leave anything that \
+        looks accidental uncommitted and call it out. Do not push. Proceed \
+        without asking for confirmation.
+        """
+
+    /// The "ship it" sibling of `startCommitAgent`: a temporary tab that
+    /// commits whatever is outstanding, pushes, and opens the pull request —
+    /// the whole default flow, no sheets, no questions.
+    func startShipAgent(in workspaceID: WorkspaceID, base: String? = nil) {
+        guard let source = activeChat(for: workspaceID),
+              chatCreationsInFlight.insert(workspaceID).inserted else { return }
+        let baseBranch = base
+            ?? workspaces.first { $0.id == workspaceID }?.baseBranch
+            ?? "main"
+        pendingNewChatMessages[workspaceID, default: []].append("""
+            Ship this branch. Commit any outstanding staged and unstaged work \
+            with clear, conventional commit messages, push the branch, and \
+            open a pull request against \(baseBranch) with a concise title \
+            and a description that covers what changed and why. Never force \
+            push. Proceed without asking for confirmation, and finish by \
+            reporting the pull request URL.
+            """)
+        showChatInCenter(workspaceID)
+        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
+        Task { await client.send(.createChat(CreateChatRequest(
+            workspaceID: workspaceID,
+            title: ResearchIdentity.unique("Ship", excluding: used),
+            harness: source.harness,
+            model: source.model,
+            permissionMode: source.permissionMode,
+            forkFrom: source.id
+        ))) }
+    }
+
+    /// Marks a chat as ephemeral: hidden from the tab strip, never focused,
+    /// rendered only by the surface that created it (the find bar's answers
+    /// panel). A zero-width space keeps the marker invisible anywhere the
+    /// title does leak.
+    static let ephemeralChatPrefix = "\u{200B}"
+
+    /// Ephemeral chats tracked by id — the durable marker. Titles round-trip
+    /// through the core and can come back normalized, which is how an
+    /// "invisible" chat once leaked into the tab strip as a visible tab.
+    private var pendingEphemeralWorkspaces: Set<WorkspaceID> = []
+    private(set) var ephemeralChatIDs: Set<ChatID> = []
+
+    func isEphemeralChat(_ id: ChatID) -> Bool {
+        ephemeralChatIDs.contains(id)
+    }
+
+    /// The workspace's ephemeral answers chat, if one is open.
+    func answersChat(in workspaceID: WorkspaceID) -> ChatSummary? {
+        chats(for: workspaceID).first {
+            ephemeralChatIDs.contains($0.id)
+                || $0.title.hasPrefix(Self.ephemeralChatPrefix)
+        }
+    }
+
+    /// Answers a question with the recent context of *every* tab in the
+    /// workspace: each chat's last turns are digested into one prompt and an
+    /// *ephemeral* chat takes the question — no tab appears and focus never
+    /// moves; the find bar streams the reply in place.
+    func askAcrossTabs(_ question: String, in workspaceID: WorkspaceID) {
+        let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task {
+            // One at a time: a re-ask replaces the previous answers chat.
+            if let previous = answersChat(in: workspaceID) {
+                closeChat(previous.id, in: workspaceID)
+            }
+            let prompt = await crossTabPrompt(question: trimmed, workspaceID: workspaceID)
+            guard chatCreationsInFlight.insert(workspaceID).inserted else { return }
+            // The id isn't known until `chatAdded`; this flag is how that
+            // handler knows the next chat here is ephemeral.
+            pendingEphemeralWorkspaces.insert(workspaceID)
+            pendingNewChatMessages[workspaceID, default: []].append(prompt)
+            let defaults = newChatDefaults(for: workspaceID)
+            let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
+            await client.send(.createChat(CreateChatRequest(
+                workspaceID: workspaceID,
+                title: Self.ephemeralChatPrefix
+                    + ResearchIdentity.unique("Answers", excluding: used),
+                harness: defaults.harness,
+                model: defaults.model,
+                permissionMode: workspaces.first { $0.id == workspaceID }?.permissionMode ?? .default
+            )))
+        }
+    }
+
+    /// One digest per tab: the user prompt and the final reply of the last
+    /// few turns, clipped hard — context for a question, not a transcript
+    /// dump into the new tab's window.
+    private func crossTabPrompt(question: String, workspaceID: WorkspaceID) async -> String {
+        var sections: [String] = []
+        // Real conversations only: a previous answers chat digesting itself
+        // would echo back into every follow-up question.
+        let real = chats(for: workspaceID).filter {
+            !ephemeralChatIDs.contains($0.id)
+                && !$0.title.hasPrefix(Self.ephemeralChatPrefix)
+        }
+        for summary in real {
+            guard let turns = try? await client.transcript(chatID: summary.id),
+                  !turns.isEmpty else { continue }
+            var lines: [String] = []
+            for turn in turns.suffix(5) {
+                if let prompt = turn.prompt, !prompt.isEmpty {
+                    lines.append("User: \(Self.clipped(prompt, to: 400))")
+                }
+                if let blocks = try? await client.blocks(turnID: turn.turnID),
+                   let reply = blocks.last(where: {
+                       $0.blockKind == .text && !$0.text.isEmpty
+                   }) {
+                    lines.append("Agent: \(Self.clipped(reply.text, to: 700))")
+                }
+            }
+            guard !lines.isEmpty else { continue }
+            sections.append(
+                "## Tab \u{201C}\(summary.title)\u{201D}\n" + lines.joined(separator: "\n")
+            )
+        }
+        let context = sections.isEmpty
+            ? "(No prior conversations in this workspace.)"
+            : sections.joined(separator: "\n\n")
+        return """
+            You have the recent context of every conversation tab in this \
+            workspace, digested below. Answer the user's question using this \
+            context first; read files in the worktree only when the digests \
+            don't hold the answer.
+
+            \(context)
+
+            ---
+            The user's question: \(question)
+            """
+    }
+
+    private static func clipped(_ text: String, to limit: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return trimmed.prefix(limit) + "…"
+    }
+
     /// Assistant workspaces whose next new conversation the user asked for and
     /// should therefore be moved to. See the `chatAdded` handler.
     private var assistantConversationsAwaitingFocus: Set<WorkspaceID> = []
@@ -1068,8 +1361,12 @@ final class AppModel {
         if let line {
             fileFocusToken += 1
             fileFocus[workspaceID, default: [:]][path] = FileFocus(line: line, token: fileFocusToken)
+            // A line reveal needs the editor — a rendered document has no
+            // line 42 to scroll to.
+            openFile(path, in: workspaceID, mode: .source)
+            return
         }
-        openFile(path, in: workspaceID, mode: .source)
+        openFile(path, in: workspaceID, mode: .preferred(forPath: path))
     }
 
     private func openFile(_ path: String, in workspaceID: WorkspaceID, mode: FilePresentationMode) {
@@ -2186,12 +2483,20 @@ final class AppModel {
             chatCreationsInFlight.remove(chat.workspaceID)
             chatOwners[chat.id] = chat.workspaceID
             upsertChat(chat)
+            // Claim the ephemeral flag *by id* before anything else can react:
+            // the title alone proved unreliable (the core may normalize it).
+            let isEphemeral = pendingEphemeralWorkspaces.remove(chat.workspaceID) != nil
+                || chat.title.hasPrefix(Self.ephemeralChatPrefix)
+            if isEphemeral { ephemeralChatIDs.insert(chat.id) }
             adoptResearchChatTitles(in: chat.workspaceID)
             // The assistant opens side chats for itself mid-answer (see its
             // prompt), and following one would move the window — and the voice
             // — off the conversation the user is being answered in. It is moved
             // deliberately instead: by New Conversation, or by a compaction.
-            if chat.workspaceID != assistantWorkspace?.id
+            // Ephemeral chats (the find bar's answers) are never focused: the
+            // whole point is that no tab appears and the user stays put.
+            if !isEphemeral,
+               chat.workspaceID != assistantWorkspace?.id
                 || assistantConversationsAwaitingFocus.remove(chat.workspaceID) != nil {
                 selectChat(chat.id, in: chat.workspaceID)
             }
@@ -2257,6 +2562,7 @@ final class AppModel {
         case .commandFailed(let failure):
             if let workspaceID = failure.workspaceID {
                 chatCreationsInFlight.remove(workspaceID)
+                pendingEphemeralWorkspaces.remove(workspaceID)
                 gitOpsInFlight[workspaceID] = nil
             }
             banners.append(Banner(message: failure.message, detail: failure.detail))
@@ -2806,7 +3112,10 @@ final class AppModel {
         where (Self.isGenericChatTitle(chat.title, workspaceName: workspace.name)
                 && chat.lastActivity == nil
                 || Self.looksLikeErrorTitle(chat.title))
-            && !chatRenamesInFlight.contains(chat.id) {
+            && !chatRenamesInFlight.contains(chat.id)
+            // An ephemeral chat's name is a marker, not a title — renaming it
+            // would surface a tab that is supposed to stay invisible.
+            && !ephemeralChatIDs.contains(chat.id) {
             let title = ResearchIdentity.nextResearchTitle(excluding: used, preferred: preferred)
             used.insert(title)
             chatRenamesInFlight.insert(chat.id)
@@ -2906,6 +3215,21 @@ private enum GitHubRepositoryInputError: LocalizedError, Sendable {
 enum FilePresentationMode: String, Sendable {
     case source
     case diff
+    /// Rendered markdown. Only offered for markdown files — a plan the agent
+    /// wrote should read as a document, not as raw markup.
+    case preview
+
+    /// Whether this path can render as a document at all.
+    static func supportsPreview(path: String) -> Bool {
+        ["md", "markdown", "mdown", "mdx"]
+            .contains((path as NSString).pathExtension.lowercased())
+    }
+
+    /// What a plain "open this file" means for this path: markdown reads as a
+    /// document by default, everything else as source.
+    static func preferred(forPath path: String) -> FilePresentationMode {
+        supportsPreview(path: path) ? .preview : .source
+    }
 }
 
 struct WorkspaceFileNode: Identifiable, Hashable, Sendable {

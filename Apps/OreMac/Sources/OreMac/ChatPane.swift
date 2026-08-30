@@ -20,6 +20,17 @@ struct ChatPane: View {
     /// needs padding added. Seeded at the one-line floor.
     @State private var composerTextHeight: CGFloat = 38
     @State private var queuedMessages: [QueuedMessageRecord] = []
+    /// Suggestion ids the user waved away this session; a dismissed nudge must
+    /// not reappear the moment conditions re-match. Dies with the pane.
+    @State private var dismissedSuggestions: Set<String> = []
+    /// The find bar (⌘F). The field's live text lives *inside* the bar (see
+    /// `TranscriptSearchBar`); the pane only holds the debounced query the
+    /// transcript actually searches, so typing never re-evaluates this body.
+    /// The token bumps on every ⌘F so an already-open bar refocuses its field
+    /// instead of toggling away.
+    @State private var isSearching = false
+    @State private var effectiveSearchQuery = ""
+    @State private var searchFocusRequest = 0
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
     /// Attachment relative paths that live as inline chips in the draft (pasted
@@ -91,8 +102,13 @@ struct ChatPane: View {
                     availableWidth: geometry.size.width,
                     revertTarget: $revertTarget,
                     renameChatTarget: $renameChatTarget,
-                    renameChatText: $renameChatText
+                    renameChatText: $renameChatText,
+                    isSearching: $isSearching,
+                    searchFocusRequest: $searchFocusRequest
                 )
+
+                // The presence roster ("Claude is working · Cursor is idle")
+                // lives in the bottom dock bar now — see `bottomDock`.
 
                 // The centre column shows either a chat transcript or — when a file
                 // tab is active — that file's diff, opened from the review list.
@@ -110,6 +126,136 @@ struct ChatPane: View {
         // header that repeated the tab title. The toolbar band was empty anyway.
         .navigationTitle(workspace.name)
         .navigationSubtitle("\(workspace.branch) → \(workspace.baseBranch)")
+    }
+
+    private struct ComposerSuggestion {
+        enum Action {
+            /// Send this prompt to the current chat.
+            case send(String)
+            /// Spin up the temporary commit tab (`AppModel.startCommitAgent`).
+            case commitAgent
+            /// Close this tab — offered on a finished commit tab.
+            case closeTab
+        }
+
+        let id: String
+        let title: String
+        let icon: String
+        let action: Action
+    }
+
+    /// The one nudge worth showing right now, or nothing. Only when it's
+    /// genuinely quiet — agent idle, nothing pending, no draft in progress —
+    /// and ordered as a priority ladder over live signals: a finished commit
+    /// tab offers to close itself, a failure offers a diagnosis, a stale base
+    /// offers a sync, uncommitted work offers the commit clerk, a diff offers
+    /// a summary, and only then the generic recap.
+    private var composerSuggestion: ComposerSuggestion? {
+        guard chat.hasRows, !chat.isBusy else { return nil }
+        guard chat.pendingPermission == nil, chat.pendingQuestion == nil,
+              chat.prominentError == nil, chat.draftComments.isEmpty,
+              queuedMessages.isEmpty else { return nil }
+        if case .proposal = chat.plan { return nil }
+        guard draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        let git = workspace.gitStatus
+        let title = chatSummary?.title ?? ""
+        let isCommitTab = title.hasPrefix("Commit")
+        let isShipTab = title.hasPrefix("Ship")
+        // A temporary git tab is done when its job is: a commit tab once the
+        // tree is clean, a ship tab once everything is also pushed.
+        let tempTabDone = (isCommitTab && !git.hasUncommittedChanges)
+            || (isShipTab && !git.hasUncommittedChanges && git.aheadOfBase == 0)
+
+        let ladder: [ComposerSuggestion?] = [
+            tempTabDone
+                ? ComposerSuggestion(
+                    id: "close-commit-tab",
+                    title: isShipTab
+                        ? "Shipped — close this tab"
+                        : "All committed — close this tab",
+                    icon: "checkmark.circle",
+                    action: .closeTab
+                ) : nil,
+            chatSummary?.status == .failed
+                ? ComposerSuggestion(
+                    id: "diagnose-failure",
+                    title: "Diagnose what went wrong",
+                    icon: "stethoscope",
+                    action: .send(
+                        "The last turn failed. Diagnose what went wrong and fix it."
+                    )
+                ) : nil,
+            git.behindBase > 0
+                ? ComposerSuggestion(
+                    id: "sync-base",
+                    title: "Sync with \(workspace.baseBranch)",
+                    icon: "arrow.triangle.merge",
+                    action: .send(
+                        "This branch is behind \(workspace.baseBranch). Rebase or merge "
+                            + "the latest \(workspace.baseBranch) and resolve any conflicts."
+                    )
+                ) : nil,
+            // Only when the git action bar isn't already offering Commit —
+            // two commit affordances stacked on one screen say the same
+            // thing twice.
+            git.hasUncommittedChanges && !isCommitTab && !isShipTab && !gitBarOffersCommit
+                ? ComposerSuggestion(
+                    id: "commit-changes",
+                    title: "Commit these changes",
+                    icon: "tray.and.arrow.down",
+                    action: .commitAgent
+                ) : nil,
+            git.changedFileCount > 0
+                ? ComposerSuggestion(
+                    id: "summarize-changes",
+                    title: "Give me a summary of the changes",
+                    icon: "doc.text.magnifyingglass",
+                    action: .send(
+                        "Give me a concise summary of the changes in this workspace so far: "
+                            + "what changed, why, and anything still unfinished."
+                    )
+                ) : nil,
+            ComposerSuggestion(
+                id: "recap-session",
+                title: "Recap this conversation",
+                icon: "text.bubble",
+                action: .send(
+                    "Recap this conversation so far: what we set out to do, "
+                        + "what's done, and what a sensible next step would be."
+                )
+            ),
+        ]
+        return ladder
+            .compactMap { $0 }
+            .first { !dismissedSuggestions.contains($0.id) }
+    }
+
+    private var gitBarOffersCommit: Bool {
+        if case .commit = model.gitAction(for: workspace.id) { return true }
+        return false
+    }
+
+    private func closeSearch() {
+        isSearching = false
+        // An empty query clears the coordinator's matches and the highlight.
+        effectiveSearchQuery = ""
+        // The answers chat is scoped to the bar: closing one closes the other.
+        if let answers = model.answersChat(in: workspace.id) {
+            model.closeChat(answers.id, in: workspace.id)
+        }
+    }
+
+    private func performSuggestion(_ suggestion: ComposerSuggestion) {
+        switch suggestion.action {
+        case .send(let prompt):
+            model.send(prompt, to: workspace.id)
+        case .commitAgent:
+            model.startCommitAgent(in: workspace.id)
+        case .closeTab:
+            guard let id = chatSummary?.id else { return }
+            model.closeChat(id, in: workspace.id)
+        }
     }
 
     /// Reloads the queued-message strip when the tab changes or its queue does.
@@ -174,6 +320,8 @@ struct ChatPane: View {
                 TranscriptHost(
                     chat: chat,
                     worktreePath: workspace.worktreePath,
+                    agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "",
+                    searchQuery: isSearching ? effectiveSearchQuery : "",
                     persistenceKey: transcriptScrollKey,
                     expandedActivityGroups: expandedActivityGroups,
                     canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
@@ -200,6 +348,30 @@ struct ChatPane: View {
     @ViewBuilder
     private func chatBody(paneHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
+            if isSearching {
+                TranscriptSearchBar(
+                    anchor: scrollAnchor,
+                    focusRequest: searchFocusRequest,
+                    onQueryChange: { effectiveSearchQuery = $0 },
+                    onAskTabs: { model.askAcrossTabs($0, in: workspace.id) },
+                    onClose: closeSearch
+                )
+                // The reply streams right here — no tab appears, focus never
+                // moves. The chat behind it is ephemeral and dies with the bar.
+                if let answers = model.answersChat(in: workspace.id) {
+                    CrossTabAnswerPanel(
+                        state: model.chat(for: answers.id),
+                        onAnswer: { answer in
+                            guard let question = model.chat(for: answers.id).pendingQuestion
+                            else { return }
+                            model.answerQuestion(
+                                question.id, answer: answer,
+                                for: workspace.id, chatID: answers.id
+                            )
+                        }
+                    )
+                }
+            }
             transcriptViewport
                 // Transition snapshots of an infinitely-sized empty view could
                 // paint over sibling split-view columns while changing tabs. The
@@ -288,9 +460,29 @@ struct ChatPane: View {
             }
 
             if !chat.draftComments.isEmpty {
-                DraftCommentsBar(comments: chat.draftComments) { index in
-                    chat.removeDraftComment(at: index)
-                }
+                DraftCommentsBar(
+                    comments: chat.draftComments,
+                    onRemove: { index in chat.removeDraftComment(at: index) },
+                    onClearAll: { chat.clearDraftComments() }
+                )
+            }
+
+            // The reference design's floating nudge: one contextual next step
+            // hovering above the composer when the agent is idle and nothing
+            // else is asking for the user's attention.
+            if let suggestion = composerSuggestion {
+                ComposerSuggestionChip(
+                    text: suggestion.title,
+                    icon: suggestion.icon,
+                    onSend: { performSuggestion(suggestion) },
+                    onDismiss: { dismissedSuggestions.insert(suggestion.id) }
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.top, OreTheme.Space.sm)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                // Identity per suggestion: a new nudge animates in rather than
+                // morphing the old one's label in place.
+                .id(suggestion.id)
             }
 
             // Hard failures — usage limits especially — belong where the user
@@ -346,6 +538,7 @@ struct ChatPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .layoutPriority(1)
         .task(id: chatSummary?.id) {
+            dismissedSuggestions = []
             draftOwnerID = chatSummary?.id
             if let injection = model.composerInjection, injection.chatID == chatSummary?.id {
                 draft = injection.text
@@ -475,6 +668,17 @@ struct ChatPane: View {
             if let effort = chatSummary?.reasoningEffort, effort != reasoningEffort {
                 reasoningEffort = effort
             }
+            // Commands can also come from voice, MCP, or the assistant. Treat
+            // their value as a request and normalize it against the current
+            // model just like a direct picker change.
+            if let tab = chatSummary { clampEffort(to: tab) }
+        }
+        // Model catalogs can refresh after the pane appears, and model changes
+        // can arrive from the assistant/MCP rather than this view's picker.
+        // Reconcile either case automatically so an effort from the previous
+        // model never remains selected for a different capability set.
+        .task(id: effortCapabilityKey) {
+            if let tab = chatSummary { clampEffort(to: tab) }
         }
         .onChange(of: fastModeEnabled) { _, enabled in
             let key = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
@@ -565,16 +769,26 @@ struct ChatPane: View {
         @Binding var revertTarget: TurnID?
         @Binding var renameChatTarget: ChatSummary?
         @Binding var renameChatText: String
+        @Binding var isSearching: Bool
+        @Binding var searchFocusRequest: Int
         @State private var hoveredTabKey: String?
 
         private var chat: ChatState { model.chat(for: workspace.id) }
         private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
 
+        /// Ephemeral chats (the find bar's Answers chat) never render as tabs.
+        private var visibleTabs: [ChatSummary] {
+            model.chats(for: workspace.id).filter {
+                !model.isEphemeralChat($0.id)
+                    && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
+            }
+        }
+
         var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: OreTheme.Space.xs) {
-                    ForEach(model.chats(for: workspace.id)) { tab in
+                    ForEach(visibleTabs) { tab in
                         Button {
                             model.selectChat(tab.id, in: workspace.id)
                             model.showChatInCenter(workspace.id)
@@ -630,11 +844,14 @@ struct ChatPane: View {
     }
 
     /// Width reserved at *each* edge of the strip: the trailing side holds the
-    /// fixed controls (new-tab, history, and the stop button while busy), and
-    /// the leading side matches it so the tabs stay optically centred rather
-    /// than shifted by the controls' width.
+    /// fixed controls (search, new-tab, history, and the stop button while
+    /// busy), and the leading side matches it so the tabs stay optically
+    /// centred rather than shifted by the controls' width. Must track the
+    /// controls' real width — reserved short, the last tab's tail (and its
+    /// close button) hides underneath them and no amount of scrolling brings
+    /// it back.
     private var tabControlAllowance: CGFloat {
-        88
+        136
     }
 
     private var activeTabKey: String {
@@ -643,8 +860,23 @@ struct ChatPane: View {
         return ""
     }
 
+    /// Past four tabs the strip drowns in truncated titles; background tabs
+    /// collapse to mark + short name and the selected tab keeps its full one.
+    private var isCrowded: Bool {
+        visibleTabs.count
+            + (model.openFilePaths[workspace.id]?.count ?? 0) > 4
+    }
+
+    /// "Femtosecond Chemistry" → "Femtosecond": the first word carries the
+    /// scientist identity; the rest is what was drowning the strip.
+    private func shortTitle(_ title: String) -> String {
+        let first = title.split(separator: " ").first.map(String.init) ?? title
+        return String(first.prefix(12))
+    }
+
     private func fileTabLabel(_ path: String) -> some View {
         let isSelected = model.activeFilePath[workspace.id] == path
+        let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             SourceFileIcon(path: path, size: 16)
             HStack(spacing: 6) {
@@ -658,8 +890,9 @@ struct ChatPane: View {
                     .onTapGesture { model.closeDiffFile(path, in: workspace.id) }
             }
         }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: 190, minHeight: 28)
+        .padding(.horizontal, compact ? 8 : 10)
+        .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
+        .help(compact ? path : "")
         .foregroundStyle(isSelected ? .primary : .secondary)
         .oreNavigationSelection(
             isSelected: isSelected,
@@ -677,6 +910,7 @@ struct ChatPane: View {
         let isSelected = tab.id == chatSummary?.id && model.activeFilePath[workspace.id] == nil
         let tabState = model.chat(for: tab.id)
         let isWorking = tabState.isBusy
+        let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected && !isWorking)
             HStack(spacing: 6) {
@@ -688,17 +922,20 @@ struct ChatPane: View {
                 } else if tab.hasUnread {
                     Circle().fill(.blue).frame(width: 6, height: 6)
                 }
-                Text(tab.title)
+                Text(compact ? shortTitle(tab.title) : tab.title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
+                if !compact, !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
                     Image(systemName: "pencil").font(.system(size: 8))
                 }
                 if tab.queuedMessageCount > 0 {
                     Text("\(tab.queuedMessageCount)")
                         .font(.caption2.monospacedDigit())
                 }
-                if model.chats(for: workspace.id).count > 1 {
+                // Compact tabs keep the close affordance on hover — hiding it
+                // entirely forced a select-then-close dance.
+                if visibleTabs.count > 1,
+                   !compact || hoveredTabKey == "chat:\(tab.id.rawValue)" {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .semibold))
                         .opacity(hoveredTabKey == "chat:\(tab.id.rawValue)" || isSelected ? 1 : 0)
@@ -707,8 +944,9 @@ struct ChatPane: View {
                 }
             }
         }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: 190, minHeight: 28)
+        .padding(.horizontal, compact ? 8 : 10)
+        .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
+        .help(compact ? tab.title : "")
         .foregroundStyle(isSelected ? .primary : .secondary)
         // The active tab is at full strength; every other tab recedes — even a
         // working one — so which tab you're actually in is never in doubt. A
@@ -753,6 +991,20 @@ struct ChatPane: View {
     @ViewBuilder
     private var trailingControls: some View {
         HStack(spacing: OreTheme.Space.xs) {
+            Button {
+                // ⌘F never closes: pressed with the bar already open it
+                // returns focus to the field. Esc is what closes.
+                isSearching = true
+                searchFocusRequest += 1
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .padding(.horizontal, 6)
+                    .frame(height: 26)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .keyboardShortcut("f", modifiers: .command)
+            .help("Find in transcript (⌘F)")
+
             Button { model.createChat(in: workspace.id) } label: {
                 HStack(spacing: 5) {
                     if model.chatCreationsInFlight.contains(workspace.id) {
@@ -1283,7 +1535,8 @@ struct ChatPane: View {
     }
 
     private func effortButton(for tab: ChatSummary) -> some View {
-        Button { showEffortChooser.toggle() } label: {
+        let efforts = availableEfforts(for: tab)
+        return Button { showEffortChooser.toggle() } label: {
             effortChipLabel
         }
         .buttonStyle(OrePressableButtonStyle())
@@ -1301,11 +1554,13 @@ struct ChatPane: View {
         .popover(isPresented: $showEffortChooser, arrowEdge: .bottom) {
             EffortChooser(
                 selection: $reasoningEffort,
-                efforts: availableEfforts(for: tab),
+                efforts: efforts,
                 harness: tab.harness
             )
         }
-        .help("Reasoning effort: \(reasoningEffort.displayName). Scroll to adjust.")
+        .help(efforts.count == 1
+            ? "Reasoning effort: \(efforts[0].displayName), selected automatically for this model."
+            : "Reasoning effort: \(reasoningEffort.displayName). Scroll to adjust.")
     }
 
     private var effortChipLabel: some View {
@@ -1358,6 +1613,16 @@ struct ChatPane: View {
         !availableEfforts(for: tab).isEmpty
     }
 
+    /// Changes whenever the selected model's effective effort capabilities do.
+    /// It deliberately includes the discovered values, not only the model id:
+    /// a late CLI catalog refresh can correct a stale built-in catalog in place.
+    private var effortCapabilityKey: String {
+        guard let tab = chatSummary else { return "none" }
+        return ([tab.harness.rawValue, tab.model ?? "default"]
+            + availableEfforts(for: tab).map(\.rawValue))
+            .joined(separator: "|")
+    }
+
     private func availableEfforts(
         for tab: ChatSummary,
         harness: HarnessKind? = nil,
@@ -1398,8 +1663,20 @@ struct ChatPane: View {
     ) {
         let efforts = availableEfforts(for: tab, harness: harness, modelID: modelID)
         guard !efforts.isEmpty else { return }
-        if efforts.contains(reasoningEffort) { return }
-        reasoningEffort = preferredEffort(in: efforts)
+        let resolved = efforts.contains(reasoningEffort)
+            ? reasoningEffort
+            : preferredEffort(in: efforts)
+        if reasoningEffort != resolved {
+            reasoningEffort = resolved
+        }
+        // If an out-of-band command persisted an unsupported value while the
+        // local state was already valid, `onChange` above will not fire. Repair
+        // the stored chat too, but only when resolving its current model (the
+        // picker also calls this speculatively before its model-change event).
+        if harness == nil, modelID == nil,
+           tab.reasoningEffort != nil, tab.reasoningEffort != resolved {
+            model.setEffort(resolved, for: tab)
+        }
     }
 
     private func persistEffort(_ effort: ReasoningEffort) {
@@ -2221,10 +2498,13 @@ struct ChatPane: View {
     private var mentionSuggestions: [WorkspaceFileNode] {
         guard let mention = activeMention else { return [] }
         let query = mention.query.lowercased()
+        // One set, not an array `contains` per file: with hundreds of files
+        // in the index the per-keystroke filter was quadratic.
+        let attachedPaths = Set(chat.draftAttachments.map(\.relativePath))
         return workspaceFileIndex
             .filter { node in
                 !node.isDirectory
-                    && !chat.draftAttachments.contains(where: { $0.relativePath == node.path })
+                    && !attachedPaths.contains(node.path)
                     && (query.isEmpty
                         || node.name.lowercased().contains(query)
                         || node.path.lowercased().contains(query))
@@ -2484,6 +2764,400 @@ enum ComposerBusyCopy {
     }
 }
 
+/// The find bar (⌘F): live query over the visible transcript with next /
+/// previous navigation, plus the escape hatch upward — "Ask All Tabs" (⌘↩)
+/// turns the query into a question answered with every tab's recent context.
+///
+/// The query is *local* state, deliberately: bound to the pane, every
+/// keystroke re-evaluated the whole ChatPane body — tab strip, suggestion
+/// ladder, transcript host diffing — which is the lag the composer had
+/// already eliminated. The pane only hears the debounced query.
+private struct TranscriptSearchBar: View {
+    let anchor: TranscriptScrollAnchor
+    /// Bumped by ⌘F while the bar is already open — refocus the field.
+    var focusRequest = 0
+    let onQueryChange: (String) -> Void
+    let onAskTabs: (String) -> Void
+    let onClose: () -> Void
+    @State private var query = ""
+    @State private var debounce: Task<Void, Never>?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            TextField("Find in transcript — or ask a question…", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: OreTheme.Font.body))
+                .focused($focused)
+                // Enter walks *older* — the search starts at the newest match
+                // and climbs up through history.
+                .onSubmit { anchor.findPrevious() }
+                .onExitCommand(perform: onClose)
+                .onChange(of: query) { _, value in
+                    debounce?.cancel()
+                    debounce = Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(180))
+                        guard !Task.isCancelled else { return }
+                        onQueryChange(value)
+                    }
+                }
+
+            if anchor.searchMatchCount > 0 {
+                Text("\(anchor.searchMatchOrdinal) of \(anchor.searchMatchCount)")
+                    .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            } else if !query.isEmpty {
+                Text("No matches")
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.tertiary)
+            }
+
+            Button { anchor.findPrevious() } label: {
+                Image(systemName: "chevron.up").frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+            .disabled(anchor.searchMatchCount == 0)
+            .help("Previous match (⇧⌘G)")
+
+            Button { anchor.findNext() } label: {
+                Image(systemName: "chevron.down").frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("g", modifiers: .command)
+            .disabled(anchor.searchMatchCount == 0)
+            .help("Next match (⌘G)")
+
+            Divider().frame(height: 14)
+
+            Button("Ask All Tabs ⌘↩") { onAskTabs(query) }
+                .buttonStyle(.link)
+                .font(.system(size: OreTheme.Font.body, weight: .medium))
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty)
+                .help(
+                    "Answer this as a question right here (⌘↩), using the "
+                        + "recent context of every conversation in this workspace"
+                )
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .help("Close (Esc)")
+        }
+        .padding(.horizontal, OreTheme.Space.sm)
+        .frame(height: 32)
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(OreTheme.hairline, lineWidth: 1)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.vertical, OreTheme.Space.xs)
+        .onAppear { focused = true }
+        .onChange(of: focusRequest) { _, _ in focused = true }
+    }
+}
+
+/// The find bar's answer surface: the ephemeral chat's reply, streamed in
+/// place — and, when that agent needs to ask something back, the question
+/// itself, fully readable with its options and a free-form reply. The chat
+/// behind it never becomes a tab and closes with the bar.
+private struct CrossTabAnswerPanel: View {
+    var state: ChatState
+    let onAnswer: (String) -> Void
+    @State private var freeform = ""
+
+    private var answer: String? {
+        state.rows.last { $0.kind == .assistantText && !$0.text.isEmpty }?.text
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.magnifyingglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                Text("Answer from all tabs")
+                    .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if state.isBusy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            if let question = state.pendingQuestion {
+                questionView(question)
+            } else if let answer {
+                ScrollView {
+                    Text((try? AttributedString(markdown: answer)) ?? AttributedString(answer))
+                        .font(.system(size: OreTheme.Font.prose))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+            } else {
+                Text(state.isBusy ? "Reading every tab…" : "Waiting for the agent…")
+                    .font(.system(size: OreTheme.Font.body))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(OreTheme.Space.sm + 2)
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: OreTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.controlRadius)
+                .stroke(OreTheme.hairline, lineWidth: 1)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.bottom, OreTheme.Space.xs)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// The agent's counter-question, in full: the whole prompt (no
+    /// truncation), each option as its own readable button, and the free-form
+    /// field when the question allows one.
+    @ViewBuilder
+    private func questionView(_ question: AgentQuestion) -> some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "questionmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text(question.prompt)
+                    .font(.system(size: OreTheme.Font.prose))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                Button {
+                    onAnswer(option.label)
+                } label: {
+                    Text(option.label)
+                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(OreTheme.selectedFill, in: RoundedRectangle(cornerRadius: OreTheme.tabRadius))
+                        .contentShape(RoundedRectangle(cornerRadius: OreTheme.tabRadius))
+                }
+                .buttonStyle(OrePressableButtonStyle())
+            }
+
+            if question.allowsFreeform {
+                HStack(spacing: OreTheme.Space.xs) {
+                    TextField("Or answer in your own words…", text: $freeform)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { submitFreeform() }
+                    Button { submitFreeform() } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(freeform.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func submitFreeform() {
+        let text = freeform.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        onAnswer(text)
+        freeform = ""
+    }
+}
+
+/// The floating capsule above the composer — the reference design's "Give me
+/// a summary of the changes today". Tap sends it; hovering reveals a dismiss.
+private struct ComposerSuggestionChip: View {
+    let text: String
+    var icon: String = "sparkles"
+    let onSend: () -> Void
+    let onDismiss: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Button(action: onSend) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                    Text(text)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 28)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .help("Send this prompt")
+
+            if isHovering {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 4)
+                .help("Dismiss")
+            }
+        }
+        .background(.regularMaterial, in: Capsule())
+        .overlay { Capsule().stroke(OreTheme.hairline, lineWidth: 1) }
+        .shadow(color: .black.opacity(0.06), radius: 6, y: 2)
+        .onHover { isHovering = $0 }
+        .animation(.easeOut(duration: 0.15), value: isHovering)
+    }
+}
+
+/// The pane's presence line: one dot per agent under the tab strip — "Claude
+/// is thinking · Codex is idle" — so who is live in this workspace is readable
+/// without hunting for the composer's animated border. One entry per harness,
+/// not per tab: presence is about the agent, and its most alive chat speaks
+/// for it.
+struct AgentPresenceStrip: View {
+    let chats: [ChatSummary]
+    /// When set, every harness appears — "Cursor is idle" included — so the
+    /// roster reads as the full crew, not just whoever has a tab open.
+    var showsAllHarnesses = false
+
+    struct Entry: Equatable, Identifiable {
+        var id: String
+        var text: String
+        var isLive: Bool
+        var needsYou: Bool
+        var failed: Bool
+    }
+
+    var body: some View {
+        HStack(spacing: OreTheme.Space.md) {
+            ForEach(displayEntries) { entry in
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(dotColor(for: entry))
+                        .frame(width: 6, height: 6)
+                    Text(entry.text)
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(entry.needsYou || entry.failed ? .primary : .secondary)
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: displayEntries)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The roster with the boring parts folded: whoever needs you or is
+    /// working gets named; the idle remainder collapses to one entry —
+    /// "Claude is idle · Codex is idle · Cursor is idle" said nothing three
+    /// times that "All agents idle" says once.
+    var displayEntries: [Entry] {
+        let all = entries
+        let interesting = all.filter { $0.isLive || $0.needsYou || $0.failed }
+        let idle = all.filter { !$0.isLive && !$0.needsYou && !$0.failed }
+
+        if interesting.isEmpty {
+            guard !idle.isEmpty else { return [] }
+            if idle.count == 1 { return idle }
+            return [Entry(
+                id: "all-idle",
+                text: "All agents idle",
+                isLive: false, needsYou: false, failed: false
+            )]
+        }
+        var result = interesting
+        if idle.count == 1 {
+            result.append(idle[0])
+        } else if idle.count > 1 {
+            result.append(Entry(
+                id: "idle-rest",
+                text: "\(idle.count) idle",
+                isLive: false, needsYou: false, failed: false
+            ))
+        }
+        return result
+    }
+
+    private func dotColor(for entry: Entry) -> Color {
+        if entry.failed { return OreTheme.Status.failed }
+        if entry.needsYou { return OreTheme.Status.needsYou }
+        return entry.isLive ? OreTheme.Presence.active : OreTheme.Presence.idle.opacity(0.6)
+    }
+
+    var entries: [Entry] {
+        var byHarness: [HarnessKind: AgentStatus] = [:]
+        var order: [HarnessKind] = []
+        if showsAllHarnesses {
+            order = HarnessKind.allCases
+            for harness in order { byHarness[harness] = .idle }
+        }
+        for chat in chats {
+            if byHarness[chat.harness] == nil { order.append(chat.harness) }
+            byHarness[chat.harness] = Self.livelier(byHarness[chat.harness], chat.status)
+        }
+        return order.map { harness in
+            let status = byHarness[harness] ?? .idle
+            return Entry(
+                id: harness.rawValue,
+                text: "\(Self.shortName(harness)) is \(Self.phrase(for: status))",
+                isLive: Self.rank(status) >= Self.rank(.requesting),
+                needsYou: status == .awaitingInput,
+                failed: status == .failed
+            )
+        }
+    }
+
+    /// "Claude", not "Claude Code" — the presence line reads like the
+    /// reference design's roster, and the surname is chrome.
+    static func shortName(_ harness: HarnessKind) -> String {
+        harness.displayName.split(separator: " ").first.map(String.init)
+            ?? harness.displayName
+    }
+
+    static func phrase(for status: AgentStatus) -> String {
+        switch status {
+        case .runningTool: "running a tool"
+        case .thinking: "thinking"
+        case .requesting: "working"
+        case .awaitingInput: "waiting on you"
+        case .failed: "stopped on an error"
+        case .interrupted: "paused"
+        case .idle: "idle"
+        }
+    }
+
+    static func livelier(_ current: AgentStatus?, _ next: AgentStatus) -> AgentStatus {
+        guard let current else { return next }
+        return rank(next) > rank(current) ? next : current
+    }
+
+    private static func rank(_ status: AgentStatus) -> Int {
+        switch status {
+        case .runningTool: 6
+        case .thinking: 5
+        case .requesting: 4
+        case .awaitingInput: 3
+        case .failed: 2
+        case .interrupted: 1
+        case .idle: 0
+        }
+    }
+}
+
 /// A stable overlay rather than another transcript row. It makes work obvious
 /// at a glance while keeping streamed text from repeatedly inserting/removing
 /// loading content and shifting the scroll position.
@@ -2502,9 +3176,13 @@ private struct ComposerBusyStatus: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             HStack(spacing: 7) {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.8)
+                // Who is working, in the same visual language as the header's
+                // presence line: the agent's mark and a live green dot. The
+                // composer's sweeping border already supplies the motion.
+                HarnessMark(harness: harness, size: 15)
+                Circle()
+                    .fill(OreTheme.Presence.active)
+                    .frame(width: 6, height: 6)
                 Text(ComposerBusyCopy.label(
                     harness: harness,
                     status: status,
@@ -3143,6 +3821,7 @@ private struct EffortChooser: View {
     let harness: HarnessKind
 
     var body: some View {
+        let scale = EffortPickerScale(efforts: efforts)
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label("Reasoning effort", systemImage: "chart.bar.fill")
@@ -3150,13 +3829,26 @@ private struct EffortChooser: View {
                 Spacer()
                 Text(selection.displayName).foregroundStyle(.secondary)
             }
-            Slider(value: indexBinding, in: 0...Double(max(0, efforts.count - 1)), step: 1)
-            HStack {
-                Text("Faster")
-                Spacer()
-                Text("Deeper")
+            if let range = scale.sliderRange {
+                Slider(value: indexBinding, in: range, step: 1)
+                HStack {
+                    Text("Faster")
+                    Spacer()
+                    Text("Deeper")
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            } else if let only = efforts.first {
+                Label(
+                    "\(only.displayName) is selected automatically for this model.",
+                    systemImage: "checkmark.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                Text("This model does not expose a reasoning-effort control.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .font(.caption).foregroundStyle(.secondary)
             Text(harness == .claudeCode
                 ? "Applied through your Claude Code session. Scroll the chip to adjust."
                 : "Applied to the next Codex turn. Scroll the chip to adjust.")
@@ -3167,13 +3859,36 @@ private struct EffortChooser: View {
     }
 
     private var indexBinding: Binding<Double> {
-        Binding(
-            get: { Double(efforts.firstIndex(of: selection) ?? min(2, max(0, efforts.count - 1))) },
+        let scale = EffortPickerScale(efforts: efforts)
+        return Binding(
+            get: { scale.value(for: selection) },
             set: {
-                guard !efforts.isEmpty else { return }
-                selection = efforts[Int($0.rounded()).clamped(to: 0...(efforts.count - 1))]
+                guard let resolved = scale.selection(at: $0) else { return }
+                selection = resolved
             }
         )
+    }
+}
+
+/// The safe, testable index mapping behind the effort slider. A slider exists
+/// only when there are at least two choices; SwiftUI treats `0...0` as an
+/// invalid slider interval and traps while presenting the popover.
+struct EffortPickerScale {
+    let efforts: [ReasoningEffort]
+
+    var sliderRange: ClosedRange<Double>? {
+        guard efforts.count > 1 else { return nil }
+        return 0...Double(efforts.count - 1)
+    }
+
+    func value(for selection: ReasoningEffort) -> Double {
+        Double(efforts.firstIndex(of: selection) ?? min(2, max(0, efforts.count - 1)))
+    }
+
+    func selection(at value: Double) -> ReasoningEffort? {
+        guard !efforts.isEmpty else { return nil }
+        let index = Int(value.rounded()).clamped(to: 0...(efforts.count - 1))
+        return efforts[index]
     }
 }
 
@@ -3530,10 +4245,39 @@ private struct PermissionCard: View {
                 .help("Deny this tool (Esc). From the composer, ⇧⌘D.")
 
                 // Harness-suggested shortcuts, kept as raw payloads so what we
-                // send back is exactly what was offered.
-                ForEach(Array(request.suggestions.enumerated()), id: \.offset) { _, suggestion in
-                    Button(suggestion.title) { onDecision(.allowWithSuggestion(suggestion.raw)) }
+                // send back is exactly what was offered. One suggestion reads
+                // inline at full width; several collapse into a menu — three
+                // side-by-side "Always allow B…" stubs told the user nothing.
+                if request.suggestions.count == 1, let only = request.suggestions.first {
+                    Button(only.title) { onDecision(.allowWithSuggestion(only.raw)) }
                         .buttonStyle(.link)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .help(only.title)
+                } else if !request.suggestions.isEmpty {
+                    Menu {
+                        ForEach(Array(request.suggestions.enumerated()), id: \.offset) { _, suggestion in
+                            Button(suggestion.title) {
+                                onDecision(.allowWithSuggestion(suggestion.raw))
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Always allow")
+                                .font(.system(size: OreTheme.Font.body, weight: .medium))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: OreTheme.RowHeight.button)
+                        .background(OreTheme.subduedFill, in: Capsule())
+                        .overlay { Capsule().stroke(OreTheme.hairline) }
+                        .contentShape(Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Standing approvals offered by the agent — read each before granting")
                 }
 
                 Spacer()
@@ -3742,6 +4486,10 @@ private struct ComposerModeTag: View {
 private struct TranscriptHost: View, Equatable {
     var chat: ChatState
     var worktreePath: String
+    /// Short agent name ("Claude") for the transcript's turn headers.
+    var agentName: String
+    /// The find bar's live query; empty when the bar is closed.
+    var searchQuery: String
     var persistenceKey: String
     var expandedActivityGroups: Set<String>
     var canFork: Bool
@@ -3780,6 +4528,8 @@ private struct TranscriptHost: View, Equatable {
         lhs.chat === rhs.chat
             && lhs.scrollAnchor === rhs.scrollAnchor
             && lhs.worktreePath == rhs.worktreePath
+            && lhs.agentName == rhs.agentName
+            && lhs.searchQuery == rhs.searchQuery
             && lhs.persistenceKey == rhs.persistenceKey
             && lhs.canFork == rhs.canFork
             && lhs.expandedActivityGroups == rhs.expandedActivityGroups
@@ -3791,6 +4541,8 @@ private struct TranscriptHost: View, Equatable {
         TranscriptView(
             rows: displayRows,
             isBusy: chat.isBusy,
+            agentName: agentName,
+            searchQuery: searchQuery,
             worktreePath: worktreePath,
             persistenceKey: persistenceKey,
             onRevert: onRevert,
@@ -3881,6 +4633,7 @@ private struct BusyTabDot: View {
 private struct DraftCommentsBar: View {
     let comments: [DiffCommentReference]
     let onRemove: (Int) -> Void
+    let onClearAll: () -> Void
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -3900,6 +4653,15 @@ private struct DraftCommentsBar: View {
                     .padding(.vertical, 3)
                     .background(OreTheme.subduedFill, in: Capsule())
                     .help(comment.body)
+                }
+
+                // A batch of chips deserves a batch exit — culling ten pending
+                // comments one ✕ at a time was busywork.
+                if comments.count > 1 {
+                    Button("Clear all", action: onClearAll)
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                        .help("Remove every pending comment")
                 }
             }
             .padding(.horizontal, OreTheme.Space.md)

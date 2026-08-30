@@ -628,7 +628,7 @@ extension InProcessCoreClient {
         let kind: HarnessKind? = switch reference.lowercased() {
         case "claude", "claudecode", "claude-code": .claudeCode
         case "codex": .codex
-        case "cursor", "cursor-agent": .cursorAgent
+        case "cursor", "cursor-agent", "agent": .cursorAgent
         default: HarnessKind(rawValue: reference)
         }
         guard let kind else {
@@ -655,6 +655,8 @@ extension InProcessCoreClient {
             var line = "\(probe.kind.rawValue): "
             if !probe.isInstalled {
                 line += "not installed"
+            } else if probe.isEnabled == false {
+                line += "installed but disabled"
             } else if probe.authState == .notAuthenticated {
                 line += "installed but not signed in"
             } else {

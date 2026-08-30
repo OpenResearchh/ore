@@ -1,37 +1,125 @@
 import AppKit
 import SwiftUI
 
-/// The floating "the assistant can hear you" pill.
+/// The floating assistant pill.
 ///
-/// Shown while the hold-to-talk mic is open and until the reply lands, on a
-/// borderless non-activating panel — it appears over whatever app the user is
-/// in without taking focus from it, which is the voice mode's whole contract.
-/// Deliberately small and contained: a waveform that breathes with the voice,
-/// and one line of what the recognizer is hearing.
+/// Two jobs on one borderless, non-activating panel that appears over
+/// whatever app the user is in without taking focus:
+/// - While the hold-to-talk mic is open: a waveform that breathes with the
+///   voice and one line of what the recognizer is hearing.
+/// - When a tab is blocked on the user and they're away from ORE (or mid
+///   voice session): the ask itself, with clickable Allow / Deny / options —
+///   the spoken "quick check" and the buttons to answer it live in one place.
 @MainActor
 final class AssistantVoiceHUD {
     static let shared = AssistantVoiceHUD()
 
+    /// What the SwiftUI content should currently render. Written only by
+    /// `evaluate()` so the panel's size and the view's rows can never
+    /// disagree.
+    @Observable
+    final class DisplayState {
+        var showsVoiceRow = false
+        var showsActions = false
+    }
+
     private var panel: NSPanel?
     private var hideTask: Task<Void, Never>?
+    private weak var model: AppModel?
+    private var controller: VoiceAssistantController?
+    private let display = DisplayState()
+    /// Cards the user waved away with ✕ — the ask itself stays pending (in
+    /// the app's own card and the menu bar); only this surface goes quiet.
+    private var dismissedNeedsYouIDs: Set<String> = []
 
-    private static let size = NSSize(width: 380, height: 56)
+    private static let pillSize = NSSize(width: 380, height: 56)
+    private static let actionWidth: CGFloat = 460
+
+    func dismissNeedsYouCard(_ id: String) {
+        dismissedNeedsYouIDs.insert(id)
+        evaluate()
+    }
 
     private init() {}
 
+    /// Called once from `AppModel.start()`; the HUD then follows the model's
+    /// needs-you list and the voice phase on its own.
+    func bind(model: AppModel) {
+        self.model = model
+        controller = model.voiceAssistant
+        armObservation()
+        for name in [
+            NSApplication.didBecomeActiveNotification,
+            NSApplication.didResignActiveNotification,
+        ] {
+            NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { _ in
+                Task { @MainActor in AssistantVoiceHUD.shared.evaluate() }
+            }
+        }
+        evaluate()
+    }
+
     func phaseChanged(_ controller: VoiceAssistantController) {
-        if controller.phase == .idle {
-            hide()
-        } else {
-            show(controller)
+        self.controller = controller
+        evaluate()
+    }
+
+    /// Re-arms after every change: `withObservationTracking` is one-shot.
+    private func armObservation() {
+        guard let model, let controller else { return }
+        withObservationTracking {
+            _ = model.tabNeedsYou
+            _ = controller.phase
+        } onChange: {
+            Task { @MainActor in
+                AssistantVoiceHUD.shared.evaluate()
+                AssistantVoiceHUD.shared.armObservation()
+            }
         }
     }
 
-    private func show(_ controller: VoiceAssistantController) {
+    /// The needs-you item worth surfacing on the pill right now. In-app, the
+    /// transcript's own card is the answer surface; the pill takes over when
+    /// the user is somewhere else or mid voice session.
+    private var actionableNeedsYou: TabNeedsYou? {
+        guard let model,
+              let item = model.tabNeedsYou.last(where: { !dismissedNeedsYouIDs.contains($0.id) })
+        else { return nil }
+        let voiceActive = (controller?.phase ?? .idle) != .idle
+        guard voiceActive || !NSApp.isActive else { return nil }
+        return item
+    }
+
+    private func evaluate() {
+        let voiceActive = (controller?.phase ?? .idle) != .idle
+        let actionable = actionableNeedsYou
+        let actions = actionable != nil
+        display.showsVoiceRow = voiceActive
+        display.showsActions = actions
+        guard voiceActive || actions else {
+            hide()
+            return
+        }
+
         hideTask?.cancel()
         hideTask = nil
-        let panel = panel ?? makePanel(controller)
-        position(panel)
+        let panel = panel ?? makePanel()
+        // Questions carry a full prompt plus an options row and need the
+        // taller card; permissions stay one line.
+        let isQuestion = if case .question = actionable { true } else { false }
+        let actionHeight: CGFloat = isQuestion ? 128 : 76
+        let size = voiceActive && actions
+            ? NSSize(width: Self.actionWidth, height: 64 + actionHeight)
+            : actions
+            ? NSSize(width: Self.actionWidth, height: actionHeight)
+            : Self.pillSize
+        panel.setContentSize(size)
+        // Buttons need the mouse; the voice-only pill must stay a ghost so
+        // it never blocks clicks in the app underneath it.
+        panel.ignoresMouseEvents = !actions
+        position(panel, size: size)
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
@@ -53,11 +141,12 @@ final class AssistantVoiceHUD {
         }
     }
 
-    private func makePanel(_ controller: VoiceAssistantController) -> NSPanel {
+    private func makePanel() -> NSPanel {
         let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: Self.size),
+            contentRect: NSRect(origin: .zero, size: Self.pillSize),
             // Non-activating is the load-bearing bit: the pill can appear over
-            // Safari without Safari losing the keyboard.
+            // Safari without Safari losing the keyboard — and its buttons
+            // still take clicks without activating ORE.
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -71,20 +160,24 @@ final class AssistantVoiceHUD {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.alphaValue = 0
-        panel.contentView = NSHostingView(rootView: AssistantHUDView(controller: controller))
+        panel.contentView = NSHostingView(rootView: AssistantHUDView(
+            controller: controller ?? VoiceAssistantController(),
+            model: model,
+            display: display
+        ))
         self.panel = panel
         return panel
     }
 
     /// Bottom-centre of whichever screen the user is working on — the mouse's
     /// screen, not ORE's, since the whole point is being somewhere else.
-    private func position(_ panel: NSPanel) {
+    private func position(_ panel: NSPanel, size: NSSize) {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.main
         guard let frame = screen?.visibleFrame else { return }
         panel.setFrameOrigin(NSPoint(
-            x: frame.midX - Self.size.width / 2,
+            x: frame.midX - size.width / 2,
             y: frame.minY + 84
         ))
     }
@@ -92,8 +185,28 @@ final class AssistantVoiceHUD {
 
 private struct AssistantHUDView: View {
     var controller: VoiceAssistantController
+    var model: AppModel?
+    var display: AssistantVoiceHUD.DisplayState
 
     var body: some View {
+        VStack(spacing: 8) {
+            Spacer(minLength: 0)
+            if display.showsVoiceRow {
+                voicePill
+            }
+            if display.showsActions, let model, let item = model.tabNeedsYou.last {
+                NeedsYouActionCard(item: item, model: model) {
+                    AssistantVoiceHUD.shared.dismissNeedsYouCard(item.id)
+                }
+            }
+        }
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeOut(duration: 0.2), value: display.showsActions)
+        .animation(.easeOut(duration: 0.2), value: controller.phase)
+    }
+
+    private var voicePill: some View {
         HStack(spacing: 12) {
             Image(systemName: controller.phase == .speaking ? "speaker.wave.2.fill" : "sparkles")
                 .font(.system(size: 13, weight: .semibold))
@@ -118,8 +231,6 @@ private struct AssistantHUDView: View {
         .background(.ultraThinMaterial, in: Capsule())
         .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1))
         .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
-        .frame(width: 380, height: 56)
-        .animation(.easeOut(duration: 0.2), value: controller.phase)
     }
 
     private var micIsOpen: Bool {
@@ -159,13 +270,203 @@ private struct AssistantHUDView: View {
     }
 }
 
+/// The ask, answerable in place: what a blocked tab wants, with the same
+/// Allow / Deny / standing options the in-app card offers — so the spoken
+/// "quick check" can be settled with one click from any app. Questions get
+/// two rows: the full prompt, then the options — a one-line squeeze
+/// truncated both into uselessness. ✕ quiets this card only; the ask stays
+/// pending in the app and the menu bar.
+private struct NeedsYouActionCard: View {
+    let item: TabNeedsYou
+    let model: AppModel
+    let onDismiss: () -> Void
+
+    var body: some View {
+        Group {
+            switch item {
+            case .permission(let payload):
+                HStack(spacing: 10) {
+                    Image(systemName: "hand.raised.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(payload.request.displayName ?? payload.request.toolName)
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                        if let summary = payload.request.summary, !summary.isEmpty {
+                            Text(summary)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    permissionButtons(payload)
+                    dismissButton
+                }
+                .frame(width: 460 - 16, height: 56)
+
+            case .question(let payload):
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "questionmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                        Text(payload.question.prompt)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        dismissButton
+                    }
+                    HStack(spacing: 8) {
+                        questionButtons(payload)
+                        Spacer(minLength: 0)
+                    }
+                }
+                .padding(.vertical, 10)
+                .frame(width: 460 - 16)
+            }
+        }
+        .padding(.horizontal, 14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private var dismissButton: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 20, height: 20)
+                .background(Color.primary.opacity(0.06), in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help("Hide this card — the question stays pending in ORE")
+    }
+
+    @ViewBuilder
+    private func permissionButtons(_ payload: TabNeedsYou.Permission) -> some View {
+        Button("Allow") {
+            model.resolvePermission(
+                payload.request.id, decision: .allow,
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        }
+        .buttonStyle(HUDActionButtonStyle(prominent: true))
+
+        Button("Deny") {
+            model.resolvePermission(
+                payload.request.id,
+                decision: .deny(reason: "The user denied this from the assistant pill."),
+                for: payload.workspaceID, chatID: payload.chatID
+            )
+        }
+        .buttonStyle(HUDActionButtonStyle())
+
+        if !payload.request.suggestions.isEmpty {
+            Menu {
+                ForEach(
+                    Array(payload.request.suggestions.enumerated()), id: \.offset
+                ) { _, suggestion in
+                    Button(suggestion.title) {
+                        model.resolvePermission(
+                            payload.request.id,
+                            decision: .allowWithSuggestion(suggestion.raw),
+                            for: payload.workspaceID, chatID: payload.chatID
+                        )
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .contentShape(Circle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Standing approvals offered by the agent")
+        }
+    }
+
+    /// Up to two options inline; the rest — and only-freeform questions —
+    /// hand off to the app, where typing is possible.
+    @ViewBuilder
+    private func questionButtons(_ payload: TabNeedsYou.Question) -> some View {
+        ForEach(Array(payload.question.options.prefix(2).enumerated()), id: \.offset) { _, option in
+            Button(option.label) {
+                model.answerQuestion(
+                    payload.question.id, answer: option.label,
+                    for: payload.workspaceID, chatID: payload.chatID
+                )
+            }
+            .buttonStyle(HUDActionButtonStyle())
+            .frame(maxWidth: 190)
+            .help(option.label)
+        }
+        if payload.question.options.count > 2 {
+            Menu {
+                ForEach(
+                    Array(payload.question.options.dropFirst(2).enumerated()), id: \.offset
+                ) { _, option in
+                    Button(option.label) {
+                        model.answerQuestion(
+                            payload.question.id, answer: option.label,
+                            for: payload.workspaceID, chatID: payload.chatID
+                        )
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .contentShape(Circle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+    }
+}
+
+/// Compact pill buttons sized for the HUD — the in-app button styles are a
+/// row taller than this panel wants.
+private struct HUDActionButtonStyle: ButtonStyle {
+    var prominent = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .lineLimit(1)
+            .foregroundStyle(prominent ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+            .padding(.horizontal, 12)
+            .frame(height: 26)
+            .background(
+                prominent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.08)),
+                in: Capsule()
+            )
+            .contentShape(Capsule())
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 /// The transcript, revealed a word at a time and scrolled to keep the newest
 /// word in view.
 ///
 /// Replaces a static "…last nine words", which showed a finished sentence with
 /// an ellipsis bolted on and looked identical whether the assistant was
 /// mid-word or done. The scroll is programmatic only — the panel ignores mouse
-/// events, so there is nothing for a user to drag.
+/// events while voice-only, so there is nothing for a user to drag.
 private struct StreamingTranscript: View {
     var text: String
     var placeholder: String
@@ -201,9 +502,9 @@ private struct StreamingTranscript: View {
                 .fixedSize(horizontal: true, vertical: false)
                 .animation(.easeOut(duration: 0.18), value: text)
             }
-            // No `scrollDisabled`: the panel already ignores mouse events, so
-            // there is no gesture to suppress — and the modifier has a habit of
-            // taking `scrollTo` down with it.
+            // No `scrollDisabled`: the voice-only panel already ignores mouse
+            // events, so there is no gesture to suppress — and the modifier
+            // has a habit of taking `scrollTo` down with it.
             .frame(height: 18)
             .onChange(of: text) { _, _ in
                 withAnimation(.easeOut(duration: 0.25)) {

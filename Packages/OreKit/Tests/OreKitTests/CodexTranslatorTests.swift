@@ -346,6 +346,29 @@ struct CodexTranslatorTests {
         #expect(project["default_tools_approval_mode"] == nil)
     }
 
+    @Test func workspaceWriteKeepsLinkedGitMetadataWritable() throws {
+        let gitRoot = URL(fileURLWithPath: "/private/tmp/repository/.git")
+        let threadConfig = CodexSession.workspaceWriteConfiguration(
+            writableRoots: [gitRoot, gitRoot]
+        )
+        #expect(threadConfig["writable_roots"]?.arrayValue?.map(\.stringValue) == [
+            gitRoot.path,
+        ])
+
+        let turnPolicy = CodexSession.sandboxPolicy(
+            permissionMode: .default,
+            writableRoots: [gitRoot]
+        )
+        #expect(turnPolicy["type"]?.stringValue == "workspaceWrite")
+        #expect(turnPolicy["writableRoots"]?.arrayValue?.map(\.stringValue) == [
+            gitRoot.path,
+        ])
+        #expect(CodexSession.sandboxPolicy(
+            permissionMode: .plan,
+            writableRoots: [gitRoot]
+        )["writableRoots"] == nil)
+    }
+
     @Test func aDelegationToolLandsOnTheSubagentRow() {
         // codex app-server has no subagent item type, so a handoff can only
         // arrive as an MCP tool. Naming it `Task` and aliasing its arguments is

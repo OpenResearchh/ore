@@ -14,9 +14,41 @@ struct Sidebar: View {
     @State private var renameWorkspace: WorkspaceSummary?
     @State private var renameText = ""
     @AppStorage("ore.collapsedRepositories") private var collapsedRepositoriesRaw = ""
+    @AppStorage("ore.sidebar.filter") private var filterRaw = SidebarFilter.all.rawValue
 
     private var collapsedRepositories: Set<String> {
         Set(collapsedRepositoriesRaw.split(separator: "\n").map(String.init))
+    }
+
+    private var filter: SidebarFilter {
+        SidebarFilter(rawValue: filterRaw) ?? .all
+    }
+
+    /// "Active" is the reference design's question — who is doing something or
+    /// waiting on me — not merely "exists": an agent working, blocked, failed,
+    /// or finished with unread output all count.
+    private func isActive(_ workspace: WorkspaceSummary) -> Bool {
+        if workspace.hasUnread { return true }
+        switch sidebarEffectiveStatus(for: workspace, chats: model.chats(for: workspace.id)) {
+        case .thinking, .requesting, .runningTool, .awaitingInput, .failed: return true
+        case .idle, .interrupted: return false
+        }
+    }
+
+    private var activeCount: Int {
+        model.sortedWorkspaces.filter(isActive).count
+    }
+
+    private var pinnedWorkspaces: [WorkspaceSummary] {
+        model.sortedWorkspaces.filter(\.isPinned)
+    }
+
+    /// What the main list shows: pinned rows live in their own strip, and the
+    /// Active tab narrows to workspaces that are doing something or need you.
+    private var listedWorkspaces: [WorkspaceSummary] {
+        var workspaces = model.sortedWorkspaces.filter { !$0.isPinned }
+        if filter == .active { workspaces = workspaces.filter(isActive) }
+        return workspaces
     }
 
     private struct RepositoryGroup: Identifiable {
@@ -33,7 +65,7 @@ struct Sidebar: View {
     }
 
     private var repositoryGroups: [RepositoryGroup] {
-        Dictionary(grouping: model.sortedWorkspaces, by: \.repositoryPath)
+        Dictionary(grouping: listedWorkspaces, by: \.repositoryPath)
             .map { path, workspaces in
                 RepositoryGroup(
                     path: path,
@@ -73,6 +105,24 @@ struct Sidebar: View {
         List {
             if model.sortedWorkspaces.isEmpty {
                 emptyState
+            } else if filter == .active, listedWorkspaces.isEmpty, pinnedWorkspaces.isEmpty {
+                Text("All agents are idle")
+                    .font(.system(size: OreTheme.Font.body))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, OreTheme.Space.sm)
+            }
+
+            if !pinnedWorkspaces.isEmpty {
+                Section {
+                    PinnedStrip(workspaces: pinnedWorkspaces, chatsFor: { model.chats(for: $0) })
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(
+                            top: 2, leading: OreTheme.Space.sm,
+                            bottom: OreTheme.Space.xs, trailing: OreTheme.Space.sm
+                        ))
+                } header: {
+                    Text("Pinned")
+                }
             }
 
             ForEach(repositoryGroups) { repository in
@@ -81,6 +131,7 @@ struct Sidebar: View {
                         WorkspaceRow(
                             workspace: workspace,
                             chats: model.chats(for: workspace.id),
+                            identity: model.researchIdentity(for: workspace),
                             isSelected: model.selectedWorkspaceID == workspace.id,
                             shortcutIndex: workspaceShortcuts[workspace.id],
                             onRename: {
@@ -93,9 +144,19 @@ struct Sidebar: View {
                             .contentShape(Rectangle())
                             .onTapGesture { model.selectedWorkspaceID = workspace.id }
                             .listRowBackground(
+                                // The selected workspace is the reference
+                                // design's solid pill — one loud selection,
+                                // everything else stays quiet.
                                 model.selectedWorkspaceID == workspace.id
-                                    ? OreTheme.selectedFill
-                                    : Color.clear
+                                    ? AnyView(
+                                        RoundedRectangle(
+                                            cornerRadius: OreTheme.pillRadius,
+                                            style: .continuous
+                                        )
+                                        .fill(OreTheme.selectedProminentFill)
+                                        .padding(.vertical, 2)
+                                    )
+                                    : AnyView(Color.clear)
                             )
                             .contextMenu { menu(for: workspace) }
                     }
@@ -145,20 +206,32 @@ struct Sidebar: View {
             else { return }
             setRepository(workspace.repositoryPath, expanded: true)
         }
+        // Warm every row's portrait up front instead of on first render, so
+        // faces appear with the list rather than popping in as you scroll.
+        .task(id: model.sortedWorkspaces.count) {
+            for workspace in model.sortedWorkspaces {
+                guard !Task.isCancelled else { return }
+                guard let identity = model.researchIdentity(for: workspace) else { continue }
+                _ = await ScientistPortraitCache.load(for: identity)
+            }
+        }
         .listStyle(.sidebar)
         // Inside a NavigationSplitView the system already renders the sidebar's
         // translucent material (and Liquid Glass on macOS 26); hiding the List's
         // own background lets that show through. A manual glassEffect here would
         // fight the system chrome, so it's intentionally gone.
         .scrollContentBackground(.hidden)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !model.sortedWorkspaces.isEmpty {
+                filterTabs
+                    .padding(.horizontal, OreTheme.Space.sm)
+                    .padding(.top, OreTheme.Space.xs)
+                    .padding(.bottom, OreTheme.Space.sm)
+            }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack(spacing: OreTheme.Space.sm) {
-                Image(systemName: "square.stack.3d.up")
-                    .font(.system(size: OreTheme.Font.body))
-                    .foregroundStyle(.secondary)
-                Text("\(model.sortedWorkspaces.count) active")
-                    .font(.system(size: OreTheme.Font.body))
-                    .foregroundStyle(.secondary)
+                connectedPill
                 Spacer()
                 SettingsLink {
                     Image(systemName: "gearshape")
@@ -188,6 +261,70 @@ struct Sidebar: View {
             }
             Button("Cancel", role: .cancel) { renameWorkspace = nil }
         }
+    }
+
+    /// The reference design's segmented capsule: All | Active, each with its
+    /// count. Selection stays quiet (a primary wash, not accent) so the blue
+    /// pill remains reserved for the selected workspace row.
+    private var filterTabs: some View {
+        HStack(spacing: 2) {
+            ForEach(SidebarFilter.allCases) { tab in
+                let isOn = filter == tab
+                Button {
+                    filterRaw = tab.rawValue
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(tab.title)
+                            .font(.system(size: OreTheme.Font.body, weight: isOn ? .semibold : .regular))
+                        Text("\(tab == .all ? model.sortedWorkspaces.count : activeCount)")
+                            .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 24)
+                    .background(
+                        isOn ? Color.primary.opacity(0.1) : .clear,
+                        in: Capsule()
+                    )
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(OrePressableButtonStyle())
+            }
+        }
+        .padding(3)
+        .modifier(SidebarGlassCapsule())
+        .animation(.easeOut(duration: 0.15), value: filterRaw)
+    }
+
+    /// The footer's presence pill: green while any agent is live, quiet gray
+    /// otherwise — the sidebar's own "Connected" light.
+    private var connectedPill: some View {
+        let working = model.sortedWorkspaces.filter { workspace in
+            switch sidebarEffectiveStatus(for: workspace, chats: model.chats(for: workspace.id)) {
+            case .thinking, .requesting, .runningTool: return true
+            default: return false
+            }
+        }.count
+        let isLive = working > 0
+        return HStack(spacing: 6) {
+            Circle()
+                .fill(isLive ? OreTheme.Presence.active : OreTheme.Presence.idle)
+                .frame(width: 7, height: 7)
+            // "Workspaces", not "active" — the filter tab above already uses
+            // "Active" to mean something narrower, and one word carrying two
+            // meanings on one surface reads as a bug.
+            Text(isLive
+                ? "\(working) working"
+                : "\(model.sortedWorkspaces.count) workspace\(model.sortedWorkspaces.count == 1 ? "" : "s")")
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+        }
+        .foregroundStyle(isLive ? OreTheme.Presence.active : Color.secondary)
+        .padding(.horizontal, 10)
+        .frame(height: 22)
+        .modifier(SidebarGlassCapsule(
+            tint: isLive ? OreTheme.Presence.active.opacity(0.12) : nil
+        ))
+        .animation(.easeOut(duration: 0.2), value: isLive)
     }
 
     /// "Archived (3) · 1.2 GB freed" — the total makes the payoff of parking
@@ -234,6 +371,248 @@ struct Sidebar: View {
                 renameWorkspace = workspace
             }
         )
+    }
+}
+
+/// Liquid Glass on macOS 26 for the sidebar's capsule chrome (filter tabs,
+/// presence pill); the flat fill + hairline treatment everywhere older.
+private struct SidebarGlassCapsule: ViewModifier {
+    var tint: Color?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            if let tint {
+                content.glassEffect(.regular.tint(tint), in: .capsule)
+            } else {
+                content.glassEffect(.regular, in: .capsule)
+            }
+        } else {
+            content
+                .background(tint ?? OreTheme.subduedFill, in: Capsule())
+                .overlay { Capsule().stroke(OreTheme.hairline, lineWidth: 1) }
+        }
+    }
+}
+
+/// The sidebar's two lenses: everything, or only workspaces that are doing
+/// something / waiting on the person.
+enum SidebarFilter: String, CaseIterable, Identifiable {
+    case all, active
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .active: "Active"
+        }
+    }
+}
+
+/// The status to actually surface for a workspace. `workspace.status` can be
+/// stuck on an old failed tab; this instead lets live, attention-worthy states
+/// win, and otherwise reflects the *most recently active* chat — so a stale
+/// failure stops dominating once a newer tab has moved on. Shared by the row,
+/// the avatar ring, and the Active filter so they never disagree.
+func sidebarEffectiveStatus(
+    for workspace: WorkspaceSummary, chats: [ChatSummary]
+) -> AgentStatus {
+    guard !chats.isEmpty else { return workspace.status }
+    if chats.contains(where: { $0.status == .runningTool }) { return .runningTool }
+    if chats.contains(where: { $0.status == .thinking }) { return .thinking }
+    if chats.contains(where: { $0.status == .requesting }) { return .requesting }
+    if chats.contains(where: { $0.status == .awaitingInput }) { return .awaitingInput }
+    let latest = chats.max {
+        ($0.lastActivity ?? $0.createdAt) < ($1.lastActivity ?? $1.createdAt)
+    }
+    return latest?.status ?? workspace.status
+}
+
+/// "3h", "5d" — the reference design's timestamp column. A full relative
+/// sentence ("5 days ago") is the row's widest element for its least important
+/// fact; the compact form keeps the name in charge. Internal for tests.
+func sidebarCompactAge(_ date: Date, now: Date = Date()) -> String {
+    let seconds = max(0, now.timeIntervalSince(date))
+    let minutes = Int(seconds / 60)
+    if minutes < 1 { return "now" }
+    if minutes < 60 { return "\(minutes)m" }
+    let hours = minutes / 60
+    if hours < 24 { return "\(hours)h" }
+    let days = hours / 24
+    if days < 7 { return "\(days)d" }
+    if days < 30 { return "\(days / 7)w" }
+    if days < 365 { return "\(days / 30)mo" }
+    return "\(days / 365)y"
+}
+
+/// The reference design's pinned strip: a horizontal row of avatars above the
+/// list, one tap from anywhere. Pinned workspaces live here instead of in the
+/// repository groups so pinning visibly promotes them.
+private struct PinnedStrip: View {
+    @Environment(AppModel.self) private var model
+    let workspaces: [WorkspaceSummary]
+    let chatsFor: (WorkspaceID) -> [ChatSummary]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: OreTheme.Space.md) {
+                ForEach(workspaces) { workspace in
+                    let isSelected = model.selectedWorkspaceID == workspace.id
+                    VStack(spacing: 4) {
+                        WorkspaceAvatar(
+                            workspace: workspace,
+                            chats: chatsFor(workspace.id),
+                            size: 36,
+                            identity: model.researchIdentity(for: workspace)
+                        )
+                        Text(workspace.name)
+                            .font(.system(
+                                size: OreTheme.Font.caption,
+                                weight: isSelected ? .semibold : .regular
+                            ))
+                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: 56)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectedWorkspaceID = workspace.id }
+                    .contextMenu {
+                        WorkspaceActionsMenu(workspace: workspace, onRename: {})
+                    }
+                    .help(workspace.name)
+                }
+            }
+            .padding(.horizontal, OreTheme.Space.xs)
+        }
+    }
+}
+
+/// In-memory portrait cache so every sidebar row doesn't re-hit the corpus on
+/// disk. Misses are remembered too — a scientist with no cached portrait must
+/// not retrigger a lookup on every redraw.
+@MainActor
+private enum ScientistPortraitCache {
+    private static var images: [String: NSImage] = [:]
+    private static var misses: Set<String> = []
+
+    static func load(for identity: ResearchIdentity) async -> NSImage? {
+        if let image = images[identity.slug] { return image }
+        if misses.contains(identity.slug) { return nil }
+        guard let profile = await ScientistCorpus.shared.profile(for: identity),
+              let url = ScientistCorpus.shared.imageURL(for: profile),
+              let image = NSImage(contentsOf: url) else {
+            misses.insert(identity.slug)
+            return nil
+        }
+        images[identity.slug] = image
+        return image
+    }
+}
+
+/// One workspace as a face: the scientist's portrait when the workspace is
+/// named for one (monogram until it loads, or when it isn't), a status ring
+/// that spins while the agent works, and the harness mark tucked in the
+/// corner so you can tell which agent lives here without reading anything.
+private struct WorkspaceAvatar: View {
+    let workspace: WorkspaceSummary
+    let chats: [ChatSummary]
+    var size: CGFloat = 28
+    /// The scientist this workspace is named for, when it is.
+    var identity: ResearchIdentity?
+    /// On the selected row's solid accent pill, colored rings vanish — the
+    /// ring turns white there instead.
+    var onProminentFill = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var portrait: NSImage?
+
+    private var status: AgentStatus {
+        sidebarEffectiveStatus(for: workspace, chats: chats)
+    }
+
+    var body: some View {
+        Group {
+            if let portrait {
+                Image(nsImage: portrait)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+            } else {
+                OreMonogram(name: workspace.name, size: size)
+            }
+        }
+        .task(id: identity?.slug) {
+            guard let identity else {
+                portrait = nil
+                return
+            }
+            portrait = await ScientistPortraitCache.load(for: identity)
+        }
+        .overlay { statusRing }
+        .overlay(alignment: .bottomTrailing) {
+            HarnessMark(harness: workspace.harness, size: size * 0.42)
+                .offset(x: 2, y: 2)
+        }
+        .help(statusHelp)
+    }
+
+    @ViewBuilder
+    private var statusRing: some View {
+        switch status {
+        case .thinking, .requesting, .runningTool:
+            if reduceMotion {
+                ring(onProminentFill ? .white : OreTheme.Status.running)
+            } else {
+                SpinningRing(color: onProminentFill ? .white : OreTheme.Status.running)
+                    .padding(-2.5)
+            }
+        case .awaitingInput:
+            ring(onProminentFill ? .white : OreTheme.Status.needsYou)
+        case .failed:
+            ring(onProminentFill ? .white : OreTheme.Status.failed)
+        case .interrupted:
+            ring(onProminentFill ? .white : OreTheme.Status.interrupted)
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private func ring(_ color: Color) -> some View {
+        Circle()
+            .stroke(color, lineWidth: 2)
+            .padding(-2.5)
+    }
+
+    private var statusHelp: String {
+        switch status {
+        case .thinking, .requesting, .runningTool: "Agent working"
+        case .awaitingInput: "Needs your attention"
+        case .failed: "Agent failed"
+        case .interrupted: "Agent interrupted"
+        case .idle: workspace.hasUnread ? "Finished with unread activity" : "No agent is working"
+        }
+    }
+}
+
+/// A short arc orbiting the avatar while the agent works — the row-scale
+/// version of the composer's sweeping busy border, sharing its cadence.
+private struct SpinningRing: View {
+    let color: Color
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    var body: some View {
+        TimelineView(
+            .animation(minimumInterval: 1.0 / 30.0, paused: controlActiveState != .key)
+        ) { context in
+            let period = 1.6
+            let angle = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: period) / period * 360
+            Circle()
+                .trim(from: 0, to: 0.32)
+                .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(angle))
+        }
     }
 }
 
@@ -351,6 +730,8 @@ private struct RepositoryRow: View {
 private struct WorkspaceRow: View {
     let workspace: WorkspaceSummary
     let chats: [ChatSummary]
+    /// The scientist this workspace is named for — drives the portrait avatar.
+    var identity: ResearchIdentity?
     let isSelected: Bool
     /// The ⌘-number that jumps here, when this workspace is one of the first
     /// nine. Shown small in the row so the shortcut is discoverable.
@@ -360,51 +741,82 @@ private struct WorkspaceRow: View {
 
     var body: some View {
         HStack(spacing: OreTheme.Space.sm) {
-            statusIcon
-                .frame(width: 16)
+            WorkspaceAvatar(
+                workspace: workspace,
+                chats: chats,
+                size: 28,
+                identity: identity,
+                onProminentFill: isSelected
+            )
 
-            VStack(alignment: .leading, spacing: OreTheme.Space.xs) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    if workspace.isPinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.secondary)
-                    }
                     Text(workspace.name)
                         .font(.system(
                             size: 14,
                             weight: effectiveNeedsAttention ? .bold
-                                : workspace.hasUnread ? .semibold : .regular
+                                : workspace.hasUnread || isSelected ? .semibold : .regular
                         ))
+                        .foregroundStyle(isSelected ? .white : Color.primary)
                         .lineLimit(1)
-                }
 
-                HStack(spacing: 6) {
-                    if workspace.stackedOn != nil {
-                        Image(systemName: "square.stack.3d.up")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+
+                    if let activity = workspace.lastActivity {
+                        Text(sidebarCompactAge(activity))
+                            .font(.system(size: 10.5, design: .rounded).monospacedDigit())
+                            .foregroundStyle(isSelected ? Color.white.opacity(0.75) : Color(.tertiaryLabelColor))
                     }
-                    Text(statusText)
-                        .font(.system(size: 12))
-                        .foregroundStyle(effectiveNeedsAttention ? indicatorColor : .secondary)
-                        .lineLimit(1)
+                }
+
+                // The second line has to earn its place: a column of rows all
+                // saying "Ready" is noise. Quiet idle rows with no diff stay
+                // one line tall.
+                if hasSecondLine {
+                    HStack(spacing: 6) {
+                        if workspace.stackedOn != nil {
+                            Image(systemName: "square.stack.3d.up")
+                                .font(.system(size: 9))
+                                .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.secondary)
+                        }
+                        if let statusLine {
+                            Text(statusLine)
+                                .font(.system(size: 12))
+                                .foregroundStyle(
+                                    isSelected ? Color.white.opacity(0.85)
+                                        : effectiveNeedsAttention ? indicatorColor : Color.secondary
+                                )
+                                .lineLimit(1)
+                        }
+
+                        // Left-aligned with the text, not floated to the far
+                        // edge — the counts belong to the row's sentence, and
+                        // right-aligned they read as a detached column.
+                        HStack(spacing: 4) {
+                            if workspace.gitStatus.insertions > 0 {
+                                Text("+\(workspace.gitStatus.insertions)")
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.added)
+                            }
+                            if workspace.gitStatus.deletions > 0 {
+                                Text("−\(workspace.gitStatus.deletions)")
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.removed)
+                            }
+                        }
+                        .font(.caption2.monospacedDigit())
+
+                        Spacer(minLength: 0)
+                    }
                 }
             }
 
-            Spacer(minLength: 0)
-
-            HStack(spacing: 4) {
-                if workspace.gitStatus.insertions > 0 {
-                    Text("+\(workspace.gitStatus.insertions)")
-                        .foregroundStyle(OreTheme.added)
-                }
-                if workspace.gitStatus.deletions > 0 {
-                    Text("−\(workspace.gitStatus.deletions)")
-                        .foregroundStyle(OreTheme.removed)
-                }
+            if workspace.hasUnread, effectiveStatus == .idle, !isSelected {
+                // Count-free by design: a workspace either has something new or
+                // it doesn't. See WorkspaceSummary.hasUnread.
+                Circle()
+                    .fill(OreTheme.Status.unread)
+                    .frame(width: 8, height: 8)
+                    .help("Finished with unread activity")
             }
-            .font(.caption2.monospacedDigit())
 
             if isHovering || isSelected {
                 Menu {
@@ -412,6 +824,7 @@ private struct WorkspaceRow: View {
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(isSelected ? .white : Color.primary)
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
@@ -432,51 +845,12 @@ private struct WorkspaceRow: View {
         .onHover { isHovering = $0 }
     }
 
-    /// The status to actually surface for this workspace. `workspace.status` can
-    /// be stuck on an old failed tab; this instead lets live, attention-worthy
-    /// states win, and otherwise reflects the *most recently active* chat — so a
-    /// stale failure stops dominating once a newer tab has moved on.
     private var effectiveStatus: AgentStatus {
-        guard !chats.isEmpty else { return workspace.status }
-        if chats.contains(where: { $0.status == .runningTool }) { return .runningTool }
-        if chats.contains(where: { $0.status == .thinking }) { return .thinking }
-        if chats.contains(where: { $0.status == .requesting }) { return .requesting }
-        if chats.contains(where: { $0.status == .awaitingInput }) { return .awaitingInput }
-        let latest = chats.max {
-            ($0.lastActivity ?? $0.createdAt) < ($1.lastActivity ?? $1.createdAt)
-        }
-        return latest?.status ?? workspace.status
+        sidebarEffectiveStatus(for: workspace, chats: chats)
     }
 
     private var effectiveNeedsAttention: Bool {
         effectiveStatus == .awaitingInput || effectiveStatus == .failed
-    }
-
-    @ViewBuilder
-    private var statusIcon: some View {
-        switch effectiveStatus {
-        case .thinking, .requesting, .runningTool:
-            ProgressView()
-                .controlSize(.small)
-                .tint(OreTheme.Status.running)
-                .help(runningAgentCount > 1 ? "\(runningAgentCount) agents working" : "Agent working")
-        case .awaitingInput:
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(OreTheme.Status.needsYou)
-                .help("Needs your attention")
-        case .failed:
-            Image(systemName: "xmark.octagon.fill")
-                .foregroundStyle(OreTheme.Status.failed)
-                .help("Agent failed")
-        case .interrupted:
-            Image(systemName: "pause.circle.fill")
-                .foregroundStyle(OreTheme.Status.interrupted)
-                .help("Agent interrupted")
-        case .idle:
-            Image(systemName: workspace.hasUnread ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(workspace.hasUnread ? OreTheme.Status.unread : Color.secondary.opacity(0.55))
-                .help(workspace.hasUnread ? "Finished with unread activity" : "No agent is working")
-        }
     }
 
     private var runningAgentCount: Int {
@@ -495,7 +869,8 @@ private struct WorkspaceRow: View {
         }
     }
 
-    private var statusText: String {
+    /// What the second line says, or nil when it would only say "Ready".
+    private var statusLine: String? {
         switch effectiveStatus {
         case .awaitingInput: return "Needs you"
         case .runningTool:
@@ -506,9 +881,14 @@ private struct WorkspaceRow: View {
             return runningAgentCount > 1 ? "\(runningAgentCount) agents working" : "Working"
         case .failed: return "Failed"
         case .interrupted: return "Interrupted"
-        case .idle:
-            guard let activity = workspace.lastActivity else { return "Ready" }
-            return activity.formatted(.relative(presentation: .named))
+        case .idle: return workspace.hasUnread ? "Finished — new activity" : nil
         }
+    }
+
+    private var hasSecondLine: Bool {
+        statusLine != nil
+            || workspace.stackedOn != nil
+            || workspace.gitStatus.insertions > 0
+            || workspace.gitStatus.deletions > 0
     }
 }

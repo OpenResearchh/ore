@@ -9,8 +9,8 @@ import OreProtocol
 /// and a registry means that costs one entry rather than the product.
 public struct HarnessRegistry: Sendable {
     private let harnesses: [HarnessKind: any AgentHarness]
-    /// Experimental harnesses ship behind a flag with declared reduced
-    /// capabilities, rather than pretending to be at parity.
+    /// Experimental harnesses can still be gated by registry policy and expose
+    /// reduced capabilities rather than pretending to be at parity.
     public let enabledExperimental: Set<HarnessKind>
 
     public init(
@@ -29,13 +29,17 @@ public struct HarnessRegistry: Sendable {
     /// `cursorAllowUnprompted` is passed rather than read from defaults so the
     /// core stays free of UI storage; only the app knows the user answered yes.
     public static func standard(
-        enabledExperimental: Set<HarnessKind> = [],
+        enabledExperimental: Set<HarnessKind> = [.cursorAgent],
         cursorAllowUnprompted: Bool = false
     ) -> HarnessRegistry {
-        var harnesses: [any AgentHarness] = [ClaudeCodeHarness(), CodexHarness()]
-        if enabledExperimental.contains(.cursorAgent) {
-            harnesses.append(CursorAgentHarness(allowUnprompted: cursorAllowUnprompted))
-        }
+        // Experimental harnesses are always registered so Settings can detect
+        // an installed CLI. `harness(for:)` and `available` still honor an
+        // explicitly restricted policy supplied by an embedding host.
+        let harnesses: [any AgentHarness] = [
+            ClaudeCodeHarness(),
+            CodexHarness(),
+            CursorAgentHarness(allowUnprompted: cursorAllowUnprompted),
+        ]
         return HarnessRegistry(
             harnesses: harnesses,
             enabledExperimental: enabledExperimental
@@ -58,8 +62,14 @@ public struct HarnessRegistry: Sendable {
     /// first run and a visibly slow one.
     public func probeAll() async -> [HarnessProbeResult] {
         await withTaskGroup(of: HarnessProbeResult.self) { group in
-            for harness in available {
-                group.addTask { await harness.probe() }
+            for harness in harnesses.values {
+                let isEnabled = !harness.kind.isExperimental
+                    || enabledExperimental.contains(harness.kind)
+                group.addTask {
+                    var result = await harness.probe()
+                    result.isEnabled = isEnabled
+                    return result
+                }
             }
             var results: [HarnessProbeResult] = []
             for await result in group { results.append(result) }

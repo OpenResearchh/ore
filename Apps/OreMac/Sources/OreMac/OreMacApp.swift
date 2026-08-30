@@ -26,13 +26,9 @@ struct OreMacApp: App {
         let created: AppModel
         do {
             let store = try OreStore(path: OreStore.defaultURL)
-            let experimental: Set<HarnessKind> = UserDefaults.standard.bool(
-                forKey: "ore.cursorExperimental"
-            ) ? [.cursorAgent] : []
             created = AppModel(client: InProcessCoreClient(
                 store: store,
                 harnessRegistry: .standard(
-                    enabledExperimental: experimental,
                     cursorAllowUnprompted: UserDefaults.standard.bool(
                         forKey: "ore.cursorAllowUnprompted"
                     )
@@ -274,6 +270,8 @@ struct RootView: View {
     @AppStorage("ore.reviewWidth") private var reviewWidth = 340.0
     @State private var terminalDragStart: CGFloat?
     @State private var reviewDragStart: CGFloat?
+    /// The presence strip's usage card (limits, tokens, spend).
+    @State private var showsUsagePopover = false
 
     private var bottomPane: BottomPane {
         get { BottomPane(rawValue: bottomPaneRaw) ?? .none }
@@ -299,6 +297,16 @@ struct RootView: View {
         }
         .overlay(alignment: .top) { banners }
         .overlay { GitHubUpdatePrompt() }
+        .overlay {
+            if let briefing = model.launchBriefing {
+                LaunchBriefingOverlay(briefing: briefing) {
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        model.dismissLaunchBriefing()
+                    }
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.25), value: model.launchBriefing == nil)
         .sheet(isPresented: $isShowingNewWorkspace) { NewWorkspaceSheet() }
         .sheet(isPresented: $isShowingPalette) { CommandPalette() }
         .sheet(isPresented: $isShowingFilePalette) {
@@ -568,6 +576,27 @@ struct RootView: View {
             }
 
             Spacer(minLength: OreTheme.Space.sm)
+
+            // The agents' presence roster lives here now — bottom-right, out
+            // of the tab strip's way, every harness accounted for. Hovering
+            // (or clicking) opens the usage card: limits, tokens, spend.
+            AgentPresenceStrip(
+                chats: model.chats(for: workspace.id).filter {
+                    !model.isEphemeralChat($0.id)
+                        && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
+                },
+                showsAllHarnesses: true
+            )
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { showsUsagePopover = true }
+            }
+            .onTapGesture { showsUsagePopover.toggle() }
+            .popover(isPresented: $showsUsagePopover, arrowEdge: .top) {
+                HarnessUsagePopover(snapshots: model.harnessUsage(in: workspace.id))
+            }
+            .help("Agent usage and limits")
+
             Text("⌥⌘T")
                 .font(.system(size: OreTheme.Font.caption, design: .rounded))
                 .foregroundStyle(.tertiary)

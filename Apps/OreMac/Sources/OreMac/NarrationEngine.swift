@@ -19,6 +19,7 @@ final class NarrationEngine {
     private static let enabledChatsKey = "ore.narrationChats"
     static let masterSwitchKey = "ore.narration.enabled"
     static let voiceKindKey = "ore.narration.voiceKind"
+    static let fleetSwitchKey = "ore.narration.fleet"
 
     private(set) var enabledChats: Set<ChatID>
     /// Which chat's words are coming out of the speakers, for the UI pulse.
@@ -80,6 +81,13 @@ final class NarrationEngine {
         UserDefaults.standard.object(forKey: Self.masterSwitchKey) as? Bool ?? true
     }
 
+    /// Fleet awareness: chats with no speaker toggle still announce the
+    /// moments that matter. On by default — it is the "assistant sitting
+    /// above the fleet" half of narration.
+    var isFleetEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.fleetSwitchKey) as? Bool ?? true
+    }
+
     /// Whether the on-device summarizer can run on this machine, as a sentence
     /// for the settings pane. Exposed here so the summarizer stays private.
     var summarizerAvailability: String {
@@ -94,10 +102,19 @@ final class NarrationEngine {
     }
 
     /// The voice that should speak the next utterance.
+    ///
+    /// The neural voice yields under load: when the CPU is already saturated
+    /// or the machine is thermally throttling — agents mid-turn are exactly
+    /// when narration speaks most — a 100M-parameter TTS pass would slow the
+    /// work the user is waiting on and stutter besides. The system voice
+    /// costs nothing and is always ready; the neural voice returns as soon
+    /// as the pressure clears, checked per utterance.
     private var voice: NarrationVoice {
         switch voiceKind.resolved(neuralReady: neuralVoice.isReady) {
-        case .neural: neuralVoice
-        case .system: systemVoice
+        case .neural:
+            SystemLoadProbe.shared.isUnderPressure ? systemVoice : neuralVoice
+        case .system:
+            systemVoice
         }
     }
 
@@ -283,7 +300,11 @@ final class NarrationEngine {
         chatID: ChatID,
         origin: NarrationOrigin
     ) {
-        guard isMasterEnabled, enabledChats.contains(chatID) else { return }
+        guard isMasterEnabled else { return }
+        guard enabledChats.contains(chatID) else {
+            observeFleet(event: event, chatID: chatID, origin: origin)
+            return
+        }
         // Background tabs only interject for things that need the user;
         // ambient progress would interleave into word salad. When they do
         // interject they name where they are, since the user isn't looking at
@@ -430,6 +451,58 @@ final class NarrationEngine {
             ))
 
         case .sessionStarted, .statusChanged, .usage:
+            break
+        }
+    }
+
+    /// The fleet half of narration — Jarvis's ambient awareness. Chats whose
+    /// speaker toggle is off still announce the moments that matter — turn
+    /// finished, turn failed, needs you — always named by place, and only from
+    /// the background: what's on screen narrates itself. Ambient progress
+    /// stays per-tab; fleet-wide progress is word salad.
+    private func observeFleet(event: AgentEvent, chatID: ChatID, origin: NarrationOrigin) {
+        guard isFleetEnabled, let background = origin.spokenLabel else { return }
+        switch event {
+        case .turnStarted:
+            // A new message obsoletes anything still queued about this chat.
+            queue.dropAll(for: chatID)
+
+        case .turnCompleted(let result):
+            speakCompletion(result, chatID: chatID, background: background)
+
+        case .permissionRequest(let request):
+            enqueue(SpokenUtterance(
+                chatID: chatID,
+                priority: .interrupt,
+                kind: .permission(request.id),
+                text: prefixed(NarrationPhraser.permission(request), background)
+            ))
+
+        case .question(let question):
+            enqueue(SpokenUtterance(
+                chatID: chatID,
+                priority: .interrupt,
+                kind: .question,
+                text: prefixed(NarrationPhraser.question(question), background)
+            ))
+
+        case .planUpdated(let update):
+            if case .proposal(let markdown, _) = update.content {
+                speakPlanProposal(markdown, chatID: chatID, background: background)
+            }
+
+        case .sessionError(let error):
+            enqueue(SpokenUtterance(
+                chatID: chatID,
+                priority: .interrupt,
+                kind: .sessionError,
+                text: prefixed(NarrationPhraser.sessionError(error), background)
+            ))
+
+        case .permissionResolved(let resolution):
+            cancelPermissionPrompt(resolution.id)
+
+        default:
             break
         }
     }

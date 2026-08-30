@@ -525,6 +525,12 @@ final class ChatState {
         draftComments.remove(at: index)
     }
 
+    /// One click instead of a chip-by-chip cull when a review's worth of
+    /// pending comments turns out to be the wrong batch.
+    func clearDraftComments() {
+        draftComments.removeAll()
+    }
+
     func takeDraftComments() -> [DiffCommentReference] {
         defer { draftComments.removeAll() }
         return draftComments

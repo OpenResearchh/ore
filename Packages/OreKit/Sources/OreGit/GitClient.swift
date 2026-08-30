@@ -307,6 +307,16 @@ public actor GitClient {
         lastRemoteFetch[key] = .now
     }
 
+    /// Whether any working tree — the main checkout included — has this
+    /// branch checked out. Moving a checked-out branch with `update-ref`
+    /// leaves that checkout's index pointing at the old commit, which reads
+    /// as phantom uncommitted changes.
+    public func isBranchCheckedOut(_ name: String) async -> Bool {
+        guard let output = try? await run(["worktree", "list", "--porcelain"])
+            .trimmedStandardOutput else { return false }
+        return output.split(separator: "\n").contains { $0 == "branch refs/heads/\(name)" }
+    }
+
     /// Fast-forward a local branch that is not checked out — typical for
     /// worktrees, where `main` lives in the repo but never in this checkout.
     ///

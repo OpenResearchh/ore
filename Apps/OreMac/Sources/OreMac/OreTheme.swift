@@ -37,12 +37,19 @@ enum OreTheme {
     static let chipRadius: CGFloat = 6
     static let tabRadius: CGFloat = 8
     static let controlRadius: CGFloat = 10
+    /// Selection pills and filter tabs — rounder than a control, squarer than
+    /// a card, so a selected sidebar row reads as one solid pill.
+    static let pillRadius: CGFloat = 11
     static let cardRadius: CGFloat = 16
     static let contentMaxWidth: CGFloat = 720
 
     static let hairline = Color.primary.opacity(0.075)
     static let subduedFill = Color.primary.opacity(0.045)
     static let selectedFill = Color.accentColor.opacity(0.11)
+    /// The loud sibling of `selectedFill`: a solid accent pill with white
+    /// content, for the one selection that should anchor the eye (the current
+    /// sidebar row). Everything else keeps the quiet wash.
+    static let selectedProminentFill = Color.accentColor
 
     /// Panel backgrounds. The transcript is the reading surface; everything
     /// around it recedes so the eye lands on the agent's reply, not on chrome.
@@ -59,6 +66,15 @@ enum OreTheme {
         /// Unread is "look here", not "success" — green is reserved for diffs.
         static let unread = Color.accentColor
         static let interrupted = Color.yellow
+    }
+
+    /// Presence is "is anyone home", distinct from `Status.running`'s "work is
+    /// happening" blue: green means an agent is live on this surface, gray
+    /// means it is sitting idle. Used by the header presence line and the
+    /// sidebar's connected pill.
+    enum Presence {
+        static let active = Color.green
+        static let idle = Color.secondary
     }
 
     /// Diff / git status tints, kept semantic so they hold up in both appearances.

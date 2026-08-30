@@ -345,12 +345,11 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         weak var editor: NSTextView?
         private var isApplying = false
         private var currentMentionNames: [String] = []
-        /// The (text, mention-names) the storage was last styled for. Every
-        /// keystroke bounces the binding through SwiftUI, so `updateNSView`
-        /// re-runs `apply` and would restyle the whole storage a second time for
-        /// the exact same content — a redundant full re-layout that showed up as
-        /// a flicker. Skipping when nothing changed makes it one pass, not two.
-        private var lastStyledSignature: String?
+        /// Whether any mention attributes are currently painted into the
+        /// storage — the flag that lets a mention-free draft (the common case)
+        /// skip the restyle pass on every keystroke, and lets deleting the
+        /// last token still trigger the one pass that clears its color.
+        private var hasStyledMentions = false
         var onHeightChange: (CGFloat) -> Void
         /// The last height handed up, so an unchanged measurement doesn't write
         /// state. This is what keeps the measurement from looping: the height
@@ -371,7 +370,14 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard !isApplying, let editor else { return }
             parentText.wrappedValue = editor.string
-            styleMentions(currentMentionNames, preservingSelection: true)
+            // Restyle only when there is anything to style: with no mention
+            // tokens in play (the common case), a keystroke needs no
+            // attribute pass and no re-layout at all. `typingAttributes` — set
+            // whenever styling does run, and at `apply` — keeps new text in
+            // the base style on its own.
+            if !currentMentionNames.isEmpty || hasStyledMentions {
+                styleMentions(currentMentionNames, preservingSelection: true)
+            }
             // Typing is an AppKit event, outside SwiftUI's update cycle, so the
             // height can be written synchronously and lands in the same frame
             // as the character.
@@ -412,6 +418,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
 
         func apply(text: String, mentionNames: [String]) {
             guard let editor else { return }
+            let mentionsChanged = mentionNames != currentMentionNames
             currentMentionNames = mentionNames
             var changed = false
             if editor.string != text {
@@ -426,7 +433,15 @@ struct InlineMentionTextEditor: NSViewRepresentable {
                 isApplying = false
                 changed = true
             }
-            styleMentions(mentionNames, preservingSelection: true)
+            // The hot path is a keystroke bouncing the binding through SwiftUI
+            // and back into `updateNSView`: the text already matches (it came
+            // from the editor) and the mentions haven't moved, so there is
+            // nothing to restyle. Restyling anyway was the second full
+            // attribute pass + re-layout every keystroke paid for — and, on a
+            // rewrite of composing text, what broke IME input.
+            if changed || mentionsChanged {
+                styleMentions(mentionNames, preservingSelection: true)
+            }
             // Only for text set from outside (slash command, voice commit, a
             // tab switch restoring a draft). Typing already reported itself
             // synchronously in `textDidChange`, and this runs inside
@@ -474,11 +489,11 @@ struct InlineMentionTextEditor: NSViewRepresentable {
 
         private func styleMentions(_ mentionNames: [String], preservingSelection: Bool) {
             guard let editor, let storage = editor.textStorage else { return }
-            // A full-storage restyle is only worth its re-layout when the text
-            // or the set of mentions actually changed since the last one.
-            let signature = "\(storage.length):\(storage.string)\u{0}\(mentionNames.joined(separator: "\u{0}"))"
-            guard signature != lastStyledSignature else { return }
-            lastStyledSignature = signature
+            // Callers gate on actual change now (see `apply` / `textDidChange`)
+            // — the old defence here was a signature string that *copied the
+            // whole draft* to decide whether to skip, an O(n) allocation per
+            // keystroke that cost nearly as much as the work it avoided.
+            hasStyledMentions = mentionNames.contains { !$0.isEmpty }
             let selection = editor.selectedRange()
             let whole = NSRange(location: 0, length: storage.length)
             let paragraph = NSMutableParagraphStyle()

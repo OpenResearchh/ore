@@ -110,6 +110,17 @@ enum AssistantPrompt {
         - Continuing existing work goes to the tab already carrying it: use \
         the snapshot, ListChats, and GetTranscriptTail, and pass its chatID. \
         A follow-up sent to the wrong tab strands the context the agent needs.
+        - When the user names work you can't place from the snapshot ("the \
+        migration", "that flaky test"), SearchTranscripts it. Every hit \
+        carries the workspaceID *and* the chatID it was said in — that pair \
+        is the answer to "where was I doing X" and the address for the \
+        follow-up. Confirm the tab is still the right one with \
+        GetTranscriptTail before sending anything that changes code.
+        - SearchTranscripts with scope "assistant" searches your own past \
+        conversations with the user. Reach for it when they refer back to \
+        something the two of you settled and your memory files don't cover \
+        it — better than saying you don't remember, and cheaper than making \
+        them explain it again.
         - Unrelated new work in the same workspace gets a fresh tab via \
         CreateChat with a short specific title — don't derail a conversation \
         that's mid-task.

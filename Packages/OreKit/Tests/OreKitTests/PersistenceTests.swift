@@ -275,6 +275,107 @@ struct PersistenceTests {
         #expect(try await store.search("AND OR NOT").isEmpty)
     }
 
+    @Test func searchNamesTheTabSoAFollowUpCanLandOnIt() async throws {
+        // "Where was I doing X" is only half an answer: the assistant has to be
+        // able to send the follow-up to the conversation that already has the
+        // context, which means the hit must carry the chat, not just the
+        // workspace.
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store, id: "ws1", name: "kailash")
+        let chatID = ChatID(rawValue: "c1")
+        try await store.saveChat(ChatRecord(
+            id: chatID,
+            workspaceID: workspace.workspaceID,
+            title: "Token refresh",
+            harness: .claudeCode
+        ))
+        let sessionID = SessionID(rawValue: "s1")
+        try await store.saveSession(SessionRecord(
+            id: sessionID, workspaceID: workspace.workspaceID, chatID: chatID, harness: .claudeCode
+        ))
+        let turnID = TurnID(rawValue: "t1")
+        try await store.saveTurn(TurnRecord(id: turnID, sessionID: sessionID, ordinal: 0))
+        try await store.appendBlock(BlockRecord(
+            id: "b1", turnID: turnID, ordinal: 0, kind: .text,
+            text: "Rotated the refresh token on every renewal."
+        ))
+
+        let hits = try await store.search("renewal")
+        #expect(hits.count == 1)
+        #expect(hits[0].chatID == chatID)
+        #expect(hits[0].chatTitle == "Token refresh")
+    }
+
+    @Test func searchScopeSeparatesTheAssistantsOwnConversations() async throws {
+        // The assistant's conversations are what the *user and it* said, not
+        // what an agent did in a repository. Fleet-wide search must not bury a
+        // project hit under them — and "what did we decide last week" must
+        // still be answerable.
+        let store = try makeStore()
+        let project = try await seedWorkspace(store, id: "ws1", name: "kailash")
+        try await store.saveWorkspace(WorkspaceRecord(
+            id: WorkspaceID(rawValue: "assistant"),
+            name: "Assistant",
+            repositoryPath: "/repo",
+            worktreePath: "/Users/x/ore/assistant",
+            branch: "main",
+            baseBranch: "main",
+            harness: .claudeCode,
+            kind: .assistant
+        ))
+
+        for (index, id) in ["ws1", "assistant"].enumerated() {
+            let sessionID = SessionID(rawValue: "s\(index)")
+            try await store.saveSession(SessionRecord(
+                id: sessionID,
+                workspaceID: WorkspaceID(rawValue: id),
+                harness: .claudeCode
+            ))
+            let turnID = TurnID(rawValue: "t\(index)")
+            try await store.saveTurn(TurnRecord(id: turnID, sessionID: sessionID, ordinal: 0))
+            try await store.appendBlock(BlockRecord(
+                id: "b\(index)", turnID: turnID, ordinal: 0, kind: .text,
+                text: "We settled on quarterly invoicing."
+            ))
+        }
+
+        // The default stays what every existing caller expects.
+        let projects = try await store.search("invoicing")
+        #expect(projects.map(\.workspaceID) == [project.workspaceID])
+
+        let own = try await store.search("invoicing", scope: .assistant)
+        #expect(own.map(\.workspaceName) == ["Assistant"])
+
+        #expect(try await store.search("invoicing", scope: .all).count == 2)
+    }
+
+    @Test func searchCanBeScopedToOneWorkspace() async throws {
+        // Two workspaces off the same repository say similar things; asking
+        // about one of them shouldn't return the other's turns.
+        let store = try makeStore()
+        let first = try await seedWorkspace(store, id: "ws1", name: "kailash")
+        _ = try await seedWorkspace(store, id: "ws2", name: "kaguya")
+
+        for (index, id) in ["ws1", "ws2"].enumerated() {
+            let sessionID = SessionID(rawValue: "s\(index)")
+            try await store.saveSession(SessionRecord(
+                id: sessionID,
+                workspaceID: WorkspaceID(rawValue: id),
+                harness: .claudeCode
+            ))
+            let turnID = TurnID(rawValue: "t\(index)")
+            try await store.saveTurn(TurnRecord(id: turnID, sessionID: sessionID, ordinal: 0))
+            try await store.appendBlock(BlockRecord(
+                id: "b\(index)", turnID: turnID, ordinal: 0, kind: .text,
+                text: "Reworked the pagination cursor."
+            ))
+        }
+
+        #expect(try await store.search("pagination").count == 2)
+        let scoped = try await store.search("pagination", workspaceID: first.workspaceID)
+        #expect(scoped.map(\.workspaceName) == ["kailash"])
+    }
+
     @Test func diffCommentsAreDraftedThenSentAsABatch() async throws {
         // Reviewing is a pass over the diff, not one message per note.
         let store = try makeStore()

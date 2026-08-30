@@ -342,11 +342,18 @@ struct AssistantBridgeTests {
         let harness = try await BridgeHarness(fixture: fixture)
         defer { Task { await harness.shutdown() } }
 
-        _ = try await harness.makeWorkspace(named: "state-test")
+        let workspaceID = try await harness.makeWorkspace(named: "state-test")
         let response = try harness.callBridge(tool: "GetAppState", arguments: [:])
         #expect(response.ok)
         #expect(response.result?.contains("[ORE app state]") == true)
         #expect(response.result?.contains("state-test") == true)
+
+        // The repository each workspace belongs to, so the assistant can tell
+        // two tabs on one project apart from two separate projects — the
+        // distinction every cross-project routing decision rests on.
+        let record = try #require(try await harness.store.workspace(workspaceID))
+        let repository = URL(fileURLWithPath: record.repositoryPath).lastPathComponent
+        #expect(response.result?.contains("repo \(repository)") == true)
     }
 
     @Test func bypassModeAsksForConfirmation() async throws {

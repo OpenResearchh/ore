@@ -235,11 +235,17 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SearchTranscripts",
-                "description": "Full-text search across every workspace's chat transcripts, newest first. Use to answer 'where was I doing X' or to resolve vague project references.",
+                "description": "Full-text search across chat transcripts, newest first. Use to answer 'where was I doing X', to resolve vague project references, and to find the exact tab a piece of work already lives in — every hit carries its chatID, so the follow-up can go to the conversation that already has the context.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "query": ["type": "string"],
+                        "scope": [
+                            "type": "string",
+                            "enum": ["projects", "assistant", "all"],
+                            "description": "Which conversations to search. `projects` (default) is the user's project tabs. `assistant` is your own past conversations with the user — use it when they refer back to something the two of you discussed and your memory files don't cover it. `all` is both.",
+                        ],
+                        "workspaceID": ["type": "string", "description": "Restrict to one workspace. Omit to search every one in scope."],
                         "limit": ["type": "integer", "description": "Max hits, default 20."],
                     ],
                     "required": ["query"],
@@ -739,15 +745,31 @@ private final class AssistantToolServer {
                 return "SearchTranscripts needs a query."
             }
             let limit = integer(arguments["limit"]) ?? 20
-            let hits = try await store.search(query, limit: max(1, min(limit, 50)))
-            guard !hits.isEmpty else { return "No transcript matches for “\(query)”." }
+            let rawScope = (arguments["scope"] as? String) ?? OreStore.SearchScope.projects.rawValue
+            guard let scope = OreStore.SearchScope(rawValue: rawScope) else {
+                return "scope must be projects, assistant, or all."
+            }
+            let scopedWorkspace = (arguments["workspaceID"] as? String)
+                .flatMap { $0.isEmpty ? nil : WorkspaceID(rawValue: $0) }
+            let hits = try await store.search(
+                query, scope: scope, workspaceID: scopedWorkspace, limit: max(1, min(limit, 50))
+            )
+            guard !hits.isEmpty else {
+                return "No transcript matches for “\(query)”"
+                    + (scope == .projects ? " in the user's projects." : " in scope \(rawScope).")
+            }
             return json(hits.map { hit in
-                [
+                var entry: [String: Any] = [
                     "workspaceID": hit.workspaceID.rawValue,
                     "workspaceName": hit.workspaceName,
                     "snippet": hit.snippet,
                     "createdAt": iso(hit.createdAt),
-                ] as [String: Any]
+                ]
+                // The tab, so a follow-up can be sent where the context already
+                // is instead of opening a fresh one beside it.
+                entry["chatID"] = hit.chatID?.rawValue
+                entry["chatTitle"] = hit.chatTitle
+                return entry
             })
 
         case "GetTranscriptTail":

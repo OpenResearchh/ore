@@ -134,7 +134,13 @@ enum NarrationPolicy {
     /// ambient interjection — it is the reply, and clipping it at 280
     /// characters is what made every answer feel evasive. Still capped, because
     /// a runaway line can only be stopped, never skipped.
-    static let assistantAnswerLimit = 900
+    ///
+    /// Sized for the answer the assistant is now asked to give: covering each
+    /// part of a multi-part question out loud runs past 900 characters often
+    /// enough that the cap, not the model, was deciding where the answer
+    /// stopped — and a clip ends in "there's more in the Assistant window",
+    /// the exact deflection the spoken reply exists to avoid.
+    static let assistantAnswerLimit = 1_400
 }
 
 // MARK: - Tool classification
@@ -582,14 +588,34 @@ enum NarrationPhraser {
         limit: Int = NarrationPolicy.utteranceLimit
     ) -> String? {
         guard let text else { return nil }
-        let spoken = sanitize(text, limit: limit)
+        // Sanitize without clipping, so the cut can be chosen on a sentence
+        // boundary below rather than wherever the character budget ran out.
+        let spoken = sanitize(text, limit: .max)
         guard !spoken.isEmpty else { return nil }
+        guard spoken.count > limit else { return spoken.ensuringTerminalPunctuation() }
         // `sanitize` marks a clip with an ellipsis, which is silent — the ear
         // just hears an answer stop mid-thought, which is exactly what a long
         // spoken answer must not do. Say that there is more instead.
-        guard spoken.hasSuffix("…") else { return spoken.ensuringTerminalPunctuation() }
-        return String(spoken.dropLast()).trimmingCharacters(in: .whitespaces)
+        return sentenceClip(spoken, limit: limit)
             + " — there's more in the Assistant window."
+    }
+
+    /// The longest run of *whole sentences* that fits, so a clipped answer
+    /// ends on a finished thought. A severed final clause is the thing that
+    /// makes a long spoken reply sound like it failed rather than ran out —
+    /// and the pointer that follows only reads as helpful after a complete one.
+    ///
+    /// Falls back to the word boundary when no sentence ends in budget, or
+    /// when honouring the boundary would throw away most of the answer (one
+    /// short opener followed by a very long sentence).
+    private static func sentenceClip(_ text: String, limit: Int) -> String {
+        let head = String(text.prefix(limit))
+        if let end = head.lastIndex(where: { $0 == "." || $0 == "!" || $0 == "?" }) {
+            let whole = String(head[...end])
+            if whole.count >= limit / 2 { return whole }
+        }
+        let cut = head.lastIndex(of: " ").map { String(head[..<$0]) } ?? head
+        return cut.trimmingCharacters(in: .whitespaces).ensuringTerminalPunctuation()
     }
 
     /// Only when the in-progress item actually changed; harnesses re-emit the

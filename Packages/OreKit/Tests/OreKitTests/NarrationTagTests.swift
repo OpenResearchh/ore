@@ -49,6 +49,27 @@ struct NarrationTagTests {
         #expect(narration == "I renamed the module")
     }
 
+    /// The reported bug, verbatim in shape: an agent explaining ORE's own
+    /// narration convention writes the delimiter inside a code span. Scanning
+    /// for the *first* opener took that literal as the real tag, paired it with
+    /// the closer at the end of the turn, and swallowed everything between —
+    /// so the transcript stopped mid-sentence at the backtick, and the line
+    /// spoken aloud was the rest of the message.
+    @Test func extractIgnoresTheDelimiterWrittenAsProse() {
+        let text = """
+            Narration tag extraction has no length limit — a long `<narration>` \
+            line survives intact.
+
+            The stream filter matches it.
+
+            <narration>I traced the pipeline and fixed the clip.</narration>
+            """
+        let (body, narration) = NarrationTag.extract(from: text)
+        #expect(narration == "I traced the pipeline and fixed the clip.")
+        #expect(body.hasSuffix("The stream filter matches it."))
+        #expect(body.contains("`<narration>` line survives intact."))
+    }
+
     @Test func extractIgnoresEmptyTag() {
         let (body, narration) = NarrationTag.extract(from: "Body.\n<narration> </narration>")
         #expect(body == "Body.")
@@ -102,6 +123,35 @@ struct NarrationTagTests {
         #expect(result.shown == "Done.\n")
         #expect(result.flush.isEmpty)
         #expect(result.narration == "Halfway through a spoken line")
+    }
+
+    /// The reported bug's streaming half. The live view must reach the same
+    /// answer as `extract`, or the message is whole in the transcript and
+    /// truncated while it streams.
+    @Test func filterGivesBackTheDelimiterWrittenAsProse() {
+        let result = run([
+            "A long `<narration>", "` line survives.\n\nMore prose.\n\n",
+            "<narration>Real spoken line.</narration>",
+        ])
+        #expect(result.shown.contains("A long `<narration>` line survives."))
+        #expect(result.shown.contains("More prose."))
+        #expect(result.narration == "Real spoken line.")
+    }
+
+    /// The same prose, in a turn that never emits a real tag. The unclosed
+    /// opener must not run to the end of the message and swallow it.
+    @Test func filterKeepsProseWhenNoRealTagEverArrives() {
+        let result = run(["The `<narration>", "` tag is stripped.\n\nThat's the whole convention."])
+        #expect(result.shown + result.flush
+            == "The `<narration>` tag is stripped.\n\nThat's the whole convention.")
+        #expect(result.narration == nil)
+    }
+
+    @Test func extractKeepsProseWhenNoRealTagEverArrives() {
+        let text = "The `<narration>` tag is stripped.\n\nThat's the whole convention."
+        let (body, narration) = NarrationTag.extract(from: text)
+        #expect(body == text)
+        #expect(narration == nil)
     }
 
     @Test func filterEmitsProseAfterCloser() {

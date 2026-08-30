@@ -324,6 +324,51 @@ struct NarrationPhraserTests {
         #expect(asked.count > NarrationPolicy.utteranceLimit)
     }
 
+    /// The clip has to sit above a realistic answer, not just above the
+    /// ambient limit: a multi-part question answered part by part is roughly
+    /// this long, and if the cap lands under it the listener gets a truncated
+    /// answer plus "there's more in the Assistant window" — the deflection the
+    /// spoken reply exists to avoid.
+    @Test func aMultiPartSpokenAnswerIsNotClippedIntoADeflection() throws {
+        // Eight sentences of ~140 characters — the shape of "why is it slow,
+        // and what would you do about it" answered properly.
+        let answer = String(
+            repeating: "The build slowed down because the resource step now runs on every "
+                + "incremental compile instead of only on a clean one. ",
+            count: 8
+        )
+        #expect(answer.count > 900, "the fixture must exercise the old 900-character cap")
+
+        let spoken = try #require(NarrationPhraser.spokenNarration(
+            answer, limit: NarrationPolicy.assistantAnswerLimit
+        ))
+        #expect(!spoken.contains("there's more in the Assistant window"))
+        #expect(!spoken.hasSuffix("…"))
+    }
+
+    /// When an answer really does overrun, it has to stop somewhere the ear
+    /// recognises as an ending. Cutting mid-clause and then bolting on "there's
+    /// more in the Assistant window" is what made a long reply sound like it
+    /// had broken rather than like it had more to give.
+    @Test func anOverlongSpokenAnswerIsCutAtASentenceBoundary() throws {
+        let sentence = "The resource step reruns on every incremental build."
+        let answer = Array(repeating: sentence, count: 30).joined(separator: " ")
+        let spoken = try #require(NarrationPhraser.spokenNarration(
+            answer, limit: NarrationPolicy.assistantAnswerLimit
+        ))
+
+        let pointer = " — there's more in the Assistant window."
+        #expect(spoken.hasSuffix(pointer))
+        let body = String(spoken.dropLast(pointer.count))
+
+        // Whole sentences only: the body is exactly N copies rejoined, with
+        // nothing severed on the end.
+        let kept = body.components(separatedBy: sentence).count - 1
+        #expect(kept > 1)
+        #expect(body == Array(repeating: sentence, count: kept).joined(separator: " "))
+        #expect(body.count <= NarrationPolicy.assistantAnswerLimit)
+    }
+
     /// An ellipsis is silent, so a clipped answer simply stops mid-thought and
     /// the listener has no way to know there was more of it.
     @Test func aClippedSpokenAnswerSaysThatItWasClipped() throws {

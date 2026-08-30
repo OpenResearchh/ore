@@ -638,6 +638,13 @@ public actor WorkspaceEngine {
         // answer twice. A model that composes a full reply and then a full
         // spoken version of it doubles the silence before the user hears
         // anything — nothing is spoken until the turn ends.
+        //
+        // The "put it in the message instead" branch is deliberately fenced.
+        // Left open it swallowed every answer with any shape to it: a
+        // two-part question came back as "have a look at the Assistant
+        // window", which is the one reply a user who asked out loud cannot
+        // use. Reading is the fallback for detail that genuinely cannot be
+        // spoken, never a substitute for answering.
         return """
             End every turn by appending one final line to your last message, in \
             exactly this form:
@@ -646,13 +653,21 @@ public actor WorkspaceEngine {
             This line is the reply the user hears, so length it the way you \
             length the answer: a sentence or two for a status check or an \
             action you took, and as long as it honestly needs to be — several \
-            sentences — when they asked you to explain something or to give \
-            them the full answer.
+            sentences — for a question with substance: a "why" or a "how", a \
+            comparison, a judgement call, a question with more than one part, \
+            or an explicit "explain" / "walk me through it". Answer every part \
+            of a multi-part question out loud. The user is listening, not \
+            reading, so a detail you leave out of this line is a detail they \
+            did not get.
             Do not write the answer twice. When the spoken line carries the \
             whole answer, the message above it can be a short written recap; \
-            when the answer is genuinely something to read — a list, a table, \
-            anything with names to check — put it in the message and let the \
-            spoken line give its crux and point at the Assistant window.
+            when part of the answer is genuinely something to read — a list, a \
+            table, exact names, numbers or paths to check — put that part in \
+            the message, and still say the substance and the verdict out loud \
+            before mentioning that the detail is in the Assistant window. \
+            Never send the user to the window in place of an answer: \
+            "open the Assistant window" is not an answer, and neither is a \
+            line that names the topic without saying anything about it.
             """
     }
 

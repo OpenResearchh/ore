@@ -295,4 +295,38 @@ struct AssistantConversationTests {
         #expect(projectPrompt.contains("One or two short spoken sentences"))
         #expect(!projectPrompt.contains("Do not write the answer twice"))
     }
+
+    /// The regression that prompted this: a question with any shape to it came
+    /// back spoken as "open the Assistant window", so the detail the user
+    /// asked for out loud was never said out loud. The written half of the
+    /// answer is still allowed to hold what can't be spoken — what is not
+    /// allowed is sending the user to read *instead* of answering.
+    @Test func theAssistantIsToldToSpeakTheAnswerRatherThanPointAtTheWindow() async throws {
+        let (_, assistant, assistantHarness, _) = try await makeAssistantEngine()
+        _ = try await assistant.ensureSession()
+        let prompt = try #require(
+            await assistantHarness.latestSession?.configuration.appendSystemPrompt
+        )
+
+        // A nuanced or multi-part question earns the longer spoken answer —
+        // not only the literal "explain this to me" the rule used to name.
+        #expect(prompt.contains("a question with more than one part"))
+        #expect(prompt.contains("Answer every part of a multi-part question out loud"))
+
+        // And the escape hatch is fenced: reading is where detail that can't
+        // be spoken goes, never where the answer goes.
+        #expect(prompt.contains("Never send the user to the window in place of an answer"))
+        #expect(prompt.contains(
+            "still say the substance and the verdict out loud before mentioning"
+        ))
+
+        // Role boundaries are unchanged: the assistant still delegates and
+        // still has no shell or editor.
+        #expect(prompt.contains("never do the work"))
+        let configuration = try #require(await assistantHarness.latestSession?.configuration)
+        #expect(configuration.allowedTools == ["mcp__ore"])
+        for tool in ["Bash", "Edit", "Write", "Read", "Task", "WebFetch"] {
+            #expect(configuration.disallowedTools.contains(tool))
+        }
+    }
 }

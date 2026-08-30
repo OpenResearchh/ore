@@ -16,11 +16,20 @@ public enum NarrationTag {
 
     /// Splits a completed text into the visible body and the narration line.
     ///
-    /// Every occurrence is stripped from the body; when the agent emits the
-    /// tag more than once, the last non-empty one wins — its final word is
-    /// the freshest account of the turn. An opener that never closes runs to
-    /// the end of the text: the agent was cut off mid-tag, and half a spoken
-    /// line beats leaking the marker into the transcript.
+    /// Every real occurrence is stripped from the body; when the agent emits
+    /// the tag more than once, the last non-empty one wins — its final word is
+    /// the freshest account of the turn.
+    ///
+    /// Two shapes are deliberately *not* treated as tags, because both are an
+    /// agent writing the delimiter as prose — most often while explaining this
+    /// very convention — and taking either one as a real tag deletes the rest
+    /// of the message from the transcript and speaks it instead:
+    ///
+    /// - An opener with another opener before its closer. Tags do not nest, so
+    ///   the outer one is prose that happened to find a later tag's closer.
+    /// - An unclosed opener whose tail spans lines. The unclosed case exists
+    ///   for an agent cut off mid-tag, which leaves a partial *single* line;
+    ///   paragraphs after the opener mean it was never a tag at all.
     public static func extract(from text: String) -> (body: String, narration: String?) {
         // The overwhelmingly common case is no tag at all (thinking blocks,
         // subagent text, harnesses that ignore the instruction) — one scan,
@@ -31,10 +40,30 @@ public enum NarrationTag {
         var narration: String?
         var remainder = Substring(text)
         while let openRange = remainder.range(of: open) {
-            body += remainder[..<openRange.lowerBound]
             let afterOpen = remainder[openRange.upperBound...]
+            let closeRange = afterOpen.range(of: close)
+
+            // Prose, not a tag: keep the delimiter in the body verbatim and
+            // resume scanning after it.
+            let isProse: Bool
+            if let nextOpen = afterOpen.range(of: open) {
+                isProse = closeRange.map { nextOpen.lowerBound < $0.lowerBound } ?? true
+            } else if closeRange == nil {
+                isProse = afterOpen
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .contains(where: \.isNewline)
+            } else {
+                isProse = false
+            }
+            guard !isProse else {
+                body += remainder[..<openRange.upperBound]
+                remainder = afterOpen
+                continue
+            }
+
+            body += remainder[..<openRange.lowerBound]
             let inner: Substring
-            if let closeRange = afterOpen.range(of: close) {
+            if let closeRange {
                 inner = afterOpen[..<closeRange.lowerBound]
                 remainder = afterOpen[closeRange.upperBound...]
             } else {
@@ -83,6 +112,17 @@ public struct NarrationTagStreamFilter: Sendable {
             if isCapturing {
                 captured += input
                 input = ""
+                // Tags do not nest, so a second opener before the closer means
+                // the one being captured was prose. Hand it back to the
+                // transcript verbatim and capture from the new one instead —
+                // the same rule `NarrationTag.extract` applies to the settled
+                // text, so the live view and the final view agree.
+                while let nextOpen = captured.range(of: NarrationTag.open),
+                      captured.range(of: NarrationTag.close)
+                          .map({ nextOpen.lowerBound < $0.lowerBound }) ?? true {
+                    emitted += NarrationTag.open + captured[..<nextOpen.lowerBound]
+                    captured = String(captured[nextOpen.upperBound...])
+                }
                 if let closeRange = captured.range(of: NarrationTag.close) {
                     let spoken = captured[..<closeRange.lowerBound]
                         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,12 +152,21 @@ public struct NarrationTagStreamFilter: Sendable {
     /// flushed, and an opener that never closed yields its content as the
     /// narration rather than reappearing in the transcript.
     public mutating func finish() -> (flush: String, narration: String?) {
+        var flush = held
         if isCapturing {
             let spoken = captured.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !spoken.isEmpty { narration = spoken }
+            // An unclosed opener is a cut-off tag only while it still looks
+            // like the single spoken line the convention asks for; a tail
+            // spanning lines was prose, and swallowing it would take the rest
+            // of the message out of the transcript.
+            if spoken.contains(where: \.isNewline) {
+                flush = NarrationTag.open + captured
+            } else if !spoken.isEmpty {
+                narration = spoken
+            }
         }
         defer { self = NarrationTagStreamFilter() }
-        return (held, narration)
+        return (flush, narration)
     }
 
     /// The longest suffix of `text` that is a strict prefix of the opener —

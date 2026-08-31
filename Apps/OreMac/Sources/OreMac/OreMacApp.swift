@@ -76,9 +76,6 @@ struct OreMacApp: App {
                 // (every unsigned build we pass around today).
                 if !updater.isConfigured { await githubUpdater.check() }
             }
-            .onDisappear {
-                Task { await model.shutdown() }
-            }
         }
         .defaultSize(width: 1_320, height: 820)
         .commands {

@@ -10,6 +10,8 @@ import UserNotifications
 /// then never shows a window at all. Setting it explicitly makes both paths
 /// behave the same.
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private var isTerminating = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         // A visual-test override; normal launches keep the system appearance.
@@ -124,6 +126,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// bar item and ⌘Q.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// Window scenes share one AppModel and one event stream. A scene's
+    /// `onDisappear` must not shut that core down while another window (or the
+    /// menu-bar app) still needs it, so shutdown belongs to the real process
+    /// termination handshake instead.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isTerminating else { return .terminateLater }
+        guard let model = MainActor.assumeIsolated({ AppModel.running() }) else {
+            return .terminateNow
+        }
+        isTerminating = true
+        Task { @MainActor in
+            await model.shutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     /// Right-click on the dock icon: jump straight to whichever agents need

@@ -1,4 +1,5 @@
 import Foundation
+import OreProtocol
 import Testing
 
 @testable import OreMac
@@ -18,5 +19,28 @@ struct SidebarCompactAgeTests {
 
     @Test func futureDatesClampToNow() {
         #expect(sidebarCompactAge(now.addingTimeInterval(3600), now: now) == "now")
+    }
+}
+
+struct WorkspaceSelectionTests {
+    private let first = WorkspaceID(rawValue: "first")
+    private let second = WorkspaceID(rawValue: "second")
+
+    @Test func anArchivedSelectionMovesToTheFirstRemainingWorkspace() {
+        #expect(workspaceSelectionAfterListChange(
+            selected: first, active: [second]
+        ) == second)
+    }
+
+    @Test func aStillActiveSelectionIsPreservedAcrossListRefreshes() {
+        #expect(workspaceSelectionAfterListChange(
+            selected: second, active: [first, second]
+        ) == second)
+    }
+
+    @Test func archivingTheLastWorkspaceClearsSelection() {
+        #expect(workspaceSelectionAfterListChange(
+            selected: first, active: []
+        ) == nil)
     }
 }

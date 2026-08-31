@@ -2508,11 +2508,13 @@ final class AppModel {
             adoptResearchIdentities()
             if selectedWorkspaceID == nil {
                 if let saved = UserDefaults.standard.string(forKey: "ore.selectedWorkspace"),
-                   workspaces.contains(where: { $0.id.rawValue == saved }) {
+                   sortedWorkspaces.contains(where: { $0.id.rawValue == saved }) {
                     selectedWorkspaceID = WorkspaceID(rawValue: saved)
                 } else {
                     selectedWorkspaceID = sortedWorkspaces.first?.id
                 }
+            } else {
+                repairWorkspaceSelection()
             }
             warmWorkspaces()
 
@@ -2534,6 +2536,7 @@ final class AppModel {
             upsert(summary)
             identityRenamesInFlight.remove(summary.id)
             rememberIdentityIfPresent(for: summary)
+            if summary.isArchived { repairWorkspaceSelection() }
 
         case .workspaceRemoved(let id):
             workspaces.removeAll { $0.id == id }
@@ -3165,6 +3168,16 @@ final class AppModel {
         }
     }
 
+    /// Selection is part of workspace-list state too. Keeping an archived row
+    /// selected leaves the detail pane and app intents pointing at a worktree
+    /// that no longer exists even when the sidebar correctly filters the row.
+    private func repairWorkspaceSelection() {
+        selectedWorkspaceID = workspaceSelectionAfterListChange(
+            selected: selectedWorkspaceID,
+            active: sortedWorkspaces.map(\.id)
+        )
+    }
+
     private func upsertChat(_ summary: ChatSummary) {
         if let index = chatSummaries.firstIndex(where: { $0.id == summary.id }) {
             chatSummaries[index] = summary
@@ -3319,6 +3332,17 @@ final class AppModel {
             detail: nil
         ))
     }
+}
+
+/// Keeps a still-valid selection, otherwise moves to the first active row.
+/// All windows share one `AppModel`, so repairing it here updates every scene
+/// without window-local invalidation or an optimistic archive.
+func workspaceSelectionAfterListChange(
+    selected: WorkspaceID?,
+    active: [WorkspaceID]
+) -> WorkspaceID? {
+    if let selected, active.contains(selected) { return selected }
+    return active.first
 }
 
 private enum HarnessAuthenticationError: LocalizedError, Sendable {

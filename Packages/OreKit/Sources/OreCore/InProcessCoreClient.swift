@@ -46,6 +46,11 @@ public actor InProcessCoreClient: CoreClient {
     var pendingAssistantConfirmations: [String: CheckedContinuation<AssistantResolution, Never>] = [:]
     var assistantTaskGrants: [AssistantTaskGrantKey: Date] = [:]
     var assistantAlwaysGrants: Set<AssistantActionClass> = []
+    /// Harnesses that already failed or exhausted quota this incident, so a
+    /// second error does not bounce back onto the one we just left.
+    var assistantFailedHarnesses: [ChatID: Set<HarnessKind>] = [:]
+    var assistantFailoverInFlight: Set<ChatID> = []
+    var assistantFailoverAt: [ChatID: ContinuousClock.Instant] = [:]
 
     public init(
         store: OreStore,
@@ -806,6 +811,14 @@ public actor InProcessCoreClient: CoreClient {
                 await self.publishFromActiveEngine(
                     .agent(id, routed.chatID, routed.event), id: id, engine: engine
                 )
+                // The Assistant is the product's own agent. A rate-limited or
+                // dead CLI must not mute it while another harness is ready.
+                // Project tabs keep their harness; only this workspace moves.
+                if engine.isAssistantWorkspace {
+                    await self.considerAssistantFailover(
+                        chatID: routed.chatID, event: routed.event
+                    )
+                }
             }
         }
         let summaryTask = Task { [weak self] in

@@ -833,26 +833,106 @@ extension InProcessCoreClient {
     /// engine's harness switch carries a locally generated handoff summary,
     /// so the conversation continues rather than restarting.
     public func assistantRateLimited(chatID: ChatID) async {
+        await failOverAssistant(chatID: chatID)
+    }
+
+    func considerAssistantFailover(chatID: ChatID, event: AgentEvent) async {
+        if AssistantFailoverPolicy.reason(for: event) != nil {
+            await failOverAssistant(chatID: chatID)
+            return
+        }
+        if case .turnCompleted(let result) = event, result.outcome == .completed {
+            assistantFailedHarnesses[chatID] = nil
+            assistantFailoverAt[chatID] = nil
+        }
+    }
+
+    /// Switch the Assistant itself — not a project tab — onto another ready
+    /// harness, then retry the last user request so a spoken question is not
+    /// lost to a 429.
+    func failOverAssistant(chatID: ChatID) async {
+        guard !assistantFailoverInFlight.contains(chatID) else { return }
+        if let last = assistantFailoverAt[chatID],
+           ContinuousClock.now - last < AssistantFailoverPolicy.cooldown {
+            return
+        }
         guard let assistant = try? await store.assistantWorkspace(),
               let chat = try? await store.chat(chatID),
               chat.workspaceID == assistant.id
         else { return }
         let current = HarnessKind(rawValue: chat.harness)
-        guard let alternate = harnessProbes.lazy.compactMap({ probe -> (
-            harness: HarnessKind, profile: AssistantManager.ModelProfile
-        )? in
-            guard probe.isReady, probe.kind != current,
-                  let profile = Self.assistantProfile(for: probe.kind, catalog: self.modelCatalog)
-            else { return nil }
-            return (probe.kind, profile)
-        }).first else { return }
+        var excluding = assistantFailedHarnesses[chatID] ?? []
+        if let current { excluding.insert(current) }
+        guard let alternate = AssistantFailoverPolicy.nextHarness(
+            current: current,
+            excluding: excluding,
+            probes: harnessProbes,
+            profile: { Self.assistantProfile(for: $0, catalog: self.modelCatalog) }
+        ) else { return }
+
+        assistantFailoverInFlight.insert(chatID)
+        defer { assistantFailoverInFlight.remove(chatID) }
+
+        let pendingPrompt: (text: String, origin: MessageOrigin)?
+        if let engine = try? await engine(for: assistant.workspaceID) {
+            pendingPrompt = await engine.lastOutboundPrompt(for: chatID)
+        } else {
+            pendingPrompt = nil
+        }
+
         await moveAssistant(
             to: alternate.harness,
             profile: alternate.profile,
             workspaceID: assistant.workspaceID,
             chatID: chatID
         )
+        assistantFailedHarnesses[chatID] = excluding
+        assistantFailoverAt[chatID] = .now
+        await retryLastAssistantPrompt(
+            workspaceID: assistant.workspaceID,
+            chatID: chatID,
+            pending: pendingPrompt
+        )
     }
+
+    /// Replay the last person-originated prompt on the new harness. Watch
+    /// digests are skipped: they are machine traffic and will come again.
+    /// Origin is `.agent` so the transcript does not look like the user typed
+    /// the same sentence twice.
+    private func retryLastAssistantPrompt(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        pending: (text: String, origin: MessageOrigin)?
+    ) async {
+        let prompt: String
+        let origin: MessageOrigin
+        if let pending {
+            prompt = pending.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            origin = pending.origin
+        } else if let turn = ((try? await store.turns(chatID: chatID)) ?? [])
+            .last(where: { !($0.prompt ?? "").isEmpty }) {
+            prompt = (turn.prompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            origin = turn.origin
+        } else {
+            return
+        }
+        guard origin != .watch, !prompt.isEmpty else { return }
+        guard let engine = try? await engine(for: workspaceID) else { return }
+        _ = try? await engine.send(SendMessageRequest(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            text: prompt,
+            queueIfBusy: false,
+            origin: .agent,
+            hiddenContext: Self.failoverRetryNote
+        ))
+    }
+
+    private static let failoverRetryNote = """
+        The previous agent hit a rate limit or failed. You are a different \
+        agent continuing the same conversation. Answer the user's last request \
+        now; do not ask them to repeat it.
+        """
 
     private func moveAssistant(
         to harness: HarnessKind,
@@ -878,7 +958,7 @@ extension InProcessCoreClient {
     /// harness. A nonempty live catalog is authoritative: if that account or
     /// CLI does not advertise the lean model, skip the harness instead of
     /// silently spending against its frontier default.
-    static func assistantProfile(
+    nonisolated static func assistantProfile(
         for harness: HarnessKind,
         catalog: [HarnessKind: [AgentModel]]
     ) -> AssistantManager.ModelProfile? {

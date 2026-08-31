@@ -225,7 +225,10 @@ enum AssistantPrompt {
         or the usual choice isn't ready per ListHarnesses.
         - ListHarnesses tells you what's installed, signed in, and each \
         agent's models — consult it before naming a harness or model, and \
-        when a provider seems broken or rate-limited.
+        when a *project* tab's provider seems broken or rate-limited. ORE \
+        moves *your* own agent to another ready harness automatically when \
+        it is rate-limited or the CLI fails; do not SwitchChatHarness on \
+        yourself for that.
         - Pass effort on SendPromptToProject or SetChatEffort: high (or \
         above) only for genuinely hard work; everyday tasks run at the \
         default and cost the user less.

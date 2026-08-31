@@ -2851,15 +2851,16 @@ final class AppModel {
                 }
                 assistantRateLimitHandled = false
             }
-            if case .rateLimit(let report) = event, report.status == .exhausted,
-               !assistantRateLimitHandled {
-                // The assistant's own provider ran dry; move it to another
-                // ready harness so the next question still gets answered.
+            if let reason = AssistantFailoverPolicy.reason(for: event),
+               !assistantRateLimitHandled,
+               let current = chatSummaries.first(where: { $0.id == chatID })?.harness
+                ?? assistantWorkspace?.harness,
+               harnesses.contains(where: { $0.isReady && $0.kind != current }) {
+                // Core performs the switch; this is only the spoken cue, and
+                // only when another ready harness actually exists.
                 assistantRateLimitHandled = true
-                Task { await client.assistantRateLimited(chatID: chatID) }
                 narration.speakAssistant(
-                    "I've hit my provider's rate limit — switching to another "
-                        + "agent to keep answering.",
+                    AssistantFailoverPolicy.spokenHandoff(reason),
                     chatID: chatID
                 )
             }

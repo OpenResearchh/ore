@@ -13,6 +13,9 @@ import OreSupport
 /// mutable state and no working directory.
 public actor WorkspaceEngine {
     public nonisolated let workspaceID: WorkspaceID
+    /// Frozen at init so the core can decide, without an actor hop on every
+    /// streamed token, whether this engine is the product assistant.
+    public nonisolated let isAssistantWorkspace: Bool
     public nonisolated let events: AsyncStream<WorkspaceAgentEvent>
 
     private nonisolated let continuation: AsyncStream<WorkspaceAgentEvent>.Continuation
@@ -56,6 +59,11 @@ public actor WorkspaceEngine {
         var currentTurnID: TurnID?
         var isTurnActive = false
         var sessionEffort: ReasoningEffort?
+        /// The prompt that opened the in-flight (or just-failed) turn. Stored
+        /// here because the transcript does not persist a turn until it starts
+        /// or completes — a rate-limit mid-send would otherwise have nothing
+        /// to retry on the next harness.
+        var lastOutboundPrompt: (text: String, origin: MessageOrigin)?
         var isGeneratingTitle = false
         var handoffContext: String?
         var queuedMessageCount = 0
@@ -88,6 +96,7 @@ public actor WorkspaceEngine {
         allowAPIKeyFallback: Bool = false
     ) {
         self.workspaceID = record.workspaceID
+        self.isAssistantWorkspace = record.workspaceKind == .assistant
         self.record = record
         self.store = store
         self.git = git
@@ -854,6 +863,7 @@ public actor WorkspaceEngine {
                 reasoningEffort: requestedEffort
             )
             try await captureCheckpoint(runtime: runtime)
+            runtime.lastOutboundPrompt = (request.text, request.origin)
             await runtime.transcript?.recordPrompt(
                 text,
                 attachments: request.attachments,
@@ -2142,6 +2152,12 @@ public actor WorkspaceEngine {
     }
 
     public func focusedChatIDValue() -> ChatID? { focusedChatID }
+
+    public func lastOutboundPrompt(
+        for chatID: ChatID
+    ) -> (text: String, origin: MessageOrigin)? {
+        chats[chatID]?.lastOutboundPrompt
+    }
 
     public func liveGitStatus() async -> GitStatusSummary {
         await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus

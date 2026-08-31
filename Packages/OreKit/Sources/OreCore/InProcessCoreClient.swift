@@ -837,6 +837,14 @@ public actor InProcessCoreClient: CoreClient {
                 )
             }
         }
+        let gitTask = Task { [weak self] in
+            for await status in await engine.gitStatusUpdates() {
+                guard !Task.isCancelled, let self else { return }
+                await self.publishFromActiveEngine(
+                    .gitStatusChanged(id, status), id: id, engine: engine
+                )
+            }
+        }
         let promptTask = Task { [weak self, continuation] in
             for await routed in await engine.promptSubmissions() {
                 guard self != nil else { return }
@@ -851,7 +859,7 @@ public actor InProcessCoreClient: CoreClient {
                 )
             }
         }
-        engineTasks[id] = [agentTask, summaryTask, chatTask, promptTask, compactionTask]
+        engineTasks[id] = [agentTask, summaryTask, chatTask, gitTask, promptTask, compactionTask]
 
         await engine.start()
         return engine

@@ -566,7 +566,7 @@ private struct WaveformBars: View {
     var mode: Mode
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval)) { context in
             let time = context.date.timeIntervalSinceReferenceDate
             HStack(spacing: 3) {
                 ForEach(0..<5, id: \.self) { index in

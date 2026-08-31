@@ -25,6 +25,12 @@ func waitUntil(
     return try await condition()
 }
 
+actor StreamCounter {
+    private var count = 0
+    func increment() { count += 1 }
+    func value() -> Int { count }
+}
+
 /// The engine's job is wiring: checkpoints around turns, the message queue,
 /// unread derivation, revert. A scripted harness makes the agent's behaviour an
 /// input, so these test the wiring rather than a model's output.
@@ -790,5 +796,91 @@ struct WorkspaceEngineTests {
         await #expect(throws: HarnessError.self) {
             _ = try await engine.ensureSession()
         }
+    }
+
+    @Test func textDeltasDoNotRepublishChatChrome() async throws {
+        // Sidebar, tab bar, and ChatPane all observe ChatSummary. A token
+        // firehose used to republish an identical summary on every delta, so
+        // streaming one background tab rebuilt every chrome surface. The
+        // focused pane's body not re-evaluating is the same fact: no
+        // chatUpdated while status/unread/queue stay put.
+        let harness = try await makeEngine()
+        let engine = harness.engine
+        let collector = StreamCounter()
+        let collect = Task {
+            for await _ in await engine.chatUpdates() {
+                await collector.increment()
+            }
+        }
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "stream this"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        let turnID = TurnID(rawValue: "stream-turn")
+        session.emit(.turnStarted(TurnStarted(turnID: turnID)))
+        // First usage is a real chrome change (nil → a meter). Later ticks
+        // in the same percent window must not republish.
+        session.emit(.usage(UsageReport(
+            turnID: turnID, inputTokens: 1, outputTokens: 10, contextWindow: 200_000
+        )))
+        try await Task.sleep(for: .milliseconds(250))
+        let before = await collector.value()
+        #expect(before >= 1)
+        let block = BlockID(rawValue: "b1")
+        for _ in 0..<40 {
+            session.emit(.textDelta(BlockDelta(turnID: turnID, blockID: block, text: "x")))
+            session.emit(.thinkingDelta(BlockDelta(turnID: turnID, blockID: block, text: "y")))
+        }
+        for tokens in [10, 50, 90, 200] {
+            session.emit(.usage(UsageReport(
+                turnID: turnID, inputTokens: 1, outputTokens: tokens, contextWindow: 200_000
+            )))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        let afterDeltas = await collector.value()
+        #expect(afterDeltas == before)
+
+        session.emit(.turnCompleted(TurnResult(
+            turnID: turnID, outcome: .completed, summary: "done"
+        )))
+        #expect(await waitUntil { await collector.value() > before })
+        collect.cancel()
+    }
+
+    @Test func gitChurnDoesNotRepublishWorkspaceSummaries() async throws {
+        let harness = try await makeEngine()
+        let engine = harness.engine
+        await engine.start()
+
+        let summaries = StreamCounter()
+        let git = StreamCounter()
+        let summaryTask = Task {
+            for await _ in await engine.summaryUpdates() {
+                await summaries.increment()
+            }
+        }
+        let gitTask = Task {
+            for await _ in await engine.gitStatusUpdates() {
+                await git.increment()
+            }
+        }
+        #expect(await waitUntil {
+            let summaryCount = await summaries.value()
+            let gitCount = await git.value()
+            return summaryCount >= 1 && gitCount >= 1
+        })
+        let summaryBefore = await summaries.value()
+        let gitBefore = await git.value()
+
+        try harness.fixture.write("nudge.txt", "dirt\n", in: harness.worktree)
+        #expect(await waitUntil(timeout: .seconds(12)) { await git.value() > gitBefore })
+        try await Task.sleep(for: .milliseconds(250))
+        let summaryAfter = await summaries.value()
+        #expect(summaryAfter == summaryBefore)
+
+        summaryTask.cancel()
+        gitTask.cancel()
+        await engine.stop()
     }
 }

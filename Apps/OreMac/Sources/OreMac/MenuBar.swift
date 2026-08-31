@@ -65,7 +65,11 @@ struct MenuBarDashboard: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if let suggestion = FleetSuggestionResolver.resolve(model.sortedWorkspaces) {
+            if let suggestion = FleetSuggestionResolver.resolve(model.sortedWorkspaces.map { workspace in
+                var copy = workspace
+                copy.gitStatus = model.gitChrome(for: workspace.id)
+                return copy
+            }) {
                 fleetSuggestionRow(suggestion)
                 Divider()
             }

@@ -446,10 +446,8 @@ struct RootView: View {
                 }
             }
             .id(workspace.id)
-            .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)") {
-                // The git action lives in the window toolbar now, so it has to
-                // stay current even when the review pane is closed.
-                model.prefetchDiff(for: workspace)
+            .background {
+                GitDiffPrefetch(workspace: workspace)
             }
         } else {
             welcome
@@ -693,6 +691,24 @@ struct RootView: View {
         }
         .padding(.top, OreTheme.Space.sm)
         .animation(.smooth(duration: 0.3), value: model.banners.count)
+    }
+}
+
+/// Prefetch lives in its own view so a git-generation bump does not rebuild
+/// the window chrome — only this task identity changes.
+private struct GitDiffPrefetch: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .task(id: "\(workspace.id.rawValue)-\(model.gitGeneration(for: workspace.id))") {
+                // The git action lives in the window toolbar now, so it has to
+                // stay current even when the review pane is closed.
+                model.prefetchDiff(for: workspace)
+            }
     }
 }
 

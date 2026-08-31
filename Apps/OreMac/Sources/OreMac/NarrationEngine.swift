@@ -55,6 +55,17 @@ final class NarrationEngine {
         return String(text[..<lastBreak])
     }
 
+    /// HUD word-progress only needs to notify when the visible prefix changes.
+    /// Intra-word clock ticks from the neural voice otherwise rebuild the pill
+    /// on every character.
+    nonisolated static func spokenProgressWouldRevealNewWords(
+        of text: String,
+        from previousCount: Int,
+        to nextCount: Int
+    ) -> Bool {
+        wholeWords(of: text, upTo: previousCount) != wholeWords(of: text, upTo: nextCount)
+    }
+
     /// Both voices are held, not one: the neural voice may still be
     /// downloading, and every utterance until it is ready falls back to the
     /// system voice rather than being dropped.
@@ -754,7 +765,11 @@ final class NarrationEngine {
         guard let currentSpokenText, text == currentSpokenText,
               characters > spokenCharacterCount
         else { return }
-        spokenCharacterCount = min(characters, currentSpokenText.utf16.count)
+        let next = min(characters, currentSpokenText.utf16.count)
+        guard Self.spokenProgressWouldRevealNewWords(
+            of: currentSpokenText, from: spokenCharacterCount, to: next
+        ) else { return }
+        spokenCharacterCount = next
     }
 
     private func utteranceEnded() {

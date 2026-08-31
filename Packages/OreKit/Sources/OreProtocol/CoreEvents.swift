@@ -288,6 +288,18 @@ public struct GitStatusSummary: Sendable, Codable, Hashable {
         self.behindBase = behindBase
         self.generation = generation
     }
+
+    /// Counts the sidebar and composer actually draw. Generation is a
+    /// freshness stamp for the review pane, not a visible field — two
+    /// snapshots can bump generation with identical dirt.
+    public func hasSameVisibleChrome(as other: GitStatusSummary) -> Bool {
+        changedFileCount == other.changedFileCount
+            && insertions == other.insertions
+            && deletions == other.deletions
+            && hasUncommittedChanges == other.hasUncommittedChanges
+            && aheadOfBase == other.aheadOfBase
+            && behindBase == other.behindBase
+    }
 }
 
 /// Origin's default branch compared to the local default ref and to this

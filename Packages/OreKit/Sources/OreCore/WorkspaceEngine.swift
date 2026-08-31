@@ -84,6 +84,10 @@ public actor WorkspaceEngine {
         /// the next outgoing message and cleared — a note in the database
         /// alone never reaches a resumed provider session's context.
         var pendingContextNotes: [String] = []
+        /// Last chrome summary yielded on `chatUpdates`. Streaming tokens
+        /// rebuild an identical value; skipping the yield is what keeps the
+        /// sidebar and tab bar off the token firehose.
+        var lastPublishedSummary: ChatSummary?
 
         init(record: ChatRecord) { self.record = record }
     }
@@ -269,18 +273,7 @@ public actor WorkspaceEngine {
         return chats.values
             .filter { includeClosed || !$0.record.isClosed }
             .sorted { $0.record.sortIndex < $1.record.sortIndex }
-            .map { runtime in
-                runtime.record.summary(
-                    status: runtime.status,
-                    capabilities: harnessRegistry.harness(
-                        for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-                    )?.capabilities ?? HarnessCapabilities(),
-                    queuedMessageCount: runtime.queuedMessageCount,
-                    isTurnActive: runtime.isTurnActive,
-                    contextUsage: runtime.latestUsage,
-                    turnCount: runtime.userTurnCount
-                )
-            }
+            .map { makeChatSummary($0) }
     }
 
     public func createChat(_ request: CreateChatRequest) async throws -> ChatSummary {
@@ -466,16 +459,7 @@ public actor WorkspaceEngine {
 
     private func summary(for runtime: ChatRuntime) async throws -> ChatSummary {
         runtime.queuedMessageCount = try await store.queuedMessages(chatID: runtime.record.chatID).count
-        return runtime.record.summary(
-            status: runtime.status,
-            capabilities: harnessRegistry.harness(
-                for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-            )?.capabilities ?? HarnessCapabilities(),
-            queuedMessageCount: runtime.queuedMessageCount,
-            isTurnActive: runtime.isTurnActive,
-            contextUsage: runtime.latestUsage,
-            turnCount: runtime.userTurnCount
-        )
+        return makeChatSummary(runtime)
     }
 
     private func syncWorkspaceCompatibility(from runtime: ChatRuntime) async {
@@ -1896,7 +1880,10 @@ public actor WorkspaceEngine {
             aheadOfBase: gitStatus.aheadOfBase,
             behindBase: baseSync?.workspaceBehindOrigin ?? gitStatus.behindBase
         )
-        publishSummaryChange()
+        // Dirt rides its own stream. Folding it into `workspaceUpdated`
+        // rewrote the client's whole workspace array — sidebar sort, composer
+        // suggestions, review pane — on every agent file write.
+        publishGitStatusChange()
     }
 
     private func startBaseSyncWatching() async {
@@ -1953,6 +1940,7 @@ public actor WorkspaceEngine {
         baseSync = next
         gitStatus.behindBase = workspaceBehind
         publishSummaryChange()
+        publishGitStatusChange()
     }
 
     /// Keeps the local default branch fresh automatically: when origin moved
@@ -2012,6 +2000,7 @@ public actor WorkspaceEngine {
             runtime.isTurnActive = true
             runtime.pendingPlan = nil
             runtime.turnDidMutate = false
+            publishChatChange(runtime)
 
         case .toolCall(let call):
             if PlanProposalPolicy.proceedsPastProposal(call.name) {
@@ -2057,7 +2046,11 @@ public actor WorkspaceEngine {
             await markUnread(runtime)
 
         case .usage(let usage):
+            let previous = runtime.latestUsage
             runtime.latestUsage = usage
+            if ChatChromePublishPolicy.shouldPublishUsage(previous: previous, next: usage) {
+                publishChatChange(runtime)
+            }
 
         case .turnCompleted:
             runtime.isTurnActive = false
@@ -2074,6 +2067,7 @@ public actor WorkspaceEngine {
             await statusWatcher?.refreshNow()
             await drainQueue(runtime: runtime)
             await compactAssistantIfOutgrown(runtime)
+            publishChatChange(runtime)
 
         case .sessionError(let error):
             if !error.isRecoverable { setStatus(.failed, runtime: runtime) }
@@ -2091,6 +2085,7 @@ public actor WorkspaceEngine {
             // A session that dies mid-turn never reports `.turnCompleted`, so
             // this is the only chance anything queued behind it gets sent.
             scheduleQueueDrain(runtime: runtime)
+            publishChatChange(runtime)
 
         case .contextCompacted:
             if record.workspaceKind == .assistant {
@@ -2104,7 +2099,9 @@ public actor WorkspaceEngine {
             break
         }
 
-        publishChatChange(runtime)
+        // Token, thinking, and tool-result deltas never change ChatSummary
+        // chrome (status, unread, queue, turn). Publishing on every one used
+        // to rebuild the sidebar and tab bar at stream rate.
         continuation.yield(WorkspaceAgentEvent(chatID: chatID, event: event))
     }
 
@@ -2112,6 +2109,7 @@ public actor WorkspaceEngine {
         guard runtime.status != newStatus else { return }
         runtime.status = newStatus
         publishSummaryChange()
+        publishChatChange(runtime)
     }
 
     /// After a permission or question is answered the harness is running
@@ -2242,8 +2240,8 @@ public actor WorkspaceEngine {
         publishSummaryChange()
     }
 
-    private func publishChatChange(_ runtime: ChatRuntime) {
-        chatContinuation?.yield(runtime.record.summary(
+    private func makeChatSummary(_ runtime: ChatRuntime) -> ChatSummary {
+        runtime.record.summary(
             status: runtime.status,
             capabilities: harnessRegistry.harness(
                 for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
@@ -2252,7 +2250,14 @@ public actor WorkspaceEngine {
             isTurnActive: runtime.isTurnActive,
             contextUsage: runtime.latestUsage,
             turnCount: runtime.userTurnCount
-        ))
+        )
+    }
+
+    private func publishChatChange(_ runtime: ChatRuntime) {
+        let summary = makeChatSummary(runtime)
+        if runtime.lastPublishedSummary == summary { return }
+        runtime.lastPublishedSummary = summary
+        chatContinuation?.yield(summary)
     }
 
     private var summaryContinuation: AsyncStream<WorkspaceSummary>.Continuation?
@@ -2273,8 +2278,27 @@ public actor WorkspaceEngine {
             bufferingPolicy: .bufferingNewest(32)
         )
         chatContinuation = continuation
-        for runtime in chats.values { publishChatChange(runtime) }
+        for runtime in chats.values {
+            let summary = makeChatSummary(runtime)
+            runtime.lastPublishedSummary = summary
+            continuation.yield(summary)
+        }
         return stream
+    }
+
+    private var gitStatusContinuation: AsyncStream<GitStatusSummary>.Continuation?
+
+    public func gitStatusUpdates() -> AsyncStream<GitStatusSummary> {
+        let (stream, continuation) = AsyncStream<GitStatusSummary>.makeStream(
+            bufferingPolicy: .bufferingNewest(8)
+        )
+        gitStatusContinuation = continuation
+        continuation.yield(gitStatus)
+        return stream
+    }
+
+    private func publishGitStatusChange() {
+        gitStatusContinuation?.yield(gitStatus)
     }
 
     private var compactionContinuation: AsyncStream<CompactedConversation>.Continuation?

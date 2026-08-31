@@ -173,7 +173,7 @@ struct ReviewPane: View {
         }
         // Silent catch-up: the agent writing files should grow this list in
         // place, not flash a spinner over it.
-        .task(id: workspace.gitStatus.generation) { await refresh() }
+        .task(id: model.gitGeneration(for: workspace.id)) { await refresh() }
         // Agent PostDiffComment writes a gitignored file, so status generation
         // does not move. Poll while this pane is up so numbered anchors appear.
         .task(id: "comments-\(workspace.id.rawValue)") {
@@ -1132,7 +1132,7 @@ struct DiffDocumentView: View {
         }
         .background(OreTheme.Surface.content)
         .task(id: path) { await load() }
-        .task(id: workspace.gitStatus.generation) { await load() }
+        .task(id: model.gitGeneration(for: workspace.id)) { await load() }
         .onChange(of: model.fileFocus[workspace.id]?[path]) { _, focus in
             // A `file:line` click on an already-open file must show source, not
             // the diff, so the line reveal lands somewhere visible.
@@ -1691,7 +1691,7 @@ private struct ShipStatusPanel: View {
         // up the moment it sees no PR (`guard let pr` below), and a PR opened
         // from the terminal moves no local file to restart it. When the action
         // notices the PR, the panel reloads with it.
-        .task(id: "\(workspace.id.rawValue)-\(workspace.gitStatus.generation)-\(model.gitAction(for: workspace.id).title)") {
+        .task(id: "\(workspace.id.rawValue)-\(model.gitGeneration(for: workspace.id))-\(model.gitAction(for: workspace.id).title)") {
             await load()
             // CI has no local filesystem event to ride on. GitHub often posts
             // the first check runs several seconds after a push, so poll fast
@@ -1779,7 +1779,7 @@ private struct ShipStatusPanel: View {
             // in the tree, clicking it spins up the temporary commit tab — an
             // agent forked from the current conversation that stages and
             // commits with real messages. With a clean tree it stays a tab.
-            if target == .commits, workspace.gitStatus.hasUncommittedChanges {
+            if target == .commits, model.gitChrome(for: workspace.id).hasUncommittedChanges {
                 model.startCommitAgent(in: workspace.id)
             }
             tab = target
@@ -1824,7 +1824,7 @@ private struct ShipStatusPanel: View {
             if commits.isEmpty, (workingTree?.files.isEmpty ?? true) {
                 shipEmpty(
                     icon: "checkmark.circle",
-                    text: workspace.gitStatus.hasUncommittedChanges
+                    text: model.gitChrome(for: workspace.id).hasUncommittedChanges
                         ? "No commits yet" : "Everything pushed"
                 )
             } else {
@@ -2261,7 +2261,7 @@ struct GitActionToolbar: View {
                 .help("Open this pull request on GitHub")
             }
         }
-        .task(id: "\(workspace.id.rawValue)-\(action.title)-\(workspace.gitStatus.generation)") {
+        .task(id: "\(workspace.id.rawValue)-\(action.title)-\(model.gitGeneration(for: workspace.id))") {
             if case .createPullRequest = action {
                 branches = await model.remoteBranches(for: workspace.id)
             }

@@ -297,4 +297,21 @@ struct ProtocolBoundaryTests {
             "decision": "acceptForSession",
         ]).impliedPermissionMode == nil)
     }
+
+    @Test func gitStatusVisibleChromeIgnoresGeneration() {
+        let dirt = GitStatusSummary(
+            changedFileCount: 1, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 1
+        )
+        let newerStamp = GitStatusSummary(
+            changedFileCount: 1, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 99
+        )
+        #expect(dirt.hasSameVisibleChrome(as: newerStamp))
+        let moreFiles = GitStatusSummary(
+            changedFileCount: 2, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 1
+        )
+        #expect(!dirt.hasSameVisibleChrome(as: moreFiles))
+    }
 }

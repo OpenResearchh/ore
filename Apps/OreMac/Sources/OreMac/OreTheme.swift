@@ -14,6 +14,11 @@ enum OreTheme {
         static let xxl: CGFloat = 96
     }
 
+    /// Decorative motion (busy borders, tab dots, HUD waveform, sidebar ring).
+    /// Matches the ~12 Hz mic-level cadence and is enough for a sweep without
+    /// competing with typing on the main thread.
+    static let decorativeAnimationInterval: TimeInterval = 1.0 / 12.0
+
     /// The whole app's type scale. Chrome uses `body`; the transcript uses
     /// `prose` so a long reply is readable without looking like UI copy.
     enum Font {
@@ -114,6 +119,9 @@ struct OreComposerSurface: ViewModifier {
     var voiceGlow: OreVoiceGlowLevel = .off
     /// Smoothed microphone loudness, 0…1 — the clouds billow with the voice.
     var voiceEnergy: Double = 0
+    /// When set, energy is read here so the parent composer body does not
+    /// subscribe to ~12 Hz `audioLevel` ticks.
+    var voiceInput: VoiceInputController? = nil
 
     private static let glassRadius: CGFloat = OreTheme.cardRadius
 
@@ -146,8 +154,13 @@ struct OreComposerSurface: ViewModifier {
     @ViewBuilder
     private func glow(cornerRadius: CGFloat) -> some View {
         if voiceGlow != .off, !reduceMotion {
-            OreVoiceGlow(cornerRadius: cornerRadius, level: voiceGlow, energy: voiceEnergy)
-                .allowsHitTesting(false)
+            ComposerVoiceGlowHost(
+                cornerRadius: cornerRadius,
+                level: voiceGlow,
+                energy: voiceEnergy,
+                voice: voiceInput
+            )
+            .allowsHitTesting(false)
         }
     }
 
@@ -213,6 +226,23 @@ struct OreVoiceGlow: View {
     }
 }
 
+/// Reads `audioLevel` in its own body so the composer dock does not rebuild
+/// on every mic tick.
+private struct ComposerVoiceGlowHost: View {
+    let cornerRadius: CGFloat
+    let level: OreVoiceGlowLevel
+    var energy: Double
+    var voice: VoiceInputController?
+
+    var body: some View {
+        OreVoiceGlow(
+            cornerRadius: cornerRadius,
+            level: level,
+            energy: voice?.audioLevel ?? energy
+        )
+    }
+}
+
 /// The crisp edge of the voice glow: a blue-to-cyan outline that fades toward
 /// the top of the composer. Under Reduce Motion this is the entire effect.
 struct OreVoiceGlowStroke: View {
@@ -264,7 +294,7 @@ struct OreComposerBusyBorder: View {
             } else {
                 TimelineView(
                     .animation(
-                        minimumInterval: 1.0 / 30.0,
+                        minimumInterval: OreTheme.decorativeAnimationInterval,
                         paused: controlActiveState != .key
                     )
                 ) { context in
@@ -482,14 +512,16 @@ extension View {
         isBusy: Bool = false,
         reduceMotion: Bool = false,
         voiceGlow: OreVoiceGlowLevel = .off,
-        voiceEnergy: Double = 0
+        voiceEnergy: Double = 0,
+        voiceInput: VoiceInputController? = nil
     ) -> some View {
         modifier(OreComposerSurface(
             padding: padding,
             isBusy: isBusy,
             reduceMotion: reduceMotion,
             voiceGlow: voiceGlow,
-            voiceEnergy: voiceEnergy
+            voiceEnergy: voiceEnergy,
+            voiceInput: voiceInput
         ))
     }
 

@@ -603,7 +603,7 @@ private struct SpinningRing: View {
 
     var body: some View {
         TimelineView(
-            .animation(minimumInterval: 1.0 / 30.0, paused: controlActiveState != .key)
+            .animation(minimumInterval: OreTheme.decorativeAnimationInterval, paused: controlActiveState != .key)
         ) { context in
             let period = 1.6
             let angle = context.date.timeIntervalSinceReferenceDate
@@ -700,6 +700,7 @@ private struct ArchivedWorkspaceRow: View {
 }
 
 private struct RepositoryRow: View {
+    @Environment(AppModel.self) private var model
     let repository: String
     let workspaces: [WorkspaceSummary]
 
@@ -713,7 +714,7 @@ private struct RepositoryRow: View {
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
             Spacer(minLength: 0)
-            let changes = workspaces.reduce(0) { $0 + $1.gitStatus.changedFileCount }
+            let changes = workspaces.reduce(0) { $0 + model.gitChrome(for: $1.id).changedFileCount }
             if changes > 0 {
                 Text("\(changes)")
                     .font(.caption2.monospacedDigit())
@@ -728,6 +729,7 @@ private struct RepositoryRow: View {
 }
 
 private struct WorkspaceRow: View {
+    @Environment(AppModel.self) private var model
     let workspace: WorkspaceSummary
     let chats: [ChatSummary]
     /// The scientist this workspace is named for — drives the portrait avatar.
@@ -793,12 +795,12 @@ private struct WorkspaceRow: View {
                         // edge — the counts belong to the row's sentence, and
                         // right-aligned they read as a detached column.
                         HStack(spacing: 4) {
-                            if workspace.gitStatus.insertions > 0 {
-                                Text("+\(workspace.gitStatus.insertions)")
+                            if git.insertions > 0 {
+                                Text("+\(git.insertions)")
                                     .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.added)
                             }
-                            if workspace.gitStatus.deletions > 0 {
-                                Text("−\(workspace.gitStatus.deletions)")
+                            if git.deletions > 0 {
+                                Text("−\(git.deletions)")
                                     .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.removed)
                             }
                         }
@@ -885,10 +887,12 @@ private struct WorkspaceRow: View {
         }
     }
 
+    private var git: GitStatusSummary { model.gitChrome(for: workspace.id) }
+
     private var hasSecondLine: Bool {
         statusLine != nil
             || workspace.stackedOn != nil
-            || workspace.gitStatus.insertions > 0
-            || workspace.gitStatus.deletions > 0
+            || git.insertions > 0
+            || git.deletions > 0
     }
 }

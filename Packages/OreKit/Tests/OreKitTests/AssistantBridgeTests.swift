@@ -337,6 +337,136 @@ struct AssistantBridgeTests {
         #expect(created.reasoningEffort == ReasoningEffort.high.rawValue)
     }
 
+    @Test func archiveSuccessPublishesTheCommittedWorkspaceState() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "bridge archive")
+        let checkpoint = await harness.recorder.checkpoint()
+        let request = AssistantBridgeRequest(
+            id: UUID().uuidString.lowercased(),
+            tool: "ArchiveWorkspace",
+            arguments: .object(["workspaceID": .string(workspaceID.rawValue)])
+        )
+        // The transport has its own socket tests. Start at the app-side
+        // handler here so this regression isolates action completion -> event
+        // propagation instead of depending on Unix-socket availability.
+        async let call = harness.client.handleAssistantRequest(request)
+        guard case .assistantConfirmationRequested(let confirmation)? =
+            await harness.recorder.waitFor(after: checkpoint, matching: {
+                if case .assistantConfirmationRequested = $0 { return true }
+                return false
+            })
+        else {
+            Issue.record("no archive confirmation")
+            return
+        }
+        await harness.client.send(
+            .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+        )
+
+        let response = await call
+        #expect(response.ok)
+        let event = await harness.recorder.waitFor(after: checkpoint) {
+            if case .workspaceUpdated(let summary) = $0 {
+                return summary.id == workspaceID && summary.isArchived
+            }
+            return false
+        }
+        #expect(event != nil)
+        #expect(try await harness.store.workspace(workspaceID)?.isArchived == true)
+    }
+
+    @Test func failedAssistantArchiveLeavesTheWorkspaceListUntouched() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "archive failure")
+        let missing = WorkspaceID(rawValue: workspaceID.rawValue + "-missing")
+        let checkpoint = await harness.recorder.checkpoint()
+        let request = AssistantBridgeRequest(
+            id: UUID().uuidString.lowercased(),
+            tool: "ArchiveWorkspace",
+            arguments: .object(["workspaceID": .string(missing.rawValue)])
+        )
+        async let call = harness.client.handleAssistantRequest(request)
+        guard case .assistantConfirmationRequested(let confirmation)? =
+            await harness.recorder.waitFor(after: checkpoint, matching: {
+                if case .assistantConfirmationRequested = $0 { return true }
+                return false
+            })
+        else {
+            Issue.record("no archive confirmation")
+            return
+        }
+        await harness.client.send(
+            .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+        )
+
+        let response = await call
+        #expect(!response.ok)
+        #expect(response.error?.contains(missing.rawValue) == true)
+        #expect(try await harness.store.workspace(workspaceID)?.isArchived == false)
+        let events = await harness.recorder.all(after: checkpoint)
+        #expect(!events.contains { event in
+            switch event {
+            case .workspaceAdded, .workspaceUpdated, .workspaceRemoved:
+                true
+            default:
+                false
+            }
+        })
+    }
+
+    @Test func assistantCloseAndReopenPublishTheirFinalListState() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "chat list")
+        let chatID = try #require(
+            try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+        )
+
+        var checkpoint = await harness.recorder.checkpoint()
+        let closed = await harness.client.handleAssistantRequest(AssistantBridgeRequest(
+            id: UUID().uuidString.lowercased(),
+            tool: "CloseChat",
+            arguments: .object([
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+            ])
+        ))
+        #expect(closed.ok)
+        let closeEvent = await harness.recorder.waitFor(after: checkpoint) { event in
+            if case .chatUpdated(let chat) = event {
+                return chat.id == chatID && chat.isClosed
+            }
+            return false
+        }
+        #expect(closeEvent != nil)
+
+        checkpoint = await harness.recorder.checkpoint()
+        let reopened = await harness.client.handleAssistantRequest(AssistantBridgeRequest(
+            id: UUID().uuidString.lowercased(),
+            tool: "ReopenChat",
+            arguments: .object([
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+            ])
+        ))
+        #expect(reopened.ok)
+        let reopenEvent = await harness.recorder.waitFor(after: checkpoint) { event in
+            if case .chatUpdated(let chat) = event {
+                return chat.id == chatID && !chat.isClosed
+            }
+            return false
+        }
+        #expect(reopenEvent != nil)
+    }
+
     @Test func getAppStateRunsWithoutConfirmation() async throws {
         let fixture = try await GitFixture.initialized()
         let harness = try await BridgeHarness(fixture: fixture)
@@ -354,6 +484,100 @@ struct AssistantBridgeTests {
         let record = try #require(try await harness.store.workspace(workspaceID))
         let repository = URL(fileURLWithPath: record.repositoryPath).lastPathComponent
         #expect(response.result?.contains("repo \(repository)") == true)
+        #expect(response.result?.contains("turns=") == true)
+    }
+
+    @Test func sendPromptToProjectRefusesToGuessAmongSeveralTabs() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "route-test")
+        let second = try harness.callBridge(
+            tool: "CreateChat",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "title": .string("Second tab"),
+            ]
+        )
+        #expect(second.ok)
+
+        let guessed = try harness.callBridge(
+            tool: "SendPromptToProject",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "text": .string("continue the work"),
+            ]
+        )
+        #expect(!guessed.ok)
+        #expect(guessed.error?.contains("chatID") == true)
+
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let secondID = try #require(chats.first { $0.title == "Second tab" }?.chatID)
+        let named = try harness.callBridge(
+            tool: "SendPromptToProject",
+            arguments: [
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(secondID.rawValue),
+                "text": .string("continue the work"),
+            ]
+        )
+        #expect(named.ok)
+    }
+
+    @Test func routeTaskNamesTheFocusedTabForUnplacedRepoWork() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "kailash")
+        let chats = try await harness.store.chats(workspaceID: workspaceID)
+        let chatID = try #require(chats.first?.chatID)
+
+        let response = try harness.callBridge(
+            tool: "RouteTask",
+            arguments: ["utterance": .string("Fix the flaky test")]
+        )
+        #expect(response.ok)
+        let body = try #require(response.result)
+        #expect(body.contains("action: sendExistingTab"))
+        #expect(body.contains("workspaceID: \(workspaceID.rawValue)"))
+        #expect(body.contains("chatID: \(chatID.rawValue)"))
+    }
+
+    @Test func createWorkspaceBesideADirtyTreeAsksFirst() async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        defer { Task { await harness.shutdown() } }
+
+        let workspaceID = try await harness.makeWorkspace(named: "dirty-sibling")
+        let worktree = try await harness.worktreePath(of: workspaceID)
+        try "uncommitted\n".write(
+            to: worktree.appendingPathComponent("wip.txt"), atomically: true, encoding: .utf8
+        )
+
+        async let call = harness.callBridgeAsync(
+            tool: "CreateWorkspace",
+            arguments: [
+                "repository": .string(fixture.repository.path),
+                "name": .string("clean-sibling"),
+            ]
+        )
+        guard case .assistantConfirmationRequested(let confirmation)? =
+            await harness.recorder.waitFor(matching: {
+                if case .assistantConfirmationRequested = $0 { return true }
+                return false
+            })
+        else {
+            Issue.record("CreateWorkspace did not confirm beside a dirty worktree")
+            return
+        }
+        #expect(confirmation.actionClass == .createWorkspace)
+        #expect(confirmation.summary.contains("uncommitted"))
+        await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+        let response = try await call
+        #expect(!response.ok)
+        #expect(response.error?.contains("declined") == true)
     }
 
     @Test func bypassModeAsksForConfirmation() async throws {

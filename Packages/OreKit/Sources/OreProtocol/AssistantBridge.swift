@@ -43,6 +43,8 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     case archiveWorkspace
     /// Resolve a project tab's permission, or switch that tab to Bypass.
     case autoAllowTab
+    /// Create a workspace that would sit beside a dirty sibling worktree.
+    case createWorkspace
 
     public var displayName: String {
         switch self {
@@ -51,6 +53,7 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
         case .createPullRequest: "Create pull requests"
         case .archiveWorkspace: "Archive workspaces"
         case .autoAllowTab: "Auto-allow a tab"
+        case .createWorkspace: "Create a workspace beside uncommitted work"
         }
     }
 }

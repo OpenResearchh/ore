@@ -628,7 +628,7 @@ struct ChatPane: View {
             // Cancel is only ever published for the assistant, so this is
             // unreachable today; parking the draft is the safe reading of
             // "stop" if it ever isn't.
-            case .commit, .cancel: finishVoice(.commitToDraft)
+            case .arm, .disarm, .commit, .cancel: finishVoice(.commitToDraft)
             }
         }
         .onDisappear {

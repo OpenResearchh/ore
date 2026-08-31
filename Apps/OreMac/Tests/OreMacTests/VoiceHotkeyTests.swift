@@ -50,13 +50,13 @@ struct VoiceChordRecognizerTests {
 
     // MARK: Hold
 
-    @Test func holdingBeginsAndEndsDictation() {
+    @Test func holdingArmsAndReleaseActivatesHandsFreeListening() {
         var recognizer = VoiceChordRecognizer()
         _ = recognizer.modifiersChanged(to: chord, at: start)
-        let began = recognizer.holdThresholdReached()
-        let ended = recognizer.modifiersChanged(to: [], at: start.advanced(by: .seconds(4)))
-        #expect(began == .beginHold)
-        #expect(ended == .endHold)
+        let armed = recognizer.holdThresholdReached()
+        let activated = recognizer.modifiersChanged(to: [], at: start.advanced(by: .seconds(2)))
+        #expect(armed == .armed)
+        #expect(activated == .activated)
     }
 
     /// A hold that already started must not also report a tap on release.
@@ -65,7 +65,7 @@ struct VoiceChordRecognizerTests {
         _ = recognizer.modifiersChanged(to: chord, at: start)
         _ = recognizer.holdThresholdReached()
         let ended = recognizer.modifiersChanged(to: [], at: start.advanced(by: afterHold))
-        #expect(ended == .endHold)
+        #expect(ended == .activated)
     }
 
     /// The reason the threshold is generous: resting on ⇧⌥ before pressing an
@@ -81,15 +81,14 @@ struct VoiceChordRecognizerTests {
         #expect(released == nil)
     }
 
-    /// If a key arrives after dictation already started, close it cleanly rather
-    /// than leaving the microphone open.
-    @Test func aKeyPressDuringAHoldEndsIt() {
+    /// Input before release means this was a shortcut, not a voice activation.
+    @Test func aKeyPressWhileArmedCancelsActivation() {
         var recognizer = VoiceChordRecognizer()
         _ = recognizer.modifiersChanged(to: chord, at: start)
         _ = recognizer.holdThresholdReached()
         let interrupted = recognizer.otherInputArrived()
         let released = recognizer.modifiersChanged(to: [], at: start.advanced(by: afterHold))
-        #expect(interrupted == .endHold)
+        #expect(interrupted == .cancelled)
         #expect(released == nil)
     }
 
@@ -128,12 +127,12 @@ struct VoiceChordRecognizerTests {
         #expect(released == nil)
     }
 
-    @Test func addingAThirdModifierDuringAHoldEndsIt() {
+    @Test func addingAThirdModifierWhileArmedCancelsIt() {
         var recognizer = VoiceChordRecognizer()
         _ = recognizer.modifiersChanged(to: chord, at: start)
         _ = recognizer.holdThresholdReached()
         let joined = recognizer.modifiersChanged(to: [.shift, .option, .command], at: start)
-        #expect(joined == .endHold)
+        #expect(joined == .cancelled)
     }
 
     @Test func otherShortcutsNeverArmTheGesture() {
@@ -161,16 +160,104 @@ struct VoiceChordRecognizerTests {
         #expect(toggled == .toggle)
     }
 
-    /// The timer is only worth arming while a hold is still possible.
-    @Test func armedOnlyWhileAHoldCouldStillBegin() {
+    @Test func thresholdMatchesThePromisedOneToTwoSecondHold() {
+        #expect(VoiceChordRecognizer.holdThreshold >= .seconds(1))
+        #expect(VoiceChordRecognizer.holdThreshold <= .seconds(2))
+    }
+
+    @Test func releasingModifiersOneAtATimeDoesNotFalseActivate() {
         var recognizer = VoiceChordRecognizer()
-        #expect(!recognizer.isArmed)
         _ = recognizer.modifiersChanged(to: chord, at: start)
-        #expect(recognizer.isArmed)
         _ = recognizer.holdThresholdReached()
-        #expect(!recognizer.isArmed)  // already holding
+        let oneReleased = recognizer.modifiersChanged(
+            to: .option, at: start.advanced(by: .milliseconds(1_300))
+        )
+        #expect(recognizer.isAwaitingRelease)
+        let allReleased = recognizer.modifiersChanged(
+            to: [], at: start.advanced(by: .milliseconds(1_350))
+        )
+        #expect(oneReleased == nil)
+        #expect(allReleased == .activated)
+        #expect(!recognizer.isAwaitingRelease)
+    }
+
+    @Test func armedGestureTimesOutWithoutActivating() {
+        var recognizer = VoiceChordRecognizer()
+        _ = recognizer.modifiersChanged(to: chord, at: start)
+        _ = recognizer.holdThresholdReached()
+        let timeout = recognizer.releaseTimedOut()
+        let release = recognizer.modifiersChanged(to: [], at: start.advanced(by: .seconds(5)))
+        #expect(timeout == .cancelled)
+        #expect(release == nil)
+    }
+
+    /// The threshold timer only runs while a hold can still be armed.
+    @Test func pendingAndAwaitingReleaseTrackSeparateGestureStages() {
+        var recognizer = VoiceChordRecognizer()
+        #expect(!recognizer.isPending)
+        #expect(!recognizer.isAwaitingRelease)
+        _ = recognizer.modifiersChanged(to: chord, at: start)
+        #expect(recognizer.isPending)
+        _ = recognizer.holdThresholdReached()
+        #expect(!recognizer.isPending)
+        #expect(recognizer.isAwaitingRelease)
         _ = recognizer.modifiersChanged(to: [], at: start.advanced(by: afterHold))
-        #expect(!recognizer.isArmed)
+        #expect(!recognizer.isPending)
+        #expect(!recognizer.isAwaitingRelease)
+    }
+}
+
+/// Hold-to-talk vs hands-free vs composer: the chord recognizer is shared;
+/// only the command mapping differs. Tests pin that table so a settings
+/// toggle cannot silently mix send-on-release with finish-phrase listening.
+struct VoiceHoldRoutingTests {
+    @Test func handsFreeArmsThenStartsOnRelease() {
+        #expect(kinds(.armed, .handsFree) == [.arm])
+        #expect(kinds(.activated, .handsFree) == [.start])
+        #expect(kinds(.cancelled, .handsFree) == [.disarm])
+    }
+
+    @Test func holdToTalkOpensTheMicAtTheThresholdAndSendsOnRelease() {
+        #expect(kinds(.armed, .holdToTalk) == [.arm, .start])
+        #expect(kinds(.activated, .holdToTalk) == [.stop])
+        #expect(kinds(.cancelled, .holdToTalk) == [.cancel])
+    }
+
+    @Test func composerHoldDictatesUntilReleaseOrCancel() {
+        #expect(kinds(.armed, .composer) == [.start])
+        #expect(kinds(.activated, .composer) == [.stop])
+        #expect(kinds(.cancelled, .composer) == [.stop])
+    }
+
+    @Test func aTapNeverBecomesAHoldCommand() {
+        for mode: VoiceHoldMode in [.handsFree, .holdToTalk, .composer] {
+            #expect(VoiceHoldRouting.commands(for: .toggle, mode: mode).isEmpty)
+        }
+    }
+
+    @Test func assistantModesNeverTargetTheComposer() {
+        for event: VoiceChordEvent in [.armed, .activated, .cancelled] {
+            for mode: VoiceHoldMode in [.handsFree, .holdToTalk] {
+                for command in VoiceHoldRouting.commands(for: event, mode: mode) {
+                    #expect(command.target == .assistant)
+                }
+            }
+        }
+    }
+
+    @Test func composerModeNeverTargetsTheAssistant() {
+        for event: VoiceChordEvent in [.armed, .activated, .cancelled] {
+            for command in VoiceHoldRouting.commands(for: event, mode: .composer) {
+                #expect(command.target == .composer)
+            }
+        }
+    }
+
+    private func kinds(
+        _ event: VoiceChordEvent,
+        _ mode: VoiceHoldMode
+    ) -> [VoiceCommand.Kind] {
+        VoiceHoldRouting.commands(for: event, mode: mode).map(\.kind)
     }
 }
 

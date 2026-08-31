@@ -107,10 +107,11 @@ struct MenuBarDashboard: View {
 
     private var voiceHint: String {
         switch model.voiceAssistant.phase {
+        case .armed: "Armed — release keys"
         case .listening, .answering: "Listening…"
         case .thinking: "Thinking…"
         case .speaking: "Speaking…"
-        case .idle: "Hold ⇧⌥ to talk"
+        case .idle: "Hold ⇧⌥, then release"
         }
     }
 

@@ -414,12 +414,16 @@ public actor OreStore {
             }
             // The stored summary is the reply's own text, so it saves loading
             // every block for turns whose blocks would only be re-clipped.
-            let reply = turn.summary ?? (try? blocks(turnID: turn.turnID))?
+            let blocks = (try? blocks(turnID: turn.turnID)) ?? []
+            let reply = turn.summary ?? blocks
                 .filter { $0.blockKind == .text }
                 .map(\.text)
                 .joined(separator: "\n")
-            if let reply, !reply.isEmpty {
+            if !reply.isEmpty {
                 parts.append("Assistant: \(String(reply.prefix(charactersPerTurn)))")
+            }
+            if let plan = Self.planTranscriptLine(in: blocks) {
+                parts.append(String(plan.prefix(charactersPerTurn)))
             }
             return parts.isEmpty ? nil : parts.joined(separator: "\n")
         }
@@ -440,17 +444,38 @@ public actor OreStore {
         let transcript = tail.compactMap { turn -> String? in
             var parts: [String] = []
             if let prompt = turn.prompt, !prompt.isEmpty { parts.append("User: \(prompt)") }
-            let text = (try? blocks(turnID: turn.turnID))?
+            let blocks = (try? blocks(turnID: turn.turnID)) ?? []
+            let text = blocks
                 .filter { $0.blockKind == .text }
                 .map(\.text)
-                .joined(separator: "\n") ?? ""
+                .joined(separator: "\n")
             if !text.isEmpty { parts.append("Assistant: \(String(text.suffix(4_000)))") }
+            if let plan = Self.planTranscriptLine(in: blocks) {
+                parts.append(plan)
+            }
             return parts.isEmpty ? nil : parts.joined(separator: "\n")
         }
         if !transcript.isEmpty {
             sections.append("Recent transcript:\n" + transcript.joined(separator: "\n\n"))
         }
         return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+    }
+
+    /// Plan blocks are a first-class transcript row, but they used to be
+    /// dropped here — so "read the plan" saw only "I'll inspect…" text while
+    /// approval controls were already on screen.
+    private static func planTranscriptLine(in blocks: [BlockRecord]) -> String? {
+        let plans = blocks.filter {
+            $0.blockKind == .plan && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard let block = plans.last else { return nil }
+        let payload = block.decodedPayload
+        if payload?.arrayValue != nil {
+            return "Todos:\n\(block.text)"
+        }
+        let ready = payload?["isReady"]?.boolValue ?? true
+        let label = ready ? "Plan" : "Plan (still being written)"
+        return "\(label):\n\(block.text)"
     }
 
     public func turn(_ id: TurnID) throws -> TurnRecord? {
@@ -546,6 +571,9 @@ public actor OreStore {
         /// added by a migration; every session written since carries one.
         public var chatID: ChatID?
         public var chatTitle: String?
+        /// Closed tabs keep their history but are not a place to send more
+        /// work — the assistant should ReopenChat or CreateChat instead.
+        public var isClosed: Bool
         public var turnID: TurnID
         public var blockID: String
         public var snippet: String
@@ -606,6 +634,7 @@ public actor OreStore {
                     workspace.name AS workspaceName,
                     session.chatID AS chatID,
                     chat.title AS chatTitle,
+                    chat.isClosed AS isClosed,
                     block.turnID AS turnID,
                     block.id AS blockID,
                     snippet(blockSearch, 0, '«', '»', '…', 12) AS snippet,
@@ -628,6 +657,7 @@ public actor OreStore {
                     workspaceName: row["workspaceName"],
                     chatID: (row["chatID"] as String?).map(ChatID.init(rawValue:)),
                     chatTitle: row["chatTitle"],
+                    isClosed: (row["isClosed"] as Bool?) ?? false,
                     turnID: TurnID(rawValue: row["turnID"]),
                     blockID: row["blockID"],
                     snippet: row["snippet"],

@@ -263,6 +263,14 @@ struct ClaudeCodeTranslatorTests {
         #expect(markdown.contains("Do the thing"))
     }
 
+    @Test func anEmptyExitPlanModeIsNotAProposal() {
+        let transcript = """
+        {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"ExitPlanMode","input":{"plan":""}}]},"session_id":"s1"}
+        """
+        let events = ClaudeCodeTranscriptReplay.events(transcript: transcript)
+        #expect(!events.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
     @Test func todoWriteBecomesAChecklist() {
         let transcript = """
         {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"TodoWrite","input":{"todos":[{"content":"Write the driver","status":"completed"},{"content":"Record fixtures","status":"in_progress"},{"content":"Ship","status":"pending"}]}}]},"session_id":"s1"}

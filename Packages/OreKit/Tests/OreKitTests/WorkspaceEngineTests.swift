@@ -521,6 +521,47 @@ struct WorkspaceEngineTests {
         #expect(question.allowsFreeform)
     }
 
+    @Test func aReadyPlanIsPendingInputAndADraftIsNot() async throws {
+        let harness = try await makeEngine()
+        _ = try await harness.engine.ensureSession()
+        let session = try #require(harness.harness.latestSession)
+        let turnID = TurnID(rawValue: "turn")
+
+        session.emit(.turnStarted(TurnStarted(turnID: turnID)))
+        session.emit(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Draft", permissionRequestID: nil),
+            isReady: false
+        )))
+        #expect(await waitUntil { await harness.engine.pendingInput().isEmpty })
+
+        session.emit(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Ship it", permissionRequestID: nil),
+            isReady: true
+        )))
+        #expect(await waitUntil {
+            await harness.engine.pendingInput().contains { $0.kind == "plan" }
+        })
+        let pending = await harness.engine.pendingInput()
+        let plan = try #require(pending.first { $0.kind == "plan" })
+        #expect(plan.summary.contains("Ship it"))
+        #expect(await harness.engine.summary().status == .awaitingInput)
+
+        session.emit(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Ship it", permissionRequestID: nil),
+            isReady: true
+        )))
+        #expect(await waitUntil { await harness.engine.pendingInput().filter { $0.kind == "plan" }.count == 1 })
+
+        session.emit(.toolCall(ToolCall(
+            turnID: turnID, id: ToolCallID(rawValue: "e1"), name: "Edit",
+            input: .object(["file_path": .string("x.txt")])
+        )))
+        #expect(await waitUntil { await harness.engine.pendingInput().allSatisfy { $0.kind != "plan" } })
+    }
+
     @Test func answeringAClaudeQuestionResolvesItsPermissionGate() async throws {
         let harness = try await makeEngine()
         _ = try await harness.engine.ensureSession()

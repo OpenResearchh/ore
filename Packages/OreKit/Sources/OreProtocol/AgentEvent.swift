@@ -253,10 +253,35 @@ public struct PlanUpdate: Sendable, Codable, Hashable {
 
     public var turnID: TurnID
     public var content: Content
+    /// For `.proposal`: the markdown is complete enough to approve. A
+    /// CreatePlan `started` with a growing body is `false` until `completed`
+    /// (or process exit) so approval and "plan ready" cannot beat the
+    /// transcript. Missing on disk from before this field existed: treat as
+    /// ready, which matches the old always-advertise behaviour.
+    public var isReady: Bool
 
-    public init(turnID: TurnID, content: Content) {
+    public init(turnID: TurnID, content: Content, isReady: Bool = true) {
         self.turnID = turnID
         self.content = content
+        self.isReady = isReady
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case turnID, content, isReady
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        turnID = try container.decode(TurnID.self, forKey: .turnID)
+        content = try container.decode(Content.self, forKey: .content)
+        isReady = try container.decodeIfPresent(Bool.self, forKey: .isReady) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(turnID, forKey: .turnID)
+        try container.encode(content, forKey: .content)
+        try container.encode(isReady, forKey: .isReady)
     }
 }
 

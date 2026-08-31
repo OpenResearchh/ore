@@ -174,6 +174,74 @@ struct ChatStateTests {
         #expect(plans[0].text == "final")
     }
 
+    @Test func aPreparingPlanUpdatesTheTranscriptWithoutApproval() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Draft", permissionRequestID: nil),
+            isReady: false
+        )))
+
+        #expect(state.plan == nil)
+        #expect(state.planTurnID == nil)
+        #expect(state.status != .awaitingInput)
+        #expect(state.rows.contains { $0.kind == .plan && $0.text.contains("Draft") })
+
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Final", permissionRequestID: nil),
+            isReady: true
+        )))
+        guard case .proposal(let markdown, _) = state.plan else {
+            Issue.record("ready must raise the approval card")
+            return
+        }
+        #expect(markdown.contains("Final"))
+        #expect(state.status == .awaitingInput)
+        #expect(state.rows.filter { $0.kind == .plan }.count == 1)
+        #expect(state.rows.last { $0.kind == .plan }?.text.contains("Final") == true)
+    }
+
+    @Test func anEmptyPlanDoesNotRaiseTheCard() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "   ", permissionRequestID: nil),
+            isReady: true
+        )))
+        #expect(state.plan == nil)
+        #expect(!state.rows.contains { $0.kind == .plan })
+    }
+
+    @Test func duplicateReadyPlansDoNotDuplicateTheRow() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        let first = PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Do it", permissionRequestID: nil)
+        )
+        let linked = PlanUpdate(
+            turnID: turnID,
+            content: .proposal(
+                markdown: "## Steps\n1. Do it",
+                permissionRequestID: PermissionRequestID(rawValue: "r1")
+            )
+        )
+        state.apply(.planUpdated(first))
+        state.apply(.planUpdated(linked))
+        #expect(state.rows.filter { $0.kind == .plan }.count == 1)
+        guard case .proposal(_, let requestID) = state.plan else {
+            Issue.record("expected a linked proposal")
+            return
+        }
+        #expect(requestID == PermissionRequestID(rawValue: "r1"))
+    }
+
     @Test func streamingDeltasBumpContentRevisionNotJustText() {
         let state = ChatState()
         let turnID = TurnID(rawValue: "t1")

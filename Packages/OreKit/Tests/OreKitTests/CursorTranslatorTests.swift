@@ -104,17 +104,139 @@ struct CursorTranslatorTests {
         ])
         let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
         #expect(calls.contains { $0.name == "CreatePlan" })
-        let plans = all.compactMap { event -> String? in
+        let plans = all.compactMap { event -> (String, Bool)? in
             if case .planUpdated(let update) = event,
                case .proposal(let markdown, let requestID) = update.content {
                 #expect(requestID == nil)
+                return (markdown, update.isReady)
+            }
+            return nil
+        }
+        #expect(plans.filter(\.1).count == 1, "only completed advertises ready")
+        #expect(plans.last?.0.contains("update loop") == true)
+        #expect(plans.last?.0.contains("profile") == true)
+        #expect(all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func createPlanStartedWithOnlyATitleIsNotReady() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","overview":"Main-thread saturation."}}}}"#,
+        ])
+        let plans = all.compactMap { event -> PlanUpdate? in
+            if case .planUpdated(let update) = event { return update }
+            return nil
+        }
+        #expect(plans.isEmpty, "name/overview on started must not flash a plan card")
+    }
+
+    /// Cursor often finishes the body on `completed` (args or `result.success`)
+    /// after a title-only `started`. Readiness must wait for that body.
+    @Test func createPlanBodyOnCompletedArgsIsReadyOnce() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","overview":"Main-thread saturation."}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","plan":"Cause: the update loop.\nFix: profile, then batch."},"result":{"success":{}}}}}"#,
+        ])
+        let plans = all.compactMap { event -> (String, Bool)? in
+            if case .planUpdated(let update) = event,
+               case .proposal(let markdown, _) = update.content {
+                return (markdown, update.isReady)
+            }
+            return nil
+        }
+        #expect(plans.count == 1)
+        #expect(plans[0].1)
+        #expect(plans[0].0.contains("update loop"))
+        #expect(all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func createPlanBodyOnCompletedResultIsReadyOnce() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze","overview":"Main-thread saturation."}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze"},"result":{"success":{"plan":"Cause: the update loop.\nFix: profile, then batch."}}}}}"#,
+        ])
+        let plans = all.compactMap { event -> (String, Bool)? in
+            if case .planUpdated(let update) = event,
+               case .proposal(let markdown, _) = update.content {
+                return (markdown, update.isReady)
+            }
+            return nil
+        }
+        #expect(plans.count == 1)
+        #expect(plans[0].1)
+        #expect(plans[0].0.contains("profile"))
+        #expect(all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func createPlanStreamContentOnStartedIsADraft() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze"},"streamContent":"Cause: the update loop.\nFix: still writing."}}}"#,
+        ])
+        let flags = all.compactMap { event -> Bool? in
+            if case .planUpdated(let update) = event,
+               case .proposal = update.content {
+                return update.isReady
+            }
+            return nil
+        }
+        #expect(flags == [false])
+        #expect(!all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func createPlanStartedWithABodyIsADraftUntilCompleted() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."},"result":{"success":{}}}}}"#,
+        ])
+        let flags = all.compactMap { event -> Bool? in
+            if case .planUpdated(let update) = event,
+               case .proposal = update.content {
+                return update.isReady
+            }
+            return nil
+        }
+        #expect(flags.contains(false), "started with a body is a transcript draft")
+        #expect(flags.last == true)
+        #expect(flags.filter { $0 }.count == 1)
+    }
+
+    @Test func duplicateCompletedCreatePlanDoesNotReAdvertise() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."},"result":{"success":{}}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."},"result":{"success":{}}}}}"#,
+        ])
+        let ready = all.compactMap { event -> String? in
+            if case .planUpdated(let update) = event, update.isReady,
+               case .proposal(let markdown, _) = update.content {
                 return markdown
             }
             return nil
         }
-        #expect(plans.count == 1, "started then completed must not double the card")
-        #expect(plans[0].contains("update loop"))
-        #expect(plans[0].contains("profile"))
+        #expect(ready.count == 1)
+    }
+
+    @Test func emptyCreatePlanIsNotAProposal() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{},"result":{"success":{}}}}}"#,
+        ])
+        #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
+    @Test func aPlanStartedThenProcessExitPromotesReadiness() {
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        let started = translator.translate(line:
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."}}}}"#
+        )
+        #expect(started.events.contains {
+            if case .planUpdated(let update) = $0 { return !update.isReady }
+            return false
+        })
+        let closed = translator.closeTurn(exitCode: 0)
+        let ready = closed.events.compactMap { event -> Bool? in
+            if case .planUpdated(let update) = event { return update.isReady }
+            return nil
+        }
+        #expect(ready == [true])
     }
 
     @Test func createPlanComposesMarkdownFromNameOverviewAndTodos() {

@@ -35,6 +35,12 @@ public actor WorkspaceEngine {
     private var chats: [ChatID: ChatRuntime] = [:]
 
     private final class ChatRuntime: @unchecked Sendable {
+        struct PendingPlan {
+            var turnID: TurnID
+            var markdown: String
+            var permissionRequestID: PermissionRequestID?
+        }
+
         var record: ChatRecord
         var session: (any AgentSession)?
         var transcript: TranscriptWriter?
@@ -43,6 +49,10 @@ public actor WorkspaceEngine {
         var latestUsage: UsageReport?
         var pendingPermissions: [PermissionRequestID: PermissionRequest] = [:]
         var pendingQuestions: [QuestionID: AgentQuestion] = [:]
+        var pendingPlan: PendingPlan?
+        /// True once this turn has edited/written/shelled. A late CreatePlan
+        /// after that must not re-advertise a plan the agent already moved past.
+        var turnDidMutate = false
         var currentTurnID: TurnID?
         var isTurnActive = false
         var sessionEffort: ReasoningEffort?
@@ -1980,11 +1990,41 @@ public actor WorkspaceEngine {
 
         switch event {
         case .statusChanged(let newStatus):
-            setStatus(newStatus, runtime: runtime)
+            if (newStatus == .idle || newStatus == .interrupted),
+               runtime.pendingPlan != nil {
+                setStatus(.awaitingInput, runtime: runtime)
+            } else {
+                setStatus(newStatus, runtime: runtime)
+            }
 
         case .turnStarted(let turn):
             runtime.currentTurnID = turn.turnID
             runtime.isTurnActive = true
+            runtime.pendingPlan = nil
+            runtime.turnDidMutate = false
+
+        case .toolCall(let call):
+            if PlanProposalPolicy.proceedsPastProposal(call.name) {
+                runtime.turnDidMutate = true
+                runtime.pendingPlan = nil
+                if runtime.status == .awaitingInput {
+                    setStatus(.runningTool, runtime: runtime)
+                }
+            }
+
+        case .planUpdated(let update):
+            if case .proposal(let markdown, let requestID) = update.content,
+               update.isReady,
+               PlanProposalPolicy.isReadyMarkdown(markdown),
+               !runtime.turnDidMutate {
+                runtime.pendingPlan = ChatRuntime.PendingPlan(
+                    turnID: update.turnID,
+                    markdown: markdown,
+                    permissionRequestID: requestID
+                )
+                setStatus(.awaitingInput, runtime: runtime)
+                await markUnread(runtime)
+            }
 
         case .permissionRequest(let request):
             runtime.pendingPermissions[request.id] = request
@@ -1993,6 +2033,9 @@ public actor WorkspaceEngine {
 
         case .permissionResolved(let resolution):
             runtime.pendingPermissions.removeValue(forKey: resolution.id)
+            if runtime.pendingPlan?.permissionRequestID == resolution.id {
+                runtime.pendingPlan = nil
+            }
             // The card is gone; the turn is not. Dropping back to requesting
             // is what makes the composer show "working" again instead of
             // looking idle while the agent continues the same turn.
@@ -2009,6 +2052,7 @@ public actor WorkspaceEngine {
         case .turnCompleted:
             runtime.isTurnActive = false
             runtime.currentTurnID = nil
+            if runtime.turnDidMutate { runtime.pendingPlan = nil }
             if runtime.currentTurnOrigin != .watch { runtime.userTurnCount += 1 }
             await markUnread(runtime)
             runtime.record.lastActivityAt = Date()
@@ -2029,7 +2073,11 @@ public actor WorkspaceEngine {
             runtime.session = nil
             runtime.sessionEffort = nil
             runtime.isTurnActive = false
-            setStatus(.idle, runtime: runtime)
+            if runtime.pendingPlan != nil {
+                setStatus(.awaitingInput, runtime: runtime)
+            } else {
+                setStatus(.idle, runtime: runtime)
+            }
             // A session that dies mid-turn never reports `.turnCompleted`, so
             // this is the only chance anything queued behind it gets sent.
             scheduleQueueDrain(runtime: runtime)
@@ -2095,6 +2143,10 @@ public actor WorkspaceEngine {
 
     public func focusedChatIDValue() -> ChatID? { focusedChatID }
 
+    public func liveGitStatus() async -> GitStatusSummary {
+        await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus
+    }
+
     public func gitStatusValue() -> GitStatusSummary { gitStatus }
 
     public struct PendingInput: Sendable, Equatable {
@@ -2132,6 +2184,17 @@ public actor WorkspaceEngine {
                     summary: String(question.prompt.prefix(160)),
                     options: question.options.map(\.label),
                     allowsFreeform: question.allowsFreeform
+                ))
+            }
+            if let plan = runtime.pendingPlan {
+                rows.append(PendingInput(
+                    chatID: runtime.record.chatID,
+                    title: runtime.record.title,
+                    kind: "plan",
+                    id: plan.permissionRequestID?.rawValue ?? "plan-\(plan.turnID.rawValue)",
+                    summary: String(plan.markdown.prefix(160)),
+                    options: [],
+                    allowsFreeform: false
                 ))
             }
         }

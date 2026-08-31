@@ -95,7 +95,7 @@ struct CodexTranslator {
             applyItem(params["item"], completed: true, to: &output)
 
         case "turn/plan/updated", "item/plan/delta":
-            applyPlan(params, to: &output)
+            applyPlan(params, ready: false, to: &output)
 
         case "thread/tokenUsage/updated":
             applyUsage(params["tokenUsage"], to: &output)
@@ -196,7 +196,9 @@ struct CodexTranslator {
         case "plan":
             guard completed, let text = item["text"]?.stringValue, !text.isEmpty else { break }
             output.events.append(.planUpdated(PlanUpdate(
-                turnID: turnID, content: .proposal(markdown: text, permissionRequestID: nil)
+                turnID: turnID,
+                content: .proposal(markdown: text, permissionRequestID: nil),
+                isReady: true
             )))
 
         case "commandExecution":
@@ -318,7 +320,7 @@ struct CodexTranslator {
 
     // MARK: - Plans, usage, completion
 
-    private mutating func applyPlan(_ params: JSONValue, to output: inout Output) {
+    private mutating func applyPlan(_ params: JSONValue, ready: Bool, to output: inout Output) {
         let turnID = ensureTurn(&output)
         if let steps = params["plan"]?.arrayValue ?? params["steps"]?.arrayValue {
             let items = steps.compactMap { entry -> TodoItem? in
@@ -337,7 +339,9 @@ struct CodexTranslator {
         } else if let text = params["delta"]?.stringValue ?? params["text"]?.stringValue,
                   !text.isEmpty {
             output.events.append(.planUpdated(PlanUpdate(
-                turnID: turnID, content: .proposal(markdown: text, permissionRequestID: nil)
+                turnID: turnID,
+                content: .proposal(markdown: text, permissionRequestID: nil),
+                isReady: ready && PlanProposalPolicy.isReadyMarkdown(text)
             )))
         }
     }

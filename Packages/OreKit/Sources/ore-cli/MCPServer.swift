@@ -40,7 +40,7 @@ func runMCPServer(options: CommandLineOptions) async {
                 "serverInfo": ["name": "ore", "version": "0.1.0"],
             ]
         case "tools/list":
-            result = ["tools": toolDefinitions() + assistant.toolDefinitions()]
+            result = ["tools": annotateToolDefinitions(toolDefinitions() + assistant.toolDefinitions())]
         case "tools/call":
             let params = request["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
@@ -96,6 +96,84 @@ private func toolDefinitions() -> [[String: Any]] { [
         ],
     ],
 ] }
+
+/// MCP clients use tool annotations as approval hints. Without them, a client
+/// has to treat a harmless review read the same as a workspace mutation and may
+/// reject the call before it ever reaches this server.
+private func annotateToolDefinitions(_ tools: [[String: Any]]) -> [[String: Any]] {
+    tools.map { tool in
+        guard let name = tool["name"] as? String else { return tool }
+        var copy = tool
+        copy["annotations"] = MCPToolAnnotation.forTool(named: name).json
+        return copy
+    }
+}
+
+private struct MCPToolAnnotation {
+    let readOnly: Bool
+    let destructive: Bool
+    let idempotent: Bool
+    let openWorld: Bool
+
+    var json: [String: Any] {
+        [
+            "readOnlyHint": readOnly,
+            "destructiveHint": destructive,
+            "idempotentHint": idempotent,
+            "openWorldHint": openWorld,
+        ]
+    }
+
+    static func forTool(named name: String) -> Self {
+        if localReadOnlyTools.contains(name)
+            || AssistantToolServer.readOnlyToolNames.contains(name)
+            || AssistantToolServer.readOnlyBridgeToolNames.contains(name) {
+            return .readOnly
+        }
+        if nonDestructiveLocalWriteTools.contains(name) {
+            return .localWrite
+        }
+        if destructiveTools.contains(name) {
+            return .destructiveLocalWrite
+        }
+        if openWorldTools.contains(name) {
+            return .openWorldAction
+        }
+        return .appAction
+    }
+
+    private static let localReadOnlyTools: Set<String> = [
+        "GetWorkspaceDiff", "GetDiffComments",
+    ]
+    private static let nonDestructiveLocalWriteTools: Set<String> = [
+        "PostDiffComment", "AskUserQuestion", "WriteMemory",
+        "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort",
+        "RenameChat", "ReopenChat", "OpenWorkspace", "AnswerChatQuestion",
+    ]
+    private static let destructiveTools: Set<String> = [
+        "DeleteMemory", "CloseChat", "InterruptChatTurn", "Commit", "ArchiveWorkspace",
+        "ResolveChatPermission",
+    ]
+    private static let openWorldTools: Set<String> = [
+        "CreateWorkspace", "CreateChat", "SendPromptToProject", "Push", "CreatePullRequest",
+    ]
+
+    private static let readOnly = Self(
+        readOnly: true, destructive: false, idempotent: true, openWorld: false
+    )
+    private static let localWrite = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: false
+    )
+    private static let destructiveLocalWrite = Self(
+        readOnly: false, destructive: true, idempotent: false, openWorld: false
+    )
+    private static let openWorldAction = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: true
+    )
+    private static let appAction = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: false
+    )
+}
 
 private func callORETool(
     _ name: String, arguments: [String: Any], directory: URL
@@ -175,17 +253,24 @@ private final class AssistantToolServer {
     private let homeURL: URL
     private var store: OreStore?
 
-    private static let readToolNames: Set<String> = [
+    fileprivate static let readOnlyToolNames: Set<String> = [
         "ListWorkspaces", "ListChats", "WorkspaceStatus",
         "SearchTranscripts", "GetTranscriptTail",
-        "ListMemory", "ReadMemory", "WriteMemory", "DeleteMemory",
+        "ListMemory", "ReadMemory",
     ]
+    private static let readWriteToolNames: Set<String> = [
+        "WriteMemory", "DeleteMemory",
+    ]
+    private static let readToolNames: Set<String> = readOnlyToolNames.union(readWriteToolNames)
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
         "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
+    ]
+    fileprivate static let readOnlyBridgeToolNames: Set<String> = [
+        "ListHarnesses", "GetAppState", "RouteTask",
     ]
 
     init(enabled: Bool, databaseURL: URL, homeURL: URL) {

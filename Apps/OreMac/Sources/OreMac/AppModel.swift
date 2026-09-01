@@ -3488,4 +3488,3 @@ final class WorkspaceLiveRegistry {
         states.removeValue(forKey: id)
     }
 }
-

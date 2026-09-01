@@ -734,6 +734,7 @@ struct WorkspaceEngineTests {
         // A project agent keeps every tool it came with — it's the one doing
         // the work.
         #expect(session.configuration.disallowedTools.isEmpty)
+        #expect(session.configuration.allowedTools == ["mcp__ore"])
     }
 
     /// The assistant orchestrates; it does not open a shell in someone else's

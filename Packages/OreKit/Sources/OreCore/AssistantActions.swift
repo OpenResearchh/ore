@@ -23,7 +23,7 @@ enum AssistantActionPolicy {
         // ListHarnesses / GetAppState are pure reads that happen to need the
         // app process. Memory writes stay in the MCP process.
         case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
-             "ListHarnesses", "GetAppState",
+             "ListHarnesses", "GetAppState", "RouteTask",
              "SetChatModel", "SwitchChatHarness", "SetChatEffort",
              "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
              "AnswerChatQuestion":
@@ -52,7 +52,7 @@ enum AssistantActionPolicy {
     static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
-        "GetAppState", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
+        "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
     ]
@@ -135,53 +135,77 @@ extension InProcessCoreClient {
             return AssistantBridgeResponse(id: request.id, ok: false, error: reason)
 
         case .auto:
+            if request.tool == "CreateWorkspace",
+               let dirty = await dirtyCreateWorkspaceConfirmation(request) {
+                return await confirm(
+                    request,
+                    summary: dirty.summary,
+                    actionClass: .createWorkspace,
+                    workspaceID: dirty.workspaceID
+                )
+            }
             return await performAudited(request, summary: summary, decision: "auto")
 
         case .confirm(let actionClass):
-            if let standing = await standingGrant(
-                for: actionClass,
-                workspaceID: requestWorkspaceID(request),
-                chatID: requestChatID(request)
-            ) {
-                return await performAudited(request, summary: summary, decision: standing)
-            }
-
-            continuation.yield(.assistantConfirmationRequested(AssistantConfirmation(
-                id: request.id,
+            return await confirm(
+                request,
+                summary: summary,
                 actionClass: actionClass,
-                workspaceID: requestWorkspaceID(request),
-                chatID: requestChatID(request),
-                summary: summary
-            )))
-            let resolution = await awaitAssistantResolution(id: request.id)
-            continuation.yield(.assistantConfirmationResolved(request.id))
+                workspaceID: requestWorkspaceID(request)
+            )
+        }
+    }
 
-            switch resolution {
-            case .allowed(let scope):
-                await applyAssistantGrant(
-                    scope,
-                    to: actionClass,
-                    workspaceID: requestWorkspaceID(request),
-                    chatID: requestChatID(request)
-                )
-                return await performAudited(
-                    request, summary: summary, decision: "allowed:\(scope.rawValue)"
-                )
-            case .denied:
-                await audit(request, summary: summary, decision: "denied")
-                return AssistantBridgeResponse(
-                    id: request.id, ok: false,
-                    error: "The user declined this action. Do not retry it; "
-                        + "ask them what they'd like instead."
-                )
-            case .timedOut:
-                await audit(request, summary: summary, decision: "timedOut")
-                return AssistantBridgeResponse(
-                    id: request.id, ok: false,
-                    error: "The user didn't answer the confirmation in time. "
-                        + "The action was not performed."
-                )
-            }
+    /// Ask the user, honoring a standing grant if one already covers this class.
+    private func confirm(
+        _ request: AssistantBridgeRequest,
+        summary: String,
+        actionClass: AssistantActionClass,
+        workspaceID: WorkspaceID?
+    ) async -> AssistantBridgeResponse {
+        if let standing = await standingGrant(
+            for: actionClass,
+            workspaceID: workspaceID,
+            chatID: requestChatID(request)
+        ) {
+            return await performAudited(request, summary: summary, decision: standing)
+        }
+
+        continuation.yield(.assistantConfirmationRequested(AssistantConfirmation(
+            id: request.id,
+            actionClass: actionClass,
+            workspaceID: workspaceID,
+            chatID: requestChatID(request),
+            summary: summary
+        )))
+        let resolution = await awaitAssistantResolution(id: request.id)
+        continuation.yield(.assistantConfirmationResolved(request.id))
+
+        switch resolution {
+        case .allowed(let scope):
+            await applyAssistantGrant(
+                scope,
+                to: actionClass,
+                workspaceID: workspaceID,
+                chatID: requestChatID(request)
+            )
+            return await performAudited(
+                request, summary: summary, decision: "allowed:\(scope.rawValue)"
+            )
+        case .denied:
+            await audit(request, summary: summary, decision: "denied")
+            return AssistantBridgeResponse(
+                id: request.id, ok: false,
+                error: "The user declined this action. Do not retry it; "
+                    + "ask them what they'd like instead."
+            )
+        case .timedOut:
+            await audit(request, summary: summary, decision: "timedOut")
+            return AssistantBridgeResponse(
+                id: request.id, ok: false,
+                error: "The user didn't answer the confirmation in time. "
+                    + "The action was not performed."
+            )
         }
     }
 
@@ -334,6 +358,7 @@ extension InProcessCoreClient {
                 reasoningEffort: arguments["effort"]?.stringValue
                     .flatMap(ReasoningEffort.init(rawValue:))
             ))
+            markListMutation()
             continuation.yield(.chatAdded(chat))
             if let prompt = arguments["prompt"]?.stringValue, !prompt.isEmpty {
                 _ = try await engine(for: workspaceID).send(SendMessageRequest(
@@ -347,7 +372,7 @@ extension InProcessCoreClient {
             guard let text = arguments["text"]?.stringValue, !text.isEmpty else {
                 throw AssistantActionError.badRequest("SendPromptToProject needs text.")
             }
-            let chatID = arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:))
+            let chatID = try await requireDelegatedChatID(arguments, workspaceID: workspaceID)
             let effort = arguments["effort"]?.stringValue
                 .flatMap(ReasoningEffort.init(rawValue:))
             let sent = try await engine(for: workspaceID).send(SendMessageRequest(
@@ -367,6 +392,15 @@ extension InProcessCoreClient {
 
         case "GetAppState":
             return await assistantAppStateText()
+
+        case "RouteTask":
+            guard let utterance = arguments["utterance"]?.stringValue, !utterance.isEmpty else {
+                throw AssistantActionError.badRequest("RouteTask needs the user's request as utterance.")
+            }
+            let snapshot = await routingSnapshot()
+            return AssistantTaskRouter.render(
+                AssistantTaskRouter.route(utterance: utterance, snapshot: snapshot)
+            )
 
         case "SetChatModel":
             let workspaceID = try requireWorkspace(arguments)
@@ -423,18 +457,23 @@ extension InProcessCoreClient {
             let chat = try await engine(for: workspaceID).renameChat(
                 chatID, title: title, userInitiated: true
             )
+            markListMutation()
             return "Renamed the tab to \"\(chat.title)\"."
 
         case "CloseChat":
             let workspaceID = try requireWorkspace(arguments)
             let chatID = try requireChat(arguments)
             let chat = try await engine(for: workspaceID).closeChat(chatID)
+            markListMutation()
+            continuation.yield(.chatUpdated(chat))
             return "Closed \"\(chat.title)\"."
 
         case "ReopenChat":
             let workspaceID = try requireWorkspace(arguments)
             let chatID = try requireChat(arguments)
             let chat = try await engine(for: workspaceID).closeChat(chatID, closed: false)
+            markListMutation()
+            continuation.yield(.chatUpdated(chat))
             return "Reopened \"\(chat.title)\"."
 
         case "InterruptChatTurn":
@@ -548,12 +587,53 @@ extension InProcessCoreClient {
         return ChatID(rawValue: raw)
     }
 
+    /// Follow-ups that change code must name the tab when the workspace has
+    /// more than one. Omitting chatID used to land on the oldest tab — the
+    /// wrong conversation more often than the main one.
+    private func requireDelegatedChatID(
+        _ arguments: JSONValue,
+        workspaceID: WorkspaceID
+    ) async throws -> ChatID? {
+        if let raw = arguments["chatID"]?.stringValue, !raw.isEmpty {
+            return ChatID(rawValue: raw)
+        }
+        let open = ((try? await store.chats(workspaceID: workspaceID)) ?? [])
+            .filter { !$0.isClosed }
+        if open.count > 1 {
+            let named = open.map { "\"\($0.title)\" (\($0.id))" }.joined(separator: ", ")
+            throw AssistantActionError.badRequest(
+                "This workspace has \(open.count) open tabs — pass chatID so the "
+                    + "follow-up reaches the conversation that already has the context. "
+                    + "Open tabs: \(named)."
+            )
+        }
+        return nil
+    }
+
     private func requestWorkspaceID(_ request: AssistantBridgeRequest) -> WorkspaceID? {
         request.arguments["workspaceID"]?.stringValue.map(WorkspaceID.init(rawValue:))
     }
 
     private func requestChatID(_ request: AssistantBridgeRequest) -> ChatID? {
         request.arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:))
+    }
+
+    /// CreateWorkspace stays automatic on a clean fleet. Forking a sibling
+    /// while another worktree on the same repo is dirty asks first.
+    private func dirtyCreateWorkspaceConfirmation(
+        _ request: AssistantBridgeRequest
+    ) async -> (summary: String, workspaceID: WorkspaceID?)? {
+        guard let repository = try? await resolveRepository(
+            request.arguments["repository"]?.stringValue
+        ) else { return nil }
+        guard let sibling = await dirtySibling(onRepository: repository.path) else {
+            return nil
+        }
+        let files = sibling.files == 1 ? "1 uncommitted file" : "\(sibling.files) uncommitted files"
+        return (
+            "Create a new worktree while “\(sibling.name)” still has \(files)",
+            sibling.id
+        )
     }
 
     private func resolveSeed(_ arguments: JSONValue) throws -> CreateWorkspaceRequest.Seed {
@@ -753,26 +833,106 @@ extension InProcessCoreClient {
     /// engine's harness switch carries a locally generated handoff summary,
     /// so the conversation continues rather than restarting.
     public func assistantRateLimited(chatID: ChatID) async {
+        await failOverAssistant(chatID: chatID)
+    }
+
+    func considerAssistantFailover(chatID: ChatID, event: AgentEvent) async {
+        if AssistantFailoverPolicy.reason(for: event) != nil {
+            await failOverAssistant(chatID: chatID)
+            return
+        }
+        if case .turnCompleted(let result) = event, result.outcome == .completed {
+            assistantFailedHarnesses[chatID] = nil
+            assistantFailoverAt[chatID] = nil
+        }
+    }
+
+    /// Switch the Assistant itself — not a project tab — onto another ready
+    /// harness, then retry the last user request so a spoken question is not
+    /// lost to a 429.
+    func failOverAssistant(chatID: ChatID) async {
+        guard !assistantFailoverInFlight.contains(chatID) else { return }
+        if let last = assistantFailoverAt[chatID],
+           ContinuousClock.now - last < AssistantFailoverPolicy.cooldown {
+            return
+        }
         guard let assistant = try? await store.assistantWorkspace(),
               let chat = try? await store.chat(chatID),
               chat.workspaceID == assistant.id
         else { return }
         let current = HarnessKind(rawValue: chat.harness)
-        guard let alternate = harnessProbes.lazy.compactMap({ probe -> (
-            harness: HarnessKind, profile: AssistantManager.ModelProfile
-        )? in
-            guard probe.isReady, probe.kind != current,
-                  let profile = Self.assistantProfile(for: probe.kind, catalog: self.modelCatalog)
-            else { return nil }
-            return (probe.kind, profile)
-        }).first else { return }
+        var excluding = assistantFailedHarnesses[chatID] ?? []
+        if let current { excluding.insert(current) }
+        guard let alternate = AssistantFailoverPolicy.nextHarness(
+            current: current,
+            excluding: excluding,
+            probes: harnessProbes,
+            profile: { Self.assistantProfile(for: $0, catalog: self.modelCatalog) }
+        ) else { return }
+
+        assistantFailoverInFlight.insert(chatID)
+        defer { assistantFailoverInFlight.remove(chatID) }
+
+        let pendingPrompt: (text: String, origin: MessageOrigin)?
+        if let engine = try? await engine(for: assistant.workspaceID) {
+            pendingPrompt = await engine.lastOutboundPrompt(for: chatID)
+        } else {
+            pendingPrompt = nil
+        }
+
         await moveAssistant(
             to: alternate.harness,
             profile: alternate.profile,
             workspaceID: assistant.workspaceID,
             chatID: chatID
         )
+        assistantFailedHarnesses[chatID] = excluding
+        assistantFailoverAt[chatID] = .now
+        await retryLastAssistantPrompt(
+            workspaceID: assistant.workspaceID,
+            chatID: chatID,
+            pending: pendingPrompt
+        )
     }
+
+    /// Replay the last person-originated prompt on the new harness. Watch
+    /// digests are skipped: they are machine traffic and will come again.
+    /// Origin is `.agent` so the transcript does not look like the user typed
+    /// the same sentence twice.
+    private func retryLastAssistantPrompt(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        pending: (text: String, origin: MessageOrigin)?
+    ) async {
+        let prompt: String
+        let origin: MessageOrigin
+        if let pending {
+            prompt = pending.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            origin = pending.origin
+        } else if let turn = ((try? await store.turns(chatID: chatID)) ?? [])
+            .last(where: { !($0.prompt ?? "").isEmpty }) {
+            prompt = (turn.prompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            origin = turn.origin
+        } else {
+            return
+        }
+        guard origin != .watch, !prompt.isEmpty else { return }
+        guard let engine = try? await engine(for: workspaceID) else { return }
+        _ = try? await engine.send(SendMessageRequest(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            text: prompt,
+            queueIfBusy: false,
+            origin: .agent,
+            hiddenContext: Self.failoverRetryNote
+        ))
+    }
+
+    private static let failoverRetryNote = """
+        The previous agent hit a rate limit or failed. You are a different \
+        agent continuing the same conversation. Answer the user's last request \
+        now; do not ask them to repeat it.
+        """
 
     private func moveAssistant(
         to harness: HarnessKind,
@@ -798,7 +958,7 @@ extension InProcessCoreClient {
     /// harness. A nonempty live catalog is authoritative: if that account or
     /// CLI does not advertise the lean model, skip the harness instead of
     /// silently spending against its frontier default.
-    static func assistantProfile(
+    nonisolated static func assistantProfile(
         for harness: HarnessKind,
         catalog: [HarnessKind: [AgentModel]]
     ) -> AssistantManager.ModelProfile? {
@@ -825,6 +985,7 @@ extension InProcessCoreClient {
         case "SendPromptToProject": return "Send a prompt to the agent\(place)"
         case "OpenWorkspace": return "Show\(place.isEmpty ? " a workspace" : place) on screen"
         case "GetAppState": return "Read the live app state"
+        case "RouteTask": return "Recommend where a request should land"
         case "SetChatModel": return "Change the model\(place)"
         case "SwitchChatHarness": return "Switch the harness\(place)"
         case "SetChatPermissionMode":

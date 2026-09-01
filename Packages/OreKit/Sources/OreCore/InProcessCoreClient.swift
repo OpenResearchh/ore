@@ -27,12 +27,30 @@ public actor InProcessCoreClient: CoreClient {
     var harnessProbes: [HarnessProbeResult] = []
     var modelCatalog: [HarnessKind: [AgentModel]] = [:]
 
+    /// Invalidates whole-list reads that suspended while a workspace or chat
+    /// mutation completed. Actor isolation does not make an async method
+    /// atomic: `resync` awaits each engine, so an older snapshot could
+    /// otherwise be emitted after a newer archive/create/close event and put
+    /// stale rows back in the UI.
+    private var listRevision: UInt64 = 0
+
+    #if DEBUG
+    /// Deterministic seam for the stale-snapshot regression test. Production
+    /// never installs it; taking it before awaiting makes it one-shot.
+    var beforeSnapshotEmission: (@Sendable () async -> Void)?
+    #endif
+
     // Assistant action lane — see AssistantActions.swift for the policy and
     // dispatch. Stored here because extensions can't add storage.
     var assistantBridge: AssistantBridgeServer?
     var pendingAssistantConfirmations: [String: CheckedContinuation<AssistantResolution, Never>] = [:]
     var assistantTaskGrants: [AssistantTaskGrantKey: Date] = [:]
     var assistantAlwaysGrants: Set<AssistantActionClass> = []
+    /// Harnesses that already failed or exhausted quota this incident, so a
+    /// second error does not bounce back onto the one we just left.
+    var assistantFailedHarnesses: [ChatID: Set<HarnessKind>] = [:]
+    var assistantFailoverInFlight: Set<ChatID> = []
+    var assistantFailoverAt: [ChatID: ContinuousClock.Instant] = [:]
 
     public init(
         store: OreStore,
@@ -88,9 +106,11 @@ public actor InProcessCoreClient: CoreClient {
 
         case .renameWorkspace(let id, let name, let userInitiated):
             try await engine(for: id).rename(name, userInitiated: userInitiated)
+            markListMutation()
 
         case .setWorkspacePinned(let id, let pinned):
             try await engine(for: id).setPinned(pinned)
+            markListMutation()
 
         case .addDiffComment(let id, let reference):
             try await engine(for: id).addDiffComment(reference)
@@ -147,19 +167,23 @@ public actor InProcessCoreClient: CoreClient {
 
         case .createChat(let request):
             let chat = try await engine(for: request.workspaceID).createChat(request)
+            markListMutation()
             continuation.yield(.chatAdded(chat))
 
         case .renameChat(let id, let chatID, let title, let userInitiated):
             _ = try await engine(for: id).renameChat(
                 chatID, title: title, userInitiated: userInitiated
             )
+            markListMutation()
 
         case .closeChat(let workspaceID, let chatID):
             let chat = try await engine(for: workspaceID).closeChat(chatID)
+            markListMutation()
             continuation.yield(.chatUpdated(chat))
 
         case .reopenChat(let workspaceID, let chatID):
             let chat = try await engine(for: workspaceID).closeChat(chatID, closed: false)
+            markListMutation()
             continuation.yield(.chatUpdated(chat))
 
         case .switchChatHarness(let workspaceID, let chatID, let harness, let model):
@@ -177,8 +201,7 @@ public actor InProcessCoreClient: CoreClient {
             continuation.yield(.chatUpdated(chat))
 
         case .listChats(let workspaceID):
-            let chats = try await engine(for: workspaceID).chatSummaries()
-            continuation.yield(.chatsListed(workspaceID, chats))
+            try await listChats(workspaceID)
 
         case .sendMessage(let request):
             let engine = try await engine(for: request.workspaceID)
@@ -301,9 +324,15 @@ public actor InProcessCoreClient: CoreClient {
     }
 
     private func resync(_ id: WorkspaceID?) async throws {
+        let revision = listRevision
         if let id {
             let engine = try await engine(for: id)
-            continuation.yield(.workspaceUpdated(await engine.summary()))
+            let summary = await engine.summary()
+            guard revision == listRevision else {
+                try await resync(id)
+                return
+            }
+            continuation.yield(.workspaceUpdated(summary))
             return
         }
 
@@ -322,10 +351,44 @@ public actor InProcessCoreClient: CoreClient {
                 ).map { $0.summary() }) ?? [])
             }
         }
-        continuation.yield(.snapshot(CoreSnapshot(
+        let snapshot = CoreSnapshot(
             workspaces: summaries, chats: chats, harnesses: harnessProbes
-        )))
+        )
+        #if DEBUG
+        if let hook = beforeSnapshotEmission {
+            beforeSnapshotEmission = nil
+            await hook()
+        }
+        #endif
+        guard revision == listRevision else {
+            // A successful list mutation owns the newer truth. Rebuild instead
+            // of publishing this stale cache; retrying also guarantees a cold
+            // client still receives every pre-existing row.
+            try await resync(nil)
+            return
+        }
+        continuation.yield(.snapshot(snapshot))
     }
+
+    private func listChats(_ workspaceID: WorkspaceID) async throws {
+        let revision = listRevision
+        let chats = try await engine(for: workspaceID).chatSummaries()
+        guard revision == listRevision else {
+            try await listChats(workspaceID)
+            return
+        }
+        continuation.yield(.chatsListed(workspaceID, chats))
+    }
+
+    func markListMutation() {
+        listRevision &+= 1
+    }
+
+    #if DEBUG
+    func pauseBeforeNextSnapshotEmission(_ hook: @escaping @Sendable () async -> Void) {
+        beforeSnapshotEmission = hook
+    }
+    #endif
 
     // MARK: - Repositories
 
@@ -478,6 +541,7 @@ public actor InProcessCoreClient: CoreClient {
         }
 
         let engine = try await makeEngine(for: record)
+        markListMutation()
         continuation.yield(.workspaceAdded(await engine.summary()))
 
         if let setup = configuration.scripts.setup {
@@ -524,13 +588,19 @@ public actor InProcessCoreClient: CoreClient {
         let manager = WorktreeManager(git: git, root: worktreeRoot)
         let preservedCommit = try await manager.archive(at: worktree, workspaceID: id)
 
-        _ = try await store.updateWorkspace(id) { record in
+        guard let updated = try await store.updateWorkspace(id, { record in
             record.isArchived = true
             record.archivedStateCommit = preservedCommit
             record.archivedAt = Date()
             record.archivedDiskBytes = reclaimedBytes
+        }) else {
+            throw OreCoreError.workspaceNotFound(id)
         }
-        try await resync(nil)
+        markListMutation()
+        // Publish the committed row directly. A whole snapshot is slower and,
+        // because building it suspends on every engine, used to be able to
+        // arrive out of order with another mutation.
+        continuation.yield(.workspaceUpdated(updated.summary()))
     }
 
     /// Total allocated size of a directory tree. Best-effort: unreadable
@@ -580,6 +650,7 @@ public actor InProcessCoreClient: CoreClient {
         }
         if let updated {
             let engine = try await makeEngine(for: updated)
+            markListMutation()
             continuation.yield(.workspaceUpdated(await engine.summary()))
         }
     }
@@ -607,6 +678,7 @@ public actor InProcessCoreClient: CoreClient {
         try? await git.runSerialized(["update-ref", "-d", "refs/ore/archive/\(id.rawValue)"])
 
         try await store.deleteWorkspace(id)
+        markListMutation()
         continuation.yield(.workspaceRemoved(id))
     }
 
@@ -733,22 +805,44 @@ public actor InProcessCoreClient: CoreClient {
         // one ordered feed, so the client has a single source of truth rather
         // than N it has to reconcile.
         let id = record.workspaceID
-        let agentTask = Task { [weak self, continuation] in
+        let agentTask = Task { [weak self] in
             for await routed in engine.events {
-                guard self != nil else { return }
-                continuation.yield(.agent(id, routed.chatID, routed.event))
+                guard !Task.isCancelled, let self else { return }
+                await self.publishFromActiveEngine(
+                    .agent(id, routed.chatID, routed.event), id: id, engine: engine
+                )
+                // The Assistant is the product's own agent. A rate-limited or
+                // dead CLI must not mute it while another harness is ready.
+                // Project tabs keep their harness; only this workspace moves.
+                if engine.isAssistantWorkspace {
+                    await self.considerAssistantFailover(
+                        chatID: routed.chatID, event: routed.event
+                    )
+                }
             }
         }
-        let summaryTask = Task { [weak self, continuation] in
+        let summaryTask = Task { [weak self] in
             for await summary in await engine.summaryUpdates() {
-                guard self != nil else { return }
-                continuation.yield(.workspaceUpdated(summary))
+                guard !Task.isCancelled, let self else { return }
+                await self.publishFromActiveEngine(
+                    .workspaceUpdated(summary), id: id, engine: engine
+                )
             }
         }
-        let chatTask = Task { [weak self, continuation] in
+        let chatTask = Task { [weak self] in
             for await chat in await engine.chatUpdates() {
-                guard self != nil else { return }
-                continuation.yield(.chatUpdated(chat))
+                guard !Task.isCancelled, let self else { return }
+                await self.publishFromActiveEngine(
+                    .chatUpdated(chat), id: id, engine: engine
+                )
+            }
+        }
+        let gitTask = Task { [weak self] in
+            for await status in await engine.gitStatusUpdates() {
+                guard !Task.isCancelled, let self else { return }
+                await self.publishFromActiveEngine(
+                    .gitStatusChanged(id, status), id: id, engine: engine
+                )
             }
         }
         let promptTask = Task { [weak self, continuation] in
@@ -765,10 +859,22 @@ public actor InProcessCoreClient: CoreClient {
                 )
             }
         }
-        engineTasks[id] = [agentTask, summaryTask, chatTask, promptTask, compactionTask]
+        engineTasks[id] = [agentTask, summaryTask, chatTask, gitTask, promptTask, compactionTask]
 
         await engine.start()
         return engine
+    }
+
+    /// A stopped engine still owns buffered AsyncStream elements. Validate its
+    /// identity on the core actor before forwarding them so an archived
+    /// workspace's cached summary cannot overwrite the committed archive row.
+    private func publishFromActiveEngine(
+        _ event: CoreEvent,
+        id: WorkspaceID,
+        engine: WorkspaceEngine
+    ) {
+        guard engines[id] === engine else { return }
+        continuation.yield(event)
     }
 
     private func stopEngine(_ id: WorkspaceID) async {
@@ -1003,9 +1109,11 @@ public actor InProcessCoreClient: CoreClient {
                     + " mode=\(chat.permissionMode.rawValue)"
                     + (chat.reasoningEffort.map { " effort=\($0.rawValue)" } ?? "")
                     + " status=\(chat.status.rawValue)"
+                    + " turns=\(chat.turnCount)"
                 if chat.queuedMessageCount > 0 {
                     chip += " queued=\(chat.queuedMessageCount)"
                 }
+                if chat.isTurnActive { chip += " turn-active" }
                 if focused == chat.id { chip += " [focused]" }
                 lines.append(chip)
             }
@@ -1027,6 +1135,70 @@ public actor InProcessCoreClient: CoreClient {
             return "[ORE app state]\n\(focusedLine)\nNo project workspaces."
         }
         return "[ORE app state]\n\(focusedLine)\n" + blocks.joined(separator: "\n")
+    }
+
+    /// Live fleet as routing candidates. Assistant workspace omitted — it is
+    /// never a destination for repository work.
+    func routingSnapshot() async -> AssistantTaskRouter.Snapshot {
+        let assistantID = (try? await store.assistantWorkspace())?.workspaceID
+            ?? WorkspaceID(rawValue: "assistant")
+        var focusedWorkspaceID: WorkspaceID?
+        var focusedChatID: ChatID?
+        var workspaces: [AssistantTaskRouter.Workspace] = []
+        for (id, engine) in engines {
+            let summary = await engine.summary()
+            if summary.isAssistant { continue }
+            let chats = (try? await engine.chatSummaries(includeClosed: true)) ?? []
+            let focused = await engine.focusedChatIDValue()
+            if let focused {
+                focusedWorkspaceID = id
+                focusedChatID = focused
+            }
+            let git = await engine.liveGitStatus()
+            let pending = await engine.pendingInput()
+            let pendingIDs = Set(pending.map(\.chatID))
+            workspaces.append(AssistantTaskRouter.Workspace(
+                id: id,
+                name: summary.name,
+                repo: URL(fileURLWithPath: summary.repositoryPath).lastPathComponent,
+                dirtyFileCount: git.hasUncommittedChanges ? git.changedFileCount : 0,
+                tabs: chats.map { chat in
+                    AssistantTaskRouter.Tab(
+                        id: chat.id,
+                        title: chat.title,
+                        status: chat.status,
+                        isClosed: chat.isClosed,
+                        isFocused: focused == chat.id,
+                        pendingInput: pendingIDs.contains(chat.id)
+                    )
+                }
+            ))
+        }
+        return AssistantTaskRouter.Snapshot(
+            assistantWorkspaceID: assistantID,
+            focusedWorkspaceID: focusedWorkspaceID,
+            focusedChatID: focusedChatID,
+            workspaces: workspaces
+        )
+    }
+
+    /// An existing worktree on this repository with uncommitted files — the
+    /// reason CreateWorkspace asks before forking a sibling.
+    func dirtySibling(
+        onRepository path: String
+    ) async -> (id: WorkspaceID, name: String, files: Int)? {
+        let wanted = URL(fileURLWithPath: path).standardizedFileURL
+        for (id, engine) in engines {
+            let summary = await engine.summary()
+            if summary.isAssistant { continue }
+            let repo = URL(fileURLWithPath: summary.repositoryPath).standardizedFileURL
+            guard repo == wanted else { continue }
+            let git = await engine.liveGitStatus()
+            if git.hasUncommittedChanges {
+                return (id, summary.name, git.changedFileCount)
+            }
+        }
+        return nil
     }
 
     public func transcript(workspaceID: WorkspaceID) async throws -> [TurnRecord] {

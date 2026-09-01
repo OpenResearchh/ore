@@ -338,9 +338,11 @@ struct ClaudeCodeTranslator {
             // Held so the permission request that gates this plan can be
             // republished with the plan attached — see `handleControlRequest`.
             pendingPlanProposals[toolCallID] = plan
+            guard PlanProposalPolicy.isReadyMarkdown(plan) else { break }
             output.events.append(.planUpdated(PlanUpdate(
                 turnID: turnID,
-                content: .proposal(markdown: plan, permissionRequestID: nil)
+                content: .proposal(markdown: plan, permissionRequestID: nil),
+                isReady: true
             )))
 
         case "TodoWrite":
@@ -539,14 +541,29 @@ struct ClaudeCodeTranslator {
         // of plan mode. Republish the proposal with the request attached so the
         // approve button has something to answer — the plan itself arrived
         // earlier, as a tool call, before any request existed to link to.
-        if let toolCallID, let plan = pendingPlanProposals.removeValue(forKey: toolCallID) {
-            output.events.append(.planUpdated(PlanUpdate(
-                turnID: turnID,
-                content: .proposal(
-                    markdown: plan,
-                    permissionRequestID: PermissionRequestID(rawValue: payload.requestID)
-                )
-            )))
+        // Empty drafts stay unpublished: a permission for ExitPlanMode is not
+        // itself "the plan is ready".
+        if let toolCallID {
+            let stored = pendingPlanProposals.removeValue(forKey: toolCallID)
+            let isPlanTool = toolName == "ExitPlanMode" || toolName == "CreatePlan"
+            if stored != nil || isPlanTool {
+                let fromInput = isPlanTool
+                    ? payload.request.input.flatMap(PlanProposalPolicy.planBody(from:))
+                    : nil
+                let plan = [stored, fromInput]
+                    .compactMap { $0 }
+                    .first { PlanProposalPolicy.isReadyMarkdown($0) } ?? ""
+                if PlanProposalPolicy.isReadyMarkdown(plan) {
+                    output.events.append(.planUpdated(PlanUpdate(
+                        turnID: turnID,
+                        content: .proposal(
+                            markdown: plan,
+                            permissionRequestID: PermissionRequestID(rawValue: payload.requestID)
+                        ),
+                        isReady: true
+                    )))
+                }
+            }
         }
 
         append(status: .awaitingInput, to: &output)

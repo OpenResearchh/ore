@@ -46,6 +46,10 @@ final class AppModel {
     /// Live transcript state is keyed by durable chat identity, never by
     /// workspace: several tabs in one worktree can stream concurrently.
     private(set) var chatStates: [ChatID: ChatState] = [:]
+    /// Git dirt lives off the `workspaces` array so a file write does not
+    /// invalidate every chrome view that read the fleet list.
+    @ObservationIgnored
+    let workspaceLive = WorkspaceLiveRegistry()
     private(set) var activeChatIDs: [WorkspaceID: ChatID] = [:]
     /// Files opened as diff tabs in the centre column, per workspace, and which
     /// one is showing. When `activeFilePath[workspace]` is nil the centre shows
@@ -710,6 +714,14 @@ final class AppModel {
     var selectedChatSummary: ChatSummary? {
         guard let workspaceID = selectedWorkspaceID else { return nil }
         return activeChat(for: workspaceID)
+    }
+
+    func gitChrome(for id: WorkspaceID) -> GitStatusSummary {
+        workspaceLive.state(for: id).gitStatus
+    }
+
+    func gitGeneration(for id: WorkspaceID) -> UInt64 {
+        workspaceLive.state(for: id).gitGeneration
     }
 
     func chats(for workspaceID: WorkspaceID, includeClosed: Bool = false) -> [ChatSummary] {
@@ -2143,7 +2155,7 @@ final class AppModel {
         async let diffs = loadDiff(for: workspace.id)
         async let action = loadGitAction(for: workspace.id)
         let snapshot = DiffSnapshot(
-            generation: workspace.gitStatus.generation,
+            generation: gitGeneration(for: workspace.id),
             diffs: try await diffs,
             gitAction: try await action
         )
@@ -2185,10 +2197,13 @@ final class AppModel {
     /// instant. Skips work when the cache already matches the current git-status
     /// generation; failures are swallowed since the real refresh reports them.
     func prefetchDiff(for workspace: WorkspaceSummary) {
+        let generation = gitGeneration(for: workspace.id)
         if let cached = diffCache[workspace.id],
-           cached.generation == workspace.gitStatus.generation { return }
+           cached.generation == generation { return }
+        var stamped = workspace
+        stamped.gitStatus.generation = generation
         Task(priority: .utility) { [weak self] in
-            _ = try? await self?.refreshDiff(for: workspace)
+            _ = try? await self?.refreshDiff(for: stamped)
         }
     }
 
@@ -2490,10 +2505,16 @@ final class AppModel {
     // MARK: - Events
 
     private func apply(_ event: CoreEvent) {
+        #if DEBUG
+        UIFanoutProbe.record(event)
+        #endif
         switch event {
         case .snapshot(let snapshot):
             assistantWorkspace = snapshot.workspaces.first(where: \.isAssistant)
             workspaces = snapshot.workspaces.filter { !$0.isAssistant }
+            for workspace in snapshot.workspaces {
+                workspaceLive.seed(workspace)
+            }
             chatSummaries = snapshot.chats
             chatOwners = Dictionary(
                 snapshot.chats.map { ($0.id, $0.workspaceID) },
@@ -2508,15 +2529,18 @@ final class AppModel {
             adoptResearchIdentities()
             if selectedWorkspaceID == nil {
                 if let saved = UserDefaults.standard.string(forKey: "ore.selectedWorkspace"),
-                   workspaces.contains(where: { $0.id.rawValue == saved }) {
+                   sortedWorkspaces.contains(where: { $0.id.rawValue == saved }) {
                     selectedWorkspaceID = WorkspaceID(rawValue: saved)
                 } else {
                     selectedWorkspaceID = sortedWorkspaces.first?.id
                 }
+            } else {
+                repairWorkspaceSelection()
             }
             warmWorkspaces()
 
         case .workspaceAdded(let summary):
+            workspaceLive.seed(summary)
             guard !summary.isAssistant else {
                 assistantWorkspace = summary
                 break
@@ -2534,9 +2558,11 @@ final class AppModel {
             upsert(summary)
             identityRenamesInFlight.remove(summary.id)
             rememberIdentityIfPresent(for: summary)
+            if summary.isArchived { repairWorkspaceSelection() }
 
         case .workspaceRemoved(let id):
             workspaces.removeAll { $0.id == id }
+            workspaceLive.remove(id)
             fleetWatcher.forget(id)
             let removed = chatSummaries.filter { $0.workspaceID == id }.map(\.id)
             chatSummaries.removeAll { $0.workspaceID == id }
@@ -2674,11 +2700,19 @@ final class AppModel {
             adoptResearchChatTitles(in: workspaceID)
 
         case .gitStatusChanged(let id, let status):
-            guard let index = workspaces.firstIndex(where: { $0.id == id }) else { return }
-            workspaces[index].gitStatus = status
+            let live = workspaceLive.state(for: id)
+            guard status.generation >= live.gitGeneration else { return }
+            live.apply(status)
             // The tree changed, so any cached diff is now stale — warm a fresh
-            // one in the background so the review pane stays instant.
-            prefetchDiff(for: workspaces[index])
+            // one in the background so the review pane stays instant. Stamp
+            // generation on a copy rather than writing `workspaces[i].gitStatus`,
+            // which would invalidate every reader of the fleet array.
+            if let workspace = workspaces.first(where: { $0.id == id })
+                ?? (assistantWorkspace?.id == id ? assistantWorkspace : nil) {
+                var stamped = workspace
+                stamped.gitStatus.generation = status.generation
+                prefetchDiff(for: stamped)
+            }
 
         case .harnessProbeCompleted(let probes):
             harnesses = probes
@@ -2848,15 +2882,16 @@ final class AppModel {
                 }
                 assistantRateLimitHandled = false
             }
-            if case .rateLimit(let report) = event, report.status == .exhausted,
-               !assistantRateLimitHandled {
-                // The assistant's own provider ran dry; move it to another
-                // ready harness so the next question still gets answered.
+            if let reason = AssistantFailoverPolicy.reason(for: event),
+               !assistantRateLimitHandled,
+               let current = chatSummaries.first(where: { $0.id == chatID })?.harness
+                ?? assistantWorkspace?.harness,
+               harnesses.contains(where: { $0.isReady && $0.kind != current }) {
+                // Core performs the switch; this is only the spoken cue, and
+                // only when another ready harness actually exists.
                 assistantRateLimitHandled = true
-                Task { await client.assistantRateLimited(chatID: chatID) }
                 narration.speakAssistant(
-                    "I've hit my provider's rate limit — switching to another "
-                        + "agent to keep answering.",
+                    AssistantFailoverPolicy.spokenHandoff(reason),
                     chatID: chatID
                 )
             }
@@ -3151,10 +3186,17 @@ final class AppModel {
 
     private func upsert(_ summary: WorkspaceSummary) {
         let previousSync = workspaces.first { $0.id == summary.id }?.baseSync
+        var next = summary
         if let index = workspaces.firstIndex(where: { $0.id == summary.id }) {
-            workspaces[index] = summary
+            // Git dirt rides `workspaceLive`. Keeping the array's copy frozen
+            // means a summary republish (unread, rename, status) does not
+            // look like a git change to every `workspaces` reader.
+            next.gitStatus = workspaces[index].gitStatus
+            if workspaces[index] == next { return }
+            workspaces[index] = next
         } else {
-            workspaces.append(summary)
+            workspaces.append(next)
+            workspaceLive.seed(summary)
         }
         noteFleetChange(summary)
         // Origin movement does not touch the worktree, so the git-action
@@ -3165,9 +3207,25 @@ final class AppModel {
         }
     }
 
+    /// Selection is part of workspace-list state too. Keeping an archived row
+    /// selected leaves the detail pane and app intents pointing at a worktree
+    /// that no longer exists even when the sidebar correctly filters the row.
+    private func repairWorkspaceSelection() {
+        selectedWorkspaceID = workspaceSelectionAfterListChange(
+            selected: selectedWorkspaceID,
+            active: sortedWorkspaces.map(\.id)
+        )
+    }
+
     private func upsertChat(_ summary: ChatSummary) {
         if let index = chatSummaries.firstIndex(where: { $0.id == summary.id }) {
-            chatSummaries[index] = summary
+            if chatSummaries[index] == summary {
+                #if DEBUG
+                UIFanoutProbe.equalChatSummariesSkipped += 1
+                #endif
+            } else {
+                chatSummaries[index] = summary
+            }
         } else {
             chatSummaries.append(summary)
         }
@@ -3321,6 +3379,17 @@ final class AppModel {
     }
 }
 
+/// Keeps a still-valid selection, otherwise moves to the first active row.
+/// All windows share one `AppModel`, so repairing it here updates every scene
+/// without window-local invalidation or an optimistic archive.
+func workspaceSelectionAfterListChange(
+    selected: WorkspaceID?,
+    active: [WorkspaceID]
+) -> WorkspaceID? {
+    if let selected, active.contains(selected) { return selected }
+    return active.first
+}
+
 private enum HarnessAuthenticationError: LocalizedError, Sendable {
     case interactiveOnly
     case notInstalled(String)
@@ -3377,5 +3446,45 @@ extension WorkspaceSummary {
     /// The one thing the sidebar is for: does this agent need me right now.
     var needsAttention: Bool {
         hasUnread || status == .awaitingInput || status == .failed
+    }
+}
+
+/// Per-workspace git dirt, independently observable so one worktree's file
+/// writes do not rebuild the fleet list, sidebar sort, or every other pane.
+@MainActor
+@Observable
+final class WorkspaceLiveState {
+    var gitStatus = GitStatusSummary()
+    /// Freshness stamp for the review pane. Updated even when the visible
+    /// counts did not move, because files can change with the same +/- totals.
+    var gitGeneration: UInt64 = 0
+
+    func apply(_ status: GitStatusSummary) {
+        gitGeneration = status.generation
+        if !gitStatus.hasSameVisibleChrome(as: status) {
+            gitStatus = status
+        }
+    }
+}
+
+@MainActor
+final class WorkspaceLiveRegistry {
+    private var states: [WorkspaceID: WorkspaceLiveState] = [:]
+
+    func state(for id: WorkspaceID) -> WorkspaceLiveState {
+        if let existing = states[id] { return existing }
+        let created = WorkspaceLiveState()
+        states[id] = created
+        return created
+    }
+
+    func seed(_ summary: WorkspaceSummary) {
+        let live = state(for: summary.id)
+        live.gitStatus = summary.gitStatus
+        live.gitGeneration = summary.gitStatus.generation
+    }
+
+    func remove(_ id: WorkspaceID) {
+        states.removeValue(forKey: id)
     }
 }

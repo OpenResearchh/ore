@@ -47,11 +47,11 @@ let package = Package(
             dependencies: ["OreProtocol", "OreSupport", "OreHarness", "OreGit", "OrePersistence"]
         ),
 
-        .executableTarget(name: "ore-cli", dependencies: ["OreCore"]),
+        .executableTarget(name: "ore-cli", dependencies: ["OreCore", "OreSupport"]),
 
         .testTarget(
             name: "OreKitTests",
-            dependencies: ["OreCore"],
+            dependencies: ["OreCore", "OreSupport"],
             resources: [.copy("Fixtures")]
         ),
     ],

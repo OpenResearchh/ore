@@ -3,6 +3,117 @@ import OreProtocol
 
 @testable import OreMac
 
+struct VoiceFinishPhraseTests {
+    @Test func canonicalPhraseAtTheEndFinishesAndIsRemoved() throws {
+        let match = try #require(VoiceFinishPhrase.match(
+            in: "Please run the focused tests. Yip yap yip yip."
+        ))
+        #expect(match.request == "Please run the focused tests.")
+    }
+
+    @Test func punctuationAndNarrowYipRecognitionVariantsStillMatch() throws {
+        let hyphenated = try #require(VoiceFinishPhrase.match(
+            in: "Show me the diff; yip-yap, yip-yip!"
+        ))
+        #expect(hyphenated.request == "Show me the diff;")
+
+        let yep = try #require(VoiceFinishPhrase.match(
+            in: "Check it yep yap yep yep"
+        ))
+        #expect(yep.request == "Check it")
+    }
+
+    @Test func ordinarySpeechAndNonterminalMentionsDoNotFalseTrigger() {
+        for phrase in [
+            "yep yep yep yep",
+            "yip yap yip",
+            "yip yap yip yip is the phrase I chose",
+            "please compare yip and yap",
+        ] {
+            #expect(VoiceFinishPhrase.match(in: phrase) == nil, "\(phrase) must not submit")
+        }
+    }
+}
+
+struct HandsFreeListeningGuardTests {
+    private let start = ContinuousClock.now
+
+    @Test func finishCandidateMustRemainStableBeforeSubmitting() {
+        var guardState = HandsFreeListeningGuard(startedAt: start)
+        let phrase = "Run the tests yip yap yip yip"
+        #expect(guardState.evaluate(transcript: phrase, at: start) == .none)
+        #expect(guardState.evaluate(
+            transcript: phrase,
+            at: start.advanced(by: HandsFreeListeningGuard.finishSettle - .milliseconds(1))
+        ) == .none)
+        #expect(guardState.evaluate(
+            transcript: phrase,
+            at: start.advanced(by: HandsFreeListeningGuard.finishSettle)
+        ) == .finish("Run the tests"))
+    }
+
+    @Test func revisedPartialHypothesisCancelsTheFinishCandidate() {
+        var guardState = HandsFreeListeningGuard(startedAt: start)
+        _ = guardState.evaluate(transcript: "Explain it yip yap yip yip", at: start)
+        #expect(guardState.evaluate(
+            transcript: "Explain why yip yap is distinctive",
+            at: start.advanced(by: .milliseconds(200))
+        ) == .none)
+        #expect(guardState.evaluate(
+            transcript: "Explain why yip yap is distinctive",
+            at: start.advanced(by: .seconds(1))
+        ) == .none)
+    }
+
+    @Test func finalRecognizerResultDoesNotNeedAnExtraSettleDelay() {
+        var guardState = HandsFreeListeningGuard(startedAt: start)
+        #expect(guardState.evaluate(
+            transcript: "Run the tests yip yap yip yip",
+            at: start,
+            isFinal: true
+        ) == .finish("Run the tests"))
+    }
+
+    @Test func emptySessionTimesOutWithoutSubmitting() {
+        var guardState = HandsFreeListeningGuard(startedAt: start)
+        #expect(guardState.evaluate(
+            transcript: "",
+            at: start.advanced(by: HandsFreeListeningGuard.noSpeechTimeout)
+        ) == .timeout)
+    }
+
+    @Test func maximumSessionTimeoutDoesNotSubmitPartialSpeech() {
+        var guardState = HandsFreeListeningGuard(startedAt: start)
+        #expect(guardState.evaluate(
+            transcript: "This request never said the finish phrase",
+            at: start.advanced(by: HandsFreeListeningGuard.maximumDuration)
+        ) == .timeout)
+    }
+}
+
+/// Quiet mode and the default voice turn: answers always play, everything else
+/// is a chime and the HUD. Mid-turn tool chatter is never spoken.
+struct VoiceSpeechPolicyTests {
+    @Test func answersAlwaysPlayEvenWhenQuiet() {
+        #expect(VoiceSpeechPolicy.shouldSpeakAnswers(quiet: false))
+        #expect(VoiceSpeechPolicy.shouldSpeakAnswers(quiet: true))
+    }
+
+    @Test func milestonesNeverPlayDuringAVoiceTurn() {
+        #expect(!VoiceSpeechPolicy.shouldSpeakMilestones(quiet: false))
+        #expect(!VoiceSpeechPolicy.shouldSpeakMilestones(quiet: true))
+    }
+
+    @Test func progressPromptsAndAcksStaySilentInQuietMode() {
+        #expect(VoiceSpeechPolicy.shouldSpeakNudge(quiet: false))
+        #expect(VoiceSpeechPolicy.shouldSpeakPrompts(quiet: false))
+        #expect(VoiceSpeechPolicy.shouldSpeakAcks(quiet: false))
+        #expect(!VoiceSpeechPolicy.shouldSpeakNudge(quiet: true))
+        #expect(!VoiceSpeechPolicy.shouldSpeakPrompts(quiet: true))
+        #expect(!VoiceSpeechPolicy.shouldSpeakAcks(quiet: true))
+    }
+}
+
 /// Spoken answers to pending assistant confirmations. The utterance is the
 /// unit — "no problem, go ahead" allows; a leftover "no" still denies.
 struct VoiceAssistantDecisionTests {

@@ -208,7 +208,7 @@ private struct AssistantHUDView: View {
 
     private var voicePill: some View {
         HStack(spacing: 12) {
-            Image(systemName: controller.phase == .speaking ? "speaker.wave.2.fill" : "sparkles")
+            Image(systemName: voiceIcon)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
 
@@ -218,6 +218,17 @@ private struct AssistantHUDView: View {
             StreamingTranscript(text: transcript, placeholder: placeholder)
                 .foregroundStyle(micIsOpen ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if controller.phase == .listening {
+                Text(controller.usesFinishPhrase
+                     ? "Say “\(VoiceFinishPhrase.spoken)” to send"
+                     : "Release to send")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 92, alignment: .trailing)
+            }
 
             // Only promised when the key can actually be seen: without
             // Accessibility the monitors are blind outside ORE, and the pill's
@@ -237,11 +248,20 @@ private struct AssistantHUDView: View {
         controller.phase == .listening || controller.phase == .answering
     }
 
+    private var voiceIcon: String {
+        switch controller.phase {
+        case .armed: "mic"
+        case .listening, .answering: "mic.fill"
+        case .speaking: "speaker.wave.2.fill"
+        case .thinking, .idle: "sparkles"
+        }
+    }
+
     private var waveform: WaveformBars.Mode {
         switch controller.phase {
         case .listening, .answering: .listening(controller.audioLevel)
         case .speaking: .speaking
-        case .thinking, .idle: .thinking
+        case .armed, .thinking, .idle: .thinking
         }
     }
 
@@ -254,13 +274,14 @@ private struct AssistantHUDView: View {
             controller.liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         case .speaking:
             controller.spokenSoFar.trimmingCharacters(in: .whitespacesAndNewlines)
-        case .thinking, .idle:
+        case .armed, .thinking, .idle:
             ""
         }
     }
 
     private var placeholder: String {
         switch controller.phase {
+        case .armed: "Armed — release ⇧⌥ to speak"
         case .listening: "Listening…"
         case .answering: controller.answerPlaceholder
         case .thinking: "Thinking…"
@@ -545,7 +566,7 @@ private struct WaveformBars: View {
     var mode: Mode
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval)) { context in
             let time = context.date.timeIntervalSinceReferenceDate
             HStack(spacing: 3) {
                 ForEach(0..<5, id: \.self) { index in

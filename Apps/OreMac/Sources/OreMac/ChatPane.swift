@@ -115,7 +115,11 @@ struct ChatPane: View {
                 if let filePath = model.activeFilePath[workspace.id] {
                     DiffDocumentView(workspace: workspace, path: filePath)
                 } else {
-                    chatBody(paneHeight: geometry.size.height)
+                    // Own view identity so transcript/composer observation
+                    // (ChatState, live git, voice) does not rebuild the tab bar.
+                    ChatConversationColumn {
+                        chatBody(paneHeight: geometry.size.height)
+                    }
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -158,7 +162,7 @@ struct ChatPane: View {
         if case .proposal = chat.plan { return nil }
         guard draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
-        let git = workspace.gitStatus
+        let git = model.gitChrome(for: workspace.id)
         let title = chatSummary?.title ?? ""
         let isCommitTab = title.hasPrefix("Commit")
         let isShipTab = title.hasPrefix("Ship")
@@ -628,7 +632,7 @@ struct ChatPane: View {
             // Cancel is only ever published for the assistant, so this is
             // unreachable today; parking the draft is the safe reading of
             // "stop" if it ever isn't.
-            case .commit, .cancel: finishVoice(.commitToDraft)
+            case .arm, .disarm, .commit, .cancel: finishVoice(.commitToDraft)
             }
         }
         .onDisappear {
@@ -761,6 +765,11 @@ struct ChatPane: View {
     /// Tab chrome is its own view so streaming `rowsRevision` cannot rebuild
     /// the close buttons. Clicks on those used to sit behind 40 Hz transcript
     /// invalidations.
+    private struct ChatConversationColumn<Content: View>: View {
+        var content: () -> Content
+        var body: some View { content() }
+    }
+
     private struct ChatTabBar: View {
         @Environment(AppModel.self) private var model
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1230,7 +1239,7 @@ struct ChatPane: View {
             // The glow keeps burning through the settle beat: the turn has not
             // gone out yet, so voice mode is not over yet either.
             voiceGlow: voice.isListening ? .full : (voice.isActive || voiceSettle != nil) ? .subdued : .off,
-            voiceEnergy: voice.audioLevel
+            voiceInput: voice
         )
         .animation(.easeOut(duration: 0.2), value: chat.isBusy)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: voice.isActive)
@@ -4635,7 +4644,7 @@ private struct BusyTabDot: View {
 
     var body: some View {
         let paused = reduceMotion || controlActiveState != .key
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { context in
+        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval, paused: paused)) { context in
             let cycle = 1.4
             let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
             let pulse = 0.5 - 0.5 * cos(t * 2 * Double.pi)

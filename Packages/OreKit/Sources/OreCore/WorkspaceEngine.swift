@@ -13,6 +13,9 @@ import OreSupport
 /// mutable state and no working directory.
 public actor WorkspaceEngine {
     public nonisolated let workspaceID: WorkspaceID
+    /// Frozen at init so the core can decide, without an actor hop on every
+    /// streamed token, whether this engine is the product assistant.
+    public nonisolated let isAssistantWorkspace: Bool
     public nonisolated let events: AsyncStream<WorkspaceAgentEvent>
 
     private nonisolated let continuation: AsyncStream<WorkspaceAgentEvent>.Continuation
@@ -35,6 +38,12 @@ public actor WorkspaceEngine {
     private var chats: [ChatID: ChatRuntime] = [:]
 
     private final class ChatRuntime: @unchecked Sendable {
+        struct PendingPlan {
+            var turnID: TurnID
+            var markdown: String
+            var permissionRequestID: PermissionRequestID?
+        }
+
         var record: ChatRecord
         var session: (any AgentSession)?
         var transcript: TranscriptWriter?
@@ -43,9 +52,18 @@ public actor WorkspaceEngine {
         var latestUsage: UsageReport?
         var pendingPermissions: [PermissionRequestID: PermissionRequest] = [:]
         var pendingQuestions: [QuestionID: AgentQuestion] = [:]
+        var pendingPlan: PendingPlan?
+        /// True once this turn has edited/written/shelled. A late CreatePlan
+        /// after that must not re-advertise a plan the agent already moved past.
+        var turnDidMutate = false
         var currentTurnID: TurnID?
         var isTurnActive = false
         var sessionEffort: ReasoningEffort?
+        /// The prompt that opened the in-flight (or just-failed) turn. Stored
+        /// here because the transcript does not persist a turn until it starts
+        /// or completes — a rate-limit mid-send would otherwise have nothing
+        /// to retry on the next harness.
+        var lastOutboundPrompt: (text: String, origin: MessageOrigin)?
         var isGeneratingTitle = false
         var handoffContext: String?
         var queuedMessageCount = 0
@@ -66,6 +84,10 @@ public actor WorkspaceEngine {
         /// the next outgoing message and cleared — a note in the database
         /// alone never reaches a resumed provider session's context.
         var pendingContextNotes: [String] = []
+        /// Last chrome summary yielded on `chatUpdates`. Streaming tokens
+        /// rebuild an identical value; skipping the yield is what keeps the
+        /// sidebar and tab bar off the token firehose.
+        var lastPublishedSummary: ChatSummary?
 
         init(record: ChatRecord) { self.record = record }
     }
@@ -78,6 +100,7 @@ public actor WorkspaceEngine {
         allowAPIKeyFallback: Bool = false
     ) {
         self.workspaceID = record.workspaceID
+        self.isAssistantWorkspace = record.workspaceKind == .assistant
         self.record = record
         self.store = store
         self.git = git
@@ -250,18 +273,7 @@ public actor WorkspaceEngine {
         return chats.values
             .filter { includeClosed || !$0.record.isClosed }
             .sorted { $0.record.sortIndex < $1.record.sortIndex }
-            .map { runtime in
-                runtime.record.summary(
-                    status: runtime.status,
-                    capabilities: harnessRegistry.harness(
-                        for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-                    )?.capabilities ?? HarnessCapabilities(),
-                    queuedMessageCount: runtime.queuedMessageCount,
-                    isTurnActive: runtime.isTurnActive,
-                    contextUsage: runtime.latestUsage,
-                    turnCount: runtime.userTurnCount
-                )
-            }
+            .map { makeChatSummary($0) }
     }
 
     public func createChat(_ request: CreateChatRequest) async throws -> ChatSummary {
@@ -447,16 +459,7 @@ public actor WorkspaceEngine {
 
     private func summary(for runtime: ChatRuntime) async throws -> ChatSummary {
         runtime.queuedMessageCount = try await store.queuedMessages(chatID: runtime.record.chatID).count
-        return runtime.record.summary(
-            status: runtime.status,
-            capabilities: harnessRegistry.harness(
-                for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
-            )?.capabilities ?? HarnessCapabilities(),
-            queuedMessageCount: runtime.queuedMessageCount,
-            isTurnActive: runtime.isTurnActive,
-            contextUsage: runtime.latestUsage,
-            turnCount: runtime.userTurnCount
-        )
+        return makeChatSummary(runtime)
     }
 
     private func syncWorkspaceCompatibility(from runtime: ChatRuntime) async {
@@ -527,10 +530,10 @@ public actor WorkspaceEngine {
             additionalWritableRoots: Self.gitMetadataWritableRoots(for: worktreeURL),
             allowAPIKeyFallback: allowAPIKeyFallback,
             mcpServer: oreMCPServer(),
-            // The assistant's ORE tools never prompt at the CLI layer: the
-            // real gate is ORE's own action policy, and a second prompt on
-            // top of it is what makes an assistant feel like paperwork.
-            allowedTools: record.workspaceKind == .assistant ? ["mcp__ore"] : [],
+            // The product-owned ORE MCP server never prompts at the CLI layer:
+            // project workspaces only get review/comment tools, while assistant
+            // actions still pass through ORE's own app-side policy.
+            allowedTools: ["mcp__ore"],
             // …and the assistant runs without a shell or an editor: its job is
             // to route work to the agent that owns the repository, not to open
             // one itself. See `AssistantActionPolicy.disallowedHarnessTools`.
@@ -844,6 +847,7 @@ public actor WorkspaceEngine {
                 reasoningEffort: requestedEffort
             )
             try await captureCheckpoint(runtime: runtime)
+            runtime.lastOutboundPrompt = (request.text, request.origin)
             await runtime.transcript?.recordPrompt(
                 text,
                 attachments: request.attachments,
@@ -1876,7 +1880,10 @@ public actor WorkspaceEngine {
             aheadOfBase: gitStatus.aheadOfBase,
             behindBase: baseSync?.workspaceBehindOrigin ?? gitStatus.behindBase
         )
-        publishSummaryChange()
+        // Dirt rides its own stream. Folding it into `workspaceUpdated`
+        // rewrote the client's whole workspace array — sidebar sort, composer
+        // suggestions, review pane — on every agent file write.
+        publishGitStatusChange()
     }
 
     private func startBaseSyncWatching() async {
@@ -1933,6 +1940,7 @@ public actor WorkspaceEngine {
         baseSync = next
         gitStatus.behindBase = workspaceBehind
         publishSummaryChange()
+        publishGitStatusChange()
     }
 
     /// Keeps the local default branch fresh automatically: when origin moved
@@ -1980,11 +1988,42 @@ public actor WorkspaceEngine {
 
         switch event {
         case .statusChanged(let newStatus):
-            setStatus(newStatus, runtime: runtime)
+            if (newStatus == .idle || newStatus == .interrupted),
+               runtime.pendingPlan != nil {
+                setStatus(.awaitingInput, runtime: runtime)
+            } else {
+                setStatus(newStatus, runtime: runtime)
+            }
 
         case .turnStarted(let turn):
             runtime.currentTurnID = turn.turnID
             runtime.isTurnActive = true
+            runtime.pendingPlan = nil
+            runtime.turnDidMutate = false
+            publishChatChange(runtime)
+
+        case .toolCall(let call):
+            if PlanProposalPolicy.proceedsPastProposal(call.name) {
+                runtime.turnDidMutate = true
+                runtime.pendingPlan = nil
+                if runtime.status == .awaitingInput {
+                    setStatus(.runningTool, runtime: runtime)
+                }
+            }
+
+        case .planUpdated(let update):
+            if case .proposal(let markdown, let requestID) = update.content,
+               update.isReady,
+               PlanProposalPolicy.isReadyMarkdown(markdown),
+               !runtime.turnDidMutate {
+                runtime.pendingPlan = ChatRuntime.PendingPlan(
+                    turnID: update.turnID,
+                    markdown: markdown,
+                    permissionRequestID: requestID
+                )
+                setStatus(.awaitingInput, runtime: runtime)
+                await markUnread(runtime)
+            }
 
         case .permissionRequest(let request):
             runtime.pendingPermissions[request.id] = request
@@ -1993,6 +2032,9 @@ public actor WorkspaceEngine {
 
         case .permissionResolved(let resolution):
             runtime.pendingPermissions.removeValue(forKey: resolution.id)
+            if runtime.pendingPlan?.permissionRequestID == resolution.id {
+                runtime.pendingPlan = nil
+            }
             // The card is gone; the turn is not. Dropping back to requesting
             // is what makes the composer show "working" again instead of
             // looking idle while the agent continues the same turn.
@@ -2004,22 +2046,30 @@ public actor WorkspaceEngine {
             await markUnread(runtime)
 
         case .usage(let usage):
+            let previous = runtime.latestUsage
             runtime.latestUsage = usage
+            if ChatChromePublishPolicy.shouldPublishUsage(previous: previous, next: usage) {
+                publishChatChange(runtime)
+            }
 
         case .turnCompleted:
             runtime.isTurnActive = false
             runtime.currentTurnID = nil
+            if runtime.turnDidMutate { runtime.pendingPlan = nil }
             if runtime.currentTurnOrigin != .watch { runtime.userTurnCount += 1 }
             await markUnread(runtime)
             runtime.record.lastActivityAt = Date()
             record.lastActivityAt = Date()
             try? await store.saveChat(runtime.record)
             try? await persistRecord()
+            // Drain first: a queued user message must not wait on `git status`,
+            // which contends with every other worktree on a loaded runner.
+            await drainQueue(runtime: runtime)
             // The agent has stopped writing, so this is the moment the diff is
             // both interesting and stable.
             await statusWatcher?.refreshNow()
-            await drainQueue(runtime: runtime)
             await compactAssistantIfOutgrown(runtime)
+            publishChatChange(runtime)
 
         case .sessionError(let error):
             if !error.isRecoverable { setStatus(.failed, runtime: runtime) }
@@ -2029,10 +2079,15 @@ public actor WorkspaceEngine {
             runtime.session = nil
             runtime.sessionEffort = nil
             runtime.isTurnActive = false
-            setStatus(.idle, runtime: runtime)
+            if runtime.pendingPlan != nil {
+                setStatus(.awaitingInput, runtime: runtime)
+            } else {
+                setStatus(.idle, runtime: runtime)
+            }
             // A session that dies mid-turn never reports `.turnCompleted`, so
             // this is the only chance anything queued behind it gets sent.
             scheduleQueueDrain(runtime: runtime)
+            publishChatChange(runtime)
 
         case .contextCompacted:
             if record.workspaceKind == .assistant {
@@ -2046,7 +2101,9 @@ public actor WorkspaceEngine {
             break
         }
 
-        publishChatChange(runtime)
+        // Token, thinking, and tool-result deltas never change ChatSummary
+        // chrome (status, unread, queue, turn). Publishing on every one used
+        // to rebuild the sidebar and tab bar at stream rate.
         continuation.yield(WorkspaceAgentEvent(chatID: chatID, event: event))
     }
 
@@ -2054,6 +2111,7 @@ public actor WorkspaceEngine {
         guard runtime.status != newStatus else { return }
         runtime.status = newStatus
         publishSummaryChange()
+        publishChatChange(runtime)
     }
 
     /// After a permission or question is answered the harness is running
@@ -2095,6 +2153,16 @@ public actor WorkspaceEngine {
 
     public func focusedChatIDValue() -> ChatID? { focusedChatID }
 
+    public func lastOutboundPrompt(
+        for chatID: ChatID
+    ) -> (text: String, origin: MessageOrigin)? {
+        chats[chatID]?.lastOutboundPrompt
+    }
+
+    public func liveGitStatus() async -> GitStatusSummary {
+        await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus
+    }
+
     public func gitStatusValue() -> GitStatusSummary { gitStatus }
 
     public struct PendingInput: Sendable, Equatable {
@@ -2134,6 +2202,17 @@ public actor WorkspaceEngine {
                     allowsFreeform: question.allowsFreeform
                 ))
             }
+            if let plan = runtime.pendingPlan {
+                rows.append(PendingInput(
+                    chatID: runtime.record.chatID,
+                    title: runtime.record.title,
+                    kind: "plan",
+                    id: plan.permissionRequestID?.rawValue ?? "plan-\(plan.turnID.rawValue)",
+                    summary: String(plan.markdown.prefix(160)),
+                    options: [],
+                    allowsFreeform: false
+                ))
+            }
         }
         return rows
     }
@@ -2163,8 +2242,8 @@ public actor WorkspaceEngine {
         publishSummaryChange()
     }
 
-    private func publishChatChange(_ runtime: ChatRuntime) {
-        chatContinuation?.yield(runtime.record.summary(
+    private func makeChatSummary(_ runtime: ChatRuntime) -> ChatSummary {
+        runtime.record.summary(
             status: runtime.status,
             capabilities: harnessRegistry.harness(
                 for: HarnessKind(rawValue: runtime.record.harness) ?? .claudeCode
@@ -2173,7 +2252,14 @@ public actor WorkspaceEngine {
             isTurnActive: runtime.isTurnActive,
             contextUsage: runtime.latestUsage,
             turnCount: runtime.userTurnCount
-        ))
+        )
+    }
+
+    private func publishChatChange(_ runtime: ChatRuntime) {
+        let summary = makeChatSummary(runtime)
+        if runtime.lastPublishedSummary == summary { return }
+        runtime.lastPublishedSummary = summary
+        chatContinuation?.yield(summary)
     }
 
     private var summaryContinuation: AsyncStream<WorkspaceSummary>.Continuation?
@@ -2194,8 +2280,27 @@ public actor WorkspaceEngine {
             bufferingPolicy: .bufferingNewest(32)
         )
         chatContinuation = continuation
-        for runtime in chats.values { publishChatChange(runtime) }
+        for runtime in chats.values {
+            let summary = makeChatSummary(runtime)
+            runtime.lastPublishedSummary = summary
+            continuation.yield(summary)
+        }
         return stream
+    }
+
+    private var gitStatusContinuation: AsyncStream<GitStatusSummary>.Continuation?
+
+    public func gitStatusUpdates() -> AsyncStream<GitStatusSummary> {
+        let (stream, continuation) = AsyncStream<GitStatusSummary>.makeStream(
+            bufferingPolicy: .bufferingNewest(8)
+        )
+        gitStatusContinuation = continuation
+        continuation.yield(gitStatus)
+        return stream
+    }
+
+    private func publishGitStatusChange() {
+        gitStatusContinuation?.yield(gitStatus)
     }
 
     private var compactionContinuation: AsyncStream<CompactedConversation>.Continuation?

@@ -40,6 +40,11 @@ struct ProtocolBoundaryTests {
             .planUpdated(PlanUpdate(
                 turnID: turnID, content: .proposal(markdown: "# plan", permissionRequestID: "r1")
             )),
+            .planUpdated(PlanUpdate(
+                turnID: turnID,
+                content: .proposal(markdown: "# draft", permissionRequestID: nil),
+                isReady: false
+            )),
             .permissionRequest(PermissionRequest(
                 turnID: turnID, id: "r1", toolCallID: "t1", toolName: "Write",
                 input: ["file_path": "/tmp/a.txt"],
@@ -79,6 +84,23 @@ struct ProtocolBoundaryTests {
         let decoded = try JSONDecoder().decode(TurnResult.self, from: Data(json.utf8))
         #expect(decoded.summary == "done")
         #expect(decoded.narration == nil)
+    }
+
+    @Test func planUpdateDecodesWithoutIsReadyAsReady() throws {
+        let encoded = try JSONEncoder().encode(PlanUpdate(
+            turnID: TurnID(rawValue: "turn-1"),
+            content: .proposal(markdown: "# plan", permissionRequestID: nil)
+        ))
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "isReady")
+        let stripped = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(PlanUpdate.self, from: stripped)
+        #expect(decoded.isReady)
+        guard case .proposal(let markdown, _) = decoded.content else {
+            Issue.record("expected a proposal")
+            return
+        }
+        #expect(markdown == "# plan")
     }
 
     @Test func coreEventSnapshotRoundTrips() throws {
@@ -274,5 +296,22 @@ struct ProtocolBoundaryTests {
         #expect(PermissionDecision.allowWithSuggestion([
             "decision": "acceptForSession",
         ]).impliedPermissionMode == nil)
+    }
+
+    @Test func gitStatusVisibleChromeIgnoresGeneration() {
+        let dirt = GitStatusSummary(
+            changedFileCount: 1, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 1
+        )
+        let newerStamp = GitStatusSummary(
+            changedFileCount: 1, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 99
+        )
+        #expect(dirt.hasSameVisibleChrome(as: newerStamp))
+        let moreFiles = GitStatusSummary(
+            changedFileCount: 2, insertions: 2, deletions: 3,
+            hasUncommittedChanges: true, generation: 1
+        )
+        #expect(!dirt.hasSameVisibleChrome(as: moreFiles))
     }
 }

@@ -3,6 +3,7 @@ import OreCore
 import OreGit
 import OrePersistence
 import OreProtocol
+import OreSupport
 
 #if canImport(Darwin)
 import Darwin
@@ -40,7 +41,7 @@ func runMCPServer(options: CommandLineOptions) async {
                 "serverInfo": ["name": "ore", "version": "0.1.0"],
             ]
         case "tools/list":
-            result = ["tools": toolDefinitions() + assistant.toolDefinitions()]
+            result = ["tools": annotateToolDefinitions(toolDefinitions() + assistant.toolDefinitions())]
         case "tools/call":
             let params = request["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
@@ -96,6 +97,84 @@ private func toolDefinitions() -> [[String: Any]] { [
         ],
     ],
 ] }
+
+/// MCP clients use tool annotations as approval hints. Without them, a client
+/// has to treat a harmless review read the same as a workspace mutation and may
+/// reject the call before it ever reaches this server.
+private func annotateToolDefinitions(_ tools: [[String: Any]]) -> [[String: Any]] {
+    tools.map { tool in
+        guard let name = tool["name"] as? String else { return tool }
+        var copy = tool
+        copy["annotations"] = MCPToolAnnotation.forTool(named: name).json
+        return copy
+    }
+}
+
+private struct MCPToolAnnotation {
+    let readOnly: Bool
+    let destructive: Bool
+    let idempotent: Bool
+    let openWorld: Bool
+
+    var json: [String: Any] {
+        [
+            "readOnlyHint": readOnly,
+            "destructiveHint": destructive,
+            "idempotentHint": idempotent,
+            "openWorldHint": openWorld,
+        ]
+    }
+
+    static func forTool(named name: String) -> Self {
+        if localReadOnlyTools.contains(name)
+            || AssistantToolServer.readOnlyToolNames.contains(name)
+            || AssistantToolServer.readOnlyBridgeToolNames.contains(name) {
+            return .readOnly
+        }
+        if nonDestructiveLocalWriteTools.contains(name) {
+            return .localWrite
+        }
+        if destructiveTools.contains(name) {
+            return .destructiveLocalWrite
+        }
+        if openWorldTools.contains(name) {
+            return .openWorldAction
+        }
+        return .appAction
+    }
+
+    private static let localReadOnlyTools: Set<String> = [
+        "GetWorkspaceDiff", "GetDiffComments",
+    ]
+    private static let nonDestructiveLocalWriteTools: Set<String> = [
+        "PostDiffComment", "AskUserQuestion", "WriteMemory",
+        "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort",
+        "RenameChat", "ReopenChat", "OpenWorkspace", "AnswerChatQuestion",
+    ]
+    private static let destructiveTools: Set<String> = [
+        "DeleteMemory", "CloseChat", "InterruptChatTurn", "Commit", "ArchiveWorkspace",
+        "ResolveChatPermission",
+    ]
+    private static let openWorldTools: Set<String> = [
+        "CreateWorkspace", "CreateChat", "SendPromptToProject", "Push", "CreatePullRequest",
+    ]
+
+    private static let readOnly = Self(
+        readOnly: true, destructive: false, idempotent: true, openWorld: false
+    )
+    private static let localWrite = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: false
+    )
+    private static let destructiveLocalWrite = Self(
+        readOnly: false, destructive: true, idempotent: false, openWorld: false
+    )
+    private static let openWorldAction = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: true
+    )
+    private static let appAction = Self(
+        readOnly: false, destructive: false, idempotent: false, openWorld: false
+    )
+}
 
 private func callORETool(
     _ name: String, arguments: [String: Any], directory: URL
@@ -175,17 +254,24 @@ private final class AssistantToolServer {
     private let homeURL: URL
     private var store: OreStore?
 
-    private static let readToolNames: Set<String> = [
+    fileprivate static let readOnlyToolNames: Set<String> = [
         "ListWorkspaces", "ListChats", "WorkspaceStatus",
         "SearchTranscripts", "GetTranscriptTail",
-        "ListMemory", "ReadMemory", "WriteMemory", "DeleteMemory",
+        "ListMemory", "ReadMemory",
     ]
+    private static let readWriteToolNames: Set<String> = [
+        "WriteMemory", "DeleteMemory",
+    ]
+    private static let readToolNames: Set<String> = readOnlyToolNames.union(readWriteToolNames)
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
-        "GetAppState", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
+        "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
+    ]
+    fileprivate static let readOnlyBridgeToolNames: Set<String> = [
+        "ListHarnesses", "GetAppState", "RouteTask",
     ]
 
     init(enabled: Bool, databaseURL: URL, homeURL: URL) {
@@ -235,7 +321,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SearchTranscripts",
-                "description": "Full-text search across chat transcripts, newest first. Use to answer 'where was I doing X', to resolve vague project references, and to find the exact tab a piece of work already lives in — every hit carries its chatID, so the follow-up can go to the conversation that already has the context.",
+                "description": "Full-text search across chat transcripts, newest first. Use to answer 'where was I doing X', to resolve vague project references, and to find the exact tab a piece of work already lives in — every hit carries its chatID, so the follow-up can go to the conversation that already has the context. Hits mark closed tabs (`isClosed`); do not SendPromptToProject to those — ReopenChat or CreateChat instead.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -253,7 +339,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "GetTranscriptTail",
-                "description": "The recent conversation of one chat: prior turn summaries plus the last few prompts and replies. Defaults to the workspace's first chat when chatID is omitted.",
+                "description": "The recent conversation of one chat: prior turn summaries plus the last few prompts and replies. Always pass chatID when you have it — omitting it reads the oldest tab, not the focused one. Closed tabs are labelled so you reopen or start fresh instead of sending more work into them.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -301,7 +387,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateWorkspace",
-                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults.",
+                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation unless another worktree on that repository already has uncommitted files — then the user is asked first. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults. Use this for a new branch/worktree, not for a new tab on an existing worktree (that is CreateChat).",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -318,7 +404,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateChat",
-                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation. Use for work unrelated to any existing tab's conversation — continuing existing work belongs in its own tab via SendPromptToProject(chatID:). Give it a short, specific title.",
+                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation. Use for work that belongs on this worktree but is unrelated to any existing tab's conversation. Continuing existing work belongs in its own tab via SendPromptToProject(chatID:). Give it a short, specific title. Do not use this for a new git worktree — that is CreateWorkspace.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -336,13 +422,13 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SendPromptToProject",
-                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. Queues automatically if that agent is mid-turn. Runs without confirmation. Write `text` as a full brief, not a relay of the user's words: goal in one line, concrete context you gathered (branch, recent turns, file/PR names), what done looks like — and quote the user's original phrasing at the end.",
+                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. Queues automatically if that agent is mid-turn. Runs without confirmation. Write `text` as a full brief, not a relay of the user's words: goal in one line, concrete context you gathered (branch, recent turns, file/PR names), what done looks like — and quote the user's original phrasing at the end. Pass chatID whenever the workspace has more than one open tab; omitting it is refused rather than guessed.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "workspaceID": ["type": "string"],
                         "text": ["type": "string", "description": "A complete brief for the project agent, richer than the user's spoken request but inventing nothing."],
-                        "chatID": ["type": "string", "description": "The tab already carrying this work (find it via ListChats + GetTranscriptTail); omit only for the workspace's main chat."],
+                        "chatID": ["type": "string", "description": "The tab already carrying this work (find it via ListChats + GetTranscriptTail). Required when the workspace has more than one open tab; omit only if it has a single open chat."],
                         "effort": ["type": "string", "description": "Reasoning depth for this one turn: none | low | medium | high | xhigh | max | adaptive."],
                         "serviceTier": ["type": "string", "description": "Optional processing tier, e.g. fast for Codex."],
                     ],
@@ -358,6 +444,17 @@ private final class AssistantToolServer {
                 "name": "GetAppState",
                 "description": "Live app state: focused workspace and tab, open tabs with harness/model/mode/effort/status, git dirt, and anything waiting on the user. Prefer the hidden snapshot on each turn; call this to refresh.",
                 "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "RouteTask",
+                "description": "Recommend where a user request should land before you CreateChat, CreateWorkspace, or SendPromptToProject. Pass the user's request as `utterance`. Returns action (sendExistingTab | createChat | createWorkspace | assistantChat | clarify), optional workspaceID/chatID, confidence, a short reason, and a single `question` when two destinations still fit. Follow high-confidence results; ask the question instead of guessing.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "utterance": ["type": "string", "description": "The user's request, in their words."],
+                    ],
+                    "required": ["utterance"],
+                ],
             ],
             [
                 "name": "SetChatModel",
@@ -604,7 +701,7 @@ private final class AssistantToolServer {
     }
 
     private func bridgeExchange(socketPath: String, payload: Data) -> Data? {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = UnixStreamSocket.open()
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
 
@@ -764,6 +861,7 @@ private final class AssistantToolServer {
                     "workspaceName": hit.workspaceName,
                     "snippet": hit.snippet,
                     "createdAt": iso(hit.createdAt),
+                    "isClosed": hit.isClosed,
                 ]
                 // The tab, so a follow-up can be sent where the context already
                 // is instead of opening a fresh one beside it.
@@ -782,8 +880,15 @@ private final class AssistantToolServer {
             } else {
                 return "That workspace has no chats yet."
             }
-            return try await store.handoffContext(chatID: chatID)
+            let closedNote: String
+            if let chat = try await store.chat(chatID), chat.isClosed {
+                closedNote = "This tab is closed. ReopenChat if the conversation is still the right one, or CreateChat for a fresh one — do not SendPromptToProject here.\n\n"
+            } else {
+                closedNote = ""
+            }
+            let tail = try await store.handoffContext(chatID: chatID)
                 ?? "That chat has no turns yet."
+            return closedNote + tail
 
         case "ListMemory":
             return AssistantMemory.listingText(home: homeURL)

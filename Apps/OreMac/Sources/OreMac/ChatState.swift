@@ -204,7 +204,7 @@ final class ChatState {
             // The card is only for a decision; once the agent is writing, it
             // has moved on — leaving `.proposal` up is why it survived Approve
             // and came back after an app switch.
-            if case .proposal = plan, Self.proceedsPastPlanProposal(call.name) {
+            if case .proposal = plan, PlanProposalPolicy.proceedsPastProposal(call.name) {
                 clearPlan()
             }
             // Cursor (and similar) re-emits the same call as `streamContent`
@@ -237,25 +237,24 @@ final class ChatState {
 
         case .planUpdated(let update):
             if case .proposal(let markdown, let requestID) = update.content {
+                let trimmed = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    upsertPlanRow(
+                        turnID: update.turnID, markdown: markdown, requestID: requestID
+                    )
+                }
+                // Drafts belong in the transcript so "read the plan" has
+                // something to find; they are not approval-ready.
+                guard update.isReady, PlanProposalPolicy.isReadyMarkdown(markdown) else { break }
+                let alreadyProceeded = rows.contains { row in
+                    row.turnID == update.turnID
+                        && row.kind == .toolCall
+                        && PlanProposalPolicy.proceedsPastProposal(row.toolName ?? "")
+                }
+                guard !alreadyProceeded else { break }
                 plan = update.content
                 planTurnID = update.turnID
                 status = .awaitingInput
-                if let index = rows.lastIndex(where: {
-                    $0.kind == .plan && $0.turnID == update.turnID
-                }) {
-                    mutateRow(at: index) { row in
-                        row.text = markdown
-                        row.permissionRequestID = requestID
-                    }
-                } else {
-                    rows.append(TranscriptRow(
-                        id: "plan-\(update.turnID.rawValue)-\(rows.count)",
-                        turnID: update.turnID,
-                        kind: .plan,
-                        text: markdown,
-                        permissionRequestID: requestID
-                    ))
-                }
             } else if case .proposal = plan {
                 // A TodoWrite after CreatePlan must not dismiss the approval card.
                 break
@@ -365,7 +364,11 @@ final class ChatState {
             }
 
         case .sessionEnded:
-            status = .idle
+            if case .proposal = plan {
+                status = .awaitingInput
+            } else {
+                status = .idle
+            }
             // The engine drops its own claim here; a session that died mid-turn
             // never reports `.turnCompleted`, and a composer left believing a
             // turn is open would queue every later message behind a dead one.
@@ -568,15 +571,36 @@ final class ChatState {
         planTurnID = nil
     }
 
+    /// Writes the plan into the transcript as soon as any markdown exists, so
+    /// readiness never races persistence. The approval card is a separate
+    /// `isReady` step.
+    private func upsertPlanRow(
+        turnID: TurnID,
+        markdown: String,
+        requestID: PermissionRequestID?
+    ) {
+        if let index = rows.lastIndex(where: {
+            $0.kind == .plan && $0.turnID == turnID
+        }) {
+            mutateRow(at: index) { row in
+                row.text = markdown
+                row.permissionRequestID = requestID
+            }
+        } else {
+            rows.append(TranscriptRow(
+                id: "plan-\(turnID.rawValue)-\(rows.count)",
+                turnID: turnID,
+                kind: .plan,
+                text: markdown,
+                permissionRequestID: requestID
+            ))
+        }
+    }
+
     /// True when the tool means the agent is implementing rather than still
     /// researching a plan the user has not answered.
     private static func proceedsPastPlanProposal(_ toolName: String) -> Bool {
-        switch toolName {
-        case "Edit", "Write", "Delete", "Bash":
-            return true
-        default:
-            return false
-        }
+        PlanProposalPolicy.proceedsPastProposal(toolName)
     }
 
     /// Drops a leftover proposal when this turn already mutated the tree —

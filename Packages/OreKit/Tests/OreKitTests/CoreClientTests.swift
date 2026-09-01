@@ -34,15 +34,23 @@ actor CoreEventRecorder {
 
     func all() -> [CoreEvent] { received }
 
+    func checkpoint() -> Int { received.count }
+
+    func all(after checkpoint: Int) -> [CoreEvent] {
+        guard checkpoint < received.count else { return [] }
+        return Array(received[checkpoint...])
+    }
+
     /// The first event matching the predicate, waiting up to `timeout`.
     /// Returns nil on timeout so a failure is a failed expectation rather than
     /// a hung suite.
     func waitFor(
+        after checkpoint: Int = 0,
         timeout: Duration = .seconds(30),
         matching: (CoreEvent) -> Bool
     ) async -> CoreEvent? {
         let deadline = ContinuousClock.now.advanced(by: timeout)
-        var index = 0
+        var index = checkpoint
         while ContinuousClock.now < deadline {
             while index < received.count {
                 let event = received[index]
@@ -56,6 +64,29 @@ actor CoreEventRecorder {
 
     deinit { task.get()?.cancel() }
 }
+
+#if DEBUG
+private actor SnapshotEmissionGate {
+    private var isPaused = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        isPaused = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        while !isPaused {
+            await Task.yield()
+        }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+#endif
 
 /// The command/event boundary is what a hosted ORE would run across, so it is
 /// exercised the way a client would: send commands, read events, never touch
@@ -251,24 +282,114 @@ struct CoreClientTests {
         let worktree = URL(fileURLWithPath: summary.worktreePath)
         try fixture.write("draft.txt", "half-finished\n", in: worktree)
 
+        let archiveCheckpoint = await recorder.checkpoint()
         await client.send(.archiveWorkspace(summary.id))
-        _ = await recorder.waitFor {
-            if case .snapshot = $0 { return true }
+        let archived = await recorder.waitFor(after: archiveCheckpoint) {
+            if case .workspaceUpdated(let update) = $0 {
+                return update.id == summary.id && update.isArchived
+            }
             return false
         }
+        #expect(archived != nil)
         #expect(!FileManager.default.fileExists(atPath: worktree.path))
 
+        let unarchiveCheckpoint = await recorder.checkpoint()
         await client.send(.unarchiveWorkspace(summary.id))
-        _ = await recorder.waitFor {
-            if case .workspaceUpdated = $0 { return true }
+        let unarchived = await recorder.waitFor(after: unarchiveCheckpoint) {
+            if case .workspaceUpdated(let update) = $0 {
+                return update.id == summary.id && !update.isArchived
+            }
             return false
         }
+        #expect(unarchived != nil)
 
         // Back exactly where the user left off, not merely on the right branch.
         #expect(fixture.read("draft.txt", in: worktree) == "half-finished\n")
 
         await client.shutdown()
     }
+
+    @Test func aFailedArchiveDoesNotPublishAWorkspaceListMutation() async throws {
+        let fixture = try await GitFixture.initialized()
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        let missing = WorkspaceID(rawValue: "missing-archive")
+        let checkpoint = await recorder.checkpoint()
+
+        await client.send(.archiveWorkspace(missing))
+
+        let failure = await recorder.waitFor(after: checkpoint) { event in
+            if case .commandFailed(let failure) = event {
+                return failure.workspaceID == missing
+            }
+            return false
+        }
+        #expect(failure != nil)
+        let events = await recorder.all(after: checkpoint)
+        #expect(!events.contains { event in
+            switch event {
+            case .workspaceAdded(let summary), .workspaceUpdated(let summary):
+                summary.id == missing
+            case .workspaceRemoved(let id):
+                id == missing
+            default:
+                false
+            }
+        })
+
+        await client.shutdown()
+    }
+
+    #if DEBUG
+    @Test func aSnapshotStartedBeforeArchiveCannotOverwriteTheArchiveEvent() async throws {
+        let fixture = try await GitFixture.initialized()
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "race archive"
+        )))
+        guard case .workspaceAdded(let workspace)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no workspace")
+            return
+        }
+
+        let gate = SnapshotEmissionGate()
+        await client.pauseBeforeNextSnapshotEmission { await gate.pause() }
+        let checkpoint = await recorder.checkpoint()
+        let staleRead = Task { await client.send(.resync(nil)) }
+        await gate.waitUntilPaused()
+
+        await client.send(.archiveWorkspace(workspace.id))
+        let archived = await recorder.waitFor(after: checkpoint) { event in
+            if case .workspaceUpdated(let summary) = event {
+                return summary.id == workspace.id && summary.isArchived
+            }
+            return false
+        }
+        #expect(archived != nil)
+
+        await gate.resume()
+        await staleRead.value
+        let refreshed = await recorder.waitFor(after: checkpoint) { event in
+            guard case .snapshot(let snapshot) = event else { return false }
+            return snapshot.workspaces.contains { $0.id == workspace.id && $0.isArchived }
+        }
+        #expect(refreshed != nil)
+
+        let events = await recorder.all(after: checkpoint)
+        #expect(!events.contains { event in
+            guard case .snapshot(let snapshot) = event else { return false }
+            return snapshot.workspaces.contains { $0.id == workspace.id && !$0.isArchived }
+        })
+
+        await client.shutdown()
+    }
+    #endif
 
     @Test func deletingAWorkspaceRemovesItsWorktreeAndCheckpointRefs() async throws {
         let fixture = try await GitFixture.initialized()

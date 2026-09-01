@@ -6,9 +6,8 @@ import Observation
 /// where the user is:
 ///
 ///   * **In ORE — tap to toggle.** Press and release; press again to stop.
-///   * **Anywhere else — hold to talk.** Dictation runs while the chord is held
-///     and stops on release, so the microphone can never be left open in an app
-///     the user has walked away from.
+///   * **Anywhere — hold to arm.** Wait for the cue, release, then talk
+///     hands-free. A distinctive spoken phrase finishes the request.
 ///
 /// macOS binds no action to a bare ⇧⌥, but it is a heavily used *prefix* —
 /// ⇧⌥← selects by word, and Option/Shift-Option type alternate characters. A
@@ -18,44 +17,58 @@ import Observation
 enum VoiceChordEvent: Equatable {
     /// A quick press and release — toggles dictation on, or off.
     case toggle
-    /// The chord has been held past the threshold: dictate until it is released.
-    case beginHold
-    case endHold
+    /// The chord has been held past the threshold. Feedback should tell the
+    /// user it is now safe to release, but the microphone is not open yet.
+    case armed
+    /// Both modifiers were released after arming: begin hands-free listening.
+    case activated
+    /// Another input/modifier or the release deadline invalidated the gesture.
+    case cancelled
 }
 
 /// Recognizes the two ⇧⌥ gestures: a tap and a hold.
 ///
 /// A hold cannot be detected from key events alone — nothing arrives while the
 /// user simply keeps the keys down — so the owner drives `holdThresholdReached()`
-/// from a timer it arms whenever `isArmed` becomes true.
+/// from a timer it arms whenever `isPending` becomes true.
 struct VoiceChordRecognizer {
     /// Held longer than this and it is a hold, not a tap. Deliberately generous:
     /// ⇧⌥ is a text-selection prefix (⇧⌥← selects by word), so resting on it for
     /// a moment before pressing an arrow must not open the microphone.
-    static let holdThreshold = Duration.milliseconds(600)
+    static let holdThreshold = Duration.milliseconds(1_200)
+    /// Once the cue has fired, a lost key-up must not leave an armed HUD around.
+    static let releaseTimeout = Duration.seconds(3)
     static let chord: NSEvent.ModifierFlags = [.shift, .option]
 
     private var armedAt: ContinuousClock.Instant?
     private var aborted = false
-    private var holding = false
+    private var armed = false
 
     /// True while a hold could still begin, which is when a timer is worth arming.
-    var isArmed: Bool { armedAt != nil && !aborted && !holding }
+    var isPending: Bool { armedAt != nil && !aborted && !armed }
+    var isAwaitingRelease: Bool { armedAt != nil && !aborted && armed }
 
     /// A key or click while the chord is down means the user was typing a real
     /// shortcut — ⇧⌥← and friends — not reaching for dictation.
     mutating func otherInputArrived() -> VoiceChordEvent? {
         guard armedAt != nil else { return nil }
         aborted = true
-        guard holding else { return nil }
-        holding = false
-        return .endHold
+        guard armed else { return nil }
+        armed = false
+        return .cancelled
     }
 
     mutating func holdThresholdReached() -> VoiceChordEvent? {
-        guard isArmed else { return nil }
-        holding = true
-        return .beginHold
+        guard isPending else { return nil }
+        armed = true
+        return .armed
+    }
+
+    mutating func releaseTimedOut() -> VoiceChordEvent? {
+        guard isAwaitingRelease else { return nil }
+        aborted = true
+        armed = false
+        return .cancelled
     }
 
     mutating func modifiersChanged(
@@ -66,20 +79,20 @@ struct VoiceChordRecognizer {
             if armedAt == nil {
                 armedAt = instant
                 aborted = false
-                holding = false
+                armed = false
             }
             return nil
         }
 
         if flags.isEmpty {
-            let wasHolding = holding
+            let wasArmed = armed
             let startedAt = armedAt
             let wasAborted = aborted
             armedAt = nil
             aborted = false
-            holding = false
+            armed = false
 
-            if wasHolding { return .endHold }
+            if wasArmed, !wasAborted { return .activated }
             guard let startedAt, !wasAborted else { return nil }
             return instant - startedAt <= Self.holdThreshold ? .toggle : nil
         }
@@ -87,9 +100,9 @@ struct VoiceChordRecognizer {
         // A third modifier joined the chord — that is a different gesture.
         if !flags.isSubset(of: Self.chord) {
             aborted = true
-            if holding {
-                holding = false
-                return .endHold
+            if armed {
+                armed = false
+                return .cancelled
             }
         }
         return nil
@@ -102,6 +115,11 @@ struct VoiceChordRecognizer {
 struct VoiceCommand: Equatable {
     enum Kind: Equatable {
         case toggle
+        /// The hold threshold was reached; show/play feedback while waiting
+        /// for the modifiers to be released.
+        case arm
+        /// An armed gesture was invalidated before release.
+        case disarm
         case start
         case stop
         /// Park whatever is being dictated in the draft without sending —
@@ -115,6 +133,59 @@ struct VoiceCommand: Equatable {
     var id: Int
     var kind: Kind
     var target: Target = .composer
+}
+
+/// Which hold-to-talk surface the ⇧⌥ chord is driving, and how release works.
+enum VoiceHoldMode: Equatable {
+    /// Hold arms, release opens a hands-free mic, a finish phrase sends.
+    case handsFree
+    /// Mic stays open only while the chord is held. Better with Bluetooth
+    /// headphones, which otherwise sit on the telephony profile until a phrase.
+    case holdToTalk
+    /// Legacy: hold outside ORE dictates into the focused composer.
+    case composer
+}
+
+/// Pure mapping from a chord event to the commands the surfaces should see.
+/// Extracted so hold-to-talk vs hands-free cannot drift between the monitor
+/// and its tests.
+enum VoiceHoldRouting {
+    static func commands(
+        for event: VoiceChordEvent,
+        mode: VoiceHoldMode
+    ) -> [(kind: VoiceCommand.Kind, target: VoiceCommand.Target)] {
+        let target: VoiceCommand.Target = mode == .composer ? .composer : .assistant
+        switch event {
+        case .toggle:
+            return []
+        case .armed:
+            switch mode {
+            case .composer:
+                return [(.start, target)]
+            case .handsFree:
+                return [(.arm, target)]
+            case .holdToTalk:
+                return [(.arm, target), (.start, target)]
+            }
+        case .activated:
+            switch mode {
+            case .composer, .holdToTalk:
+                return [(.stop, target)]
+            case .handsFree:
+                return [(.start, target)]
+            }
+        case .cancelled:
+            switch mode {
+            case .composer:
+                return [(.stop, target)]
+            case .handsFree:
+                return [(.disarm, target)]
+            case .holdToTalk:
+                // Drop rather than send: release is the send gesture.
+                return [(.cancel, target)]
+            }
+        }
+    }
 }
 
 @MainActor
@@ -142,21 +213,30 @@ final class VoiceHotkeyMonitor {
     private var recognizer = VoiceChordRecognizer()
     private var isRunning = false
     private var holdTimer: Task<Void, Never>?
-    /// Only send `.stop` for a hold we actually started, so releasing the chord
-    /// can never cancel a dictation the user began by tapping.
-    private var holdIsDictating = false
-    /// Where the current hold's words are going, fixed at `beginHold` so the
-    /// release always lands on the surface that started listening.
-    private var holdTarget: VoiceCommand.Target = .assistant
+    private var releaseTimer: Task<Void, Never>?
+    /// Only activate a gesture whose threshold cue was actually delivered.
+    private var holdIsArmed = false
+    /// Hold mode captured at arm so release/cancel cannot mix surfaces if the
+    /// setting flips mid-gesture.
+    private var holdModeInFlight: VoiceHoldMode = .handsFree
     private var sequence = 0
 
     /// Pre-assistant behavior: holding the chord outside ORE dictated into the
     /// focused composer (pulling ORE frontmost). Off by default now that hold
     /// belongs to the assistant; the Settings toggle brings it back.
     static let legacyHoldDictationKey = "ore.voice.holdDictatesComposer"
+    /// Assistant mic stays open only while ⇧⌥ is held. Off by default; the
+    /// hands-free finish phrase is the default send.
+    static let holdToTalkKey = "ore.voice.holdToTalk"
 
     private var legacyHoldDictation: Bool {
         UserDefaults.standard.bool(forKey: Self.legacyHoldDictationKey)
+    }
+
+    private var holdMode: VoiceHoldMode {
+        if legacyHoldDictation { return .composer }
+        if UserDefaults.standard.bool(forKey: Self.holdToTalkKey) { return .holdToTalk }
+        return .handsFree
     }
 
     private init() {}
@@ -199,7 +279,9 @@ final class VoiceHotkeyMonitor {
         isRunning = false
         holdTimer?.cancel()
         holdTimer = nil
-        holdIsDictating = false
+        releaseTimer?.cancel()
+        releaseTimer = nil
+        holdIsArmed = false
         recognizer = VoiceChordRecognizer()
     }
 
@@ -242,7 +324,9 @@ final class VoiceHotkeyMonitor {
                 // means "forget it", so releasing the chord afterwards must not
                 // still send the words the user just abandoned.
                 _ = recognizer.otherInputArrived()
-                holdIsDictating = false
+                releaseTimer?.cancel()
+                releaseTimer = nil
+                holdIsArmed = false
                 publish(.cancel, target: .assistant)
                 return
             }
@@ -262,7 +346,7 @@ final class VoiceHotkeyMonitor {
     /// noticed on a timer rather than an event.
     private func armHoldTimerIfNeeded() {
         holdTimer?.cancel()
-        guard recognizer.isArmed else {
+        guard recognizer.isPending else {
             holdTimer = nil
             return
         }
@@ -270,6 +354,27 @@ final class VoiceHotkeyMonitor {
             try? await Task.sleep(for: VoiceChordRecognizer.holdThreshold)
             guard !Task.isCancelled, let self else { return }
             self.emit(self.recognizer.holdThresholdReached())
+            self.armReleaseTimerIfNeeded()
+        }
+    }
+
+    private func armReleaseTimerIfNeeded() {
+        releaseTimer?.cancel()
+        guard recognizer.isAwaitingRelease else {
+            releaseTimer = nil
+            return
+        }
+        // Hold-to-talk and composer dictation keep the chord down for the
+        // whole utterance. The lost-keyup watchdog is only for hands-free,
+        // where release is supposed to happen right after the threshold cue.
+        if holdModeInFlight == .holdToTalk || holdModeInFlight == .composer {
+            releaseTimer = nil
+            return
+        }
+        releaseTimer = Task { [weak self] in
+            try? await Task.sleep(for: VoiceChordRecognizer.releaseTimeout)
+            guard !Task.isCancelled, let self else { return }
+            self.emit(self.recognizer.releaseTimedOut())
         }
     }
 
@@ -282,26 +387,38 @@ final class VoiceHotkeyMonitor {
             guard NSApp.isActive else { return }
             publish(.toggle, target: .composer)
 
-        case .beginHold:
-            if legacyHoldDictation {
+        case .armed:
+            let mode = holdMode
+            if mode == .composer {
                 // The old behavior: hold outside ORE dictates into the focused
                 // composer, pulling the app frontmost. In-app it stays inert
                 // (the chord is a text-selection prefix there).
                 guard !NSApp.isActive else { return }
                 NSApp.activate(ignoringOtherApps: true)
-                holdTarget = .composer
-            } else {
-                // Hold is the assistant, everywhere — and the assistant is
-                // headless, so the user's focus stays exactly where it is.
-                holdTarget = .assistant
             }
-            holdIsDictating = true
-            publish(.start, target: holdTarget)
+            holdModeInFlight = mode
+            holdIsArmed = true
+            for command in VoiceHoldRouting.commands(for: .armed, mode: mode) {
+                publish(command.kind, target: command.target)
+            }
 
-        case .endHold:
-            guard holdIsDictating else { return }
-            holdIsDictating = false
-            publish(.stop, target: holdTarget)
+        case .activated:
+            releaseTimer?.cancel()
+            releaseTimer = nil
+            guard holdIsArmed else { return }
+            holdIsArmed = false
+            for command in VoiceHoldRouting.commands(for: .activated, mode: holdModeInFlight) {
+                publish(command.kind, target: command.target)
+            }
+
+        case .cancelled:
+            releaseTimer?.cancel()
+            releaseTimer = nil
+            guard holdIsArmed else { return }
+            holdIsArmed = false
+            for command in VoiceHoldRouting.commands(for: .cancelled, mode: holdModeInFlight) {
+                publish(command.kind, target: command.target)
+            }
 
         case nil:
             break

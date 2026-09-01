@@ -3,6 +3,137 @@ import Foundation
 import Observation
 import OreProtocol
 
+/// A deliberately unusual spoken terminator for hands-free requests.
+///
+/// Detection is suffix-only and token-based: punctuation and hyphens do not
+/// matter, but ordinary prose containing the words earlier in the request does.
+/// "Yep" is the one narrow ASR accommodation for "yip"; accepting broader
+/// near-matches would turn a safety mechanism into a false-submit hazard.
+enum VoiceFinishPhrase {
+    static let spoken = "yip yap yip yip"
+    static let vocabulary = ["yip", "yap", "yep", spoken]
+
+    struct Match: Equatable {
+        let request: String
+    }
+
+    private struct Token {
+        let value: String
+        let range: Range<String.Index>
+    }
+
+    static func match(in text: String) -> Match? {
+        let tokens = tokens(in: text)
+        guard tokens.count >= 4 else { return nil }
+        let suffix = Array(tokens.suffix(4))
+        let yip = Set(["yip", "yep"])
+        guard yip.contains(suffix[0].value),
+              suffix[1].value == "yap",
+              yip.contains(suffix[2].value),
+              yip.contains(suffix[3].value)
+        else { return nil }
+
+        let request = String(text[..<suffix[0].range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Match(request: request)
+    }
+
+    private static func tokens(in text: String) -> [Token] {
+        var result: [Token] = []
+        var start: String.Index?
+        for index in text.indices {
+            let character = text[index]
+            if character.isLetter || character.isNumber {
+                if start == nil { start = index }
+            } else if let tokenStart = start {
+                result.append(Token(
+                    value: String(text[tokenStart..<index]).lowercased(),
+                    range: tokenStart..<index
+                ))
+                start = nil
+            }
+        }
+        if let tokenStart = start {
+            result.append(Token(
+                value: String(text[tokenStart...]).lowercased(),
+                range: tokenStart..<text.endIndex
+            ))
+        }
+        return result
+    }
+}
+
+/// Pure timing guard for a hands-free microphone session. A finish phrase has
+/// to remain the recognizer's current hypothesis briefly before it submits;
+/// that prevents one volatile partial result from firing a turn. Empty and
+/// abandoned sessions time out without ever sending words.
+struct HandsFreeListeningGuard {
+    enum Action: Equatable {
+        case none
+        case finish(String)
+        case timeout
+    }
+
+    static let finishSettle = Duration.milliseconds(350)
+    static let noSpeechTimeout = Duration.seconds(15)
+    static let maximumDuration = Duration.seconds(180)
+
+    private let startedAt: ContinuousClock.Instant
+    private var finishCandidate: String?
+    private var finishCandidateSince: ContinuousClock.Instant?
+
+    init(startedAt: ContinuousClock.Instant) {
+        self.startedAt = startedAt
+    }
+
+    mutating func evaluate(
+        transcript: String,
+        at instant: ContinuousClock.Instant,
+        isFinal: Bool = false
+    ) -> Action {
+        let current = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let match = VoiceFinishPhrase.match(in: current) {
+            // A final recognizer result has already passed a stronger stability
+            // boundary than the polling settle delay.
+            if isFinal { return .finish(match.request) }
+            if finishCandidate == current {
+                if let since = finishCandidateSince,
+                   instant - since >= Self.finishSettle {
+                    return .finish(match.request)
+                }
+            } else {
+                finishCandidate = current
+                finishCandidateSince = instant
+            }
+        } else {
+            finishCandidate = nil
+            finishCandidateSince = nil
+        }
+
+        if current.isEmpty, instant - startedAt >= Self.noSpeechTimeout {
+            return .timeout
+        }
+        if instant - startedAt >= Self.maximumDuration {
+            return .timeout
+        }
+        return .none
+    }
+}
+
+/// What the assistant may say out loud while the user may be listening to
+/// music. Answers to a spoken question always play; everything else is a
+/// chime and the HUD unless quiet mode is off.
+enum VoiceSpeechPolicy {
+    /// Mid-turn tool chatter talks over music and the HUD already shows
+    /// Thinking…. Never spoken during a voice turn.
+    static func shouldSpeakMilestones(quiet _: Bool) -> Bool { false }
+
+    static func shouldSpeakNudge(quiet: Bool) -> Bool { !quiet }
+    static func shouldSpeakPrompts(quiet: Bool) -> Bool { !quiet }
+    static func shouldSpeakAcks(quiet: Bool) -> Bool { !quiet }
+    static func shouldSpeakAnswers(quiet _: Bool) -> Bool { true }
+}
+
 /// The global voice mode: hold ⇧⌥ anywhere, talk to the assistant, hear it
 /// answer. App-level and headless — it never steals focus, never opens a
 /// window, and works the same whether the user is in ORE, Safari, or a
@@ -18,6 +149,8 @@ final class VoiceAssistantController {
     /// waiting on the assistant → nothing again once the reply is spoken.
     enum Phase: Equatable {
         case idle
+        /// The hold threshold fired; release the modifiers to open the mic.
+        case armed
         case listening
         case thinking
         /// A short open mic right after a narrated confirmation, so "yes"
@@ -53,13 +186,27 @@ final class VoiceAssistantController {
     /// Whether Escape has something to stop — a turn in flight or a line being
     /// spoken. The HUD shows the key cap exactly when this is true.
     var canInterrupt: Bool {
-        phase == .thinking || phase == .speaking
+        phase == .armed || phase == .thinking || phase == .speaking
+    }
+
+    /// Hands-free send uses a spoken finish phrase. Hold-to-talk sends on
+    /// release, so the HUD and the recognizer must not wait for one.
+    var usesFinishPhrase: Bool {
+        !UserDefaults.standard.bool(forKey: VoiceHotkeyMonitor.holdToTalkKey)
+    }
+
+    /// HUD and chimes only: speak the answer to a spoken question, not progress.
+    static let quietModeKey = "ore.voice.quietMode"
+
+    private var quietMode: Bool {
+        UserDefaults.standard.bool(forKey: Self.quietModeKey)
     }
 
     weak var model: AppModel?
 
     private let voice = VoiceInputController()
     private var startTask: Task<Void, Never>?
+    private var handsFreeTask: Task<Void, Never>?
     private var stillWorkingTask: Task<Void, Never>?
     private var answerWindowTask: Task<Void, Never>?
     private var speechWatchdogTask: Task<Void, Never>?
@@ -122,6 +269,8 @@ final class VoiceAssistantController {
     func handle(_ command: VoiceCommand) {
         guard command.target == .assistant else { return }
         switch command.kind {
+        case .arm: armTrigger()
+        case .disarm: disarmTrigger()
         case .start: begin()
         case .stop: finish()
         case .cancel: cancel()
@@ -142,8 +291,12 @@ final class VoiceAssistantController {
         startTask = nil
         stillWorkingTask?.cancel()
         stillWorkingTask = nil
+        handsFreeTask?.cancel()
+        handsFreeTask = nil
 
         switch phase {
+        case .armed:
+            phase = .idle
         case .answering:
             // The confirmation itself stays pending: Escape declines to answer
             // by voice, it doesn't answer. The window and the notification
@@ -171,11 +324,24 @@ final class VoiceAssistantController {
 
     // MARK: - Microphone
 
-    private func begin() {
-        guard let model else { return }
-        // A hold while the hands-free answer mic is open supersedes it — the
-        // user reached for the chord, so give them the full session.
+    private func armTrigger() {
+        // A full assistant request can replace the tiny automatic answer
+        // window, but an in-flight request/answer still belongs to Escape.
         if phase == .answering { closeAnswerWindow() }
+        guard phase == .idle else { return }
+        phase = .armed
+        playCue(named: "Tink", volume: 0.24)
+    }
+
+    private func disarmTrigger() {
+        guard phase == .armed else { return }
+        startTask?.cancel()
+        startTask = nil
+        phase = .idle
+    }
+
+    private func begin() {
+        guard let model, phase == .armed else { return }
         guard !voice.isActive else { return }
         startTask?.cancel()
         if model.narration.isMicActive {
@@ -194,14 +360,63 @@ final class VoiceAssistantController {
     }
 
     private func openMic() {
-        guard let model, !voice.isActive else { return }
+        guard let model, phase == .armed, !voice.isActive else { return }
         // Prime the recognizer with the names it will otherwise mangle.
-        voice.vocabulary = projectNames()
+        var names = projectNames()
+        if usesFinishPhrase { names += VoiceFinishPhrase.vocabulary }
+        voice.vocabulary = names
         phase = .listening
         // Ducking: the assistant must not talk over the user, and its TTS
         // must not leak into the transcription.
         model.narration.setMicActive(true)
         voice.start()
+        // Hold-to-talk sends on release; a finish-phrase watcher would steal the
+        // utterance or time out while the chord is still down.
+        if usesFinishPhrase { watchHandsFreeSession() }
+    }
+
+    private func watchHandsFreeSession() {
+        handsFreeTask?.cancel()
+        handsFreeTask = Task { @MainActor [weak self] in
+            var guardState: HandsFreeListeningGuard?
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let self, self.phase == .listening else { return }
+                if case .error = self.voice.status {
+                    self.closeListeningWithoutSending(playCue: false)
+                    return
+                }
+                let now = ContinuousClock.now
+                if guardState == nil {
+                    // Permission/model preparation can legitimately take longer
+                    // than the no-speech window. Start that clock only once
+                    // audio is really flowing.
+                    guard self.voice.isListening else { continue }
+                    guardState = HandsFreeListeningGuard(startedAt: now)
+                }
+                guard var next = guardState else { continue }
+                let recognitionEnded = !self.voice.isActive
+                let action = next.evaluate(
+                    transcript: self.voice.transcript,
+                    at: now,
+                    isFinal: recognitionEnded
+                )
+                guardState = next
+                switch action {
+                case .none:
+                    if recognitionEnded {
+                        self.closeListeningWithoutSending(playCue: true)
+                        return
+                    }
+                    continue
+                case .finish(let request):
+                    self.finish(spokenOverride: request)
+                case .timeout:
+                    self.closeListeningWithoutSending(playCue: true)
+                }
+                return
+            }
+        }
     }
 
     /// The proper nouns of this user's world: workspace names and repository
@@ -213,11 +428,14 @@ final class VoiceAssistantController {
         return names
     }
 
-    private func finish() {
+    private func finish(spokenOverride: String? = nil) {
         startTask?.cancel()
         startTask = nil
+        handsFreeTask?.cancel()
+        handsFreeTask = nil
         guard isListening else { return }
-        let heard = voice.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let heard = (spokenOverride ?? voice.transcript)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let spoken = VoiceVocabulary(names: projectNames()).corrected(heard)
         if voice.isActive { voice.stop() }
         model?.narration.setMicActive(false)
@@ -238,7 +456,7 @@ final class VoiceAssistantController {
             if let chatID = model.assistantChatID {
                 let ack = if case .allow = decision { "Okay, going ahead." }
                     else { "Okay, I won't." }
-                speakKeepingHUD(ack, chatID: chatID)
+                acknowledge(ack, chatID: chatID)
             }
             return
         }
@@ -266,20 +484,30 @@ final class VoiceAssistantController {
         // The chat the message actually reached, rather than whichever is
         // active by the time the answer arrives.
         awaitingSpokenReplyFrom = model.send(spoken, to: assistant.id)
-        if let chatID = awaitingSpokenReplyFrom {
-            speakKeepingHUD("On it.", chatID: chatID, resume: .thinking)
-        }
+        // A spoken "On it." talks over whatever the user is listening to.
+        // The HUD already says Thinking…; a quiet close-mic cue is enough.
+        playCue(named: "Pop", volume: 0.16)
         scheduleStillWorkingNudge()
     }
 
+    private func closeListeningWithoutSending(playCue shouldPlay: Bool) {
+        handsFreeTask?.cancel()
+        handsFreeTask = nil
+        if voice.isActive { voice.stop() }
+        model?.narration.setMicActive(false)
+        phase = .idle
+        if shouldPlay { playCue(named: "Pop", volume: 0.18) }
+    }
+
     /// One nudge, once, and only if the turn is genuinely still open — silence
-    /// after "On it." is what makes a slow answer feel like a dropped one.
+    /// after the close-mic cue is what makes a slow answer feel like a dropped one.
     private func scheduleStillWorkingNudge() {
         stillWorkingTask?.cancel()
         stillWorkingTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: Self.stillWorkingDelay)
             guard !Task.isCancelled, let self, self.phase == .thinking,
-                  let model = self.model, let chatID = model.assistantChatID
+                  let model = self.model, let chatID = model.assistantChatID,
+                  VoiceSpeechPolicy.shouldSpeakNudge(quiet: self.quietMode)
             else { return }
             model.narration.speakAssistant("Still on it — a moment.", chatID: chatID)
             phase = .speaking
@@ -313,6 +541,9 @@ final class VoiceAssistantController {
             else { return }
             lastMilestone = phrase
             lastMilestoneAt = Date()
+            // The HUD already shows Thinking…. Spoken milestones talk over
+            // music even when quiet mode is off.
+            guard VoiceSpeechPolicy.shouldSpeakMilestones(quiet: quietMode) else { return }
             model.narration.speakAssistant(phrase, chatID: chatID, priority: .progress)
             if phase == .thinking {
                 phase = .speaking
@@ -358,16 +589,21 @@ final class VoiceAssistantController {
             Date().timeIntervalSince($0) < Self.voiceSessionWindow
         } ?? false
         guard awaitingSpokenReply || recentVoice else { return }
-        model.narration.speakAssistant(
-            "Quick check — \(confirmation.summary). Yes to allow it for this "
-                + "task, or no.",
-            chatID: chatID
-        )
-        phase = .speaking
-        let token = cancelToken
-        model.narration.notifyWhenQuiet { [weak self] in
-            guard let self, self.cancelToken == token else { return }
-            self.openAnswerWindow(for: confirmation.id)
+        if VoiceSpeechPolicy.shouldSpeakPrompts(quiet: quietMode) {
+            model.narration.speakAssistant(
+                "Quick check — \(confirmation.summary). Yes to allow it for this "
+                    + "task, or no.",
+                chatID: chatID
+            )
+            phase = .speaking
+            let token = cancelToken
+            model.narration.notifyWhenQuiet { [weak self] in
+                guard let self, self.cancelToken == token else { return }
+                self.openAnswerWindow(for: confirmation.id)
+            }
+        } else {
+            playCue(named: "Tink", volume: 0.24)
+            openAnswerWindow(for: confirmation.id)
         }
     }
 
@@ -384,8 +620,12 @@ final class VoiceAssistantController {
     /// A soft cue that the microphone just opened for an answer — quiet by
     /// design: it marks a turn to speak, it doesn't demand one.
     private func playMicChime() {
-        guard let sound = NSSound(named: "Tink") else { return }
-        sound.volume = 0.2
+        playCue(named: "Tink", volume: 0.2)
+    }
+
+    private func playCue(named name: NSSound.Name, volume: Float) {
+        guard let sound = NSSound(named: name) else { return }
+        sound.volume = volume
         sound.play()
     }
 
@@ -400,16 +640,20 @@ final class VoiceAssistantController {
             || (isQuestion && voiceAsksEnabled) else { return false }
         lastVoiceInteraction = Date()
         activeNeedsYouID = item.id
-        model.narration.speakAssistant(
-            item.spokenPrompt,
-            chatID: chatID,
-            kind: item.narrationKind
-        )
-        phase = .speaking
-        let token = cancelToken
-        model.narration.notifyWhenQuiet { [weak self] in
-            guard let self, self.cancelToken == token else { return }
-            self.openNeedsYouWindow(for: item.id)
+        if VoiceSpeechPolicy.shouldSpeakPrompts(quiet: quietMode) {
+            model.narration.speakAssistant(
+                item.spokenPrompt,
+                chatID: chatID,
+                kind: item.narrationKind
+            )
+            phase = .speaking
+            let token = cancelToken
+            model.narration.notifyWhenQuiet { [weak self] in
+                guard let self, self.cancelToken == token else { return }
+                self.openNeedsYouWindow(for: item.id)
+            }
+        } else {
+            openNeedsYouWindow(for: item.id)
         }
         return true
     }
@@ -431,6 +675,17 @@ final class VoiceAssistantController {
             // A permission can interrupt an assistant answer already in
             // flight. Return to waiting for that answer instead of making the
             // whole voice exchange look finished.
+            phase = awaitingSpokenReply ? .thinking : .idle
+        }
+    }
+
+    /// Acks are optional under quiet mode: a Pop is enough, and the HUD
+    /// already shows whether a turn is still running.
+    private func acknowledge(_ text: String, chatID: ChatID) {
+        if VoiceSpeechPolicy.shouldSpeakAcks(quiet: quietMode) {
+            speakKeepingHUD(text, chatID: chatID)
+        } else {
+            playCue(named: "Pop", volume: 0.16)
             phase = awaitingSpokenReply ? .thinking : .idle
         }
     }
@@ -494,7 +749,7 @@ final class VoiceAssistantController {
                 if let chatID = model.assistantChatID {
                     let ack = if case .allow = settled { "Okay, going ahead." }
                         else { "Okay, I won't." }
-                    self.speakKeepingHUD(ack, chatID: chatID)
+                    self.acknowledge(ack, chatID: chatID)
                 }
                 return
             }
@@ -626,7 +881,7 @@ final class VoiceAssistantController {
             if case .deny = decision { ack = "Okay, I won't." }
             else if case .allow(.always) = decision { ack = "Okay — auto-allowing that tab." }
             else { ack = "Okay, going ahead." }
-            speakKeepingHUD(ack, chatID: chatID)
+            acknowledge(ack, chatID: chatID)
         }
     }
 
@@ -641,7 +896,7 @@ final class VoiceAssistantController {
             chatID: payload.chatID
         )
         if let chatID = model.assistantChatID {
-            speakKeepingHUD("Got it — I passed that answer along.", chatID: chatID)
+            acknowledge("Got it — I passed that answer along.", chatID: chatID)
         }
     }
 

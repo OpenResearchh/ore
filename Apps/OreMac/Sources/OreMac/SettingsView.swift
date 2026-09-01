@@ -24,6 +24,8 @@ struct SettingsView: View {
     @AppStorage(AppModel.greetingVoiceKey) private var greetingVoice = true
     @AppStorage(NarrationEngine.fleetSwitchKey) private var fleetNarration = true
     @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
+    @AppStorage(VoiceAssistantController.quietModeKey) private var quietMode = false
+    @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
@@ -213,10 +215,20 @@ struct SettingsView: View {
         )
     }
 
+    private var hotkeyTitle: String {
+        holdToTalk && !legacyHoldDictation
+            ? "⇧⌥ — tap to dictate, hold to talk to the assistant"
+            : "⇧⌥ — tap to dictate, hold then release for the assistant"
+    }
+
     private var hotkeyDetail: String {
-        hotkey.isGlobal
-            ? "Tap ⇧⌥ in ORE to dictate into the composer; tap again to stop. Hold ⇧⌥ anywhere to talk to the assistant."
-            : "Tap to dictate while ORE is frontmost. Allow Accessibility to also hold ⇧⌥ for the assistant from any other app."
+        guard hotkey.isGlobal else {
+            return "Tap to dictate while ORE is frontmost. Allow Accessibility to arm the hands-free assistant from any app."
+        }
+        if holdToTalk && !legacyHoldDictation {
+            return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, keep holding while you speak, then release to send."
+        }
+        return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(VoiceFinishPhrase.spoken).”"
     }
 
     private var general: some View {
@@ -281,8 +293,18 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()
+                Toggle("Keep the assistant quiet while you listen to music", isOn: $quietMode)
+                Text("The HUD and chimes still show progress. The assistant speaks the answer to a question you asked, not confirmations, progress, or “still on it.”")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Hold ⇧⌥ to talk", isOn: $holdToTalk)
+                    .disabled(legacyHoldDictation)
+                Text("The mic stays open only while you hold the chord. Release sends; a click or Escape drops it. Better with Bluetooth headphones, which otherwise sit on the telephony profile until you say the finish phrase.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
                 SettingsRow(
-                    "⇧⌥ — tap to dictate, hold for the assistant",
+                    hotkeyTitle,
                     detail: hotkeyDetail
                 ) {
                     if hotkey.isGlobal {

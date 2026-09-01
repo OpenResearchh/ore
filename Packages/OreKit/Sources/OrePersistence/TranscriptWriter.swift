@@ -177,6 +177,7 @@ public actor TranscriptWriter {
         case .planUpdated(let update):
             let payload: JSONValue
             let text: String
+            let stableID: String
             switch update.content {
             case .todos(let items):
                 text = items.map { "\($0.status == .completed ? "x" : " ") \($0.text)" }
@@ -184,15 +185,33 @@ public actor TranscriptWriter {
                 payload = .array(items.map { item in
                     .object(["text": .string(item.text), "status": .string(item.status.rawValue)])
                 })
+                stableID = "plan-\(update.turnID.rawValue)-todos"
             case .proposal(let markdown, let requestID):
                 text = markdown
                 payload = .object([
                     "kind": .string("proposal"),
                     "permissionRequestID": requestID.map { .string($0.rawValue) } ?? .null,
+                    "isReady": .bool(update.isReady),
                 ])
+                // One proposal row per turn: a CreatePlan `started` draft then
+                // `completed` ready must not append a second block the tail
+                // would miss or double.
+                stableID = "plan-\(update.turnID.rawValue)-proposal"
+            }
+            if let existing = try await store.block(stableID) {
+                try await append(BlockRecord(
+                    id: existing.id,
+                    turnID: update.turnID,
+                    ordinal: existing.ordinal,
+                    kind: .plan,
+                    text: text,
+                    payload: payload,
+                    createdAt: existing.createdAt
+                ))
+                return
             }
             try await append(BlockRecord(
-                id: "plan-\(update.turnID.rawValue)-\(nextOrdinalPreview())",
+                id: stableID,
                 turnID: update.turnID,
                 ordinal: nextOrdinal(),
                 kind: .plan,

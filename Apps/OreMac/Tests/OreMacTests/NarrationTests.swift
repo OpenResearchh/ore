@@ -745,4 +745,10 @@ struct SpokenPrefixTests {
             #expect(text.hasPrefix(prefix))
         }
     }
+
+    @Test func intraWordProgressDoesNotRevealNewWords() {
+        let line = "Kaguya's agent is on it."
+        #expect(!NarrationEngine.spokenProgressWouldRevealNewWords(of: line, from: 8, to: 11))
+        #expect(NarrationEngine.spokenProgressWouldRevealNewWords(of: line, from: 8, to: 14))
+    }
 }

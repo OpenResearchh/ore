@@ -36,6 +36,13 @@ struct CursorAgentTranslator {
     /// Last plan markdown emitted this turn, so a `started` then `completed`
     /// CreatePlan with the same body is one card, not two.
     private var lastPlanMarkdown: String?
+    /// Whether this turn already advertised a *ready* proposal. Cursor often
+    /// CreatePlan-then-exits without a `completed` record; `closeTurn` promotes
+    /// a draft only if this is still false.
+    private var didAdvertisePlanReady = false
+    /// Last ready-flag emitted with `lastPlanMarkdown`, so a duplicate
+    /// completed record does not republish.
+    private var lastPlanReady = false
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -105,6 +112,10 @@ struct CursorAgentTranslator {
             return output
         }
         flushStreamedBlocks(turnID: turnID, to: &output)
+        // Cursor sometimes CreatePlan-then-exits with only a `started` record.
+        // Promote a draft that never saw `completed` so approval is not lost,
+        // but never advertise readiness without a body in the transcript.
+        promotePendingPlanIfNeeded(turnID: turnID, to: &output)
         // The process-exit path used to end the turn with no summary at all,
         // which is why Cursor completions could only ever narrate "All done."
         // The text streamed this turn *is* the final report; hand it over.
@@ -171,7 +182,12 @@ struct CursorAgentTranslator {
         case "started":
             emitCall()
             append(status: .runningTool, to: &output)
-            emitPlanProposal(from: toolInputs[toolCallID], turnID: turnID, to: &output)
+            // Draft only: Cursor sends name/overview on start while still
+            // writing. Advertising ready here is what flashed approval before
+            // any plan body existed in the transcript.
+            emitPlanProposal(
+                from: toolInputs[toolCallID], turnID: turnID, ready: false, to: &output
+            )
         case "completed":
             let result = payload["result"]
             emitCall(result: result)
@@ -182,8 +198,14 @@ struct CursorAgentTranslator {
                     || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
-            append(status: .requesting, to: &output)
-            emitPlanProposal(from: toolInputs[toolCallID], turnID: turnID, to: &output)
+            emitPlanProposal(
+                from: toolInputs[toolCallID], turnID: turnID, ready: true, to: &output
+            )
+            if didAdvertisePlanReady {
+                append(status: .awaitingInput, to: &output)
+            } else {
+                append(status: .requesting, to: &output)
+            }
         default:
             break
         }
@@ -192,15 +214,40 @@ struct CursorAgentTranslator {
     private mutating func emitPlanProposal(
         from input: JSONValue?,
         turnID: TurnID,
+        ready: Bool,
         to output: inout Output
     ) {
         guard let input, let markdown = Self.planMarkdown(from: input) else { return }
-        guard markdown != lastPlanMarkdown else { return }
+        let trimmed = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Title/overview with no body is Cursor's CreatePlan-started placeholder.
+        guard PlanProposalPolicy.isReadyInput(input) else { return }
+
+        let isReady = ready
+        if markdown == lastPlanMarkdown, isReady == lastPlanReady { return }
         lastPlanMarkdown = markdown
+        lastPlanReady = isReady
+        if isReady { didAdvertisePlanReady = true }
         output.events.append(.planUpdated(PlanUpdate(
             turnID: turnID,
-            content: .proposal(markdown: markdown, permissionRequestID: nil)
+            content: .proposal(markdown: markdown, permissionRequestID: nil),
+            isReady: isReady
         )))
+    }
+
+    private mutating func promotePendingPlanIfNeeded(turnID: TurnID, to output: inout Output) {
+        guard !didAdvertisePlanReady,
+              let markdown = lastPlanMarkdown,
+              PlanProposalPolicy.isReadyMarkdown(markdown)
+        else { return }
+        didAdvertisePlanReady = true
+        lastPlanReady = true
+        output.events.append(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: markdown, permissionRequestID: nil),
+            isReady: true
+        )))
+        append(status: .awaitingInput, to: &output)
     }
 
     /// Cursor's `tool_call` object mixes the real payload (`readToolCall`,
@@ -385,8 +432,17 @@ struct CursorAgentTranslator {
 
     private static func mergePlanFields(from source: JSONValue?, into dict: inout [String: JSONValue]) {
         guard let object = source?.objectValue else { return }
-        for key in ["plan", "markdown", "overview", "name", "title", "todos", "steps"] {
-            if let value = object[key], dict[key] == nil {
+        for key in [
+            "plan", "markdown", "content", "overview", "name", "title",
+            "todos", "steps", "streamContent", "stream_content",
+        ] {
+            guard let value = object[key] else { continue }
+            if dict[key] == nil {
+                dict[key] = value
+                continue
+            }
+            if let current = dict[key]?.stringValue, current.isEmpty,
+               let incoming = value.stringValue, !incoming.isEmpty {
                 dict[key] = value
             }
         }
@@ -605,7 +661,9 @@ struct CursorAgentTranslator {
                 )))
                 append(status: .runningTool, to: &output)
                 if Self.isPlanTool(name) {
-                    emitPlanProposal(from: input, turnID: turnID, to: &output)
+                    // One-shot tool_use inside an assistant message has no
+                    // started/completed pair; advertise ready if the body is here.
+                    emitPlanProposal(from: input, turnID: turnID, ready: true, to: &output)
                 }
 
             default:
@@ -640,6 +698,7 @@ struct CursorAgentTranslator {
     private mutating func applyResult(_ message: JSONValue, to output: inout Output) {
         let turnID = ensureTurn(&output)
         flushStreamedBlocks(turnID: turnID, to: &output)
+        promotePendingPlanIfNeeded(turnID: turnID, to: &output)
 
         if let usage = message["usage"] {
             output.events.append(.usage(UsageReport(
@@ -794,6 +853,8 @@ struct CursorAgentTranslator {
         emittedAssistantText = ""
         didReportResult = false
         lastPlanMarkdown = nil
+        lastPlanReady = false
+        didAdvertisePlanReady = false
         output.events.append(.turnStarted(TurnStarted(turnID: turnID, model: model)))
         return turnID
     }

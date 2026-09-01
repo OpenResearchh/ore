@@ -44,7 +44,7 @@ public final class AssistantBridgeServer: @unchecked Sendable {
         )
         unlink(socketURL.path)
 
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = UnixStreamSocket.open()
         guard descriptor >= 0 else {
             throw BridgeError.socketFailed(errno)
         }

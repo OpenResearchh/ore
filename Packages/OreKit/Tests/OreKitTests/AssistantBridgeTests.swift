@@ -1,240 +1,243 @@
 import Foundation
 import Testing
 
+import OreSupport
 @testable import OreCore
 @testable import OrePersistence
 @testable import OreProtocol
 
 #if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
 #endif
 
 /// The assistant's action lane, exercised the way the MCP-server process uses
 /// it: real socket, real NDJSON, real policy — no shortcuts through the actor.
+///
+/// Serialized: each test owns a listen socket and several git processes. Running
+/// them in parallel on a 2-core CI runner exhausts fds (`socket`) and starves
+/// `workspaceAdded` waits (`noWorkspace`).
+@Suite(.serialized)
 struct AssistantBridgeTests {
     @Test func autoActionsRunWithoutConfirmationAndAreAudited() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "auto-test")
+            let workspaceID = try await harness.makeWorkspace(named: "auto-test")
 
-        // OpenWorkspace is in the auto tier: no confirmation event, immediate
-        // success, and a UI action on the event stream.
-        let response = try harness.callBridge(
-            tool: "OpenWorkspace",
-            arguments: ["workspaceID": .string(workspaceID.rawValue)]
-        )
-        #expect(response.ok)
+            // OpenWorkspace is in the auto tier: no confirmation event, immediate
+            // success, and a UI action on the event stream.
+            let response = try harness.callBridge(
+                tool: "OpenWorkspace",
+                arguments: ["workspaceID": .string(workspaceID.rawValue)]
+            )
+            #expect(response.ok)
 
-        let event = await harness.recorder.waitFor {
-            if case .assistantUIAction = $0 { return true }
-            return false
+            let event = await harness.recorder.waitFor {
+                if case .assistantUIAction = $0 { return true }
+                return false
+            }
+            #expect(event != nil)
+
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "OpenWorkspace")
+            #expect(audit.first?.decision == "auto")
         }
-        #expect(event != nil)
-
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.first?.tool == "OpenWorkspace")
-        #expect(audit.first?.decision == "auto")
     }
 
     @Test func decliningAConfirmationDeniesTheActionAndTellsTheModel() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "deny-test")
+            let workspaceID = try await harness.makeWorkspace(named: "deny-test")
 
-        // Commit is in the confirm tier. Answer the confirmation with a deny
-        // from a parallel task while the bridge call blocks on it.
-        async let call = harness.callBridgeAsync(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "message": .string("should not land"),
-            ]
-        )
+            // Commit is in the confirm tier. Answer the confirmation with a deny
+            // from a parallel task while the bridge call blocks on it.
+            async let call = harness.callBridgeAsync(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "message": .string("should not land"),
+                ]
+            )
 
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            #expect(confirmation.actionClass == .commit)
+            await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+
+            let response = try await call
+            #expect(!response.ok)
+            #expect(response.error?.contains("declined") == true)
+
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.decision == "denied")
         }
-        #expect(confirmation.actionClass == .commit)
-        await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
-
-        let response = try await call
-        #expect(!response.ok)
-        #expect(response.error?.contains("declined") == true)
-
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.first?.decision == "denied")
     }
 
     @Test func aTaskGrantCoversTheSecondActionWithoutAsking() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "grant-test")
-        let worktree = try await harness.worktreePath(of: workspaceID)
+            let workspaceID = try await harness.makeWorkspace(named: "grant-test")
+            let worktree = try await harness.worktreePath(of: workspaceID)
 
-        // First commit: confirm with "allow for this task".
-        try "one\n".write(
-            to: worktree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
-        )
-        async let first = harness.callBridgeAsync(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "message": .string("first"),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            // First commit: confirm with "allow for this task".
+            try "one\n".write(
+                to: worktree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
+            )
+            async let first = harness.callBridgeAsync(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "message": .string("first"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.task))
+            )
+            let firstResponse = try await first
+            #expect(firstResponse.ok)
+
+            // Second commit inside the grant window: no confirmation, just done.
+            try "two\n".write(
+                to: worktree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
+            )
+            let second = try harness.callBridge(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "message": .string("second"),
+                ]
+            )
+            #expect(second.ok)
+
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.decision == "granted:task")
+            #expect(audit.count { $0.tool == "Commit" } == 2)
         }
-        await harness.client.send(
-            .resolveAssistantConfirmation(confirmation.id, .allow(.task))
-        )
-        let firstResponse = try await first
-        #expect(firstResponse.ok)
-
-        // Second commit inside the grant window: no confirmation, just done.
-        try "two\n".write(
-            to: worktree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
-        )
-        let second = try harness.callBridge(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "message": .string("second"),
-            ]
-        )
-        #expect(second.ok)
-
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.first?.decision == "granted:task")
-        #expect(audit.count { $0.tool == "Commit" } == 2)
     }
 
     @Test func aTaskGrantDoesNotCoverADifferentWorkspace() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let first = try await harness.makeWorkspace(named: "grant-a")
-        let second = try await harness.makeWorkspace(named: "grant-b")
-        let ids = Set((try await harness.store.workspaces()).map(\.workspaceID))
-        #expect(ids.count == 2)
-        let otherID = ids.first { $0 != first } ?? second
-        let firstTree = try await harness.worktreePath(of: first)
-        try "one\n".write(
-            to: firstTree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
-        )
+            let first = try await harness.makeWorkspace(named: "grant-a")
+            let second = try await harness.makeWorkspace(named: "grant-b")
+            let ids = Set((try await harness.store.workspaces()).map(\.workspaceID))
+            #expect(ids.count == 2)
+            let otherID = ids.first { $0 != first } ?? second
+            let firstTree = try await harness.worktreePath(of: first)
+            try "one\n".write(
+                to: firstTree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
+            )
 
-        async let allowed = harness.callBridgeAsync(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(first.rawValue),
-                "message": .string("first"),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            async let allowed = harness.callBridgeAsync(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(first.rawValue),
+                    "message": .string("first"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.task))
+            )
+            #expect(try await allowed.ok)
+
+            let secondTree = try await harness.worktreePath(of: otherID)
+            try "two\n".write(
+                to: secondTree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
+            )
+            async let other = harness.callBridgeAsync(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(otherID.rawValue),
+                    "message": .string("other"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let next)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested(let confirmation) = $0 {
+                        return confirmation.workspaceID == otherID
+                    }
+                    return false
+                })
+            else {
+                Issue.record("the other workspace was not asked")
+                return
+            }
+            await harness.client.send(.resolveAssistantConfirmation(next.id, .deny))
+            let response = try await other
+            #expect(!response.ok)
         }
-        await harness.client.send(
-            .resolveAssistantConfirmation(confirmation.id, .allow(.task))
-        )
-        #expect(try await allowed.ok)
-
-        let secondTree = try await harness.worktreePath(of: otherID)
-        try "two\n".write(
-            to: secondTree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
-        )
-        async let other = harness.callBridgeAsync(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(otherID.rawValue),
-                "message": .string("other"),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let next)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested(let confirmation) = $0 {
-                    return confirmation.workspaceID == otherID
-                }
-                return false
-            })
-        else {
-            Issue.record("the other workspace was not asked")
-            return
-        }
-        await harness.client.send(.resolveAssistantConfirmation(next.id, .deny))
-        let response = try await other
-        #expect(!response.ok)
     }
 
     @Test func anAlwaysGrantIsRememberedInMemoryImmediately() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "always-test")
-        let worktree = try await harness.worktreePath(of: workspaceID)
-        try "one\n".write(
-            to: worktree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
-        )
+            let workspaceID = try await harness.makeWorkspace(named: "always-test")
+            let worktree = try await harness.worktreePath(of: workspaceID)
+            try "one\n".write(
+                to: worktree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8
+            )
 
-        async let first = harness.callBridgeAsync(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "message": .string("first"),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            async let first = harness.callBridgeAsync(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "message": .string("first"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.always))
+            )
+            #expect(try await first.ok)
+
+            try "two\n".write(
+                to: worktree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
+            )
+            let second = try harness.callBridge(
+                tool: "Commit",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "message": .string("second"),
+                ]
+            )
+            #expect(second.ok)
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.contains { $0.decision == "granted:always" })
         }
-        await harness.client.send(
-            .resolveAssistantConfirmation(confirmation.id, .allow(.always))
-        )
-        #expect(try await first.ok)
-
-        try "two\n".write(
-            to: worktree.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8
-        )
-        let second = try harness.callBridge(
-            tool: "Commit",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "message": .string("second"),
-            ]
-        )
-        #expect(second.ok)
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.contains { $0.decision == "granted:always" })
     }
 
     @Test func longHomesDoNotBindABareSocketInTmp() {
@@ -248,200 +251,409 @@ struct AssistantBridgeTests {
     }
 
     @Test func unknownActionsAreDenied() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let response = try harness.callBridge(tool: "MergePullRequest", arguments: [:])
-        #expect(!response.ok)
+            let response = try harness.callBridge(tool: "MergePullRequest", arguments: [:])
+            #expect(!response.ok)
+        }
     }
 
     @Test func listHarnessesRunsWithoutConfirmation() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        // The test registry has no harnesses, so probes stay empty — the tool
-        // still answers (auto tier, no confirmation event) rather than asking
-        // or failing.
-        let response = try harness.callBridge(tool: "ListHarnesses", arguments: [:])
-        #expect(response.ok)
-        #expect(response.result?.contains("probed") == true)
+            // The test registry has no harnesses, so probes stay empty — the tool
+            // still answers (auto tier, no confirmation event) rather than asking
+            // or failing.
+            let response = try harness.callBridge(tool: "ListHarnesses", arguments: [:])
+            #expect(response.ok)
+            #expect(response.result?.contains("probed") == true)
 
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.first?.tool == "ListHarnesses")
-        #expect(audit.first?.decision == "auto")
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "ListHarnesses")
+            #expect(audit.first?.decision == "auto")
+        }
     }
 
     @Test func creatingAWorkspaceOnAnUnreadyHarnessFailsHelpfully() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        await harness.client.send(.addRepository(path: fixture.repository.path))
-        let response = try harness.callBridge(
-            tool: "CreateWorkspace",
-            arguments: [
-                "repository": .string(fixture.repository.path),
-                "harness": .string("codex"),
-            ]
-        )
-        #expect(!response.ok)
-        #expect(response.error?.contains("isn't ready") == true)
+            await harness.client.send(.addRepository(path: harness.fixture.repository.path))
+            let response = try harness.callBridge(
+                tool: "CreateWorkspace",
+                arguments: [
+                    "repository": .string(harness.fixture.repository.path),
+                    "harness": .string("codex"),
+                ]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("isn't ready") == true)
+        }
     }
 
     @Test func setChatModelRunsWithoutConfirmation() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "model-test")
-        let chats = try await harness.store.chats(workspaceID: workspaceID)
-        let chatID = try #require(chats.first?.chatID)
+            let workspaceID = try await harness.makeWorkspace(named: "model-test")
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let chatID = try #require(chats.first?.chatID)
 
-        let response = try harness.callBridge(
-            tool: "SetChatModel",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "chatID": .string(chatID.rawValue),
-                "model": .string("claude-opus-4-6"),
-            ]
-        )
-        #expect(response.ok)
-        #expect(response.result?.contains("claude-opus-4-6") == true)
+            let response = try harness.callBridge(
+                tool: "SetChatModel",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "model": .string("claude-opus-4-6"),
+                ]
+            )
+            #expect(response.ok)
+            #expect(response.result?.contains("claude-opus-4-6") == true)
 
-        let audit = try await harness.store.assistantActions()
-        #expect(audit.first?.tool == "SetChatModel")
-        #expect(audit.first?.decision == "auto")
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "SetChatModel")
+            #expect(audit.first?.decision == "auto")
+        }
     }
 
     @Test func createChatPassesModelModeAndEffort() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "chat-config")
-        let response = try harness.callBridge(
-            tool: "CreateChat",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "title": .string("Plan pass"),
-                "permissionMode": .string("plan"),
-                "effort": .string("high"),
-            ]
-        )
-        #expect(response.ok)
-        let chats = try await harness.store.chats(workspaceID: workspaceID)
-        let created = try #require(chats.first { $0.title == "Plan pass" })
-        #expect(created.permissionMode == PermissionMode.plan.rawValue)
-        #expect(created.reasoningEffort == ReasoningEffort.high.rawValue)
+            let workspaceID = try await harness.makeWorkspace(named: "chat-config")
+            let response = try harness.callBridge(
+                tool: "CreateChat",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "title": .string("Plan pass"),
+                    "permissionMode": .string("plan"),
+                    "effort": .string("high"),
+                ]
+            )
+            #expect(response.ok)
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let created = try #require(chats.first { $0.title == "Plan pass" })
+            #expect(created.permissionMode == PermissionMode.plan.rawValue)
+            #expect(created.reasoningEffort == ReasoningEffort.high.rawValue)
+        }
+    }
+
+    @Test func archiveSuccessPublishesTheCommittedWorkspaceState() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "bridge archive")
+            let checkpoint = await harness.recorder.checkpoint()
+            let request = AssistantBridgeRequest(
+                id: UUID().uuidString.lowercased(),
+                tool: "ArchiveWorkspace",
+                arguments: .object(["workspaceID": .string(workspaceID.rawValue)])
+            )
+            // The transport has its own socket tests. Start at the app-side
+            // handler here so this regression isolates action completion -> event
+            // propagation instead of depending on Unix-socket availability.
+            async let call = harness.client.handleAssistantRequest(request)
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(after: checkpoint, matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no archive confirmation")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+            )
+
+            let response = await call
+            #expect(response.ok)
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .workspaceUpdated(let summary) = $0 {
+                    return summary.id == workspaceID && summary.isArchived
+                }
+                return false
+            }
+            #expect(event != nil)
+            #expect(try await harness.store.workspace(workspaceID)?.isArchived == true)
+        }
+    }
+
+    @Test func failedAssistantArchiveLeavesTheWorkspaceListUntouched() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "archive failure")
+            let missing = WorkspaceID(rawValue: workspaceID.rawValue + "-missing")
+            let checkpoint = await harness.recorder.checkpoint()
+            let request = AssistantBridgeRequest(
+                id: UUID().uuidString.lowercased(),
+                tool: "ArchiveWorkspace",
+                arguments: .object(["workspaceID": .string(missing.rawValue)])
+            )
+            async let call = harness.client.handleAssistantRequest(request)
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(after: checkpoint, matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no archive confirmation")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+            )
+
+            let response = await call
+            #expect(!response.ok)
+            #expect(response.error?.contains(missing.rawValue) == true)
+            #expect(try await harness.store.workspace(workspaceID)?.isArchived == false)
+            let events = await harness.recorder.all(after: checkpoint)
+            #expect(!events.contains { event in
+                switch event {
+                case .workspaceAdded, .workspaceUpdated, .workspaceRemoved:
+                    true
+                default:
+                    false
+                }
+            })
+        }
+    }
+
+    @Test func assistantCloseAndReopenPublishTheirFinalListState() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "chat list")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+
+            var checkpoint = await harness.recorder.checkpoint()
+            let closed = await harness.client.handleAssistantRequest(AssistantBridgeRequest(
+                id: UUID().uuidString.lowercased(),
+                tool: "CloseChat",
+                arguments: .object([
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                ])
+            ))
+            #expect(closed.ok)
+            let closeEvent = await harness.recorder.waitFor(after: checkpoint) { event in
+                if case .chatUpdated(let chat) = event {
+                    return chat.id == chatID && chat.isClosed
+                }
+                return false
+            }
+            #expect(closeEvent != nil)
+
+            checkpoint = await harness.recorder.checkpoint()
+            let reopened = await harness.client.handleAssistantRequest(AssistantBridgeRequest(
+                id: UUID().uuidString.lowercased(),
+                tool: "ReopenChat",
+                arguments: .object([
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                ])
+            ))
+            #expect(reopened.ok)
+            let reopenEvent = await harness.recorder.waitFor(after: checkpoint) { event in
+                if case .chatUpdated(let chat) = event {
+                    return chat.id == chatID && !chat.isClosed
+                }
+                return false
+            }
+            #expect(reopenEvent != nil)
+        }
     }
 
     @Test func getAppStateRunsWithoutConfirmation() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "state-test")
-        let response = try harness.callBridge(tool: "GetAppState", arguments: [:])
-        #expect(response.ok)
-        #expect(response.result?.contains("[ORE app state]") == true)
-        #expect(response.result?.contains("state-test") == true)
+            let workspaceID = try await harness.makeWorkspace(named: "state-test")
+            let response = try harness.callBridge(tool: "GetAppState", arguments: [:])
+            #expect(response.ok)
+            #expect(response.result?.contains("[ORE app state]") == true)
+            #expect(response.result?.contains("state-test") == true)
 
-        // The repository each workspace belongs to, so the assistant can tell
-        // two tabs on one project apart from two separate projects — the
-        // distinction every cross-project routing decision rests on.
-        let record = try #require(try await harness.store.workspace(workspaceID))
-        let repository = URL(fileURLWithPath: record.repositoryPath).lastPathComponent
-        #expect(response.result?.contains("repo \(repository)") == true)
+            // The repository each workspace belongs to, so the assistant can tell
+            // two tabs on one project apart from two separate projects — the
+            // distinction every cross-project routing decision rests on.
+            let record = try #require(try await harness.store.workspace(workspaceID))
+            let repository = URL(fileURLWithPath: record.repositoryPath).lastPathComponent
+            #expect(response.result?.contains("repo \(repository)") == true)
+            #expect(response.result?.contains("turns=") == true)
+        }
+    }
+
+    @Test func sendPromptToProjectRefusesToGuessAmongSeveralTabs() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "route-test")
+            let second = try harness.callBridge(
+                tool: "CreateChat",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "title": .string("Second tab"),
+                ]
+            )
+            #expect(second.ok)
+
+            let guessed = try harness.callBridge(
+                tool: "SendPromptToProject",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "text": .string("continue the work"),
+                ]
+            )
+            #expect(!guessed.ok)
+            #expect(guessed.error?.contains("chatID") == true)
+
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let secondID = try #require(chats.first { $0.title == "Second tab" }?.chatID)
+            let named = try harness.callBridge(
+                tool: "SendPromptToProject",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(secondID.rawValue),
+                    "text": .string("continue the work"),
+                ]
+            )
+            #expect(named.ok)
+        }
+    }
+
+    @Test func routeTaskNamesTheFocusedTabForUnplacedRepoWork() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "kailash")
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let chatID = try #require(chats.first?.chatID)
+
+            let response = try harness.callBridge(
+                tool: "RouteTask",
+                arguments: ["utterance": .string("Fix the flaky test")]
+            )
+            #expect(response.ok)
+            let body = try #require(response.result)
+            #expect(body.contains("action: sendExistingTab"))
+            #expect(body.contains("workspaceID: \(workspaceID.rawValue)"))
+            #expect(body.contains("chatID: \(chatID.rawValue)"))
+        }
+    }
+
+    @Test func createWorkspaceBesideADirtyTreeAsksFirst() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "dirty-sibling")
+            let worktree = try await harness.worktreePath(of: workspaceID)
+            try "uncommitted\n".write(
+                to: worktree.appendingPathComponent("wip.txt"), atomically: true, encoding: .utf8
+            )
+
+            async let call = harness.callBridgeAsync(
+                tool: "CreateWorkspace",
+                arguments: [
+                    "repository": .string(harness.fixture.repository.path),
+                    "name": .string("clean-sibling"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("CreateWorkspace did not confirm beside a dirty worktree")
+                return
+            }
+            #expect(confirmation.actionClass == .createWorkspace)
+            #expect(confirmation.summary.contains("uncommitted"))
+            await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+            let response = try await call
+            #expect(!response.ok)
+            #expect(response.error?.contains("declined") == true)
+        }
     }
 
     @Test func bypassModeAsksForConfirmation() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "bypass-test")
-        let chats = try await harness.store.chats(workspaceID: workspaceID)
-        let chatID = try #require(chats.first?.chatID)
+            let workspaceID = try await harness.makeWorkspace(named: "bypass-test")
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let chatID = try #require(chats.first?.chatID)
 
-        async let call = harness.callBridgeAsync(
-            tool: "SetChatPermissionMode",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "chatID": .string(chatID.rawValue),
-                "mode": .string("bypassPermissions"),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            async let call = harness.callBridgeAsync(
+                tool: "SetChatPermissionMode",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "mode": .string("bypassPermissions"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            #expect(confirmation.actionClass == .autoAllowTab)
+            #expect(confirmation.chatID == chatID)
+            await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+            let response = try await call
+            #expect(!response.ok)
         }
-        #expect(confirmation.actionClass == .autoAllowTab)
-        #expect(confirmation.chatID == chatID)
-        await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
-        let response = try await call
-        #expect(!response.ok)
     }
 
     @Test func acceptEditsModeDoesNotAsk() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "edits-test")
-        let chats = try await harness.store.chats(workspaceID: workspaceID)
-        let chatID = try #require(chats.first?.chatID)
+            let workspaceID = try await harness.makeWorkspace(named: "edits-test")
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let chatID = try #require(chats.first?.chatID)
 
-        let response = try harness.callBridge(
-            tool: "SetChatPermissionMode",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "chatID": .string(chatID.rawValue),
-                "mode": .string("acceptEdits"),
-            ]
-        )
-        #expect(response.ok)
+            let response = try harness.callBridge(
+                tool: "SetChatPermissionMode",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "mode": .string("acceptEdits"),
+                ]
+            )
+            #expect(response.ok)
+        }
     }
 
     @Test func aStalePermissionIDCannotReportFalseSuccess() async throws {
-        let fixture = try await GitFixture.initialized()
-        let harness = try await BridgeHarness(fixture: fixture)
-        defer { Task { await harness.shutdown() } }
+        try await BridgeHarness.run { harness in
 
-        let workspaceID = try await harness.makeWorkspace(named: "permission-test")
-        let chats = try await harness.store.chats(workspaceID: workspaceID)
-        let chatID = try #require(chats.first?.chatID)
-        async let call = harness.callBridgeAsync(
-            tool: "ResolveChatPermission",
-            arguments: [
-                "workspaceID": .string(workspaceID.rawValue),
-                "chatID": .string(chatID.rawValue),
-                "permissionID": .string("stale-permission"),
-                "allow": .bool(true),
-            ]
-        )
-        guard case .assistantConfirmationRequested(let confirmation)? =
-            await harness.recorder.waitFor(matching: {
-                if case .assistantConfirmationRequested = $0 { return true }
-                return false
-            })
-        else {
-            Issue.record("no confirmation was requested")
-            return
+            let workspaceID = try await harness.makeWorkspace(named: "permission-test")
+            let chats = try await harness.store.chats(workspaceID: workspaceID)
+            let chatID = try #require(chats.first?.chatID)
+            async let call = harness.callBridgeAsync(
+                tool: "ResolveChatPermission",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "permissionID": .string("stale-permission"),
+                    "allow": .bool(true),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("no confirmation was requested")
+                return
+            }
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.once))
+            )
+
+            let response = try await call
+            #expect(!response.ok)
+            #expect(response.error?.contains("not pending") == true)
         }
-        await harness.client.send(
-            .resolveAssistantConfirmation(confirmation.id, .allow(.once))
-        )
-
-        let response = try await call
-        #expect(!response.ok)
-        #expect(response.error?.contains("not pending") == true)
     }
 }
 
@@ -452,6 +664,18 @@ private final class BridgeHarness: @unchecked Sendable {
     let client: InProcessCoreClient
     let recorder: CoreEventRecorder
     let socketURL: URL
+
+    static func run(_ body: (BridgeHarness) async throws -> Void) async throws {
+        let fixture = try await GitFixture.initialized()
+        let harness = try await BridgeHarness(fixture: fixture)
+        do {
+            try await body(harness)
+        } catch {
+            await harness.shutdown()
+            throw error
+        }
+        await harness.shutdown()
+    }
 
     init(fixture: GitFixture) async throws {
         let databasePath = fixture.root.appendingPathComponent("ore.sqlite")
@@ -467,7 +691,7 @@ private final class BridgeHarness: @unchecked Sendable {
         try await client.start()
     }
 
-    private let fixture: GitFixture
+    let fixture: GitFixture
 
     func shutdown() async {
         await client.shutdown()
@@ -512,7 +736,7 @@ private final class BridgeHarness: @unchecked Sendable {
         var payload = try JSONEncoder().encode(request)
         payload.append(UInt8(ascii: "\n"))
 
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = UnixStreamSocket.open()
         guard descriptor >= 0 else { throw HarnessError.socket }
         defer { close(descriptor) }
 

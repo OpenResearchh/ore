@@ -304,6 +304,35 @@ struct PersistenceTests {
         #expect(hits.count == 1)
         #expect(hits[0].chatID == chatID)
         #expect(hits[0].chatTitle == "Token refresh")
+        #expect(!hits[0].isClosed)
+    }
+
+    @Test func searchMarksAClosedTabSoFollowUpsDoNotLandThere() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store, id: "ws1", name: "kailash")
+        let chatID = ChatID(rawValue: "c-closed")
+        try await store.saveChat(ChatRecord(
+            id: chatID,
+            workspaceID: workspace.workspaceID,
+            title: "Old migration",
+            harness: .claudeCode,
+            isClosed: true
+        ))
+        let sessionID = SessionID(rawValue: "s-closed")
+        try await store.saveSession(SessionRecord(
+            id: sessionID, workspaceID: workspace.workspaceID, chatID: chatID, harness: .claudeCode
+        ))
+        let turnID = TurnID(rawValue: "t-closed")
+        try await store.saveTurn(TurnRecord(id: turnID, sessionID: sessionID, ordinal: 0))
+        try await store.appendBlock(BlockRecord(
+            id: "b-closed", turnID: turnID, ordinal: 0, kind: .text,
+            text: "The schema migration landed last week."
+        ))
+
+        let hits = try await store.search("migration")
+        #expect(hits.count == 1)
+        #expect(hits[0].isClosed)
+        #expect(hits[0].chatID == chatID)
     }
 
     @Test func searchScopeSeparatesTheAssistantsOwnConversations() async throws {
@@ -638,5 +667,59 @@ struct TranscriptWriterTests {
         #expect(blocks.count == 1)
         #expect(blocks[0].ordinal == 0)
         #expect(blocks[0].decodedPayload?["patch"]?.stringValue?.contains("+new") == true)
+    }
+
+    @Test func aPlanDraftThenReadyUpsertsOneBlockAndAppearsInTheTail() async throws {
+        let store = try OreStore()
+        try await store.addRepository(RepositoryRecord(
+            path: "/repo", name: "repo", defaultBranch: "main"
+        ))
+        let workspaceID = WorkspaceID(rawValue: "ws1")
+        try await store.saveWorkspace(WorkspaceRecord(
+            id: workspaceID, name: "ws", repositoryPath: "/repo",
+            worktreePath: "/wt", branch: "ore/ws", baseBranch: "main", harness: .cursorAgent
+        ))
+        let chatID = ChatID(rawValue: workspaceID.rawValue)
+        try await store.saveChat(ChatRecord(
+            id: chatID, workspaceID: workspaceID, title: "Plan race",
+            harness: .cursorAgent
+        ))
+        let sessionID = SessionID(rawValue: "s1")
+        let writer = TranscriptWriter(
+            store: store, sessionID: sessionID, harness: .cursorAgent, chatID: chatID
+        )
+        await writer.configure(workspaceID: workspaceID)
+        let turnID = TurnID(rawValue: "t1")
+
+        await writer.recordPrompt("make a plan")
+        await writer.handle(.turnStarted(TurnStarted(turnID: turnID)))
+        await writer.handle(.blockCompleted(BlockCompleted(
+            turnID: turnID, blockID: "b0", kind: .text,
+            text: "I'll inspect the update loop."
+        )))
+        await writer.handle(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Draft", permissionRequestID: nil),
+            isReady: false
+        )))
+
+        let draftTail = try #require(try await store.handoffContext(chatID: chatID))
+        #expect(draftTail.contains("I'll inspect the update loop."))
+        #expect(draftTail.contains("Plan (still being written)"))
+        #expect(draftTail.contains("Draft"))
+
+        await writer.handle(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "## Steps\n1. Final body", permissionRequestID: nil),
+            isReady: true
+        )))
+        let blocks = try await store.blocks(turnID: turnID)
+        #expect(blocks.filter { $0.blockKind == .plan }.count == 1)
+        #expect(blocks.last { $0.blockKind == .plan }?.text.contains("Final body") == true)
+        #expect(blocks.last { $0.blockKind == .plan }?.decodedPayload?["isReady"]?.boolValue == true)
+
+        let readyTail = try #require(try await store.handoffContext(chatID: chatID))
+        #expect(readyTail.contains("Plan:\n## Steps\n1. Final body"))
+        #expect(!readyTail.contains("still being written"))
     }
 }

@@ -55,6 +55,17 @@ final class NarrationEngine {
         return String(text[..<lastBreak])
     }
 
+    /// HUD word-progress only needs to notify when the visible prefix changes.
+    /// Intra-word clock ticks from the neural voice otherwise rebuild the pill
+    /// on every character.
+    nonisolated static func spokenProgressWouldRevealNewWords(
+        of text: String,
+        from previousCount: Int,
+        to nextCount: Int
+    ) -> Bool {
+        wholeWords(of: text, upTo: previousCount) != wholeWords(of: text, upTo: nextCount)
+    }
+
     /// Both voices are held, not one: the neural voice may still be
     /// downloading, and every utterance until it is ready falls back to the
     /// system voice rather than being dropped.
@@ -72,6 +83,7 @@ final class NarrationEngine {
     /// Rotates the phraser's frames for the utterances the coalescer doesn't
     /// own (todos, completions), so those don't repeat one sentence either.
     private var phraseVariant: [ChatID: Int] = [:]
+    private var planReadiness = PlanReadinessGate()
     private var activeChatID: ChatID?
     private var micActive = false
     private var summaryTask: Task<Void, Never>?
@@ -318,6 +330,7 @@ final class NarrationEngine {
             queue.dropAll(for: chatID)
             coalescers[chatID]?.reset()
             digests[chatID, default: DigestBuffer()].clear()
+            planReadiness.reset(scope: chatID.rawValue)
             if speakingChatID == chatID {
                 stopSpeaking(immediate: false)
             }
@@ -383,7 +396,7 @@ final class NarrationEngine {
                     enqueueProgress(phrase, kind: .todo, chatID: chatID)
                 }
             case .proposal(let markdown, _):
-                speakPlanProposal(markdown, chatID: chatID, background: background)
+                speakPlanProposal(update, markdown: markdown, chatID: chatID, background: background)
             }
 
         case .permissionRequest(let request):
@@ -466,6 +479,7 @@ final class NarrationEngine {
         case .turnStarted:
             // A new message obsoletes anything still queued about this chat.
             queue.dropAll(for: chatID)
+            planReadiness.reset(scope: chatID.rawValue)
 
         case .turnCompleted(let result):
             speakCompletion(result, chatID: chatID, background: background)
@@ -488,7 +502,7 @@ final class NarrationEngine {
 
         case .planUpdated(let update):
             if case .proposal(let markdown, _) = update.content {
-                speakPlanProposal(markdown, chatID: chatID, background: background)
+                speakPlanProposal(update, markdown: markdown, chatID: chatID, background: background)
             }
 
         case .sessionError(let error):
@@ -579,7 +593,22 @@ final class NarrationEngine {
     /// for that sentence — acceptable for a "come look at this" line, since
     /// the plan card is already on screen either way. Timeout or absence
     /// falls back to the canned phrase.
-    private func speakPlanProposal(_ markdown: String, chatID: ChatID, background: String?) {
+    ///
+    /// Drafts and duplicate ready events for the same turn are silent: Cursor
+    /// CreatePlan `started` then `completed`, and Claude's republish with a
+    /// permission id, must not re-say "the plan is ready".
+    private func speakPlanProposal(
+        _ update: PlanUpdate,
+        markdown: String,
+        chatID: ChatID,
+        background: String?
+    ) {
+        guard planReadiness.shouldAnnounce(
+            scope: chatID.rawValue,
+            turnID: update.turnID,
+            markdown: markdown,
+            isReady: update.isReady
+        ) else { return }
         let variant = phraseVariant[chatID] ?? 0
         advanceVariant(for: chatID)
         guard summarizer.isAvailable, !markdown.isEmpty else {
@@ -736,7 +765,11 @@ final class NarrationEngine {
         guard let currentSpokenText, text == currentSpokenText,
               characters > spokenCharacterCount
         else { return }
-        spokenCharacterCount = min(characters, currentSpokenText.utf16.count)
+        let next = min(characters, currentSpokenText.utf16.count)
+        guard Self.spokenProgressWouldRevealNewWords(
+            of: currentSpokenText, from: spokenCharacterCount, to: next
+        ) else { return }
+        spokenCharacterCount = next
     }
 
     private func utteranceEnded() {

@@ -1,12 +1,15 @@
 import Foundation
 import Testing
 
+import OreSupport
 @testable import OreCore
 @testable import OrePersistence
 @testable import OreProtocol
 
 #if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
 #endif
 
 /// The assistant's action lane, exercised the way the MCP-server process uses
@@ -736,7 +739,7 @@ private final class BridgeHarness: @unchecked Sendable {
         var payload = try JSONEncoder().encode(request)
         payload.append(UInt8(ascii: "\n"))
 
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = UnixStreamSocket.open()
         guard descriptor >= 0 else { throw HarnessError.socket }
         defer { close(descriptor) }
 

@@ -340,7 +340,7 @@ struct CodexTranslatorTests {
         )
         #expect(assistant["default_tools_approval_mode"]?.stringValue == "approve")
         #expect(assistant["command"]?.stringValue == mcp.command)
-        #expect(assistant["args"]?.arrayValue?.map(\.stringValue) == mcp.arguments)
+        #expect(assistant["args"]?.arrayValue == mcp.arguments.map(JSONValue.string))
 
         let project = CodexSession.mcpServerConfiguration(mcp, allowedTools: [])
         #expect(project["default_tools_approval_mode"] == nil)
@@ -351,8 +351,8 @@ struct CodexTranslatorTests {
         let threadConfig = CodexSession.workspaceWriteConfiguration(
             writableRoots: [gitRoot, gitRoot]
         )
-        #expect(threadConfig["writable_roots"]?.arrayValue?.map(\.stringValue) == [
-            gitRoot.path,
+        #expect(threadConfig["writable_roots"]?.arrayValue == [
+            .string(gitRoot.path),
         ])
 
         let turnPolicy = CodexSession.sandboxPolicy(
@@ -360,8 +360,8 @@ struct CodexTranslatorTests {
             writableRoots: [gitRoot]
         )
         #expect(turnPolicy["type"]?.stringValue == "workspaceWrite")
-        #expect(turnPolicy["writableRoots"]?.arrayValue?.map(\.stringValue) == [
-            gitRoot.path,
+        #expect(turnPolicy["writableRoots"]?.arrayValue == [
+            .string(gitRoot.path),
         ])
         #expect(CodexSession.sandboxPolicy(
             permissionMode: .plan,

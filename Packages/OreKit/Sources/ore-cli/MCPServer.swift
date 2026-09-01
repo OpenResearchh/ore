@@ -3,6 +3,7 @@ import OreCore
 import OreGit
 import OrePersistence
 import OreProtocol
+import OreSupport
 
 #if canImport(Darwin)
 import Darwin
@@ -700,7 +701,7 @@ private final class AssistantToolServer {
     }
 
     private func bridgeExchange(socketPath: String, payload: Data) -> Data? {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = UnixStreamSocket.open()
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
 

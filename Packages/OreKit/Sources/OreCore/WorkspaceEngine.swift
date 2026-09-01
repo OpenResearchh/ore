@@ -2062,10 +2062,12 @@ public actor WorkspaceEngine {
             record.lastActivityAt = Date()
             try? await store.saveChat(runtime.record)
             try? await persistRecord()
+            // Drain first: a queued user message must not wait on `git status`,
+            // which contends with every other worktree on a loaded runner.
+            await drainQueue(runtime: runtime)
             // The agent has stopped writing, so this is the moment the diff is
             // both interesting and stable.
             await statusWatcher?.refreshNow()
-            await drainQueue(runtime: runtime)
             await compactAssistantIfOutgrown(runtime)
             publishChatChange(runtime)
 

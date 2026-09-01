@@ -106,6 +106,7 @@ struct AssistantFailoverPolicyTests {
 }
 
 /// The Assistant's own agent, not a project tab, moves when its CLI dries up.
+@Suite(.serialized)
 struct AssistantFailoverIntegrationTests {
     @Test func anExhaustedAssistantMovesToAnotherReadyHarnessAndRetries() async throws {
         let fixture = try await makeFixture()
@@ -120,8 +121,8 @@ struct AssistantFailoverIntegrationTests {
         let (client, store, recorder) = try makeClient(
             fixture: fixture, harnesses: [claude, codex]
         )
-        defer { Task { await client.shutdown() } }
         try await client.start()
+        defer { Task { await client.shutdown() } }
         try await waitForProbes(recorder, count: 2)
 
         let assistant = try #require(try await store.assistantWorkspace())
@@ -165,8 +166,8 @@ struct AssistantFailoverIntegrationTests {
         let (client, store, recorder) = try makeClient(
             fixture: fixture, harnesses: [claude, codex]
         )
-        defer { Task { await client.shutdown() } }
         try await client.start()
+        defer { Task { await client.shutdown() } }
         try await waitForProbes(recorder, count: 2)
 
         let assistant = try #require(try await store.assistantWorkspace())
@@ -201,8 +202,8 @@ struct AssistantFailoverIntegrationTests {
         let (client, store, recorder) = try makeClient(
             fixture: fixture, harnesses: [claude, codex]
         )
-        defer { Task { await client.shutdown() } }
         try await client.start()
+        defer { Task { await client.shutdown() } }
         try await waitForProbes(recorder, count: 2)
 
         await client.send(.addRepository(path: fixture.repository.path))
@@ -251,8 +252,8 @@ struct AssistantFailoverIntegrationTests {
             harnesses: [claude, codex, cursor],
             enabledExperimental: [.cursorAgent]
         )
-        defer { Task { await client.shutdown() } }
         try await client.start()
+        defer { Task { await client.shutdown() } }
         try await waitForProbes(recorder, count: 3)
 
         let assistant = try #require(try await store.assistantWorkspace())
@@ -290,8 +291,8 @@ struct AssistantFailoverIntegrationTests {
         let (client, store, recorder) = try makeClient(
             fixture: fixture, harnesses: [claude]
         )
-        defer { Task { await client.shutdown() } }
         try await client.start()
+        defer { Task { await client.shutdown() } }
         try await waitForProbes(recorder, count: 1)
 
         let assistant = try #require(try await store.assistantWorkspace())

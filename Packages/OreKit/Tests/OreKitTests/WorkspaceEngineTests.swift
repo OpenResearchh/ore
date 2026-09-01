@@ -875,7 +875,8 @@ struct WorkspaceEngineTests {
         let gitBefore = await git.value()
 
         try harness.fixture.write("nudge.txt", "dirt\n", in: harness.worktree)
-        #expect(await waitUntil(timeout: .seconds(12)) { await git.value() > gitBefore })
+        // Linux has no FSEvents — only the 10s poll. Leave room for a delayed tick.
+        #expect(await waitUntil(timeout: .seconds(25)) { await git.value() > gitBefore })
         try await Task.sleep(for: .milliseconds(250))
         let summaryAfter = await summaries.value()
         #expect(summaryAfter == summaryBefore)

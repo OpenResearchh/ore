@@ -213,7 +213,7 @@ public enum ShellEnvironment {
         process.environment = probeEnvironment
 
         do {
-            try process.run()
+            try ProcessLaunch.run(process)
         } catch {
             return nil
         }
@@ -233,7 +233,7 @@ public enum ShellEnvironment {
             _ = finished.wait(timeout: .now() + 1)
             return nil
         }
-        process.waitUntilExit()
+        ProcessLaunch.waitUntilExit(process)
 
         guard let text = String(data: output.get(), encoding: .utf8),
               let beginRange = text.range(of: begin + "\n"),

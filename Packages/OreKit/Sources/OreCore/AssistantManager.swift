@@ -1,6 +1,7 @@
 import Foundation
 import OrePersistence
 import OreProtocol
+import OreSupport
 
 /// Creates and maintains the product-owned assistant workspace: one hidden
 /// workspace per user, living at `OreHome.assistantDirectory`, whose agent
@@ -46,7 +47,7 @@ public enum AssistantManager {
         let home = databaseURL
             .deletingLastPathComponent()
             .appendingPathComponent("assistant", isDirectory: true)
-        try ensureHome(at: home)
+        try await ensureHome(at: home)
 
         if let existing = try await store.assistantWorkspace() {
             return existing
@@ -94,7 +95,7 @@ public enum AssistantManager {
     /// `~/ore/assistant/` — a tiny git repository so the engine's status
     /// watcher and checkpoints are well-defined, holding the memory files that
     /// are the assistant's durable knowledge.
-    private static func ensureHome(at home: URL) throws {
+    private static func ensureHome(at home: URL) async throws {
         let files = FileManager.default
         try files.createDirectory(at: home, withIntermediateDirectories: true)
         try files.createDirectory(
@@ -157,14 +158,14 @@ public enum AssistantManager {
         """)
 
         if !files.fileExists(atPath: home.appendingPathComponent(".git").path) {
-            runGit(["init", "--initial-branch", "main"], in: home)
+            await runGit(["init", "--initial-branch", "main"], in: home)
         }
         // An initial commit gives the repo a HEAD, which the diff and status
         // machinery assume. Committed with a local identity so this works on a
         // machine with no global git config.
-        if !hasHead(in: home) {
-            runGit(["add", "-A"], in: home)
-            runGit([
+        if !(await hasHead(in: home)) {
+            await runGit(["add", "-A"], in: home)
+            await runGit([
                 "-c", "user.name=ORE", "-c", "user.email=assistant@ore.local",
                 "commit", "-m", "Assistant home",
             ], in: home)
@@ -176,30 +177,28 @@ public enum AssistantManager {
         try? contents.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private static func hasHead(in directory: URL) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["rev-parse", "--verify", "HEAD"]
-        process.currentDirectoryURL = directory
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
+    private static func hasHead(in directory: URL) async -> Bool {
+        await runGit(["rev-parse", "--verify", "HEAD"], in: directory) == 0
     }
 
-    private static func runGit(_ arguments: [String], in directory: URL) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = directory
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
+    /// Short-lived git via `ChildProcess`, so Linux launches share the
+    /// `ProcessLaunch` lock instead of calling `Process.run()` / `waitUntilExit()`
+    /// beside every other test's git spawn.
+    @discardableResult
+    private static func runGit(_ arguments: [String], in directory: URL) async -> Int32 {
+        let git = ShellEnvironment.locate("git", in: ProcessInfo.processInfo.environment)
+            ?? "/usr/bin/git"
+        guard let process = try? ChildProcess(
+            executablePath: git,
+            arguments: arguments,
+            workingDirectory: directory,
+            environment: ProcessInfo.processInfo.environment
+        ) else { return 1 }
+        process.closeStandardInput()
+        async let stdout = process.stdoutChunks.collectText()
+        async let stderr = process.stderrChunks.collectText()
+        _ = await stdout
+        _ = await stderr
+        return await process.waitForExit()
     }
 }

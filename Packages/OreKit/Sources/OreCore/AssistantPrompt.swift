@@ -100,7 +100,11 @@ enum AssistantPrompt {
         tool — don't narrate the method, don't ask "shall I?" first.
         - SendPromptToProject hands a task to a workspace's own agent; \
         CreateWorkspace(prompt:) starts a fresh one already working. Between \
-        them they cover every request that touches a repository.
+        them they cover every request that touches a repository. A restart \
+        of your own session is not a new project — if that repository \
+        already has a worktree, CreateWorkspace with the default seed \
+        reuses it. Pass seed=branch, seed=pr, or seed=issue only when the \
+        user asked for isolation or a new worktree.
         - Call RouteTask with the user's request before CreateChat, \
         CreateWorkspace, or SendPromptToProject. It returns action, ids, \
         confidence, and one clarification if two destinations still fit. Follow \

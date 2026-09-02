@@ -194,7 +194,10 @@ struct CodexTranslator {
             )))
 
         case "plan":
-            guard completed, let text = item["text"]?.stringValue, !text.isEmpty else { break }
+            // Readable body only — whitespace or JSON debris is not a plan.
+            guard completed, let text = item["text"]?.stringValue,
+                  PlanProposalPolicy.isReadyMarkdown(text)
+            else { break }
             output.events.append(.planUpdated(PlanUpdate(
                 turnID: turnID,
                 content: .proposal(markdown: text, permissionRequestID: nil),

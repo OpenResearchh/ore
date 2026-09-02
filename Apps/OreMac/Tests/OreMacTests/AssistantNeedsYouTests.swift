@@ -3,10 +3,11 @@ import OreProtocol
 
 @testable import OreMac
 
-/// How a blocked project tab reads when it is offered for action on the
-/// Assistant surface rather than spoken. The assistant narrates "[ORE needs
-/// you] a tab wants to run Bash"; the row beside the Allow button has to say
-/// which tab, and which command.
+/// How a blocked project tab reads, and how it sounds.
+///
+/// Two different sentences for one event, on purpose: the row beside the Allow
+/// button has to say which tool and which command, and the line the assistant
+/// speaks has to sound like every other line it speaks.
 struct AssistantNeedsYouRowTests {
     private func permission(
         tool: String = "Bash",
@@ -39,6 +40,64 @@ struct AssistantNeedsYouRowTests {
 
     @Test func aPermissionWithoutADisplayNameFallsBackToTheToolName() {
         #expect(permission(displayName: nil, summary: nil).headline == "Bash")
+    }
+
+    // MARK: - How the ask sounds
+
+    /// The regression this suite exists to hold. The spoken prompt used to be
+    /// its own template — "Quick check — A tab wants to run Bash (swift test).
+    /// Yes to allow, no to deny, or always to auto-allow this tab." — spoken
+    /// through the assistant's own voice, so the user heard the assistant
+    /// abruptly start talking like a phone menu whenever a permission landed.
+    @Test func aPermissionAskSoundsLikeTheRestOfTheNarration() {
+        let spoken = permission().spokenPrompt()
+        // Says what is happening, not which tool symbol is being invoked.
+        #expect(spoken.contains("swift test"))
+        #expect(!spoken.contains("Bash"))
+        // None of the phone-tree furniture.
+        #expect(!spoken.contains("Quick check"))
+        #expect(!spoken.contains("A tab"))
+        #expect(!spoken.lowercased().contains("no to deny"))
+        #expect(!spoken.lowercased().contains("auto-allow"))
+    }
+
+    /// The choices live on the HUD placeholder and the window's buttons. What
+    /// the voice owes the listener is an invitation to answer, not the list.
+    @Test func aPermissionAskInvitesAnAnswer() {
+        #expect(permission().spokenPrompt().hasSuffix("Okay to go ahead?"))
+    }
+
+    @Test func anAskFromAnotherWorkspaceNamesIt() {
+        let spoken = permission().spokenPrompt(place: "kailash")
+        #expect(spoken.hasPrefix("Over in kailash, "))
+        #expect(spoken.contains("swift test"))
+    }
+
+    /// Nil place means the tab is the one on screen, and naming it would tell
+    /// the user something they can already see.
+    @Test func anAskFromTheTabOnScreenNamesNoPlace() {
+        #expect(!permission().spokenPrompt().contains("Over in"))
+        #expect(!permission().spokenPrompt(place: "").contains("Over in"))
+    }
+
+    /// A question's options *are* the ask — unlike a permission's yes/no, no
+    /// button on screen spells them out while the mic is open.
+    @Test func aQuestionAskStillRecitesItsChoices() {
+        let item = TabNeedsYou.question(TabNeedsYou.Question(
+            workspaceID: WorkspaceID(rawValue: "ws"),
+            chatID: ChatID(rawValue: "chat"),
+            question: AgentQuestion(
+                turnID: TurnID(rawValue: "turn"),
+                id: QuestionID(rawValue: "q1"),
+                prompt: "Which branch should this target?",
+                options: [
+                    AgentQuestion.Option(label: "main"),
+                    AgentQuestion.Option(label: "develop"),
+                ]
+            )
+        ))
+        #expect(item.spokenPrompt().contains("main, or develop"))
+        #expect(!item.spokenPrompt().contains("Quick check"))
     }
 
     @Test func aQuestionHeadlineIsTheWholePromptUnclipped() {
@@ -75,5 +134,39 @@ struct AssistantNeedsYouRowTests {
         #expect(
             permission().placeLabel(workspace: nil, tab: nil) == "another workspace"
         )
+    }
+
+    @Test func aReadyPlanHeadlineIsTheFirstProseLine() {
+        let item = TabNeedsYou.plan(TabNeedsYou.Plan(
+            workspaceID: WorkspaceID(rawValue: "ws"),
+            chatID: ChatID(rawValue: "chat"),
+            turnID: TurnID(rawValue: "t1"),
+            markdown: "## Split the parser\n1. Extract the lexer",
+            permissionRequestID: nil
+        ))
+        #expect(item.headline == "Split the parser")
+        #expect(item.spokenSummary.contains("Split the parser"))
+        #expect(item.spokenPrompt().contains("split the parser"))
+        #expect(item.id == "plan-chat-t1")
+        #expect(item.narrationKind == .planProposal)
+    }
+
+    @Test func linkingAPermissionDoesNotChangeThePlanNeedsYouIdentity() {
+        let turn = TurnID(rawValue: "t1")
+        let draft = TabNeedsYou.plan(TabNeedsYou.Plan(
+            workspaceID: WorkspaceID(rawValue: "ws"),
+            chatID: ChatID(rawValue: "chat"),
+            turnID: turn,
+            markdown: "## Steps\n1. Do it",
+            permissionRequestID: nil
+        ))
+        let linked = TabNeedsYou.plan(TabNeedsYou.Plan(
+            workspaceID: WorkspaceID(rawValue: "ws"),
+            chatID: ChatID(rawValue: "chat"),
+            turnID: turn,
+            markdown: "## Steps\n1. Do it",
+            permissionRequestID: PermissionRequestID(rawValue: "r1")
+        ))
+        #expect(draft.id == linked.id)
     }
 }

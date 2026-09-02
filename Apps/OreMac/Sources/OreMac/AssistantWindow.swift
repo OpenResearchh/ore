@@ -353,8 +353,25 @@ struct AssistantActivityView: View {
                         }
                     }
 
-                case .question(let payload):
+                case .question:
                     EmptyView()
+                case .plan(let payload):
+                    Button("Reject") {
+                        model.respondToPlan(
+                            chatID: payload.chatID,
+                            workspaceID: payload.workspaceID,
+                            approve: false
+                        )
+                    }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    Button("Approve") {
+                        model.respondToPlan(
+                            chatID: payload.chatID,
+                            workspaceID: payload.workspaceID,
+                            approve: true
+                        )
+                    }
+                    .buttonStyle(OrePrimaryButtonStyle())
                 }
                 Spacer(minLength: 0)
             }
@@ -388,6 +405,7 @@ struct AssistantActivityView: View {
         switch item {
         case .permission: "hand.raised.fill"
         case .question: "questionmark.circle.fill"
+        case .plan: "checklist"
         }
     }
 
@@ -395,6 +413,7 @@ struct AssistantActivityView: View {
         switch item {
         case .permission: .orange
         case .question: .accentColor
+        case .plan: .purple
         }
     }
 

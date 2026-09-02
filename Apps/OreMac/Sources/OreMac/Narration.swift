@@ -557,6 +557,39 @@ enum NarrationPhraser {
             .ensuringTerminalPunctuation()
     }
 
+    /// The permission line for the hands-free flow, where the microphone opens
+    /// as soon as the sentence ends.
+    ///
+    /// Deliberately `permission` plus a short invitation rather than a phrasing
+    /// of its own: the same event must not have two spoken forms, which is what
+    /// the "Quick check — a tab wants to run Bash" template amounted to. The
+    /// choices are not recited. "Yes to allow, no to deny, or always to
+    /// auto-allow this tab" is phone-tree grammar, and nothing else ORE says
+    /// out loud talks that way — the HUD placeholder ("Yes, no, or always?")
+    /// and the window's buttons already carry them, on screen, where a list is
+    /// something you scan rather than something you have to hold in your head.
+    static func permissionAsk(_ request: PermissionRequest) -> String {
+        permission(request) + " Okay to go ahead?"
+    }
+
+    /// The ready-plan ask. Same trade as `permissionAsk`: the crux out loud,
+    /// the approve/reject/amend options left to the buttons.
+    static func planAsk(crux: String) -> String {
+        let spoken = sanitize(lowercasedLead(crux), limit: 200)
+        guard !spoken.isEmpty else { return "It's got a plan ready. Shall I go ahead?" }
+        return "It's got a plan ready — \(spoken.ensuringTerminalPunctuation()) Shall I go ahead?"
+    }
+
+    /// The assistant's own confirmation before a consequential action. Shares
+    /// the closing question with `permissionAsk` on purpose: to the listener
+    /// these are the same moment, and they were the two places that sounded
+    /// least like the rest of the voice.
+    static func confirmationAsk(_ summary: String) -> String {
+        let spoken = sanitize(summary)
+        guard !spoken.isEmpty else { return "It needs your okay first. Okay to go ahead?" }
+        return spoken.ensuringTerminalPunctuation() + " Okay to go ahead?"
+    }
+
     static func planProposal(variant: Int = 0) -> String {
         pick([
             "It's got a plan ready for you to look at.",

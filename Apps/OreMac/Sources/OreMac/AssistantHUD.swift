@@ -347,6 +347,41 @@ private struct NeedsYouActionCard: View {
                 }
                 .padding(.vertical, 10)
                 .frame(width: 460 - 16)
+
+            case .plan(let payload):
+                HStack(spacing: 10) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.purple)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Plan ready")
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(1)
+                        Text(item.headline)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Approve") {
+                        model.respondToPlan(
+                            chatID: payload.chatID,
+                            workspaceID: payload.workspaceID,
+                            approve: true
+                        )
+                    }
+                    .buttonStyle(HUDActionButtonStyle(prominent: true))
+                    Button("Reject") {
+                        model.respondToPlan(
+                            chatID: payload.chatID,
+                            workspaceID: payload.workspaceID,
+                            approve: false
+                        )
+                    }
+                    .buttonStyle(HUDActionButtonStyle())
+                    dismissButton
+                }
+                .frame(width: 460 - 16, height: 56)
             }
         }
         .padding(.horizontal, 14)

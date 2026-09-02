@@ -1,8 +1,12 @@
 import Foundation
 import OreProtocol
 
-/// A project tab blocked on the user — permission or question — surfaced on
-/// the voice HUD and menu bar when the user is in another app.
+/// A project tab blocked on the user — permission, question, or a ready plan —
+/// surfaced on the voice HUD and menu bar when the user is in another app.
+///
+/// Plans join this enum only when `PlanUpdate.isReady` is true and the markdown
+/// survived `PlanProposalPolicy` (a real body, not a CreatePlan `started`
+/// title and not streamed JSON debris). Drafts stay on the transcript row.
 enum TabNeedsYou: Identifiable, Equatable {
     struct Permission: Equatable {
         var workspaceID: WorkspaceID
@@ -16,13 +20,25 @@ enum TabNeedsYou: Identifiable, Equatable {
         var question: AgentQuestion
     }
 
+    /// One ready proposal per turn. `id` is scoped to the turn so a later
+    /// permission-link update replaces this row instead of stacking a second.
+    struct Plan: Equatable {
+        var workspaceID: WorkspaceID
+        var chatID: ChatID
+        var turnID: TurnID
+        var markdown: String
+        var permissionRequestID: PermissionRequestID?
+    }
+
     case permission(Permission)
     case question(Question)
+    case plan(Plan)
 
     var id: String {
         switch self {
         case .permission(let item): return "permission-\(item.request.id.rawValue)"
         case .question(let item): return "question-\(item.question.id.rawValue)"
+        case .plan(let item): return "plan-\(item.chatID.rawValue)-\(item.turnID.rawValue)"
         }
     }
 
@@ -30,6 +46,7 @@ enum TabNeedsYou: Identifiable, Equatable {
         switch self {
         case .permission(let item): return item.workspaceID
         case .question(let item): return item.workspaceID
+        case .plan(let item): return item.workspaceID
         }
     }
 
@@ -37,6 +54,7 @@ enum TabNeedsYou: Identifiable, Equatable {
         switch self {
         case .permission(let item): return item.chatID
         case .question(let item): return item.chatID
+        case .plan(let item): return item.chatID
         }
     }
 
@@ -47,13 +65,15 @@ enum TabNeedsYou: Identifiable, Equatable {
         switch self {
         case .permission(let item): return .permission(item.request.id)
         case .question: return .question
+        case .plan: return .planProposal
         }
     }
 
     /// The written form of the ask, for a row the user reads rather than
-    /// hears. Deliberately not `spokenSummary`: "A tab wants to run Bash." is
-    /// the right sentence out loud and the wrong one next to a button that
-    /// says Allow, where the tool and its argument are the whole point.
+    /// hears. Deliberately not `spokenSummary`: "It needs your permission for
+    /// git push." is the right sentence out loud and the wrong one next to a
+    /// button that says Allow, where the tool and its argument are the whole
+    /// point.
     var headline: String {
         switch self {
         case .permission(let item):
@@ -62,6 +82,8 @@ enum TabNeedsYou: Identifiable, Equatable {
             return "\(tool) — \(summary)"
         case .question(let item):
             return item.question.prompt
+        case .plan(let item):
+            return PlanProposalPolicy.headline(from: item.markdown)
         }
     }
 
@@ -74,38 +96,59 @@ enum TabNeedsYou: Identifiable, Equatable {
         return "\(place) / \(tab)"
     }
 
+    /// The ask as one sentence for the ear, in the same vocabulary as the
+    /// ambient narration of the very same event — `NarrationPhraser` owns the
+    /// wording so there is exactly one spoken form per event. It used to have
+    /// two, and the one the voice HUD reached for ("A tab wants to run Bash.")
+    /// was the one that broke the house style: an anonymous subject, and a raw
+    /// tool identifier read out where every other line says what is happening.
     var spokenSummary: String {
         switch self {
         case .permission(let item):
-            let tool = item.request.displayName ?? item.request.toolName
-            let detail = item.request.summary.map { " (\($0))" } ?? ""
-            return "A tab wants to run \(tool)\(detail)."
+            return NarrationPhraser.permission(item.request)
         case .question(let item):
             return String(item.question.prompt.prefix(160))
+        case .plan(let item):
+            let crux = PlanProposalPolicy.headline(from: item.markdown, limit: 120)
+            return "There's a plan ready — \(crux)."
         }
     }
 
-    /// One complete spoken prompt. Questions include every choice instead of
-    /// being flattened into a yes/no permission prompt, and explicitly leave
-    /// room for the user's own answer when the harness supports it.
-    var spokenPrompt: String {
+    /// One complete spoken prompt, named for where it came from.
+    ///
+    /// `place` is `NarrationOrigin.spokenLabel`: nil when the tab is the one on
+    /// screen, "the auth tab" or "kailash" otherwise. Passing it is what stops
+    /// these prompts being the only lines ORE speaks that don't say where they
+    /// are — the anonymous "a tab" was half of why they sounded like a machine.
+    ///
+    /// Questions still recite their choices; unlike a permission's yes/no they
+    /// are the content of the ask, and the answer window's placeholder is only
+    /// "Say your answer…". Freeform is still spelled out when the harness
+    /// allows it, because nothing on screen says so.
+    func spokenPrompt(place: String? = nil) -> String {
+        let line: String
         switch self {
-        case .permission:
-            return "Quick check — \(spokenSummary) Yes to allow, no to deny, "
-                + "or always to auto-allow this tab."
+        case .permission(let item):
+            line = NarrationPhraser.permissionAsk(item.request)
         case .question(let item):
-            var prompt = "Quick check — \(item.question.prompt)"
+            var prompt = NarrationPhraser.question(item.question)
             if !item.question.options.isEmpty {
                 let labels = item.question.options.map(\.label)
                 prompt += " Your options are \(Self.spokenList(labels))."
             }
             if item.question.allowsFreeform {
-                prompt += " Say an option, or say your own answer."
+                prompt += " Say one of those, or answer in your own words."
             } else if !item.question.options.isEmpty {
-                prompt += " Say the option you want."
+                prompt += " Say the one you want."
             }
-            return prompt
+            line = prompt
+        case .plan(let item):
+            line = NarrationPhraser.planAsk(
+                crux: PlanProposalPolicy.headline(from: item.markdown, limit: 120)
+            )
         }
+        guard let place, !place.isEmpty else { return line }
+        return NarrationPhraser.prefixed(line, place: place)
     }
 
     private static func spokenList(_ values: [String]) -> String {

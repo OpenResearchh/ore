@@ -1182,6 +1182,17 @@ public actor InProcessCoreClient: CoreClient {
         )
     }
 
+    /// The most recently active project worktree on this repository, if any.
+    /// Used by the Assistant's CreateWorkspace so a restarted session reuses
+    /// the worktree it already owns instead of minting a sibling.
+    func existingProjectWorkspace(onRepository path: String) async -> WorkspaceRecord? {
+        let wanted = URL(fileURLWithPath: path).standardizedFileURL
+        let records = (try? await store.workspaces()) ?? []
+        return records.first { record in
+            URL(fileURLWithPath: record.repositoryPath).standardizedFileURL == wanted
+        }
+    }
+
     /// An existing worktree on this repository with uncommitted files — the
     /// reason CreateWorkspace asks before forking a sibling.
     func dirtySibling(

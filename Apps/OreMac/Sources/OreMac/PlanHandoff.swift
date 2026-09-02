@@ -1,4 +1,5 @@
 import Foundation
+import OreProtocol
 
 /// Composer text for a new tab that should execute an existing plan.
 ///
@@ -7,8 +8,8 @@ import Foundation
 /// a canned "implement this" prompt — the user owns that.
 enum PlanHandoff {
     static func composerDraft(from markdown: String) -> String? {
-        let body = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty else { return nil }
+        let body = PlanProposalPolicy.normalizedMarkdown(markdown)
+        guard let body, PlanProposalPolicy.isReadyMarkdown(body) else { return nil }
         return body + "\n"
     }
 }

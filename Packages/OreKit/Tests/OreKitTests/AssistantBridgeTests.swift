@@ -551,6 +551,8 @@ struct AssistantBridgeTests {
                 arguments: [
                     "repository": .string(harness.fixture.repository.path),
                     "name": .string("clean-sibling"),
+                    "seed": .string("workspace"),
+                    "seedRef": .string(workspaceID.rawValue),
                 ]
             )
             guard case .assistantConfirmationRequested(let confirmation)? =
@@ -568,6 +570,49 @@ struct AssistantBridgeTests {
             let response = try await call
             #expect(!response.ok)
             #expect(response.error?.contains("declined") == true)
+        }
+    }
+
+    @Test func createWorkspaceOnARepoThatAlreadyHasAWorktreeReusesIt() async throws {
+        try await BridgeHarness.run { harness in
+
+            _ = try await harness.makeWorkspace(named: "existing")
+            let before = try await harness.store.workspaces().map(\.id)
+
+            let response = try harness.callBridge(
+                tool: "CreateWorkspace",
+                arguments: [
+                    "repository": .string(harness.fixture.repository.path),
+                    "name": .string("looks-new"),
+                ]
+            )
+            #expect(response.ok)
+            #expect(response.result?.contains("Reused existing workspace") == true)
+            #expect(response.result?.contains("existing") == true)
+            #expect(try await harness.store.workspaces().map(\.id) == before)
+        }
+    }
+
+    @Test func createWorkspaceWithAnIsolationSeedStillForks() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "parent")
+            let response = try harness.callBridge(
+                tool: "CreateWorkspace",
+                arguments: [
+                    "repository": .string(harness.fixture.repository.path),
+                    "name": .string("stacked"),
+                    "seed": .string("workspace"),
+                    "seedRef": .string(workspaceID.rawValue),
+                ]
+            )
+            #expect(response.ok)
+            #expect(response.result?.contains("Created workspace") == true)
+            #expect(response.result?.contains("stacked") == true)
+            let names = try await harness.store.workspaces().map(\.name)
+            #expect(names.contains("parent"))
+            #expect(names.contains("stacked"))
+            #expect(names.count == 2)
         }
     }
 

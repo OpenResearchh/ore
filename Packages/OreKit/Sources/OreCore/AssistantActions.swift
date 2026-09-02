@@ -135,14 +135,16 @@ extension InProcessCoreClient {
             return AssistantBridgeResponse(id: request.id, ok: false, error: reason)
 
         case .auto:
-            if request.tool == "CreateWorkspace",
-               let dirty = await dirtyCreateWorkspaceConfirmation(request) {
-                return await confirm(
-                    request,
-                    summary: dirty.summary,
-                    actionClass: .createWorkspace,
-                    workspaceID: dirty.workspaceID
-                )
+            if request.tool == "CreateWorkspace" {
+                let reusing = await wouldReuseExistingProjectWorkspace(request)
+                if !reusing, let dirty = await dirtyCreateWorkspaceConfirmation(request) {
+                    return await confirm(
+                        request,
+                        summary: dirty.summary,
+                        actionClass: .createWorkspace,
+                        workspaceID: dirty.workspaceID
+                    )
+                }
             }
             return await performAudited(request, summary: summary, decision: "auto")
 
@@ -326,6 +328,19 @@ extension InProcessCoreClient {
 
         switch request.tool {
         case "CreateWorkspace":
+            // A restarted Assistant often reaches for CreateWorkspace because
+            // it has no transcript of the worktree it already owns. Default
+            // seed on a repo that already has a project workspace is reuse,
+            // not a second scientist checkout. Explicit isolation seeds still
+            // fork. The user's Create Workspace sheet is a different path and
+            // always creates.
+            if let reuse = try await reusableProjectWorkspace(arguments: arguments) {
+                return try await reuseProjectWorkspace(
+                    reuse.workspace,
+                    repository: reuse.repository,
+                    prompt: arguments["prompt"]?.stringValue
+                )
+            }
             let repository = try await resolveRepository(arguments["repository"]?.stringValue)
             let harness = try resolveHarness(arguments["harness"]?.stringValue)
             let record = try await createWorkspace(CreateWorkspaceRequest(
@@ -616,6 +631,47 @@ extension InProcessCoreClient {
 
     private func requestChatID(_ request: AssistantBridgeRequest) -> ChatID? {
         request.arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:))
+    }
+
+    /// Default-seed CreateWorkspace on a repo that already has a project
+    /// worktree reuses that worktree. Isolation seeds still fork.
+    private func wouldReuseExistingProjectWorkspace(_ request: AssistantBridgeRequest) async -> Bool {
+        (try? await reusableProjectWorkspace(arguments: request.arguments)) != nil
+    }
+
+    private func reusableProjectWorkspace(
+        arguments: JSONValue
+    ) async throws -> (repository: RepositoryRecord, workspace: WorkspaceRecord)? {
+        let seed = try resolveSeed(arguments)
+        guard case .defaultBranch = seed else { return nil }
+        let repository = try await resolveRepository(arguments["repository"]?.stringValue)
+        guard let existing = await existingProjectWorkspace(onRepository: repository.path) else {
+            return nil
+        }
+        return (repository, existing)
+    }
+
+    private func reuseProjectWorkspace(
+        _ existing: WorkspaceRecord,
+        repository: RepositoryRecord,
+        prompt: String?
+    ) async throws -> String {
+        var sent = false
+        if let prompt, !prompt.isEmpty {
+            let engine = try await engine(for: existing.workspaceID)
+            _ = try await engine.send(SendMessageRequest(
+                workspaceID: existing.workspaceID,
+                text: prompt,
+                queueIfBusy: false,
+                origin: .agent
+            ))
+            sent = true
+        }
+        return "Reused existing workspace \"\(existing.name)\" (id \(existing.id)) "
+            + "on branch \(existing.branch) in \(repository.name). "
+            + "This repository already has a worktree; pass seed=branch, seed=pr, "
+            + "or seed=issue to fork a new one."
+            + (sent ? " The prompt was sent to its agent." : "")
     }
 
     /// CreateWorkspace stays automatic on a clean fleet. Forking a sibling

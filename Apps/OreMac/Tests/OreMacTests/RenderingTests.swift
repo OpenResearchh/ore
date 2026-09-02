@@ -946,6 +946,29 @@ struct GitHubUpdaterVersionTests {
         #expect(GitHubUpdater.displayVersion("V1.0") == "V1.0")
     }
 
+    @Test func relaunchScriptSwapsThenRemovesItsOwnJobLast() {
+        // The helper runs as its own launchd job (a nohup child dies with the
+        // app before it can swap — the "update never lands" bug). `launchctl
+        // remove` SIGTERMs the job, so it must be the very last line.
+        let script = GitHubUpdater.relaunchScript(
+            newApp: URL(fileURLWithPath: "/tmp/stage/ORE.app"),
+            destination: URL(fileURLWithPath: "/Applications/ORE.app"),
+            pid: 123,
+            scriptPath: "/tmp/relaunch.sh",
+            label: "dev.ore.relaunch.test"
+        )
+        let lines = script.split(separator: "\n").map(String.init)
+        #expect(lines.first == "#!/bin/bash")
+        #expect(lines.last == "/bin/launchctl remove 'dev.ore.relaunch.test'")
+        #expect(script.contains("while /bin/kill -0 123"))
+        let ditto = lines.firstIndex { $0.hasPrefix("/usr/bin/ditto") }
+        let clear = lines.firstIndex { $0.hasPrefix("/bin/rm -rf '/Applications") }
+        let open = lines.firstIndex { $0.hasPrefix("/usr/bin/open") }
+        #expect(clear != nil && ditto != nil && open != nil)
+        // Clear the old bundle, copy the new one in, then relaunch — in order.
+        #expect(clear! < ditto! && ditto! < open!)
+    }
+
     @Test func prefersDmgOverZip() {
         let assets: [[String: Any]] = [
             [

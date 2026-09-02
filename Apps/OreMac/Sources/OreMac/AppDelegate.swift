@@ -132,6 +132,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// `onDisappear` must not shut that core down while another window (or the
     /// menu-bar app) still needs it, so shutdown belongs to the real process
     /// termination handshake instead.
+    ///
+    /// The graceful shutdown is raced against a deadline. It stops every
+    /// engine and agent session serially, and a single wedged await — a
+    /// harness CLI that stopped reading its stdin, say — used to leave the
+    /// app in terminate-later limbo forever: alive, mid-quit, unquittable.
+    /// That is how the in-app updater "hung at downloading": the update had
+    /// fully staged and only the quit never finished. Past the deadline the
+    /// remaining children are abandoned to their 3s-grace SIGKILL paths;
+    /// a bounded quit beats a perfect one.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateLater }
         guard let model = MainActor.assumeIsolated({ AppModel.running() }) else {
@@ -139,7 +148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         isTerminating = true
         Task { @MainActor in
-            await model.shutdown()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await model.shutdown() }
+                group.addTask { try? await Task.sleep(for: .seconds(8)) }
+                await group.next()
+                group.cancelAll()
+            }
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

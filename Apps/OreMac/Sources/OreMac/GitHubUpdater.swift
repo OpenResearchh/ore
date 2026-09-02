@@ -58,6 +58,9 @@ final class GitHubUpdater {
     /// `Later` hides the popup for this session; the menu item stays so the
     /// user can still install without another launch.
     private(set) var dismissed = false
+    /// The in-flight install, kept so Cancel can actually stop the download
+    /// rather than leaving the user trapped behind a disabled modal.
+    private var installTask: Task<Void, Never>?
 
     /// `owner/repo` this build updates from.
     nonisolated static let repository = "OpenResearchh/ore"
@@ -117,19 +120,40 @@ final class GitHubUpdater {
         }
         dismissed = false
         phase = .downloading
-        Task {
+        installTask = Task {
             do {
-                let replacement = try await Self.prepareReplacement(from: available)
+                let work = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("ore-update-\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+                guard let archive = await Self.downloadInstaller(available, into: work) else {
+                    try? FileManager.default.removeItem(at: work)
+                    guard !Task.isCancelled else { return }
+                    throw GitHubUpdateError.downloadFailed
+                }
+                // Past here the swap is seconds away; `.installing` is also
+                // what pins the prompt's buttons, so the cancellable window
+                // ends at the download.
                 phase = .installing
+                let replacement = try await Self.unpackApp(from: archive, into: work)
                 try Self.scheduleReplaceAndRelaunch(
                     from: replacement,
                     replacing: Self.installDestination(currentBundle: Bundle.main.bundleURL)
                 )
                 NSApp.terminate(nil)
             } catch {
-                phase = .failed(error.localizedDescription)
+                phase = Task.isCancelled ? .idle : .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Stops an in-flight download and puts the prompt back to rest. Only the
+    /// brief unpack-and-swap at the end is uncancellable.
+    func cancelInstall() {
+        guard phase == .downloading else { return }
+        installTask?.cancel()
+        installTask = nil
+        phase = .idle
+        dismissed = true
     }
 
     // MARK: - Version comparison
@@ -224,18 +248,8 @@ final class GitHubUpdater {
 
     // MARK: - Download, unpack, replace
 
-    /// Downloads and unpacks the release into a staging copy of `ORE.app`.
-    private nonisolated static func prepareReplacement(from release: Available) async throws -> URL {
-        let work = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ore-update-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-        guard let archive = await downloadInstaller(release, into: work) else {
-            throw GitHubUpdateError.downloadFailed
-        }
-        return try await unpackApp(from: archive, into: work)
-    }
-
     private nonisolated static func downloadInstaller(_ release: Available, into directory: URL) async -> URL? {
+        guard !Task.isCancelled else { return nil }
         if let gh = executable(named: "gh") {
             let pattern = release.assetName ?? "*.dmg"
             let status = await runStatus(gh, [
@@ -248,6 +262,7 @@ final class GitHubUpdater {
             if status == 0, let found = firstInstaller(in: directory) {
                 return found
             }
+            guard !Task.isCancelled else { return nil }
             if let id = release.assetID {
                 let name = release.assetName
                     ?? release.downloadURL?.lastPathComponent
@@ -264,6 +279,7 @@ final class GitHubUpdater {
                 }
             }
         }
+        guard !Task.isCancelled else { return nil }
         if let url = release.downloadURL, let local = await download(url) {
             let dest = directory.appendingPathComponent(local.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
@@ -358,34 +374,31 @@ final class GitHubUpdater {
         return currentBundle
     }
 
-    /// Hands off to a detached script so the swap happens after this process
-    /// has actually quit — replacing a running bundle in-place is racy.
+    /// Hands off to a script running as its own launchd job so the swap
+    /// happens after this process has actually quit — replacing a running
+    /// bundle in-place is racy.
+    ///
+    /// `launchctl submit`, not `nohup … &`: a helper spawned into the app's
+    /// own launchd session dies with the app, which is why past update
+    /// attempts left a fully staged bundle and an orphaned script behind
+    /// while `/Applications/ORE.app` stayed old. A submitted job runs under
+    /// the user's launchd domain and outlives the app that scheduled it.
     private nonisolated static func scheduleReplaceAndRelaunch(from newApp: URL, replacing dest: URL) throws {
-        let src = shellQuote(newApp.path)
-        let dst = shellQuote(dest.path)
-        let staging = shellQuote(newApp.deletingLastPathComponent().path)
-        let pid = ProcessInfo.processInfo.processIdentifier
+        let label = "dev.ore.relaunch.\(UUID().uuidString.prefix(8))"
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("ore-relaunch-\(UUID().uuidString).sh")
-        let script = """
-        #!/bin/bash
-        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done
-        /bin/sleep 0.3
-        /bin/rm -rf \(dst)
-        /usr/bin/ditto \(src) \(dst)
-        /usr/bin/xattr -dr com.apple.quarantine \(dst) || true
-        /usr/bin/open \(dst)
-        /bin/rm -rf \(staging)
-        /bin/rm -f \(shellQuote(scriptURL.path))
-        """
+        let script = relaunchScript(
+            newApp: newApp,
+            destination: dest,
+            pid: ProcessInfo.processInfo.processIdentifier,
+            scriptPath: scriptURL.path,
+            label: String(label)
+        )
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [
-            "-c",
-            "nohup /bin/bash \(shellQuote(scriptURL.path)) >/dev/null 2>&1 &",
-        ]
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["submit", "-l", String(label), "--", "/bin/bash", scriptURL.path]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -394,71 +407,120 @@ final class GitHubUpdater {
         guard process.terminationStatus == 0 else { throw GitHubUpdateError.relaunchFailed }
     }
 
+    /// The swap script: wait out the app, replace the bundle, relaunch, clean
+    /// up. `launchctl remove` SIGTERMs its own job, so it must be the last
+    /// line — anything after it never runs.
+    nonisolated static func relaunchScript(
+        newApp: URL,
+        destination: URL,
+        pid: Int32,
+        scriptPath: String,
+        label: String
+    ) -> String {
+        let src = shellQuote(newApp.path)
+        let dst = shellQuote(destination.path)
+        let staging = shellQuote(newApp.deletingLastPathComponent().path)
+        return """
+        #!/bin/bash
+        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done
+        /bin/sleep 0.3
+        /bin/rm -rf \(dst)
+        /usr/bin/ditto \(src) \(dst)
+        /usr/bin/xattr -dr com.apple.quarantine \(dst) || true
+        /usr/bin/open \(dst)
+        /bin/rm -rf \(staging)
+        /bin/rm -f \(shellQuote(scriptPath))
+        /bin/launchctl remove \(shellQuote(label))
+        """
+    }
+
     nonisolated static func shellQuote(_ path: String) -> String {
         "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     private nonisolated static func download(_ url: URL) async -> URL? {
-        await withCheckedContinuation { continuation in
-            URLSession.shared.downloadTask(with: url) { temp, response, _ in
-                guard let temp,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        // The async API is cancellation-aware, so Cancel actually stops the
+        // transfer instead of letting it run to the 7-day resource timeout.
+        guard let (temp, response) = try? await URLSession.shared.download(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200
+        else { return nil }
+        // Move to a stably-named file so Finder shows the real installer
+        // name rather than a `CFNetworkDownload_xxxx.tmp` scratch file.
+        let name = url.lastPathComponent.isEmpty ? "ORE-update.dmg" : url.lastPathComponent
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: destination)
+        do {
+            try FileManager.default.moveItem(at: temp, to: destination)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
+    /// Waits for a child without ever waiting forever: exit is observed via
+    /// the termination handler, a deadline terminates a wedged child, and
+    /// task cancellation terminates it early. The old `waitUntilExit` had
+    /// none of that — a child that never exited pinned the update (and the
+    /// modal above it) for good.
+    private nonisolated static func awaitExit(
+        of process: Process,
+        timeout: Duration
+    ) async -> Int32? {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+                do {
+                    try process.run()
+                } catch {
+                    process.terminationHandler = nil
                     continuation.resume(returning: nil)
                     return
                 }
-                // Move to a stably-named file so Finder shows the real installer
-                // name rather than a `CFNetworkDownload_xxxx.tmp` scratch file.
-                let name = url.lastPathComponent.isEmpty ? "ORE-update.dmg" : url.lastPathComponent
-                let destination = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(name)
-                try? FileManager.default.removeItem(at: destination)
-                do {
-                    try FileManager.default.moveItem(at: temp, to: destination)
-                    continuation.resume(returning: destination)
-                } catch {
-                    continuation.resume(returning: nil)
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    if process.isRunning { process.terminate() }
                 }
-            }.resume()
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
         }
     }
 
-    private nonisolated static func run(_ launchPath: String, _ arguments: [String]) async -> Data? {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: launchPath)
-            process.arguments = arguments
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = Pipe()
-            let handle = pipe.fileHandleForReading
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: nil)
-                return
-            }
-            let data = handle.readDataToEndOfFile()
-            process.waitUntilExit()
-            continuation.resume(returning: process.terminationStatus == 0 ? data : nil)
-        }
+    private nonisolated static func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        timeout: Duration = .seconds(120)
+    ) async -> Data? {
+        guard !Task.isCancelled else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        // stderr goes nowhere rather than into a Pipe nobody drains — a
+        // chatty child filling the 64KB buffer deadlocks against the wait.
+        process.standardError = FileHandle.nullDevice
+        let handle = pipe.fileHandleForReading
+        // Drain stdout concurrently for the same reason.
+        let reader = Task.detached { handle.readDataToEndOfFile() }
+        let status = await awaitExit(of: process, timeout: timeout)
+        let data = await reader.value
+        return status == 0 ? data : nil
     }
 
-    private nonisolated static func runStatus(_ launchPath: String, _ arguments: [String]) async -> Int32? {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: launchPath)
-            process.arguments = arguments
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: nil)
-                return
-            }
-            process.waitUntilExit()
-            continuation.resume(returning: process.terminationStatus)
-        }
+    private nonisolated static func runStatus(
+        _ launchPath: String,
+        _ arguments: [String],
+        timeout: Duration = .seconds(600)
+    ) async -> Int32? {
+        guard !Task.isCancelled else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        return await awaitExit(of: process, timeout: timeout)
     }
 
     /// Synchronous helper for cleanup that has to finish before we return
@@ -530,10 +592,19 @@ struct GitHubUpdatePrompt: View {
 
                     HStack(spacing: OreTheme.Space.sm) {
                         Spacer()
-                        Button("Later") { updater.dismiss() }
+                        // A download must stay escapable: this was the modal
+                        // that trapped the whole app when an install wedged.
+                        // Only the brief final swap disables the way out.
+                        Button(updater.phase == .downloading ? "Cancel" : "Later") {
+                            if updater.phase == .downloading {
+                                updater.cancelInstall()
+                            } else {
+                                updater.dismiss()
+                            }
+                        }
                             .buttonStyle(OreSecondaryButtonStyle())
                             .keyboardShortcut(.cancelAction)
-                            .disabled(updater.isInstalling)
+                            .disabled(updater.phase == .installing)
 
                         Button(actionTitle(for: available)) { updater.install() }
                             .buttonStyle(OrePrimaryButtonStyle())

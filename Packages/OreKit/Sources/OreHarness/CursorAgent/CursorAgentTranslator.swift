@@ -185,9 +185,13 @@ struct CursorAgentTranslator {
             // Draft only: Cursor sends name/overview on start while still
             // writing. Advertising ready here is what flashed approval before
             // any plan body existed in the transcript.
-            emitPlanProposal(
-                from: toolInputs[toolCallID], turnID: turnID, ready: false, to: &output
-            )
+            // Read/Grep/Shell `content` is a file or command dump, not a plan —
+            // only CreatePlan / ExitPlanMode may publish the purple card.
+            if Self.isPlanTool(name) {
+                emitPlanProposal(
+                    from: toolInputs[toolCallID], turnID: turnID, ready: false, to: &output
+                )
+            }
         case "completed":
             let result = payload["result"]
             emitCall(result: result)
@@ -198,9 +202,11 @@ struct CursorAgentTranslator {
                     || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
-            emitPlanProposal(
-                from: toolInputs[toolCallID], turnID: turnID, ready: true, to: &output
-            )
+            if Self.isPlanTool(name) {
+                emitPlanProposal(
+                    from: toolInputs[toolCallID], turnID: turnID, ready: true, to: &output
+                )
+            }
             if didAdvertisePlanReady {
                 append(status: .awaitingInput, to: &output)
             } else {
@@ -218,9 +224,9 @@ struct CursorAgentTranslator {
         to output: inout Output
     ) {
         guard let input, let markdown = Self.planMarkdown(from: input) else { return }
-        let trimmed = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard PlanProposalPolicy.isReadyMarkdown(markdown) else { return }
         // Title/overview with no body is Cursor's CreatePlan-started placeholder.
+        // JSON debris (`}}`, wrapping args) is also not a body.
         guard PlanProposalPolicy.isReadyInput(input) else { return }
 
         let isReady = ready
@@ -325,14 +331,9 @@ struct CursorAgentTranslator {
     /// Cursor's CreatePlan args are `name` / `overview` / `plan` / `todos`,
     /// sometimes with the body on `streamContent` while it is still writing.
     static func planMarkdown(from input: JSONValue) -> String? {
-        let body = input["plan"]?.stringValue
-            ?? input["markdown"]?.stringValue
-            ?? input["content"]?.stringValue
-            ?? input["streamContent"]?.stringValue
-            ?? input["stream_content"]?.stringValue
+        let body = PlanProposalPolicy.planBody(from: input)
         if let body, body.contains("\n") || body.hasPrefix("#") {
-            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            return body
         }
 
         var sections: [String] = []
@@ -344,9 +345,7 @@ struct CursorAgentTranslator {
            !overview.isEmpty {
             sections.append(overview)
         }
-        if let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            sections.append(body)
-        }
+        if let body { sections.append(body) }
         let todos = input["todos"]?.arrayValue ?? input["steps"]?.arrayValue ?? []
         let items = todos.compactMap { item -> String? in
             let text = item["content"]?.stringValue
@@ -359,7 +358,8 @@ struct CursorAgentTranslator {
         if !items.isEmpty { sections.append(items.joined(separator: "\n")) }
         let markdown = sections.joined(separator: "\n\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return markdown.isEmpty ? nil : markdown
+        return PlanProposalPolicy.normalizedMarkdown(markdown)
+            ?? (PlanProposalPolicy.isReadyMarkdown(markdown) ? markdown : nil)
     }
 
     /// Maps Cursor's per-tool arg names onto the keys the UI's presentation
@@ -386,7 +386,12 @@ struct CursorAgentTranslator {
             dict["streamContent"] = .string(stream)
         }
         mergeDiffFields(from: result?["success"] ?? result, into: &dict)
-        mergePlanFields(from: result?["success"] ?? result, into: &dict)
+        // Plan tools only: for Read/Grep/Shell the result's `content` is a
+        // file or command dump, and merging it under plan keys is what let it
+        // masquerade as a proposal body downstream.
+        if isPlanTool(tool) {
+            mergePlanFields(from: result?["success"] ?? result, into: &dict)
+        }
 
         if let path = dict["path"]?.stringValue { dict["file_path"] = .string(path) }
         if let target = dict["targetDirectory"]?.stringValue ?? dict["target_directory"]?.stringValue {
@@ -661,9 +666,12 @@ struct CursorAgentTranslator {
                 )))
                 append(status: .runningTool, to: &output)
                 if Self.isPlanTool(name) {
-                    // One-shot tool_use inside an assistant message has no
-                    // started/completed pair; advertise ready if the body is here.
-                    emitPlanProposal(from: input, turnID: turnID, ready: true, to: &output)
+                    // One-shot tool_use inside a *final* assistant message has
+                    // no started/completed pair; advertise ready if the body is
+                    // here. A partial chunk (`timestamp_ms`) may carry a
+                    // truncated body mid-stream — that is a draft, promoted at
+                    // turn end if nothing fuller arrives.
+                    emitPlanProposal(from: input, turnID: turnID, ready: !isPartial, to: &output)
                 }
 
             default:

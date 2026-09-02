@@ -864,9 +864,12 @@ final class AppModel {
             // live session shows them.
             return nil
         case .plan:
+            guard let body = PlanProposalPolicy.normalizedMarkdown(block.text),
+                  PlanProposalPolicy.isReadyMarkdown(body)
+            else { return nil }
             return TranscriptRow(
                 id: block.id, turnID: turnID, kind: .plan,
-                text: block.text, isComplete: true, createdAt: block.createdAt
+                text: body, isComplete: true, createdAt: block.createdAt
             )
         case .permission, .question:
             // Both are resolved by the time history is read; replaying them
@@ -1057,8 +1060,11 @@ final class AppModel {
         narration.cancelPermissionPrompt(requestID)
         chat(for: resolvedChatID).resolvePermission(requestID)
         tabNeedsYou.removeAll {
-            if case .permission(let item) = $0, item.request.id == requestID { return true }
-            return false
+            switch $0 {
+            case .permission(let item): return item.request.id == requestID
+            case .plan(let item): return item.permissionRequestID == requestID
+            case .question: return false
+            }
         }
         Task { await client.send(.resolveChatPermission(id, resolvedChatID, requestID, decision)) }
     }
@@ -2914,6 +2920,10 @@ final class AppModel {
             assistantOwnsNarration = noteTabNeedsYou(.question(TabNeedsYou.Question(
                 workspaceID: workspaceID, chatID: chatID, question: question
             )))
+        case .planUpdated(let update):
+            assistantOwnsNarration = noteReadyPlan(
+                update, workspaceID: workspaceID, chatID: chatID
+            )
         default:
             assistantOwnsNarration = false
         }
@@ -2924,14 +2934,31 @@ final class AppModel {
         case .permissionResolved(let resolution):
             voiceAssistant.permissionResolved(resolution.id)
             tabNeedsYou.removeAll {
-                if case .permission(let item) = $0, item.request.id == resolution.id { return true }
+                switch $0 {
+                case .permission(let item): return item.request.id == resolution.id
+                case .plan(let item): return item.permissionRequestID == resolution.id
+                case .question: return false
+                }
+            }
+        case .toolCall(let call)
+            where PlanProposalPolicy.proceedsPastProposal(call.name):
+            tabNeedsYou.removeAll {
+                if case .plan(let item) = $0, item.chatID == chatID { return true }
+                return false
+            }
+        case .turnStarted:
+            tabNeedsYou.removeAll {
+                if case .plan(let item) = $0, item.chatID == chatID { return true }
                 return false
             }
         case .turnCompleted:
+            // Cursor's CreatePlan turn is already over when the plan is ready.
+            // Dropping plan needs-you here would hide the ask.
             tabNeedsYou.removeAll {
                 switch $0 {
                 case .permission(let item): return item.chatID == chatID
                 case .question(let item): return item.chatID == chatID
+                case .plan: return false
                 }
             }
         default:
@@ -2960,6 +2987,16 @@ final class AppModel {
                 category: NotificationCategory.agentQuestion,
                 extraInfo: ["questionID": question.id.rawValue]
             )
+        case .planUpdated(let update):
+            if case .proposal(let markdown, _) = update.content, update.isReady,
+               PlanProposalPolicy.isReadyMarkdown(markdown) {
+                postNotification(
+                    title: "ORE needs you",
+                    body: place + " has a plan ready.",
+                    workspaceID: workspaceID,
+                    chatID: chatID
+                )
+            }
         case .turnCompleted where UserDefaults.standard.object(forKey: "ore.notifications.turnComplete") as? Bool ?? true:
             postNotification(
                 title: "Agent finished",
@@ -2974,20 +3011,111 @@ final class AppModel {
 
     @discardableResult
     private func noteTabNeedsYou(_ item: TabNeedsYou) -> Bool {
+        let replacing = tabNeedsYou.contains { $0.id == item.id }
         tabNeedsYou.removeAll { $0.id == item.id }
         tabNeedsYou.append(item)
+        // Same id (Claude linking a permission onto an already-ready plan)
+        // must not speak again. Returning true still owns narration so the
+        // engine's PlanReadinessGate is not the only thing preventing a
+        // second "the plan is ready".
+        if replacing { return true }
         let spokenByAssistant = voiceAssistant.needsYouArrived(item)
         informAssistantOfNeedsYou(item)
         return spokenByAssistant
+    }
+
+    /// Ready plans only. Drafts (`isReady: false`) and JSON debris stay off
+    /// this list so the HUD cannot ask for approval of `}}`.
+    @discardableResult
+    private func noteReadyPlan(
+        _ update: PlanUpdate,
+        workspaceID: WorkspaceID,
+        chatID: ChatID
+    ) -> Bool {
+        guard case .proposal(let markdown, let requestID) = update.content else { return false }
+        guard let body = PlanProposalPolicy.normalizedMarkdown(markdown),
+              update.isReady, PlanProposalPolicy.isReadyMarkdown(body)
+        else { return false }
+        return noteTabNeedsYou(.plan(TabNeedsYou.Plan(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            turnID: update.turnID,
+            markdown: body,
+            permissionRequestID: requestID
+        )))
+    }
+
+    /// Approve or reject a ready plan from any surface (transcript card, HUD,
+    /// menu bar, voice). Cursor has no permission id — those follow-ups are
+    /// a new user turn. Claude's ExitPlanMode is the linked permission.
+    func respondToPlan(
+        chatID: ChatID,
+        workspaceID: WorkspaceID,
+        approve: Bool,
+        feedback: String = ""
+    ) {
+        let chat = chat(for: chatID)
+        let requestID: PermissionRequestID?
+        if case .proposal(_, let id) = chat.plan {
+            requestID = id
+        } else if let item = tabNeedsYou.compactMap({
+            if case .plan(let plan) = $0, plan.chatID == chatID { return plan }
+            return nil
+        }).last {
+            requestID = item.permissionRequestID
+        } else {
+            requestID = nil
+        }
+        chat.dismissPlan()
+        tabNeedsYou.removeAll {
+            if case .plan(let item) = $0, item.chatID == chatID { return true }
+            return false
+        }
+        let note = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let requestID {
+            resolvePermission(
+                requestID,
+                decision: approve
+                    ? .allow
+                    : .deny(reason: note.isEmpty ? "Revise the plan." : note),
+                for: workspaceID,
+                chatID: chatID
+            )
+            if approve { setPermissionMode(.default, for: workspaceID) }
+            if approve, !note.isEmpty { send(note, to: workspaceID, chatID: chatID) }
+            return
+        }
+        if approve { setPermissionMode(.default, for: workspaceID) }
+        if approve {
+            send(
+                note.isEmpty ? "The user approved the plan. Implement it." : note,
+                to: workspaceID,
+                chatID: chatID
+            )
+        } else {
+            send(
+                note.isEmpty
+                    ? "The user rejected the plan. Revise it."
+                    : "The user rejected the plan: \(note)",
+                to: workspaceID,
+                chatID: chatID
+            )
+        }
     }
 
     /// Immediate, unlike the watch digest: the assistant may offer auto-allow
     /// but must not duplicate the HUD confirmation.
     private func informAssistantOfNeedsYou(_ item: TabNeedsYou) {
         guard proactiveWatchEnabled, let assistant = assistantWorkspace else { return }
+        // Named, so the assistant can say "kailash" rather than inheriting the
+        // anonymous "a tab" this notice used to hand it — it has no other way
+        // to know where the ask came from, and it speaks what it is given.
+        let ask = spokenPlace(for: item).map {
+            NarrationPhraser.prefixed(item.spokenSummary, place: $0)
+        } ?? item.spokenSummary
         send(
             """
-            [ORE needs you] \(item.spokenSummary)
+            [ORE needs you] \(ask)
             The user is being asked via the HUD / a notification. Do not call \
             ResolveChatPermission or AnswerChatQuestion unless they tell you \
             to in this conversation. You MAY offer auto-allow for this tab.
@@ -3059,6 +3187,16 @@ final class AppModel {
         }
         guard activeChatIDs[workspaceID] != chatID else { return .foreground }
         return .otherTab(chatTitle: title ?? "")
+    }
+
+    /// How to name a blocked tab out loud, or nil when it's the tab on screen.
+    ///
+    /// The same origin the ambient narration uses, so "kailash" is "kailash" in
+    /// both — a spoken permission prompt naming the place differently from the
+    /// line before it is the kind of seam a listener hears even when they
+    /// can't say what changed.
+    func spokenPlace(for item: TabNeedsYou) -> String? {
+        narrationOrigin(workspaceID: item.workspaceID, chatID: item.chatID).spokenLabel
     }
 
     /// Drops everything keyed by a chat that no longer exists.

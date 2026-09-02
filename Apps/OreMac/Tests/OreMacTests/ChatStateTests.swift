@@ -217,6 +217,41 @@ struct ChatStateTests {
         #expect(!state.rows.contains { $0.kind == .plan })
     }
 
+    @Test func jsonDebrisDoesNotBecomeAPlanRow() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: "}}\n", permissionRequestID: nil),
+            isReady: true
+        )))
+        #expect(state.plan == nil)
+        #expect(!state.rows.contains { $0.kind == .plan })
+    }
+
+    @Test func aJSONEnvelopePlanShowsTheInnerMarkdown() {
+        let state = ChatState()
+        let turnID = TurnID(rawValue: "t1")
+        let envelope = """
+        {"name":"Fix freeze","plan":"# Cause\\nThe update loop.\\n\\n# Fix\\nProfile, then batch."}
+        """
+        state.apply(.turnStarted(TurnStarted(turnID: turnID)))
+        state.apply(.planUpdated(PlanUpdate(
+            turnID: turnID,
+            content: .proposal(markdown: envelope, permissionRequestID: nil),
+            isReady: true
+        )))
+        guard case .proposal(let markdown, _) = state.plan else {
+            Issue.record("expected the unwrapped plan")
+            return
+        }
+        #expect(markdown.contains("update loop"))
+        #expect(!markdown.hasPrefix("}"))
+        #expect(!markdown.hasPrefix("{"))
+        #expect(state.rows.last { $0.kind == .plan }?.text.contains("Profile") == true)
+    }
+
     @Test func duplicateReadyPlansDoNotDuplicateTheRow() {
         let state = ChatState()
         let turnID = TurnID(rawValue: "t1")
@@ -446,6 +481,34 @@ struct TranscriptDisplayTests {
             from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
         )
         #expect(shown.contains { $0.kind == .plan })
+    }
+
+    @Test func jsonDebrisPlanRowsAreDroppedFromDisplay() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "plan", turnID: turn, kind: .plan, text: "}}\n"),
+        ]
+        let shown = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(!shown.contains { $0.kind == .plan })
+    }
+
+    @Test func aJSONEnvelopePlanRowShowsTheInnerMarkdown() {
+        let turn = TurnID(rawValue: "t1")
+        let envelope = """
+        {"plan":"# Cause\\nThe update loop.\\n# Fix\\nProfile."}
+        """
+        let rows = [
+            TranscriptRow(id: "plan", turnID: turn, kind: .plan, text: envelope),
+        ]
+        let shown = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        let plan = shown.first { $0.kind == .plan }
+        #expect(plan?.text.contains("update loop") == true)
+        #expect(plan?.text.hasPrefix("{") != true)
+        #expect(plan?.text.hasPrefix("}") != true)
     }
 
     @Test func aToolCallRemembersARunningLabel() {

@@ -25,6 +25,34 @@ struct CodexTranslatorTests {
         #expect(started.first?.harnessVersion != nil)
     }
 
+    @Test func aWhitespaceOnlyPlanItemIsDropped() {
+        // A completed plan item with no readable body must not advertise
+        // "plan ready" — whitespace and JSON debris are not a plan.
+        let events = CodexTranscriptReplay.events(transcript: """
+        {"method":"item/completed","params":{"item":{"type":"plan","id":"item_1","text":"  \\n  "}}}
+        {"method":"item/completed","params":{"item":{"type":"plan","id":"item_2","text":"}}"}}}
+        """)
+        #expect(!events.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
+    @Test func aCompletedPlanItemIsReadyExactlyOnce() {
+        let events = CodexTranscriptReplay.events(transcript: """
+        {"method":"item/started","params":{"item":{"type":"plan","id":"item_1","text":"## Steps\\n1. Draft"}}}
+        {"method":"item/completed","params":{"item":{"type":"plan","id":"item_1","text":"## Steps\\n1. Do the thing"}}}
+        """)
+        let plans = events.compactMap { event -> PlanUpdate? in
+            if case .planUpdated(let update) = event { return update }
+            return nil
+        }
+        #expect(plans.count == 1)
+        #expect(plans.first?.isReady == true)
+        guard case .proposal(let markdown, _)? = plans.first?.content else {
+            Issue.record("expected a plan proposal")
+            return
+        }
+        #expect(markdown.contains("Do the thing"))
+    }
+
     @Test func streamedTextIsDeliveredAsDeltasThenOneCompletedBlock() {
         let events = CodexTranscriptReplay.events(
             transcript: Fixtures.load("codex-simple-text")

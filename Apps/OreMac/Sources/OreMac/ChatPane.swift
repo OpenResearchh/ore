@@ -401,48 +401,20 @@ struct ChatPane: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            if case .proposal(let markdown, let requestID) = chat.plan {
+            if case .proposal(let markdown, let requestID) = chat.plan,
+               let planChatID = chatSummary?.id {
                 PlanApprovalCard(markdown: markdown, onHandoff: {
                     model.handoffPlan(markdown, in: workspace.id)
                 }) { feedback in
-                    // Dismiss first, and unconditionally. The card used to
-                    // linger until a `permissionResolved` that a proposal
-                    // without a request id never sends — which is why a second
-                    // proposal left two cards and answering one kept the other.
-                    chat.dismissPlan()
-                    if let requestID {
-                        model.resolvePermission(requestID, decision: .allow, for: workspace.id)
-                    }
-                    model.setPermissionMode(.default, for: workspace.id)
-                    let followUp = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !followUp.isEmpty {
-                        model.send(followUp, to: workspace.id)
-                    } else if requestID == nil {
-                        // Cursor has no permission callback: the CreatePlan
-                        // turn already exited. Approving has to start the next
-                        // one or the agent waits for a typed "continue".
-                        model.send(
-                            "The user approved the plan. Implement it.",
-                            to: workspace.id
-                        )
-                    }
+                    model.respondToPlan(
+                        chatID: planChatID, workspaceID: workspace.id,
+                        approve: true, feedback: feedback
+                    )
                 } onReject: { feedback in
-                    chat.dismissPlan()
-                    if let requestID {
-                        model.resolvePermission(
-                            requestID,
-                            decision: .deny(reason: feedback.isEmpty ? "Revise the plan." : feedback),
-                            for: workspace.id
-                        )
-                    } else {
-                        let reason = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
-                        model.send(
-                            reason.isEmpty
-                                ? "The user rejected the plan. Revise it."
-                                : "The user rejected the plan: \(reason)",
-                            to: workspace.id
-                        )
-                    }
+                    model.respondToPlan(
+                        chatID: planChatID, workspaceID: workspace.id,
+                        approve: false, feedback: feedback
+                    )
                 }
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .padding(.horizontal, OreTheme.Space.md)
@@ -4314,8 +4286,9 @@ private struct PlanApprovalCard: View {
                     .font(.system(size: OreTheme.Font.prose))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxHeight: 280)
+            .frame(maxHeight: 480)
             TextField("Optional feedback…", text: $feedback)
                 .onSubmit { onApprove(feedback) }
             HStack {
@@ -4347,10 +4320,26 @@ private struct PlanApprovalCard: View {
             }
         }
         .oreCard(padding: 12)
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
+                .fill(Color.purple.opacity(0.08))
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var displayMarkdown: String {
+        PlanProposalPolicy.normalizedMarkdown(markdown) ?? ""
     }
 
     private var planBody: AttributedString {
-        (try? AttributedString(markdown: markdown)) ?? AttributedString(markdown)
+        let source = displayMarkdown
+        guard !source.isEmpty else { return AttributedString("Plan body is still being written.") }
+        let rendered = MarkdownRenderer(
+            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
+            textColor: .labelColor,
+            highlighter: SyntaxHighlighter.shared
+        ).render(source, highlighting: .all)
+        return AttributedString(rendered)
     }
 }
 

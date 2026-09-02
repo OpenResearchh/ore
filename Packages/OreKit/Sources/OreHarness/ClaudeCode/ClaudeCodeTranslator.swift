@@ -299,7 +299,7 @@ struct ClaudeCodeTranslator {
                 )))
                 appendSemanticEvents(
                     tool: name, toolCallID: toolCallID, input: input,
-                    turnID: turnID, to: &output
+                    turnID: turnID, parent: parent, to: &output
                 )
                 // AskUserQuestion is a prompt, not work in flight — leaving
                 // `.runningTool` on top of `.awaitingInput` hid the card.
@@ -328,16 +328,21 @@ struct ClaudeCodeTranslator {
         toolCallID: ToolCallID,
         input: JSONValue,
         turnID: TurnID,
+        parent: ToolCallID?,
         to output: inout Output
     ) {
         switch tool {
         case "ExitPlanMode", "CreatePlan":
-            let plan = input["plan"]?.stringValue
-                ?? input["markdown"]?.stringValue
-                ?? ""
+            let plan = PlanProposalPolicy.planBody(from: input) ?? ""
             // Held so the permission request that gates this plan can be
             // republished with the plan attached — see `handleControlRequest`.
             pendingPlanProposals[toolCallID] = plan
+            // A subagent's plan tool is its own business — publishing it here
+            // would raise the main chat's approval card for a plan the user
+            // was never meant to approve. (The gated path still works: if the
+            // CLI actually blocks on a permission, `handleControlRequest`
+            // republishes the stored plan with the request attached.)
+            guard parent == nil else { break }
             guard PlanProposalPolicy.isReadyMarkdown(plan) else { break }
             output.events.append(.planUpdated(PlanUpdate(
                 turnID: turnID,
@@ -346,6 +351,8 @@ struct ClaudeCodeTranslator {
             )))
 
         case "TodoWrite":
+            // A subagent's checklist must not overwrite the main chat's.
+            guard parent == nil else { break }
             guard let todos = input["todos"]?.arrayValue else { break }
             let items = todos.compactMap { entry -> TodoItem? in
                 guard let text = entry["content"]?.stringValue else { return nil }

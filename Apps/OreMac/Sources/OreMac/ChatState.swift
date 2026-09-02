@@ -237,22 +237,24 @@ final class ChatState {
 
         case .planUpdated(let update):
             if case .proposal(let markdown, let requestID) = update.content {
-                let trimmed = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    upsertPlanRow(
-                        turnID: update.turnID, markdown: markdown, requestID: requestID
-                    )
-                }
+                // `?? markdown` used to put `}}` and Read-tool file dumps on
+                // the purple row when unwrap failed. Debris is not a draft.
+                guard let body = PlanProposalPolicy.normalizedMarkdown(markdown),
+                      PlanProposalPolicy.isReadyMarkdown(body)
+                else { break }
+                upsertPlanRow(
+                    turnID: update.turnID, markdown: body, requestID: requestID
+                )
                 // Drafts belong in the transcript so "read the plan" has
                 // something to find; they are not approval-ready.
-                guard update.isReady, PlanProposalPolicy.isReadyMarkdown(markdown) else { break }
+                guard update.isReady else { break }
                 let alreadyProceeded = rows.contains { row in
                     row.turnID == update.turnID
                         && row.kind == .toolCall
                         && PlanProposalPolicy.proceedsPastProposal(row.toolName ?? "")
                 }
                 guard !alreadyProceeded else { break }
-                plan = update.content
+                plan = .proposal(markdown: body, permissionRequestID: requestID)
                 planTurnID = update.turnID
                 status = .awaitingInput
             } else if case .proposal = plan {

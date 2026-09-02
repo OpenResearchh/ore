@@ -166,6 +166,8 @@ struct MenuBarDashboard: View {
                         permissionCard(item)
                     case .question(let payload):
                         questionCard(item, payload: payload)
+                    case .plan(let payload):
+                        planCard(item, payload: payload)
                     }
                 }
                 .padding(OreTheme.Space.sm)
@@ -177,7 +179,10 @@ struct MenuBarDashboard: View {
 
     private func permissionCard(_ item: TabNeedsYou) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(item.spokenSummary)
+            // `headline`, not `spokenSummary`: this card is read, and it sits
+            // above an Allow button where the tool and its argument are the
+            // whole point — see the note on both properties.
+            Text(item.headline)
                 .font(.system(size: OreTheme.Font.caption, weight: .medium))
                 .lineLimit(2)
             HStack(spacing: OreTheme.Space.sm) {
@@ -224,6 +229,34 @@ struct MenuBarDashboard: View {
                     .buttonStyle(.plain)
                     .disabled(questionText(for: item.id).isEmpty)
                 }
+            }
+        }
+    }
+
+    private func planCard(_ item: TabNeedsYou, payload: TabNeedsYou.Plan) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(item.headline)
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .lineLimit(3)
+            HStack(spacing: OreTheme.Space.sm) {
+                Button("Reject") {
+                    model.respondToPlan(
+                        chatID: payload.chatID,
+                        workspaceID: payload.workspaceID,
+                        approve: false
+                    )
+                }
+                .controlSize(.small)
+                Spacer()
+                Button("Approve") {
+                    model.respondToPlan(
+                        chatID: payload.chatID,
+                        workspaceID: payload.workspaceID,
+                        approve: true
+                    )
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
             }
         }
     }

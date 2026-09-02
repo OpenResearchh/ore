@@ -473,6 +473,11 @@ final class VoiceAssistantController {
                     resolveQuestionNeed(needs, answer: answer)
                     return
                 }
+            case .plan(let payload):
+                if let decision = Self.confirmationDecision(from: spoken) {
+                    resolvePlanNeed(payload, decision: decision, spoken: spoken)
+                    return
+                }
             }
         }
 
@@ -591,8 +596,7 @@ final class VoiceAssistantController {
         guard awaitingSpokenReply || recentVoice else { return }
         if VoiceSpeechPolicy.shouldSpeakPrompts(quiet: quietMode) {
             model.narration.speakAssistant(
-                "Quick check — \(confirmation.summary). Yes to allow it for this "
-                    + "task, or no.",
+                NarrationPhraser.confirmationAsk(confirmation.summary),
                 chatID: chatID
             )
             phase = .speaking
@@ -641,9 +645,15 @@ final class VoiceAssistantController {
         lastVoiceInteraction = Date()
         activeNeedsYouID = item.id
         if VoiceSpeechPolicy.shouldSpeakPrompts(quiet: quietMode) {
+            // The assistant's limit, not the ambient one. A question carrying
+            // several options runs past 280 characters easily, and at the
+            // ambient cap `spokenNarration` replaced the tail of the option
+            // list with "there's more in the Assistant window" — cutting off
+            // the choices in the middle of reading them out.
             model.narration.speakAssistant(
-                item.spokenPrompt,
+                item.spokenPrompt(place: model.spokenPlace(for: item)),
                 chatID: chatID,
+                limit: NarrationPolicy.assistantAnswerLimit,
                 kind: item.narrationKind
             )
             phase = .speaking
@@ -766,6 +776,8 @@ final class VoiceAssistantController {
             openPermissionWindow(for: item)
         case .question(let payload):
             openQuestionWindow(for: item, question: payload.question)
+        case .plan(let payload):
+            openPlanWindow(for: item, payload: payload)
         }
     }
 
@@ -848,6 +860,72 @@ final class VoiceAssistantController {
         }
     }
 
+    private func openPlanWindow(for item: TabNeedsYou, payload: TabNeedsYou.Plan) {
+        guard let model else { return }
+        answerPlaceholder = "Yes to approve, or no to reject"
+        voice.vocabulary = ["yes", "no", "approve", "reject"]
+        phase = .answering
+        playMicChime()
+        model.narration.setMicActive(true)
+        voice.start()
+
+        answerWindowTask?.cancel()
+        answerWindowTask = Task { @MainActor [weak self] in
+            let deadline = ContinuousClock.now.advanced(by: Self.answerWindow)
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, self.phase == .answering, let model = self.model else { return }
+                guard model.tabNeedsYou.contains(where: { $0.id == item.id }) else {
+                    self.closeAnswerWindow()
+                    return
+                }
+                guard Self.confirmationDecision(from: self.voice.transcript) != nil else {
+                    continue
+                }
+                try? await Task.sleep(for: .milliseconds(700))
+                guard !Task.isCancelled, self.phase == .answering else { return }
+                let settled = Self.confirmationDecision(from: self.voice.transcript)
+                self.closeAnswerWindow()
+                guard let settled else { return }
+                self.lastVoiceInteraction = Date()
+                self.resolvePlanNeed(payload, decision: settled, spoken: self.voice.transcript)
+                return
+            }
+            self?.closeAnswerWindow()
+        }
+    }
+
+    private func resolvePlanNeed(
+        _ payload: TabNeedsYou.Plan,
+        decision: AssistantConfirmationDecision,
+        spoken: String
+    ) {
+        guard let model else { return }
+        activeNeedsYouID = nil
+        phase = .idle
+        let approve: Bool
+        switch decision {
+        case .allow: approve = true
+        case .deny: approve = false
+        }
+        let feedback: String
+        if case .deny = decision {
+            let stripped = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+            feedback = Self.confirmationDecision(from: stripped) != nil ? "" : stripped
+        } else {
+            feedback = ""
+        }
+        model.respondToPlan(
+            chatID: payload.chatID,
+            workspaceID: payload.workspaceID,
+            approve: approve,
+            feedback: feedback
+        )
+        if let chatID = model.assistantChatID {
+            acknowledge(approve ? "Okay, going ahead." : "Okay, I'll send that back.", chatID: chatID)
+        }
+    }
+
     private func resolvePermissionNeed(
         _ item: TabNeedsYou,
         decision: AssistantConfirmationDecision
@@ -873,7 +951,7 @@ final class VoiceAssistantController {
                 decision: .deny(reason: "The user denied this by voice."),
                 for: payload.workspaceID, chatID: payload.chatID
             )
-        case (.question, _):
+        case (.question, _), (.plan, _):
             return
         }
         if let chatID = model.assistantChatID {

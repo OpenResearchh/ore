@@ -1770,7 +1770,7 @@ final class TranscriptCell: NSTableCellView {
 
         let rendered: NSAttributedString
         switch row.kind {
-        case .assistantText, .plan:
+        case .assistantText:
             // swift-markdown accepts incomplete CommonMark, so the answer can
             // grow as a structured document: headings, lists, and fenced code
             // settle progressively instead of flashing from raw source to rich
@@ -1780,6 +1780,14 @@ final class TranscriptCell: NSTableCellView {
                 textColor: textColor(for: row),
                 highlighter: SyntaxHighlighter.shared
             ).render(row.text, highlighting: row.isComplete ? .all : .stablePrefix)
+
+        case .plan:
+            let source = PlanProposalPolicy.normalizedMarkdown(row.text) ?? ""
+            rendered = MarkdownRenderer(
+                baseFont: font(for: row),
+                textColor: textColor(for: row),
+                highlighter: SyntaxHighlighter.shared
+            ).render(source, highlighting: row.isComplete ? .all : .stablePrefix)
 
         case .toolCall, .thinking, .error:
             rendered = processText(for: row, worktreePath: worktreePath)
@@ -1886,6 +1894,9 @@ final class TranscriptCell: NSTableCellView {
     }
 
     static func copyableText(for row: TranscriptRow) -> String {
+        if row.kind == .plan {
+            return PlanProposalPolicy.normalizedMarkdown(row.text) ?? ""
+        }
         guard !row.attachments.isEmpty else { return row.text }
         let names = row.attachments.map { "@\($0.displayName)" }.joined(separator: "  ")
         if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return names }

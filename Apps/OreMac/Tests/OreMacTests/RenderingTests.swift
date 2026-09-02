@@ -264,6 +264,30 @@ struct MarkdownRendererTests {
         #expect(font?.isFixedPitch == false)
         #expect(font.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } == true)
     }
+
+    @Test func aPlanEnvelopeRendersTheInnerMarkdownNotTheBraces() {
+        let row = TranscriptRow(
+            id: "plan",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .plan,
+            text: "{\"plan\":\"# Cause\\nThe update loop.\\n# Fix\\nProfile.\"}"
+        )
+        let result = TranscriptCell.attributedText(for: row)
+        #expect(result.string.contains("update loop"))
+        #expect(result.string.contains("Profile"))
+        #expect(!result.string.hasPrefix("}"))
+        #expect(!result.string.hasPrefix("{"))
+        #expect(TranscriptCell.copyableText(for: row).contains("update loop"))
+        #expect(!TranscriptCell.copyableText(for: row).hasPrefix("{"))
+    }
+
+    @Test func jsonDebrisDoesNotRenderAsAPlan() {
+        let row = TranscriptRow(
+            id: "plan", turnID: TurnID(rawValue: "t1"), kind: .plan, text: "}}\n"
+        )
+        let result = TranscriptCell.attributedText(for: row)
+        #expect(!result.string.contains("}"))
+    }
 }
 
 @MainActor

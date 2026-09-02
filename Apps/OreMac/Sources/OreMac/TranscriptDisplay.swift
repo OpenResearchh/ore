@@ -291,8 +291,14 @@ enum TranscriptDisplay {
         expanded: Set<String>,
         hidingPlanTurnID: TurnID?
     ) -> TranscriptRow? {
-        if source.kind == .plan, source.turnID == hidingPlanTurnID {
-            return nil
+        if source.kind == .plan {
+            guard let body = PlanProposalPolicy.normalizedMarkdown(source.text),
+                  PlanProposalPolicy.isReadyMarkdown(body)
+            else { return nil }
+            if source.turnID == hidingPlanTurnID { return nil }
+            var row = source
+            row.text = body
+            return row
         }
         if source.kind == .error, !isMeaningfulError(source.text, result: source.resultText) {
             return nil

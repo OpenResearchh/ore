@@ -549,6 +549,87 @@ struct CoreClientTests {
         await client.shutdown()
     }
 
+    @Test func ensureAssistantIsIdempotentAndRecoversAMisTaggedHome() async throws {
+        let fixture = try await GitFixture.initialized()
+        let databasePath = fixture.root.appendingPathComponent("ore.sqlite")
+        let store = try OreStore(path: databasePath)
+
+        let first = try #require(try await AssistantManager.ensureAssistant(store: store))
+        let second = try #require(try await AssistantManager.ensureAssistant(store: store))
+        #expect(first.workspaceID == second.workspaceID)
+        #expect(try await store.chats(workspaceID: first.workspaceID).count == 1)
+        #expect(try await store.workspaces(includeArchived: true, includeAssistant: true).count == 1)
+
+        _ = try await store.updateWorkspace(first.workspaceID) {
+            $0.kind = WorkspaceKind.standard.rawValue
+        }
+        #expect(try await store.assistantWorkspace() == nil)
+
+        let recovered = try #require(try await AssistantManager.ensureAssistant(store: store))
+        #expect(recovered.workspaceID == first.workspaceID)
+        #expect(recovered.workspaceKind == .assistant)
+        #expect(try await store.chats(workspaceID: recovered.workspaceID).count == 1)
+        #expect(try await store.workspaces(includeArchived: true, includeAssistant: true).count == 1)
+        #expect(try await store.assistantWorkspace()?.workspaceID == first.workspaceID)
+    }
+
+    @Test func restartingTheCoreReusesTheAssistantAndDoesNotMintProjects() async throws {
+        let fixture = try await GitFixture.initialized()
+        let databasePath = fixture.root.appendingPathComponent("ore.sqlite")
+        let firstStore = try OreStore(path: databasePath)
+
+        let first = InProcessCoreClient(
+            store: firstStore,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let firstRecorder = CoreEventRecorder(first)
+        try await first.start()
+        await first.send(.addRepository(path: fixture.repository.path))
+        await first.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "persistent"
+        )))
+        _ = await firstRecorder.waitFor {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }
+
+        let assistantID = try #require(try await firstStore.assistantWorkspace()).workspaceID
+        let assistantChatIDs = try await firstStore.chats(workspaceID: assistantID).map(\.id)
+        let userWorkspaceIDs = try await firstStore.workspaces().map(\.id)
+        #expect(assistantChatIDs.count == 1)
+        #expect(userWorkspaceIDs.count == 1)
+        await first.shutdown()
+
+        let store = try OreStore(path: databasePath)
+        let second = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let secondRecorder = CoreEventRecorder(second)
+        try await second.start()
+
+        let assistantAfter = try #require(try await store.assistantWorkspace())
+        #expect(assistantAfter.workspaceID == assistantID)
+        #expect(try await store.chats(workspaceID: assistantAfter.workspaceID).map(\.id)
+            == assistantChatIDs)
+        #expect(try await store.workspaces().map(\.id) == userWorkspaceIDs)
+        #expect(try await store.workspaces(includeArchived: true, includeAssistant: true).count == 2)
+
+        await second.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "second-project"
+        )))
+        _ = await secondRecorder.waitFor {
+            if case .workspaceAdded(let summary) = $0 { return summary.name == "second-project" }
+            return false
+        }
+        #expect(try await store.workspaces().count == 2)
+        #expect(try await store.assistantWorkspace()?.workspaceID == assistantID)
+
+        await second.shutdown()
+    }
+
     @Test func startupDownshiftsOnlyTheAssistantToTheLeanHarnessProfile() async throws {
         let fixture = try await GitFixture.initialized()
         let databasePath = fixture.root.appendingPathComponent("ore.sqlite")

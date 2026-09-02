@@ -182,6 +182,13 @@ struct CursorTranslatorTests {
         #expect(!all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
     }
 
+    @Test func createPlanStartedWithJSONPunctuationIsNotAPlan() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze"},"streamContent":"}}"}}}"#,
+        ])
+        #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
     @Test func createPlanStartedWithABodyIsADraftUntilCompleted() {
         let all = events([
             #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"plan":"Cause: the update loop.\nFix: profile."}}}}"#,
@@ -220,6 +227,95 @@ struct CursorTranslatorTests {
             #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{},"result":{"success":{}}}}}"#,
         ])
         #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
+    @Test func aReadToolFileBodyIsNotAPlanProposal() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"readToolCall":{"args":{"path":"/tmp/RenderingTests.swift"}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"readToolCall":{"args":{"path":"/tmp/RenderingTests.swift"},"result":{"success":{"content":"guard let x = y else { return }\n    let location = 1\n"}}}}}"#,
+        ])
+        #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+        let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
+        #expect(calls.contains { $0.name == "Read" })
+    }
+
+    @Test func createPlanStreamedJSONEnvelopeUnwrapsToThePlan() {
+        let started =
+            #"{"type":"tool_call","subtype":"started","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze"},"streamContent":""#
+            + #"{\"plan\":\"Cause: the update loop.\\nFix: profile.\"}"#
+            + #""}}}"#
+        let completed =
+            #"{"type":"tool_call","subtype":"completed","call_id":"p1","tool_call":{"createPlanToolCall":{"args":{"name":"Fix freeze"},"result":{"success":{"plan":"Cause: the update loop.\nFix: profile."}}}}}"#
+        let all = events([started, completed])
+        let plans = all.compactMap { event -> (String, Bool)? in
+            if case .planUpdated(let update) = event,
+               case .proposal(let markdown, _) = update.content {
+                return (markdown, update.isReady)
+            }
+            return nil
+        }
+        #expect(!plans.isEmpty)
+        #expect(plans.contains { $0.0.contains("update loop") && !$0.0.hasPrefix("}") })
+        #expect(plans.last?.1 == true)
+        #expect(plans.last?.0.contains("profile") == true)
+    }
+
+    @Test func todoWriteIsNotAPlanProposal() {
+        // Cursor agents often open a turn by writing their checklist. That is
+        // not a plan to approve — advertising it raised "plan ready" while the
+        // agent was only getting started.
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"t1","tool_call":{"todoWriteToolCall":{"args":{"todos":[{"content":"Investigate the bug"},{"content":"Fix it"}]}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"t1","tool_call":{"todoWriteToolCall":{"args":{"todos":[{"content":"Investigate the bug"},{"content":"Fix it"}]},"result":{"success":{}}}}}"#,
+        ])
+        #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+        #expect(!all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func aResultWithStrayBracesIsNotAPlanNorNeedsYou() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"g1","tool_call":{"grepToolCall":{"args":{"query":"plan"}}}}"#,
+            #"{"type":"tool_call","subtype":"completed","call_id":"g1","tool_call":{"grepToolCall":{"args":{"query":"plan"},"result":{"success":{"content":"}\n}\n{\"key\": 1}\n"}}}}}"#,
+        ])
+        #expect(!all.contains { if case .planUpdated = $0 { return true }; return false })
+        #expect(!all.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func anEditStreamIsNeverPromotedToAPlanAtProcessExit() {
+        // A turn that only ever streamed an edit body must not have that body
+        // promoted to a ready plan when the process exits.
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        _ = translator.translate(line:
+            #"{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"editToolCall":{"args":{"path":"/tmp/x.txt"},"streamContent":"let x = 1\nlet y = 2\n"}}}"#
+        )
+        let closed = translator.closeTurn(exitCode: 0)
+        #expect(!closed.events.contains { if case .planUpdated = $0 { return true }; return false })
+        #expect(!closed.events.contains { if case .statusChanged(.awaitingInput) = $0 { return true }; return false })
+    }
+
+    @Test func aPartialAssistantEmbeddedPlanIsADraftUntilTheTurnEnds() {
+        // A partial assistant chunk (`timestamp_ms`) can carry a tool_call
+        // block whose args are still streaming — a truncated body advertised
+        // ready would flash approval mid-write and never be corrected, since
+        // later chunks of the same call id are deduplicated.
+        var translator = CursorAgentTranslator(sessionID: SessionID.generate())
+        let partial = translator.translate(line:
+            #"{"type":"assistant","message":{"content":[{"type":"tool_call","id":"p9","name":"CreatePlan","arguments":{"plan":"Cause: the update loop.\nFix: prof"}}]},"timestamp_ms":1}"#
+        )
+        #expect(partial.events.contains {
+            if case .planUpdated(let update) = $0 { return !update.isReady }
+            return false
+        })
+        #expect(!partial.events.contains {
+            if case .planUpdated(let update) = $0 { return update.isReady }
+            return false
+        })
+        let closed = translator.closeTurn(exitCode: 0)
+        let ready = closed.events.compactMap { event -> Bool? in
+            if case .planUpdated(let update) = event { return update.isReady }
+            return nil
+        }
+        #expect(ready == [true])
     }
 
     @Test func aPlanStartedThenProcessExitPromotesReadiness() {

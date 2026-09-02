@@ -2013,12 +2013,13 @@ public actor WorkspaceEngine {
 
         case .planUpdated(let update):
             if case .proposal(let markdown, let requestID) = update.content,
+               let body = PlanProposalPolicy.normalizedMarkdown(markdown),
                update.isReady,
-               PlanProposalPolicy.isReadyMarkdown(markdown),
+               PlanProposalPolicy.isReadyMarkdown(body),
                !runtime.turnDidMutate {
                 runtime.pendingPlan = ChatRuntime.PendingPlan(
                     turnID: update.turnID,
-                    markdown: markdown,
+                    markdown: body,
                     permissionRequestID: requestID
                 )
                 setStatus(.awaitingInput, runtime: runtime)

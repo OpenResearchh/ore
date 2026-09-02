@@ -387,7 +387,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateWorkspace",
-                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. Runs without confirmation unless another worktree on that repository already has uncommitted files — then the user is asked first. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults. Use this for a new branch/worktree, not for a new tab on an existing worktree (that is CreateChat).",
+                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. If that repository already has a project worktree and you omit seed (or pass seed=default), ORE reuses the existing worktree instead of forking — a restarted session is not a new project. Pass seed=branch, seed=pr, or seed=issue when the user asked for isolation or a new worktree. Forking beside a dirty sibling asks the user first. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults. Use this for a new branch/worktree, not for a new tab on an existing worktree (that is CreateChat).",
                 "inputSchema": [
                     "type": "object",
                     "properties": [

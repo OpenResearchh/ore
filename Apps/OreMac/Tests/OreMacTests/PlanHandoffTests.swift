@@ -16,4 +16,15 @@ struct PlanHandoffTests {
     @Test func alreadyTrimmedMarkdownStillGetsATrailingNewline() {
         #expect(PlanHandoff.composerDraft(from: "Ship it") == "Ship it\n")
     }
+
+    @Test func aJSONEnvelopeHandsOffTheInnerPlan() {
+        let envelope = """
+        {"name":"Fix freeze","plan":"## Steps\\n1. Do the thing"}
+        """
+        #expect(PlanHandoff.composerDraft(from: envelope) == "## Steps\n1. Do the thing\n")
+    }
+
+    @Test func jsonDebrisIsNothingToHandOff() {
+        #expect(PlanHandoff.composerDraft(from: "}}") == nil)
+    }
 }

@@ -116,6 +116,8 @@ enum ConfirmationIntent {
         (["nah"], .deny),
         (["deny"], .deny),
         (["denied"], .deny),
+        (["reject"], .deny),
+        (["rejected"], .deny),
         (["cancel"], .deny),
         (["stop"], .deny),
         (["never"], .deny),

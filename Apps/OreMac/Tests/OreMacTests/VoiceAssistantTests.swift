@@ -154,7 +154,7 @@ struct VoiceAssistantDecisionTests {
     }
 
     @Test func denialStillWinsWhenTheUserIsRefusing() {
-        for phrase in ["no", "Nope", "no, don't allow it", "cancel that", "stop"] {
+        for phrase in ["no", "Nope", "no, don't allow it", "cancel that", "stop", "reject"] {
             #expect(
                 VoiceAssistantController.confirmationDecision(from: phrase) == .deny,
                 "\(phrase) should deny"
@@ -205,8 +205,8 @@ struct VoiceAssistantQuestionTests {
             chatID: ChatID(rawValue: "chat"),
             question: question
         ))
-        #expect(item.spokenPrompt.contains("main, or develop"))
-        #expect(item.spokenPrompt.contains("say your own answer"))
+        #expect(item.spokenPrompt().contains("main, or develop"))
+        #expect(item.spokenPrompt().contains("answer in your own words"))
     }
 
     @Test func aClosedChoiceRejectsUnlistedSpeech() {

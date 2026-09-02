@@ -53,6 +53,91 @@ struct PlanProposalPolicyTests {
         #expect(!PlanProposalPolicy.proceedsPastProposal("Read"))
         #expect(!PlanProposalPolicy.proceedsPastProposal("CreatePlan"))
     }
+
+    @Test func jsonDebrisIsNotAPlanBody() {
+        #expect(PlanProposalPolicy.normalizedMarkdown("}}") == nil)
+        #expect(PlanProposalPolicy.normalizedMarkdown("},") == nil)
+        #expect(!PlanProposalPolicy.isReadyMarkdown("}}"))
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "content": .string("}}\n"),
+        ])) == nil)
+    }
+
+    @Test func aJSONEnvelopeUnwrapsToTheInnerPlan() {
+        let envelope = """
+        {"name":"Fix freeze","plan":"# Cause\\nThe update loop.\\n\\n# Fix\\nProfile, then batch."}
+        """
+        let body = PlanProposalPolicy.normalizedMarkdown(envelope)
+        #expect(body?.contains("update loop") == true)
+        #expect(body?.hasPrefix("#") == true)
+        #expect(body?.contains("{") != true)
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "content": .string(envelope),
+        ]))?.contains("Profile") == true)
+    }
+
+    @Test func leftoverBracesBeforeAnEnvelopeAreStripped() {
+        let raw = """
+        }}{"plan":"## Steps\\n1. Do the thing"}
+        """
+        let body = PlanProposalPolicy.normalizedMarkdown(raw)
+        #expect(body?.contains("Do the thing") == true)
+        #expect(body?.contains("}") != true)
+    }
+
+    @Test func aNestedResultEnvelopeUnwraps() {
+        let raw = """
+        {"result":{"success":{"plan":"Cause: the update loop.\\nFix: profile."}}}
+        """
+        #expect(PlanProposalPolicy.normalizedMarkdown(raw)?.contains("profile") == true)
+    }
+
+    @Test func aReadToolFileBodyIsNotAPlan() {
+        let source = """
+        guard let boldRange = result.string.range(of: "bold") else { return }
+            let location = result.string.distance(
+                from: result.string.startIndex, to: boldRange.lowerBound
+            )
+        """
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "content": .string(source),
+        ])) == nil)
+        #expect(!PlanProposalPolicy.isReadyInput(.object([
+            "path": .string("/tmp/RenderingTests.swift"),
+            "content": .string(source),
+        ])))
+    }
+
+    @Test func jsonWithoutAPlanFieldIsNotMarkdown() {
+        let dump = """
+        {"mode":"search","pattern":"plan","matches":[]}
+        """
+        #expect(PlanProposalPolicy.normalizedMarkdown(dump) == nil)
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "content": .string(dump),
+        ])) == nil)
+    }
+
+    @Test func incompleteJSONStreamChunksAreNotABody() {
+        #expect(PlanProposalPolicy.normalizedMarkdown(#"{"name": "Fix freeze""#) == nil)
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "streamContent": .string("}}"),
+        ])) == nil)
+        #expect(!PlanProposalPolicy.isReadyInput(.object([
+            "name": .string("Fix freeze"),
+            "streamContent": .string("}}"),
+        ])))
+    }
+
+    @Test func createPlanArgsWithoutAPlanFieldAreNotABody() {
+        let args = """
+        {"name":"Fix freeze","overview":"Main-thread saturation."}
+        """
+        #expect(PlanProposalPolicy.normalizedMarkdown(args) == nil)
+        #expect(PlanProposalPolicy.planBody(from: .object([
+            "streamContent": .string(args),
+        ])) == nil)
+    }
 }
 
 struct PlanReadinessGateTests {

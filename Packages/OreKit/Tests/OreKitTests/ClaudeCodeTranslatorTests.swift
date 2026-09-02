@@ -271,6 +271,30 @@ struct ClaudeCodeTranslatorTests {
         #expect(!events.contains { if case .planUpdated = $0 { return true }; return false })
     }
 
+    @Test func aSubagentExitPlanModeDoesNotRaiseThePlanCard() {
+        // A Task subagent's plan tool is its own business: publishing it as a
+        // proposal raised the main chat's approval card for a plan the user
+        // was never meant to approve.
+        let transcript = """
+        {"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"ExitPlanMode","input":{"plan":"## Steps\\n1. Do the thing"}}]},"session_id":"s1"}
+        """
+        let events = ClaudeCodeTranscriptReplay.events(transcript: transcript)
+        #expect(!events.contains { if case .planUpdated = $0 { return true }; return false })
+        // The raw tool call still lands in the transcript, under its parent.
+        #expect(events.contains { event in
+            if case .toolCall(let call) = event { return call.parentToolCallID != nil }
+            return false
+        })
+    }
+
+    @Test func aSubagentTodoWriteDoesNotReplaceTheMainChecklist() {
+        let transcript = """
+        {"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"TodoWrite","input":{"todos":[{"content":"Child step","status":"pending"}]}}]},"session_id":"s1"}
+        """
+        let events = ClaudeCodeTranscriptReplay.events(transcript: transcript)
+        #expect(!events.contains { if case .planUpdated = $0 { return true }; return false })
+    }
+
     @Test func todoWriteBecomesAChecklist() {
         let transcript = """
         {"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"TodoWrite","input":{"todos":[{"content":"Write the driver","status":"completed"},{"content":"Record fixtures","status":"in_progress"},{"content":"Ship","status":"pending"}]}}]},"session_id":"s1"}

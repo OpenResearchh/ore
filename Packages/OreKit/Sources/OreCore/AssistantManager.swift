@@ -52,6 +52,12 @@ public enum AssistantManager {
         if let existing = try await store.assistantWorkspace() {
             return existing
         }
+        // A previous run may have written the home (and even a workspace row)
+        // before `kind = assistant` landed. Minting another id would look like
+        // the Assistant "creating a new project" on every restart.
+        if let recovered = try await recoverAssistantWorkspace(store: store, home: home) {
+            return recovered
+        }
 
         // Workspaces have a foreign key to a repository, so the home registers
         // as one — `OreStore.repositories()` hides it from every picker.
@@ -88,6 +94,32 @@ public enum AssistantManager {
             reasoningEffort: modelProfile(for: .claudeCode).reasoningEffort
         ))
         return record
+    }
+
+    /// Same disk home, already a workspace row — reuse it, and mark it
+    /// assistant if the kind never stuck.
+    private static func recoverAssistantWorkspace(
+        store: OreStore,
+        home: URL
+    ) async throws -> WorkspaceRecord? {
+        let homePath = home.resolvingSymlinksInPath().standardizedFileURL.path
+        let orphan = try await store.workspaces(includeArchived: true, includeAssistant: true)
+            .first { record in
+                workspacePath(record.worktreePath) == homePath
+                    || workspacePath(record.repositoryPath) == homePath
+            }
+        guard var recovered = orphan else { return nil }
+        if recovered.workspaceKind != .assistant {
+            recovered = try await store.updateWorkspace(recovered.workspaceID) {
+                $0.kind = WorkspaceKind.assistant.rawValue
+            } ?? recovered
+        }
+        _ = try await store.ensureDefaultChat(for: recovered)
+        return recovered
+    }
+
+    private static func workspacePath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     // MARK: - Home on disk

@@ -253,8 +253,92 @@ struct AssistantBridgeTests {
     @Test func unknownActionsAreDenied() async throws {
         try await BridgeHarness.run { harness in
 
-            let response = try harness.callBridge(tool: "MergePullRequest", arguments: [:])
+            let response = try harness.callBridge(tool: "TeleportWorkspace", arguments: [:])
             #expect(!response.ok)
+        }
+    }
+
+    @Test func workspaceOrganizationActionsMatchTheSidebarWithoutConfirmation() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "before")
+
+            let renamed = try harness.callBridge(
+                tool: "RenameWorkspace",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "name": .string("after"),
+                ]
+            )
+            #expect(renamed.ok)
+            #expect(try await harness.store.workspace(workspaceID)?.name == "after")
+
+            let pinned = try harness.callBridge(
+                tool: "SetWorkspacePinned",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "pinned": .bool(true),
+                ]
+            )
+            #expect(pinned.ok)
+            #expect(try await harness.store.workspace(workspaceID)?.isPinned == true)
+
+            let actions = try await harness.store.assistantActions()
+            #expect(actions.first { $0.tool == "RenameWorkspace" }?.decision == "auto")
+            #expect(actions.first { $0.tool == "SetWorkspacePinned" }?.decision == "auto")
+        }
+    }
+
+    @Test func destructiveParityActionsStillRequireTheUser() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "protected")
+            async let call = harness.callBridgeAsync(
+                tool: "MergePullRequest",
+                arguments: ["workspaceID": .string(workspaceID.rawValue)]
+            )
+
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("merge did not request confirmation")
+                return
+            }
+            #expect(confirmation.actionClass == .changeGitHistory)
+            await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+            let response = try await call
+            #expect(!response.ok)
+        }
+    }
+
+    @Test func diffReviewStateActionsAreScopedToAWorkspace() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "review")
+            let comment = try harness.callBridge(
+                tool: "AddDiffComment",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "path": .string("main.swift"),
+                    "startLine": .integer(7),
+                    "body": .string("Keep this branch explicit."),
+                ]
+            )
+            #expect(comment.ok)
+            let pending = try await harness.client.pendingDiffComments(workspaceID: workspaceID)
+            #expect(pending.count == 1)
+            #expect(pending.first?.filePath == "main.swift")
+
+            let viewed = try harness.callBridge(
+                tool: "MarkFileViewed",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "path": .string("main.swift"),
+                    "contentHash": .string("hash-1"),
+                ]
+            )
+            #expect(viewed.ok)
+            #expect(try await harness.store.viewedFiles(workspaceID: workspaceID)["main.swift"] == "hash-1")
         }
     }
 
@@ -462,6 +546,279 @@ struct AssistantBridgeTests {
         }
     }
 
+    @Test func setComposerDraftStagesTextWithoutConfirmation() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "composer-draft")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let checkpoint = await harness.recorder.checkpoint()
+
+            let response = try harness.callBridge(
+                tool: "SetComposerDraft",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "text": .string("Draft this for me"),
+                ]
+            )
+            #expect(response.ok)
+
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .assistantUIAction(.setComposerDraft(_, let id, let text, let append)) = $0 {
+                    return id == chatID && text == "Draft this for me" && append == false
+                }
+                return false
+            }
+            #expect(event != nil)
+
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "SetComposerDraft")
+            #expect(audit.first?.decision == "auto")
+        }
+    }
+
+    @Test func setComposerDraftRefusesAClosedTab() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "closed-composer")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let closed = await harness.client.handleAssistantRequest(AssistantBridgeRequest(
+                id: UUID().uuidString.lowercased(),
+                tool: "CloseChat",
+                arguments: .object([
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                ])
+            ))
+            #expect(closed.ok)
+
+            let response = try harness.callBridge(
+                tool: "SetComposerDraft",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "text": .string("into a closed tab"),
+                ]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("closed") == true)
+        }
+    }
+
+    @Test func tagComposerFileValidatesTheFileExists() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "composer-tag")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let worktree = try await harness.worktreePath(of: workspaceID)
+            try "print(1)\n".write(
+                to: worktree.appendingPathComponent("main.swift"),
+                atomically: true, encoding: .utf8
+            )
+            let checkpoint = await harness.recorder.checkpoint()
+
+            let tagged = try harness.callBridge(
+                tool: "TagComposerFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "path": .string("main.swift"),
+                ]
+            )
+            #expect(tagged.ok)
+            #expect(tagged.result?.contains("main.swift") == true)
+
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .assistantUIAction(.tagComposerFile(_, let id, let path, let name)) = $0 {
+                    return id == chatID && path == "main.swift" && name == "main.swift"
+                }
+                return false
+            }
+            #expect(event != nil)
+
+            // A file that isn't there fails loudly rather than tagging a ghost.
+            let missing = try harness.callBridge(
+                tool: "TagComposerFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "path": .string("does-not-exist.txt"),
+                ]
+            )
+            #expect(!missing.ok)
+            #expect(missing.error?.contains("No file") == true)
+        }
+    }
+
+    @Test func tagComposerFileRefusesToEscapeTheWorktree() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "composer-escape")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+
+            let response = try harness.callBridge(
+                tool: "TagComposerFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "path": .string("../../etc/hosts"),
+                ]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("outside the workspace") == true)
+        }
+    }
+
+    @Test func clearComposerTagsRunsWithoutConfirmation() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "composer-clear")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let checkpoint = await harness.recorder.checkpoint()
+
+            let response = try harness.callBridge(
+                tool: "ClearComposerTags",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "clearDraft": .bool(true),
+                ]
+            )
+            #expect(response.ok)
+
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .assistantUIAction(.clearComposerTags(_, let id, let clearDraft)) = $0 {
+                    return id == chatID && clearDraft == true
+                }
+                return false
+            }
+            #expect(event != nil)
+
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "ClearComposerTags")
+            #expect(audit.first?.decision == "auto")
+        }
+    }
+
+    @Test func openFileValidatesTheFileExists() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "open-file")
+            let worktree = try await harness.worktreePath(of: workspaceID)
+            try "hello\n".write(
+                to: worktree.appendingPathComponent("readme.md"), atomically: true, encoding: .utf8
+            )
+
+            let missing = try harness.callBridge(
+                tool: "OpenFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "path": .string("nope.swift"),
+                ]
+            )
+            #expect(!missing.ok)
+
+            let checkpoint = await harness.recorder.checkpoint()
+            let opened = try harness.callBridge(
+                tool: "OpenFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "path": .string("readme.md"),
+                    "mode": .string("diff"),
+                ]
+            )
+            #expect(opened.ok)
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .assistantUIAction(.openFile(_, let path, let mode, let line)) = $0 {
+                    return path == "readme.md" && mode == "diff" && line == nil
+                }
+                return false
+            }
+            #expect(event != nil)
+        }
+    }
+
+    @Test func closeFileRunsWithoutConfirmation() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "close-file")
+            let checkpoint = await harness.recorder.checkpoint()
+            let response = try harness.callBridge(
+                tool: "CloseFile",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "path": .string("readme.md"),
+                ]
+            )
+            #expect(response.ok)
+            let event = await harness.recorder.waitFor(after: checkpoint) {
+                if case .assistantUIAction(.closeFile(_, let path)) = $0 {
+                    return path == "readme.md"
+                }
+                return false
+            }
+            #expect(event != nil)
+        }
+    }
+
+    @Test func respondToPlanRefusesWhenNoneIsPending() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "no-plan")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let response = try harness.callBridge(
+                tool: "RespondToPlan",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                    "approve": .bool(true),
+                ]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("plan") == true)
+        }
+    }
+
+    @Test func retryLastTurnRefusesWhenThereIsNoPrompt() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "no-retry")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let response = try harness.callBridge(
+                tool: "RetryLastTurn",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "chatID": .string(chatID.rawValue),
+                ]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("prompt") == true)
+        }
+    }
+
+    @Test func addRepositoryRegistersALocalGitRepo() async throws {
+        try await BridgeHarness.run { harness in
+            let extra = try await GitFixture.initialized()
+            let before = try await harness.store.repositories().count
+            let response = try harness.callBridge(
+                tool: "AddRepository",
+                arguments: ["path": .string(extra.repository.path)]
+            )
+            #expect(response.ok)
+            #expect(try await harness.store.repositories().count == before + 1)
+        }
+    }
+
     @Test func getAppStateRunsWithoutConfirmation() async throws {
         try await BridgeHarness.run { harness in
 
@@ -478,6 +835,30 @@ struct AssistantBridgeTests {
             let repository = URL(fileURLWithPath: record.repositoryPath).lastPathComponent
             #expect(response.result?.contains("repo \(repository)") == true)
             #expect(response.result?.contains("turns=") == true)
+        }
+    }
+
+    @Test func appStateReportsAStagedComposerDraft() async throws {
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "draft-state")
+            let chatID = try #require(
+                try await harness.store.chats(workspaceID: workspaceID).first?.chatID
+            )
+            let checkpoint = await harness.recorder.checkpoint()
+            await harness.client.send(
+                .setChatDraft(workspaceID, chatID, text: "half a thought")
+            )
+            _ = await harness.recorder.waitFor(after: checkpoint) {
+                if case .chatUpdated(let chat) = $0 {
+                    return chat.id == chatID && chat.draftText == "half a thought"
+                }
+                return false
+            }
+
+            let response = try harness.callBridge(tool: "GetAppState", arguments: [:])
+            #expect(response.ok)
+            #expect(response.result?.contains("draft=\"half a thought\"") == true)
         }
     }
 

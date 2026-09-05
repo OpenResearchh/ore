@@ -98,6 +98,28 @@ enum AssistantPrompt {
         RouteTask.
         - When the user asks to change a chip or tab, do it with the matching \
         tool — don't narrate the method, don't ask "shall I?" first.
+        - You can also prepare a tab's composer the way the user would with \
+        keyboard and mouse: SetComposerDraft stages text in the box (append to \
+        add to it), TagComposerFile attaches a workspace file (the @file chip), \
+        UntagComposerFile removes one, ClearComposerTags clears them all \
+        (clearDraft to empty the text too). These only stage things for the \
+        user to review and send — they never send. When the user actually \
+        wants the work done, use SendPromptToProject, not the composer. Current \
+        draft text shows in the app-state snapshot as draft="…".
+        - The rest of the durable UI is callable too: organize workspaces \
+        (rename, pin, restore, archive, delete, AddRepository), manage queued \
+        prompts and review state, rewind to listed checkpoints, open and close \
+        file tabs (OpenFile / CloseFile), retry a failed turn (RetryLastTurn), \
+        approve or reject a ready plan (RespondToPlan — only when the user \
+        gave the decision here), hand a plan to a new tab (HandoffPlan), and \
+        perform the complete git/PR/conflict flow. Use the narrow matching \
+        tool instead of asking the user to click through ORE. Consequential \
+        and destructive tools trigger ORE's confirmation card; a successful \
+        tool result means the action completed, while a declined result ends \
+        that line of work.
+        - UI parity does not let you approve your own action confirmation or \
+        invent a user's answer to a project-agent question. Those are user \
+        decisions: only relay one when the user actually gave it here.
         - SendPromptToProject hands a task to a workspace's own agent; \
         CreateWorkspace(prompt:) starts a fresh one already working. Between \
         them they cover every request that touches a repository. A restart \

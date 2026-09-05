@@ -45,6 +45,14 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     case autoAllowTab
     /// Create a workspace that would sit beside a dirty sibling worktree.
     case createWorkspace
+    /// Permanently remove an archived workspace, optionally including its branch.
+    case deleteWorkspace
+    /// Move or merge published git history (retarget, merge, continue, or pull).
+    case changeGitHistory
+    /// Replace conflicted file contents or rewind a workspace checkpoint.
+    case rewriteWorkspace
+    /// Create or update state on a remote hosting provider.
+    case remoteRepository
 
     public var displayName: String {
         switch self {
@@ -54,6 +62,10 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
         case .archiveWorkspace: "Archive workspaces"
         case .autoAllowTab: "Auto-allow a tab"
         case .createWorkspace: "Create a workspace beside uncommitted work"
+        case .deleteWorkspace: "Permanently delete workspaces"
+        case .changeGitHistory: "Change git history"
+        case .rewriteWorkspace: "Rewrite workspace files"
+        case .remoteRepository: "Change remote repository state"
         }
     }
 }
@@ -101,10 +113,34 @@ public struct AssistantConfirmation: Sendable, Codable, Hashable, Identifiable {
 }
 
 /// UI-level effects the assistant can cause — things that live in the Mac app
-/// rather than the core, like which workspace is frontmost.
+/// rather than the core, like which workspace is frontmost or what sits in a
+/// tab's composer.
+///
+/// The composer cases exist because a tab's draft text and its tagged files are
+/// view state, not core state: the draft only reaches a *visible* composer
+/// through the injection channel, and the tagged files live on the UI's
+/// `ChatState` (and `UserDefaults`), never in the store. So the core validates
+/// what it can — the file is really in the worktree — and then hands the actual
+/// mutation to the app, exactly as `revealWorkspace` does.
 public enum AssistantUIAction: Sendable, Codable, Hashable {
     case revealWorkspace(WorkspaceID)
     case revealChat(WorkspaceID, ChatID)
+    /// Replace (or, when `append`, extend) a tab's composer draft, then focus it.
+    case setComposerDraft(WorkspaceID, ChatID, text: String, append: Bool)
+    /// Tag a workspace file onto a tab's composer as a shelf attachment.
+    case tagComposerFile(WorkspaceID, ChatID, relativePath: String, displayName: String)
+    /// Drop one tagged file from a tab's composer, matched by path or name.
+    case untagComposerFile(WorkspaceID, ChatID, reference: String)
+    /// Clear every tagged file from a tab's composer; optionally the draft too.
+    case clearComposerTags(WorkspaceID, ChatID, clearDraft: Bool)
+    /// Open (or re-focus) a workspace file as a centre-column tab.
+    case openFile(WorkspaceID, relativePath: String, mode: String?, line: Int?)
+    /// Close a centre-column file tab.
+    case closeFile(WorkspaceID, relativePath: String)
+    /// Approve or reject a project tab's pending plan, with optional feedback.
+    case respondToPlan(WorkspaceID, ChatID, approve: Bool, feedback: String)
+    /// Copy a pending plan into a new tab's composer, unsent.
+    case handoffPlan(WorkspaceID, ChatID)
 }
 
 /// Where the bridge socket lives, derived from the database's location so the

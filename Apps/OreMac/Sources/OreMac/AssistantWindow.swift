@@ -41,6 +41,21 @@ struct AssistantActivityView: View {
                 )
             }
         }
+        // The same smoked glass as the main window — this was the one room
+        // still wearing the old opaque chrome, which read as a different app
+        // the moment the two windows sat side by side.
+        .preferredColorScheme(.dark)
+        // And the same transparent title bar: without this the window kept an
+        // opaque lid over its glass, which is most of why it still didn't
+        // read as glass at all.
+        .toolbarBackground(.hidden, for: .windowToolbar)
+        .background {
+            ZStack {
+                OreWindowGlassBase()
+                Color.black.opacity(0.22)
+            }
+            .ignoresSafeArea()
+        }
         .frame(minWidth: 440, minHeight: 480)
     }
 
@@ -66,7 +81,8 @@ struct AssistantActivityView: View {
                 )
             }
         }
-        .background(OreTheme.Surface.chrome)
+        // No opaque fill — the window's glass base shows through, exactly as
+        // in the main window's conversation column.
         // Row caches belong to the conversation that built them. The draft
         // deliberately survives: a compaction switches conversations without
         // being asked, and destroying a half-typed question would be the user's
@@ -226,10 +242,8 @@ struct AssistantActivityView: View {
                     .frame(maxHeight: .infinity)
                 }
             }
-            // The transcript is the reading surface here exactly as it is in a
-            // project tab; without this it showed chrome grey through while the
-            // main chat showed paper white.
-            .background(OreTheme.Surface.content)
+            // The transcript rides the window's glass directly, exactly as the
+            // main chat column does now.
             .layoutPriority(1)
 
             ForEach(model.assistantConfirmations) { confirmation in
@@ -671,6 +685,9 @@ private struct AssistantAuditView: View {
                     .padding(.vertical, 2)
                 }
                 .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+                .scrollIndicators(.hidden)
+                .background(OreListScrollerOverlay())
             }
         }
     }
@@ -740,6 +757,9 @@ private struct AssistantMemoryView: View {
                 Label(file.name, systemImage: "doc.text")
                     .tag(file.id)
             }
+            .scrollContentBackground(.hidden)
+            .scrollIndicators(.hidden)
+            .background(OreListScrollerOverlay())
             .frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
 
             ScrollView {
@@ -752,7 +772,10 @@ private struct AssistantMemoryView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(OreTheme.Space.md)
             }
-            .background(OreTheme.Surface.content)
+            .scrollIndicators(.hidden)
+            // Raw memory files are a reading surface: mostly paper, the same
+            // bargain the diff documents strike over the glass.
+            .background(OreTheme.Surface.content.opacity(0.85))
         }
         // Re-listed whenever the assistant acts: it writes these files while
         // this tab is open, and a list loaded once goes stale in front of the

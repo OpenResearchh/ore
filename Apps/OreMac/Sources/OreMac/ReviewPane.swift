@@ -143,7 +143,10 @@ struct ReviewPane: View {
             ShipStatusPanel(workspace: workspace)
                 .id(workspace.id)
         }
-        .background(OreTheme.Surface.chrome)
+        // No fill of its own: the pane is cut from Liquid Glass where it is
+        // laid out (`RootView.workspaceMain` clips it to the card radius and
+        // applies `oreGlassSurface`). A material here as well would stack
+        // glass on glass, which Apple's guidance is explicit about avoiding.
         .sheet(item: $reviewSetup) { _ in
             reviewSetupSheet
         }
@@ -246,7 +249,8 @@ struct ReviewPane: View {
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: OreTheme.RowHeight.bar)
-        .background(.bar)
+        // Sits directly on the inspector's glass — a bar material here would
+        // stack a second pane over it.
     }
 
     private func segment(_ title: String, count: Int?, target: ReviewTab) -> some View {
@@ -310,7 +314,6 @@ struct ReviewPane: View {
             }
             .padding(.horizontal, OreTheme.Space.sm)
             .frame(height: 34)
-            .background(.bar)
 
             Divider()
 
@@ -330,9 +333,13 @@ struct ReviewPane: View {
                 }
                 .listStyle(.sidebar)
                 .scrollContentBackground(.hidden)
+                .scrollIndicators(.hidden)
+                // List ignores the modifier above on macOS — see the probe.
+                .background(OreListScrollerOverlay())
             }
         }
-        .background(OreTheme.Surface.well)
+        // The list rides the inspector's glass; an opaque well here would punch
+        // a matte hole in the pane.
     }
 
     private func fileTreeRow(
@@ -537,7 +544,6 @@ struct ReviewPane: View {
             .font(.system(size: OreTheme.Font.caption))
             .padding(.horizontal, OreTheme.Space.sm)
             .frame(height: 26)
-            .background(.bar)
         }
     }
 
@@ -648,8 +654,11 @@ struct ReviewPane: View {
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
+            .scrollIndicators(.hidden)
+            // List ignores the modifier above on macOS — see the probe.
+            .background(OreListScrollerOverlay())
         }
-        .background(OreTheme.Surface.well)
+        // Rides the inspector's glass — see `allFilesView`.
     }
 
     private var changesLayoutToggle: some View {
@@ -1047,6 +1056,14 @@ private struct MarkdownPreview: NSViewRepresentable {
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
+        // Overlay, explicitly: with "always show scroll bars" set system-wide,
+        // AppKit's legacy scroller paints an opaque track — a white ladder
+        // bolted onto the glass. Every scroll surface in the window makes the
+        // same choice so the bars read as one family.
+        scroll.scrollerStyle = .overlay
+        // One knob family window-wide — see TranscriptView.
+        scroll.scrollerKnobStyle = .light
+        scroll.autohidesScrollers = true
         return scroll
     }
 
@@ -1130,7 +1147,11 @@ struct DiffDocumentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(OreTheme.Surface.content)
+        // Code wants paper, not weather: syntax colour on drifting wallpaper
+        // light is where translucency stops being worth it. Nearly opaque, with
+        // just enough of the glass base bleeding through to stay in the same
+        // window as everything else.
+        .background(OreTheme.Surface.content.opacity(0.85))
         .task(id: path) { await load() }
         .task(id: model.gitGeneration(for: workspace.id)) { await load() }
         .onChange(of: model.fileFocus[workspace.id]?[path]) { _, focus in
@@ -1286,6 +1307,9 @@ struct DiffDocumentView: View {
     }
 
     private func diffScroll(_ file: FileDiff) -> some View {
+        // Indicators off here and on every glass-riding scroll surface — with
+        // "always show scroll bars" set system-wide these drew the legacy
+        // white track, one pane at a time.
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(file.hunks.enumerated()), id: \.element.diffRowID) { hunkIndex, hunk in
@@ -1328,6 +1352,7 @@ struct DiffDocumentView: View {
                     )
             }
         }
+        .scrollIndicators(.hidden)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
     }
 
@@ -1761,7 +1786,6 @@ private struct ShipStatusPanel: View {
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: 29)
-        .background(.bar)
     }
 
     /// Running or failing checks are the ones worth counting; a wall of green
@@ -1864,6 +1888,7 @@ private struct ShipStatusPanel: View {
                     }
                     .padding(.vertical, 6)
                 }
+                .scrollIndicators(.hidden)
             }
         }
     }
@@ -2010,6 +2035,7 @@ private struct ShipStatusPanel: View {
                     }
                     .padding(.vertical, 3)
                 }
+                .scrollIndicators(.hidden)
             } else if pullRequest != nil {
                 shipEmpty(icon: "checklist", text: "No checks reported")
             } else {
@@ -2079,6 +2105,7 @@ private struct ShipStatusPanel: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .scrollIndicators(.hidden)
                     .frame(maxHeight: 160)
                     .padding(6)
                     .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 6))
@@ -2578,39 +2605,46 @@ private struct BaseSyncBanner: View {
 
     var body: some View {
         if let prompt {
-            HStack(alignment: .center, spacing: OreTheme.Space.sm) {
-                Image(systemName: prompt.icon)
-                    .foregroundStyle(prompt.tone)
-                VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: OreTheme.Space.sm) {
+                    Image(systemName: prompt.icon)
+                        .foregroundStyle(prompt.tone)
+                        .frame(width: 16)
                     Text(prompt.title)
                         .font(.system(size: OreTheme.Font.body, weight: .semibold))
-                    Text(prompt.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 8)
-                if prompt.showPull {
-                    Button {
-                        model.pullDefaultBranch(workspace.id)
-                    } label: {
-                        if model.gitOp(for: workspace.id) == .pullDefaultBranch {
-                            ProgressView().controlSize(.mini)
-                        } else {
-                            Text("Pull \(prompt.defaultBranch)")
+                Text(prompt.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 24)
+
+                HStack(spacing: OreTheme.Space.sm) {
+                    Spacer(minLength: 24)
+                    if prompt.showPull {
+                        Button {
+                            model.pullDefaultBranch(workspace.id)
+                        } label: {
+                            if model.gitOp(for: workspace.id) == .pullDefaultBranch {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Text("Pull \(prompt.defaultBranch)")
+                            }
                         }
+                        .buttonStyle(OreSecondaryButtonStyle())
+                        .disabled(model.isGitOpInFlight(workspace.id))
                     }
-                    .buttonStyle(OreSecondaryButtonStyle())
-                    .disabled(model.isGitOpInFlight(workspace.id))
-                }
-                if prompt.showRebase {
-                    Button("Ask agent to rebase") {
-                        model.placePromptInComposer(
-                            GitShipPrompt.rebaseOnto(prompt.defaultBranch),
-                            in: workspace.id
-                        )
+                    if prompt.showRebase {
+                        Button("Rebase with agent") {
+                            model.placePromptInComposer(
+                                GitShipPrompt.rebaseOnto(prompt.defaultBranch),
+                                in: workspace.id
+                            )
+                        }
+                        .buttonStyle(OrePrimaryButtonStyle())
                     }
-                    .buttonStyle(OreSecondaryButtonStyle())
                 }
             }
             .padding(12)
@@ -2655,7 +2689,7 @@ private struct BaseSyncBanner: View {
                 icon = "arrow.down.circle"
                 tone = Color.accentColor
                 title = "origin/\(sync.defaultBranch) moved"
-                detail = "This branch is \(sync.workspaceBehindOrigin) commit\(sync.workspaceBehindOrigin == 1 ? "" : "s") behind. Rebase here rather than on GitHub."
+                detail = "\(sync.workspaceBehindOrigin) commit\(sync.workspaceBehindOrigin == 1 ? "" : "s") behind · Rebase in ORE to update this branch."
             } else {
                 icon = "arrow.down.circle"
                 tone = Color.accentColor

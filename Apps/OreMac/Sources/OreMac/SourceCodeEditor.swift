@@ -65,6 +65,11 @@ struct SourceCodeEditor: NSViewRepresentable {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
+        // Overlay even when the system pref says legacy — an opaque scroller
+        // track is the one rectangle the glass window can't absorb.
+        scrollView.scrollerStyle = .overlay
+        // One knob family window-wide — see TranscriptView.
+        scrollView.scrollerKnobStyle = .light
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.borderType = .noBorder

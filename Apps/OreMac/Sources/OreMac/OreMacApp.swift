@@ -327,7 +327,35 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 340)
         } detail: {
             detail
+                // The whole detail column sits on the wallpaper's light, the
+                // way the system already renders the sidebar. Every pane above
+                // is translucent, so this one layer is what makes the window
+                // read as glass instead of a grid of white rectangles.
+                .background {
+                    ZStack {
+                        OreWindowGlassBase()
+                        // Smoke in the glass: a bright wallpaper region (a
+                        // nebula core, a sunlit photo) otherwise backlights
+                        // the prose right through the HUD material. This keeps
+                        // the see-through quality while capping how loud
+                        // what's behind can get.
+                        Color.black.opacity(0.22)
+                    }
+                    .ignoresSafeArea()
+                }
         }
+        // The reference design is smoked glass: a dark panel over whatever the
+        // desktop is showing, even on a bright wallpaper in light mode. Dark
+        // isn't a theme here so much as the color of the glass itself — light-
+        // mode vibrancy renders the same materials as a milky white sheet.
+        // Scoped to this window (sheets included); Settings and the assistant
+        // window still follow the system.
+        .preferredColorScheme(.dark)
+        // The title bar is part of the same sheet of glass, not a separate
+        // opaque lid: with the background hidden, the glass base (which already
+        // ignores the safe area) runs all the way to the window's top edge and
+        // the toolbar's controls float directly on it.
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .overlay(alignment: .top) { banners }
         .overlay { GitHubUpdatePrompt() }
         .overlay {
@@ -534,6 +562,20 @@ struct RootView: View {
                             .clipped()
                         reviewResizeHandle
                         ReviewPane(workspace: workspace)
+                            // A floating glass inspector: clipped to the card
+                            // radius, cut from glass, and inset from the
+                            // window's edges so the wallpaper base reads
+                            // around it — a pane resting *on* the window
+                            // rather than a column welded into it.
+                            .clipShape(RoundedRectangle(
+                                cornerRadius: OreTheme.cardRadius, style: .continuous
+                            ))
+                            .oreGlassSurface(
+                                .rect(cornerRadius: OreTheme.cardRadius),
+                                elevation: .inset
+                            )
+                            .padding(.vertical, OreTheme.Space.sm)
+                            .padding(.trailing, OreTheme.Space.sm)
                             .frame(width: resolvedReviewWidth, height: geometry.size.height)
                             .clipped()
                     }
@@ -551,8 +593,10 @@ struct RootView: View {
     }
 
     private var reviewResizeHandle: some View {
+        // Invisible except for its grip: the inspector floats now, so a filled
+        // divider bar would weld it back onto the chat column.
         Rectangle()
-            .fill(OreTheme.hairline)
+            .fill(.clear)
             .frame(width: 5)
             .overlay {
                 Capsule()
@@ -639,10 +683,12 @@ struct RootView: View {
         }
         .padding(.horizontal, OreTheme.Space.md)
         .frame(height: OreTheme.RowHeight.bar)
-        .background(OreTheme.Surface.chrome)
-        .overlay(alignment: .top) {
-            Rectangle().fill(OreTheme.hairline).frame(height: 1)
-        }
+        // A detached glass capsule floating just off the window's foot — the
+        // bottom-bar treatment Apple moved to with Liquid Glass — instead of a
+        // full-width strip welded on with a hairline.
+        .oreGlassSurface(.capsule, elevation: .inset)
+        .padding(.horizontal, OreTheme.Space.md)
+        .padding(.vertical, OreTheme.Space.xs + 2)
     }
 
     private func dockTerminalTab(_ tab: TerminalTab, in workspace: WorkspaceSummary) -> some View {
@@ -692,7 +738,7 @@ struct RootView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(OreTheme.Space.xl)
-        .background(OreTheme.Surface.chrome)
+        // No fill: the welcome floats directly on the window's glass base.
     }
 
     private var banners: some View {

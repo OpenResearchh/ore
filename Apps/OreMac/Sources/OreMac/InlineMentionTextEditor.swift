@@ -285,6 +285,8 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         // the height cap shrank the text container width and re-wrapped every
         // line — the "shutter" the user saw when a space pushed to a new line.
         scrollView.scrollerStyle = .overlay
+        // One knob family window-wide — see TranscriptView.
+        scrollView.scrollerKnobStyle = .light
         scrollView.borderType = .noBorder
 
         let editor = PromptTextView()
@@ -304,6 +306,12 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         editor.textContainerInset = NSSize(width: 5, height: 6)
         editor.textContainer?.lineFragmentPadding = 0
         editor.textContainer?.widthTracksTextView = true
+        // The base style from the first keystroke. Without this the editor
+        // typed in NSTextView's default font until the first mention pass
+        // (typically a pasted image's chip) restyled the whole draft to the
+        // real style — a visible size jump mid-composition.
+        editor.font = NSFont.systemFont(ofSize: OreTheme.Font.prose)
+        editor.typingAttributes = Coordinator.baseAttributes
         editor.setAccessibilityLabel("Agent prompt")
         scrollView.documentView = editor
         context.coordinator.editor = editor
@@ -365,6 +373,20 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             parentText = text
             self.onTab = onTab
             self.onHeightChange = onHeightChange
+        }
+
+        /// The composer's one text style, shared by editor creation and the
+        /// mention pass so the draft renders identically with and without
+        /// chips.
+        static var baseAttributes: [NSAttributedString.Key: Any] {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = 2
+            paragraph.lineBreakMode = .byWordWrapping
+            return [
+                .font: NSFont.systemFont(ofSize: OreTheme.Font.prose),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: paragraph,
+            ]
         }
 
         func textDidChange(_ notification: Notification) {
@@ -496,14 +518,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             hasStyledMentions = mentionNames.contains { !$0.isEmpty }
             let selection = editor.selectedRange()
             let whole = NSRange(location: 0, length: storage.length)
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineSpacing = 2
-            paragraph.lineBreakMode = .byWordWrapping
-            let base: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: OreTheme.Font.prose),
-                .foregroundColor: NSColor.labelColor,
-                .paragraphStyle: paragraph,
-            ]
+            let base = Self.baseAttributes
 
             isApplying = true
             storage.beginEditing()
@@ -517,8 +532,8 @@ struct InlineMentionTextEditor: NSViewRepresentable {
                     guard found.location != NSNotFound else { break }
                     storage.addAttributes([
                         .font: NSFont.systemFont(ofSize: OreTheme.Font.prose, weight: .semibold),
-                        .foregroundColor: NSColor.controlAccentColor,
-                        .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
+                        .foregroundColor: NSColor.oreInlineChipText,
+                        .backgroundColor: NSColor.oreInlineChipFill,
                     ], range: found)
                     let next = NSMaxRange(found)
                     search = NSRange(location: next, length: source.length - next)

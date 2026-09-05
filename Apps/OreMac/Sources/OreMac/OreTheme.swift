@@ -50,6 +50,11 @@ enum OreTheme {
 
     static let hairline = Color.primary.opacity(0.075)
     static let subduedFill = Color.primary.opacity(0.045)
+    /// A hair brighter than `subduedFill`: for small chips and controls that sit
+    /// *on* a glass panel (HUD buttons, the ✕ dismiss, the esc hint), where the
+    /// quieter wash would dissolve into the glass behind it.
+    static let glassControlFill = Color.primary.opacity(0.08)
+    static let glassControlStroke = Color.primary.opacity(0.10)
     static let selectedFill = Color.accentColor.opacity(0.11)
     /// The loud sibling of `selectedFill`: a solid accent pill with white
     /// content, for the one selection that should anchor the eye (the current
@@ -88,6 +93,252 @@ enum OreTheme {
     static let warning = Color.orange
 }
 
+/// The window's glass floor: the desktop wallpaper, blurred behind the window,
+/// exactly the optical base the system gives a `NavigationSplitView` sidebar.
+///
+/// This is what was missing from the first Liquid Glass pass. Glass only reads
+/// as glass when there is light behind it — the HUD and the menus refract, but
+/// they were floating over an opaque white grid of panes, so the whole window
+/// stayed matte. Laying this under the detail column turns the window into one
+/// continuous glass environment (the way Tahoe's Music and Notes windows pick
+/// up the wallpaper), and every material above it — `.bar` strips, `.thin`
+/// inspector, the composer's `glassEffect` — starts compositing over real
+/// light instead of flat paint.
+///
+/// AppKit, not SwiftUI: in-window materials can only sample in-window content,
+/// and "the desktop behind the window" is strictly `NSVisualEffectView` in
+/// behind-window blending.
+struct OreWindowGlassBase: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = OreAdaptiveGlassView()
+        view.blendingMode = .behindWindow
+        // Dims with the window so an inactive ORE recedes like every other
+        // wallpaper-tinted window on the desktop.
+        view.state = .followsWindowActiveState
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+}
+
+/// The glass floor's AppKit view, choosing its material by how the window is
+/// standing.
+///
+/// Windowed, it is `.hudWindow` — the most transparent material AppKit ships;
+/// `.underWindowBackground` is the near-opaque sidebar stock, and the reference
+/// design is a smoked-glass panel you can genuinely see the desktop through.
+/// In full screen that bargain inverts: the window *is* the whole screen, the
+/// only thing behind it is the space wallpaper, and deep transparency stops
+/// being depth and starts being noise under the prose. So full screen eases
+/// back to `.underWindowBackground` — still glass, but calm enough to read on.
+///
+/// Selector-based notification observers, deliberately: block observers on an
+/// `@MainActor` NSView are a strict-concurrency argument nobody needs to have.
+final class OreAdaptiveGlassView: NSVisualEffectView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self)
+        guard let window else { return }
+        apply(fullScreen: window.styleMask.contains(.fullScreen))
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(didEnterFullScreen),
+            name: NSWindow.didEnterFullScreenNotification, object: window
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(didExitFullScreen),
+            name: NSWindow.didExitFullScreenNotification, object: window
+        )
+    }
+
+    @objc private func didEnterFullScreen(_ note: Notification) {
+        apply(fullScreen: true)
+    }
+
+    @objc private func didExitFullScreen(_ note: Notification) {
+        apply(fullScreen: false)
+    }
+
+    private func apply(fullScreen: Bool) {
+        material = fullScreen ? .underWindowBackground : .hudWindow
+    }
+}
+
+/// macOS `List` ignores `.scrollIndicators(.hidden)`: it is NSTableView-backed,
+/// and the modifier only reaches SwiftUI's own scrollers. With "Show scroll
+/// bars: Always" set system-wide, every List kept drawing the opaque legacy
+/// track — the one rectangle the glass window can't absorb. This probe sits in
+/// a List's `.background`, finds the backing scroll view, and forces the same
+/// overlay/light-knob answer every AppKit scroll surface in the app uses.
+struct OreListScrollerOverlay: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let probe = NSView()
+        DispatchQueue.main.async { Self.apply(near: probe) }
+        return probe
+    }
+
+    func updateNSView(_ probe: NSView, context: Context) {
+        // Re-applied on SwiftUI updates: AppKit resets scroller style when the
+        // system preference changes, and the List can rebuild its scroll view.
+        DispatchQueue.main.async { Self.apply(near: probe) }
+    }
+
+    private static func apply(near probe: NSView) {
+        // The background probe is a sibling of the list's scroll view, not an
+        // ancestor — climb a few levels, searching down at each.
+        var root: NSView? = probe.superview
+        for _ in 0..<4 {
+            guard let candidate = root else { return }
+            if let scroll = firstTableScrollView(in: candidate) {
+                scroll.scrollerStyle = .overlay
+                scroll.scrollerKnobStyle = .light
+                scroll.autohidesScrollers = true
+                return
+            }
+            root = candidate.superview
+        }
+    }
+
+    private static func firstTableScrollView(in view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView, scroll.documentView is NSTableView {
+            return scroll
+        }
+        for subview in view.subviews {
+            if let found = firstTableScrollView(in: subview) { return found }
+        }
+        return nil
+    }
+}
+
+/// The shape a glass surface is cut to. Only the two the app actually uses, so
+/// the specular rim can stay a concrete `strokeBorder` instead of going fully
+/// generic over `InsettableShape` at every call site.
+enum OreGlassShape: Equatable {
+    case capsule
+    case rect(cornerRadius: CGFloat)
+}
+
+/// How high a glass surface floats, and therefore how hard it shadows. A HUD
+/// panel hovering over a *different* app has to sit convincingly above it, so it
+/// casts more than a menu anchored to a control a few points below the composer.
+/// Shared so every floating surface reads at a consistent, physically-plausible
+/// depth rather than each site inventing its own shadow.
+enum OreGlassElevation: Equatable {
+    /// Anchored just above a control — slash / mention menus, the effort popover.
+    case popover
+    /// A detached panel over arbitrary content — the assistant HUD.
+    case floating
+    /// Resting on the app's own content — decision cards, settings tiles.
+    case inset
+
+    var shadowRadius: CGFloat {
+        switch self {
+        case .popover: 16
+        case .floating: 20
+        case .inset: 4
+        }
+    }
+
+    var shadowY: CGFloat {
+        switch self {
+        case .popover: 6
+        case .floating: 10
+        case .inset: 1
+        }
+    }
+
+    var shadowOpacity: Double {
+        switch self {
+        case .popover: 0.14
+        case .floating: 0.22
+        case .inset: 0.05
+        }
+    }
+}
+
+/// The one Liquid Glass grammar every floating and layered surface shares: the
+/// assistant HUD, its answer cards, the composer's slash / mention menus, and
+/// the in-app cards. Apple reserves Liquid Glass for this functional layer that
+/// sits *over* content, which is exactly why the reading surfaces (transcript,
+/// wells) stay deliberately opaque and are not routed through here.
+///
+/// macOS 26 supplies the true optics — blur, refraction, light picked up from
+/// what's behind — through `glassEffect`, and they are left strictly alone: a
+/// hand-painted highlight on real glass reads as a sticker. Earlier releases
+/// get a hand-built stand-in — a blurred material under a specular rim — so the
+/// same look reaches back to macOS 14. Only the elevation shadow is shared.
+struct OreGlassSurface: ViewModifier {
+    var shape: OreGlassShape
+    var tint: Color? = nil
+    var elevation: OreGlassElevation = .floating
+    /// Let the glass respond to the pointer. For panels this stays off; buttons
+    /// opt in so the press has the wet, springy give of a real glass control.
+    var interactive: Bool = false
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        switch shape {
+        case .capsule:
+            decorate(content, shape: Capsule(style: .continuous))
+        case .rect(let radius):
+            decorate(content, shape: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
+    }
+
+    @ViewBuilder
+    private func decorate<S: InsettableShape>(_ content: Content, shape: S) -> some View {
+        if #available(macOS 26.0, *) {
+            // The system's glass carries its own edge lighting, optical
+            // response, *and depth*; hands off entirely. A manual `.shadow`
+            // here silhouetted the view's rectangular frame — not the glass
+            // shape — and printed square halos at the foot of every pane.
+            content.glassEffect(glass, in: shape)
+        } else {
+            content
+                .background(.ultraThinMaterial, in: shape)
+                .background { if let tint { shape.fill(tint) } }
+                .overlay { specularRim(shape) }
+                // The hand-built stand-in has no depth of its own, so the
+                // elevation shadow is still ours to draw.
+                .shadow(
+                    color: .black.opacity(elevation.shadowOpacity),
+                    radius: elevation.shadowRadius,
+                    y: elevation.shadowY
+                )
+        }
+    }
+
+    /// A thin edge that catches light on the top rim, fades to nothing, and
+    /// settles into a hairline of definition along the bottom — the read that
+    /// says "glass" more than the blur does.
+    private func specularRim<S: InsettableShape>(_ shape: S) -> some View {
+        shape.strokeBorder(
+            LinearGradient(
+                stops: [
+                    .init(color: .white.opacity(colorScheme == .dark ? 0.40 : 0.60), location: 0),
+                    .init(color: .white.opacity(0.04), location: 0.35),
+                    .init(color: OreTheme.hairline, location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            ),
+            lineWidth: 1
+        )
+        .allowsHitTesting(false)
+    }
+
+    @available(macOS 26.0, *)
+    private var glass: Glass {
+        var glass: Glass = .regular
+        if let tint { glass = glass.tint(tint) }
+        if interactive { glass = glass.interactive() }
+        return glass
+    }
+}
+
+/// An in-app card / tile. It sits on the app's own content, so it floats low
+/// (`.inset`) and never carries a tint — but it is still cut from the same glass
+/// as the HUD so a settings tile and a floating pill read as one material.
 struct OreCard: ViewModifier {
     var padding: CGFloat = OreTheme.Space.md
     var radius: CGFloat = OreTheme.cardRadius
@@ -95,12 +346,7 @@ struct OreCard: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(padding)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius))
-            .overlay {
-                RoundedRectangle(cornerRadius: radius)
-                    .stroke(OreTheme.hairline, lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.045), radius: 4, y: 1)
+            .modifier(OreGlassSurface(shape: .rect(cornerRadius: radius), elevation: .inset))
     }
 }
 
@@ -335,20 +581,31 @@ struct OreNavigationSurface: ViewModifier {
     }
 }
 
-/// A selected document tab is navigation chrome, so it can adopt Liquid Glass
-/// without turning the document or transcript itself into glass. Unselected
-/// tabs stay visually quiet and only pick up a conventional hover fill.
+/// Tabs are navigation chrome floating over the transcript, so every pill is
+/// cut from Liquid Glass — not only the selected one. Transparent unselected
+/// tabs read fine on a fixed bar, but this strip floats: rows scroll directly
+/// beneath it, and label-through-label was the result. Each pill carrying its
+/// own glass is also how the system's floating tab groups stay legible.
 struct OreNavigationSelection: ViewModifier {
     let isSelected: Bool
     let isHovered: Bool
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *), isSelected {
-            content.glassEffect(.regular.interactive(), in: .rect(cornerRadius: OreTheme.tabRadius))
+        if #available(macOS 26.0, *) {
+            // A whisper of accent in the selected pill's glass — the "you are
+            // here" marker; strong enough to pick out at a glance, weak enough
+            // that the one loud accent in the pane stays the primary action.
+            content.glassEffect(
+                isSelected
+                    ? .regular.tint(Color.accentColor.opacity(0.25)).interactive()
+                    : .regular.interactive(),
+                in: .rect(cornerRadius: OreTheme.tabRadius)
+            )
         } else {
             content.background(
-                isSelected ? OreTheme.selectedFill : isHovered ? OreTheme.subduedFill : .clear,
+                isSelected ? OreTheme.selectedFill
+                    : isHovered ? OreTheme.subduedFill : Color.black.opacity(0.30),
                 in: RoundedRectangle(cornerRadius: OreTheme.tabRadius)
             )
         }
@@ -522,6 +779,22 @@ extension View {
             voiceGlow: voiceGlow,
             voiceEnergy: voiceEnergy,
             voiceInput: voiceInput
+        ))
+    }
+
+    /// A floating / layered Liquid Glass surface — the HUD pill, its answer
+    /// cards, the composer's slash and mention menus. See `OreGlassSurface`.
+    func oreGlassSurface(
+        _ shape: OreGlassShape,
+        tint: Color? = nil,
+        elevation: OreGlassElevation = .floating,
+        interactive: Bool = false
+    ) -> some View {
+        modifier(OreGlassSurface(
+            shape: shape,
+            tint: tint,
+            elevation: elevation,
+            interactive: interactive
         ))
     }
 

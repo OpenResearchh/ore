@@ -8,6 +8,35 @@ import OrePersistence
 import OreProtocol
 import UserNotifications
 
+/// Turns the review annotations collected beside a diff into plan-decision
+/// feedback. A plan replaces the ordinary composer while it awaits a decision,
+/// so these comments have to travel with Approve or Reject rather than waiting
+/// for a later message that may never be sent.
+enum PlanDecisionFeedback {
+    static func combining(
+        _ feedback: String,
+        comments: [DiffCommentReference]
+    ) -> String {
+        var sections: [String] = []
+        let note = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !note.isEmpty { sections.append(note) }
+        guard !comments.isEmpty else { return sections.joined(separator: "\n\n") }
+
+        sections.append("Review comments on the current diff:")
+        for comment in comments {
+            let location = comment.startLine == comment.endLine
+                ? "\(comment.filePath):\(comment.startLine)"
+                : "\(comment.filePath):\(comment.startLine)-\(comment.endLine)"
+            var section = "**\(location)**\n\(comment.body)"
+            if let context = comment.context, !context.isEmpty {
+                section += "\n\n```\n\(context)\n```"
+            }
+            sections.append(section)
+        }
+        return sections.joined(separator: "\n\n")
+    }
+}
+
 /// The app's view state.
 ///
 /// One `@Observable` object holding what every surface reads. It is the only
@@ -3066,12 +3095,16 @@ final class AppModel {
         } else {
             requestID = nil
         }
+        // The plan card owns pending review comments while it is visible. Drain
+        // them into this decision before dismissing the card so they cannot be
+        // stranded behind the now-restored composer.
+        let comments = chat.takeDraftComments()
+        let note = PlanDecisionFeedback.combining(feedback, comments: comments)
         chat.dismissPlan()
         tabNeedsYou.removeAll {
             if case .plan(let item) = $0, item.chatID == chatID { return true }
             return false
         }
-        let note = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
         if let requestID {
             resolvePermission(
                 requestID,

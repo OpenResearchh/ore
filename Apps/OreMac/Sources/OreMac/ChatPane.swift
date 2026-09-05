@@ -240,6 +240,14 @@ struct ChatPane: View {
         return false
     }
 
+    /// A ready plan is its own response surface. Keeping the ordinary composer
+    /// beneath it produces two competing places to type and, under vertical
+    /// compression, lets the transcript squeeze the plan body to zero height.
+    private var isReviewingPlan: Bool {
+        if case .proposal = chat.plan { return true }
+        return false
+    }
+
     private func closeSearch() {
         isSearching = false
         // An empty query clears the coordinator's matches and the highlight.
@@ -403,22 +411,34 @@ struct ChatPane: View {
 
             if case .proposal(let markdown, let requestID) = chat.plan,
                let planChatID = chatSummary?.id {
-                PlanApprovalCard(markdown: markdown, onHandoff: {
-                    model.handoffPlan(markdown, in: workspace.id)
-                }) { feedback in
-                    model.respondToPlan(
-                        chatID: planChatID, workspaceID: workspace.id,
-                        approve: true, feedback: feedback
-                    )
-                } onReject: { feedback in
-                    model.respondToPlan(
-                        chatID: planChatID, workspaceID: workspace.id,
-                        approve: false, feedback: feedback
-                    )
-                }
+                PlanApprovalCard(
+                    markdown: markdown,
+                    comments: chat.draftComments,
+                    paneHeight: paneHeight,
+                    onRemoveComment: { index in chat.removeDraftComment(at: index) },
+                    onClearComments: { chat.clearDraftComments() },
+                    onHandoff: {
+                        model.handoffPlan(markdown, in: workspace.id)
+                    },
+                    onApprove: { feedback in
+                        model.respondToPlan(
+                            chatID: planChatID, workspaceID: workspace.id,
+                            approve: true, feedback: feedback
+                        )
+                    },
+                    onReject: { feedback in
+                        model.respondToPlan(
+                            chatID: planChatID, workspaceID: workspace.id,
+                            approve: false, feedback: feedback
+                        )
+                    }
+                )
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.top, OreTheme.Space.sm)
+                // The decision surface must win vertical compression over the
+                // transcript; approving a plan the user cannot see is unsafe.
+                .layoutPriority(2)
                 // A new proposal must reset the card's own feedback field;
                 // without an identity SwiftUI reuses the previous card's state.
                 .id(requestID?.rawValue ?? markdown)
@@ -435,7 +455,7 @@ struct ChatPane: View {
                 .padding(.horizontal, OreTheme.Space.md)
             }
 
-            if !chat.draftComments.isEmpty {
+            if !chat.draftComments.isEmpty && !isReviewingPlan {
                 DraftCommentsBar(
                     comments: chat.draftComments,
                     onRemove: { index in chat.removeDraftComment(at: index) },
@@ -507,7 +527,7 @@ struct ChatPane: View {
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.vertical, 10)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else {
+            } else if !isReviewingPlan {
                 composer(paneHeight: paneHeight)
             }
         }
@@ -4272,6 +4292,10 @@ private struct PermissionCard: View {
 
 private struct PlanApprovalCard: View {
     let markdown: String
+    let comments: [DiffCommentReference]
+    let paneHeight: CGFloat
+    let onRemoveComment: (Int) -> Void
+    let onClearComments: () -> Void
     let onHandoff: () -> Void
     let onApprove: (String) -> Void
     let onReject: (String) -> Void
@@ -4288,8 +4312,35 @@ private struct PlanApprovalCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxHeight: 480)
-            TextField("Optional feedback…", text: $feedback)
+            // A max height alone lets this collapse all the way to zero when
+            // the surrounding VStack is tight. Preserve enough of the plan to
+            // make the decision informed, and scroll longer proposals.
+            .frame(
+                minHeight: 180,
+                idealHeight: 260,
+                maxHeight: min(420, paneHeight * 0.45)
+            )
+            .layoutPriority(1)
+
+            if !comments.isEmpty {
+                VStack(alignment: .leading, spacing: OreTheme.Space.xs) {
+                    Label(
+                        "\(comments.count) review \(comments.count == 1 ? "comment" : "comments") included with this decision",
+                        systemImage: "text.bubble"
+                    )
+                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                    DraftCommentsBar(
+                        comments: comments,
+                        horizontalPadding: 0,
+                        onRemove: onRemoveComment,
+                        onClearAll: onClearComments
+                    )
+                }
+            }
+
+            TextField("Feedback or revision notes…", text: $feedback)
                 .onSubmit { onApprove(feedback) }
             HStack {
                 Button {
@@ -4648,11 +4699,12 @@ private struct BusyTabDot: View {
 /// Comments left on the diff, waiting to go out with the next message.
 private struct DraftCommentsBar: View {
     let comments: [DiffCommentReference]
+    var horizontalPadding: CGFloat = OreTheme.Space.md
     let onRemove: (Int) -> Void
     let onClearAll: () -> Void
 
     var body: some View {
-        ScrollView(.horizontal) {
+        ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(Array(comments.enumerated()), id: \.offset) { index, comment in
                     HStack(spacing: 4) {
@@ -4680,7 +4732,7 @@ private struct DraftCommentsBar: View {
                         .help("Remove every pending comment")
                 }
             }
-            .padding(.horizontal, OreTheme.Space.md)
+            .padding(.horizontal, horizontalPadding)
         }
         .frame(height: 28)
     }

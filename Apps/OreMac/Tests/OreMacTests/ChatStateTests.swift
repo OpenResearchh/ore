@@ -659,8 +659,14 @@ struct RateLimitExpiryTests {
         )))
         #expect(state.rateLimit != nil)
         // The expiry timer, not another event, is what clears it: an idle tab
-        // never sees another rate-limit event.
-        try await Task.sleep(for: .milliseconds(1400))
+        // never sees another rate-limit event. The timer's sleep has a
+        // one-second floor, and under a fully parallel test run the main actor
+        // can lag hundreds of milliseconds past it — so wait in slices up to a
+        // generous bound instead of betting on one fixed margin. (This was the
+        // suite's one intermittent failure.)
+        for _ in 0..<50 where state.rateLimit != nil {
+            try await Task.sleep(for: .milliseconds(100))
+        }
         #expect(state.rateLimit == nil)
     }
 }

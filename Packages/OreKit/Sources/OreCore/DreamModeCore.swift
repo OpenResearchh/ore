@@ -152,6 +152,16 @@ extension InProcessCoreClient {
         )
         let acceptance = try await store.dreamKindAcceptance()
         let kinds = DreamKind.allCases.filter(\.isMVP)
+        if let repositoryPath, await isExcludedDreamRepository(repositoryPath) {
+            if manual {
+                continuation.yield(.commandFailed(CommandFailure(
+                    workspaceID: nil,
+                    message: "This project is excluded from Dream Mode.",
+                    detail: "Remove it from Excluded projects in Settings, then try Dream now."
+                )))
+            }
+            return
+        }
         let candidate: DreamPlanner.Candidate?
         if let repositoryPath {
             let row = activity.first { $0.repositoryPath == repositoryPath }
@@ -823,6 +833,23 @@ extension InProcessCoreClient {
             if related.contains(where: { liveStatuses.contains($0.status) }) { continue }
             try? await deleteWorkspace(workspace.workspaceID, deleteBranch: true)
         }
+    }
+
+    private func isExcludedDreamRepository(_ path: String) async -> Bool {
+        let excluded = dreamSettings.excludedRepoPaths
+        if DreamPlanner.isExcludedRepository(path, excludedRepoPaths: excluded) {
+            return true
+        }
+        guard let canonical = try? await canonicalRepositoryURL(path) else { return false }
+        if DreamPlanner.isExcludedRepository(canonical.path, excludedRepoPaths: excluded) {
+            return true
+        }
+        for item in excluded {
+            if let other = try? await canonicalRepositoryURL(item), other.path == canonical.path {
+                return true
+            }
+        }
+        return false
     }
 
     private func parkedUntil(for harness: HarnessKind, now: Date) -> Date? {

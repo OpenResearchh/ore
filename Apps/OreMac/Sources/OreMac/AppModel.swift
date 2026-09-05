@@ -998,11 +998,13 @@ final class AppModel {
     func pushDreamSettings() {
         let settings = DreamSettingsStore.load()
         Task { await client.send(.updateDreamSettings(settings)) }
+        syncDreamMonitor()
+    }
+
+    private func syncDreamMonitor() {
+        dreamMonitor?.isDreaming = dreamInbox.run?.state == .dreaming
+        dreamMonitor?.refreshAssertion()
         refreshDreamSleepStatus()
-        dreamMonitor?.push(
-            isSleepImminent: false,
-            isDreaming: dreamInbox.run?.state == .dreaming
-        )
     }
 
     private func startDreamMode() {
@@ -2737,7 +2739,7 @@ final class AppModel {
             var inbox = dreamInbox
             inbox.run = run
             dreamInbox = inbox
-            refreshDreamSleepStatus()
+            syncDreamMonitor()
             maybeNotifyDreamFinished(run)
 
         case .dreamTaskUpdated:
@@ -2751,7 +2753,7 @@ final class AppModel {
 
         case .dreamInboxUpdated(let inbox):
             dreamInbox = inbox
-            refreshDreamSleepStatus()
+            syncDreamMonitor()
 
         case .assistantConfirmationRequested(let confirmation):
             assistantConfirmations.append(confirmation)

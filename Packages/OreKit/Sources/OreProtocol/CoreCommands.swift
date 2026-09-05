@@ -88,7 +88,7 @@ public enum CoreCommand: Sendable, Codable {
     case updateDreamSettings(DreamSettings)
     case updateDreamEnvironment(DreamEnvironmentSnapshot)
     /// Manual "Dream now". Bypasses idle/quiet-hours/AC gates; still honors
-    /// the night token cap and research-only tool policy.
+    /// the night token cap, excluded-repo list, and research-only tool policy.
     case startDreamRun(manual: Bool, repositoryPath: String?)
     case abortDreamRun
     case resolveDreamFinding(DreamFindingID, DreamFindingResolution)

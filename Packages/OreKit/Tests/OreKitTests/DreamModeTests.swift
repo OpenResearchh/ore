@@ -213,6 +213,17 @@ struct DreamPlannerTests {
         #expect(candidate == nil)
     }
 
+    @Test func excludedReposAreRefusedForManualStartsToo() {
+        #expect(DreamPlanner.isExcludedRepository(
+            "/tmp/secret",
+            excludedRepoPaths: ["/tmp/secret", "/tmp/other"]
+        ))
+        #expect(!DreamPlanner.isExcludedRepository(
+            "/tmp/ok",
+            excludedRepoPaths: ["/tmp/secret"]
+        ))
+    }
+
     @Test func rejectedBugHuntsFallThroughToReview() {
         let now = Date()
         let activity = DreamRepositoryActivity(

@@ -158,4 +158,8 @@ public enum DreamPlanner {
         } ?? true
         return inputIdle && oreIdle
     }
+
+    public static func isExcludedRepository(_ path: String, excludedRepoPaths: [String]) -> Bool {
+        excludedRepoPaths.contains(path)
+    }
 }

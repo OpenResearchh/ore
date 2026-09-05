@@ -716,7 +716,7 @@ struct SettingsView: View {
                     ForEach(appModel.repositories, id: \.self) { path in
                         Toggle(URL(fileURLWithPath: path).lastPathComponent, isOn: excludedRepoBinding(path))
                     }
-                    Text("Excluded projects are never chosen for a dream. Dream now on the current workspace still runs if you ask.")
+                    Text("Excluded projects are never dreamed about, including Dream now.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

@@ -50,6 +50,10 @@ final class DreamEnvironmentMonitor {
     private var assertionID: IOPMAssertionID = 0
     private var assertionHeld = false
     private var sleepObservers: [NSObjectProtocol] = []
+    /// Last known dream-run activity. The 30s timer and sleep observers must
+    /// use this rather than defaulting to false, or a manual dream outside
+    /// quiet hours drops the keep-awake assertion on the next tick.
+    var isDreaming = false
 
     init(client: any CoreClient) {
         self.client = client
@@ -95,7 +99,7 @@ final class DreamEnvironmentMonitor {
         releaseAssertion()
     }
 
-    func push(isSleepImminent: Bool, isDreaming: Bool = false) {
+    func push(isSleepImminent: Bool) {
         let settings = DreamSettingsStore.load()
         let environment = DreamEnvironmentSnapshot(
             secondsSinceInput: Self.secondsSinceInput(),
@@ -109,7 +113,23 @@ final class DreamEnvironmentMonitor {
             isSleepImminent: isSleepImminent
         )
         Task { await client.send(.updateDreamEnvironment(environment)) }
+        refreshAssertion(settings: settings, environment: environment)
+    }
 
+    /// Re-evaluate the sleep assertion from the stored dreaming flag without
+    /// pushing a new environment snapshot.
+    func refreshAssertion() {
+        let settings = DreamSettingsStore.load()
+        let environment = DreamEnvironmentSnapshot(
+            secondsSinceInput: Self.secondsSinceInput(),
+            now: Date(),
+            isOnACPower: Self.isOnACPower(),
+            thermalPressure: SystemLoadProbe.shared.isUnderPressure
+        )
+        refreshAssertion(settings: settings, environment: environment)
+    }
+
+    private func refreshAssertion(settings: DreamSettings, environment: DreamEnvironmentSnapshot) {
         let hold = DreamScheduler.shouldHoldSleepAssertion(
             settings: settings,
             environment: environment,
@@ -129,7 +149,7 @@ final class DreamEnvironmentMonitor {
         return DreamScheduler.sleepStatus(
             settings: settings,
             environment: environment,
-            isDreaming: false
+            isDreaming: isDreaming
         )
     }
 

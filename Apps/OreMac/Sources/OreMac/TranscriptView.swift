@@ -80,6 +80,16 @@ struct TranscriptView: NSViewRepresentable {
     var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
     var canFork = false
     var scrollAnchor: TranscriptScrollAnchor?
+    /// Extra clearance at the foot of the scroll: the composer dock floats
+    /// *over* the transcript now, so rows must be able to scroll out from
+    /// underneath its glass — and the pinned-to-bottom position must rest the
+    /// newest line just above it, not behind it.
+    var bottomInset: CGFloat = 12
+    /// Head clearance, same idea upward: the chat pane's tab strip floats over
+    /// the transcript's top, so the resting first row starts below it while
+    /// scrolled rows slide underneath. Hosts without floating top chrome (the
+    /// assistant window, the split column) keep the plain default.
+    var topInset: CGFloat = 10
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -116,6 +126,11 @@ struct TranscriptView: NSViewRepresentable {
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.scrollerStyle = .overlay
+        // Pinned light: with `.default`, AppKit picks each knob's darkness by
+        // sampling what happens to be behind it — over glass that flipped per
+        // pane, one white knob beside one black. The window is always dark
+        // now, so every scroll surface pins the same answer.
+        scrollView.scrollerKnobStyle = .light
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.backgroundColor = .textBackgroundColor
@@ -123,7 +138,7 @@ struct TranscriptView: NSViewRepresentable {
         scrollView.usesPredominantAxisScrolling = true
         // Overlay scrollers keep the table width stable while scrolling, so
         // a scroller appearing cannot invalidate every row height mid-gesture.
-        scrollView.contentInsets = NSEdgeInsets(top: 10, left: 0, bottom: 12, right: 0)
+        scrollView.contentInsets = NSEdgeInsets(top: topInset, left: 0, bottom: bottomInset, right: 0)
 
         // Row heights depend on width, so a resize invalidates the cache.
         NotificationCenter.default.addObserver(
@@ -180,6 +195,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.isBusy = isBusy
         context.coordinator.agentName = agentName
         context.coordinator.bind(scrollAnchor: scrollAnchor)
+        context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.setSearchQuery(searchQuery)
         context.coordinator.update(rows: rows)
     }
@@ -364,14 +380,12 @@ struct TranscriptView: NSViewRepresentable {
                 container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
             }
 
-            if previous.isEmpty, !newRows.isEmpty {
-                let saved = UserDefaults.standard.double(forKey: persistenceKey)
-                if saved > 0 {
-                    pendingScrollRestore = saved
-                    restorePendingScrollIfReady()
-                    return
-                }
-            }
+            // A chat you switch to opens at the newest exchange, deliberately:
+            // this used to restore the saved scroll offset here, and landing on
+            // week-old messages read as "where am I?" rather than continuity.
+            // The latest reply is what a tab switch is *for*; scrolling back is
+            // cheap, finding "latest" by hand was not. (The offset is still
+            // persisted below for possible future use.)
 
             // Follow the conversation only while the reader is not holding the
             // view somewhere else — and never mid-gesture, where a programmatic
@@ -489,6 +503,11 @@ struct TranscriptView: NSViewRepresentable {
             // A width was just established; a restore that couldn't run on load
             // (view not yet sized) can finally land correctly.
             restorePendingScrollIfReady()
+            // A newly selected tab can receive its first row update before
+            // AppKit gives the table its real width. Re-pin after that first
+            // layout so "latest" means the actual bottom of the measured
+            // transcript rather than the bottom of its placeholder geometry.
+            if policy.allowsAutoScroll { scrollToBottom(tableView) }
         }
 
         @objc func liveScrollWillStart(_ notification: Notification) {
@@ -912,6 +931,20 @@ struct TranscriptView: NSViewRepresentable {
             )
         }
 
+        /// The floating composer dock grew or shrank. Re-inset the scroll so
+        /// rows can clear its glass, and — if the reader was pinned — re-pin,
+        /// so a taller dock never swallows the newest line.
+        func setContentInsets(top: CGFloat, bottom: CGFloat) {
+            guard let tableView,
+                  let scrollView = tableView.enclosingScrollView else { return }
+            let previous = scrollView.contentInsets
+            guard abs(previous.top - top) > 0.5
+                    || abs(previous.bottom - bottom) > 0.5 else { return }
+            scrollView.contentInsets.top = top
+            scrollView.contentInsets.bottom = bottom
+            if policy.isFollowingBottom { scrollToBottom(tableView) }
+        }
+
         /// The reader asked to catch up. This resumes following, so the agent's
         /// next output keeps the view pinned rather than dropping it again the
         /// moment the jump lands.
@@ -951,7 +984,14 @@ struct TranscriptView: NSViewRepresentable {
             let lastRect = tableView.rect(ofRow: rows.count - 1)
             let contentHeight = lastRect == .zero ? tableView.bounds.height : lastRect.maxY
             let clip = scrollView.contentView
-            let targetY = max(0, contentHeight - clip.bounds.height)
+            // The insets are part of the scrollable range: the resting bottom
+            // is `+ insets.bottom` past the document (clear of the floating
+            // composer dock), and the resting top is `-insets.top`.
+            let insets = scrollView.contentInsets
+            let targetY = max(
+                -insets.top,
+                contentHeight - clip.bounds.height + insets.bottom
+            )
             // Already there: scrolling anyway would still post a bounds change and
             // cancel any momentum the reader has in flight, for no movement.
             guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
@@ -1468,10 +1508,13 @@ final class TranscriptCell: NSTableCellView {
         label.onDoubleClick = row.kind == .userMessage ? { onRevert(row.turnID) } : nil
 
         // `cgColor` snapshots a dynamic colour against the appearance current
-        // at this instant, so every layer colour is re-resolved on each
-        // configure rather than set once in `init` — the transcript reloads on
-        // an appearance change precisely so this runs again.
-        bubble.layer?.backgroundColor = Self.background(for: row).cgColor
+        // at this instant — which, in a window whose appearance is forced dark
+        // while the system runs light, is the *wrong* appearance. Resolve
+        // against the bubble's own effective appearance so the wash comes out
+        // in the window's palette, not the system's.
+        bubble.effectiveAppearance.performAsCurrentDrawingAppearance {
+            bubble.layer?.backgroundColor = Self.background(for: row).cgColor
+        }
         // The find bar's active match wears an accent ring; everything else
         // stays borderless as before.
         bubble.layer?.borderWidth = isSearchHighlighted ? 1.5 : 0
@@ -1973,8 +2016,8 @@ final class TranscriptCell: NSTableCellView {
                 guard found.location != NSNotFound else { break }
                 var tokenAttributes: [NSAttributedString.Key: Any] = [
                     .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
-                    .foregroundColor: NSColor.controlAccentColor,
-                    .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.10),
+                    .foregroundColor: NSColor.oreInlineChipText,
+                    .backgroundColor: NSColor.oreInlineChipFill,
                 ]
                 if attachment.isHoverPreviewable {
                     tokenAttributes[.oreAttachmentPreview] = attachment.fileURL(worktreePath: worktreePath)
@@ -2069,6 +2112,22 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
+    /// Bubble fills were tuned on paper white, where a 10% wash of a saturated
+    /// hue reads as a soft pastel card. Over the smoked-glass window the same
+    /// wash collapses into a near-black void — the hue has nothing bright
+    /// behind it to tint. In dark appearances the hue is lifted toward white
+    /// and given a touch more alpha, so a message still reads as a soft
+    /// colored card with crisp text, in both the main and assistant windows.
+    private static func bubbleWash(_ color: NSColor, alpha: CGFloat) -> NSColor {
+        NSColor(name: nil) { appearance in
+            guard appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua else {
+                return color.withAlphaComponent(alpha)
+            }
+            let lifted = color.blended(withFraction: 0.55, of: .white) ?? color
+            return lifted.withAlphaComponent(min(1, alpha + 0.06))
+        }
+    }
+
     static func background(for row: TranscriptRow) -> NSColor {
         // A queued message is drawn as a faint outline of the bubble it will
         // become, so it reads as waiting rather than as one more sent message
@@ -2078,24 +2137,24 @@ final class TranscriptCell: NSTableCellView {
         // write gets a fixed teal instead, so the two never converge on the same
         // bubble no matter which accent is set.
         if row.kind == .userMessage, row.origin == .agent {
-            return .systemTeal.withAlphaComponent(row.isQueued ? 0.05 : 0.12)
+            return bubbleWash(.systemTeal, alpha: row.isQueued ? 0.05 : 0.12)
         }
-        if row.isQueued { return .controlAccentColor.withAlphaComponent(0.04) }
+        if row.isQueued { return bubbleWash(.controlAccentColor, alpha: 0.04) }
         switch row.kind {
-        case .userMessage: return .controlAccentColor.withAlphaComponent(0.10)
+        case .userMessage: return bubbleWash(.controlAccentColor, alpha: 0.10)
         // Activity rows stay on the plain transcript — no full-width band. The
         // file/argument reads as a small outlined pill inside the line instead,
         // which is quieter and keeps the agent's prose dominant.
         case .toolCall: return .clear
         case .activityGroup: return .clear
         case .thinking: return .clear
-        case .plan: return .systemPurple.withAlphaComponent(0.08)
-        case .error: return .systemRed.withAlphaComponent(0.08)
+        case .plan: return bubbleWash(.systemPurple, alpha: 0.08)
+        case .error: return bubbleWash(.systemRed, alpha: 0.08)
         // A whisper of a card behind the agent's prose — the reference
         // design's message feel — while the transcript surface stays the
         // reading background. Faint enough that code blocks and chips inside
         // still dominate.
-        case .assistantText: return .labelColor.withAlphaComponent(0.03)
+        case .assistantText: return bubbleWash(.labelColor, alpha: 0.03)
         case .divider: return .clear
         case .turnFooter: return .clear
         }

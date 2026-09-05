@@ -1644,6 +1644,17 @@ public actor WorkspaceEngine {
         }
     }
 
+    /// The last thing said in a conversation, for the sidebar's snippet line:
+    /// the turn's stored summary when one exists, else the prompt that opened
+    /// it. Sequential guards, not a multi-clause condition — see the OreKit
+    /// async-frame miscompile.
+    public func lastTurnDigest(chatID: ChatID) async throws -> String? {
+        let turn = try await store.latestTurn(chatID: chatID)
+        guard let turn else { return nil }
+        if let summary = turn.summary, !summary.isEmpty { return summary }
+        return turn.prompt
+    }
+
     public func diffFromCheckpoint(_ commit: String) async throws -> [FileDiff] {
         try await diffEngine.diffFromCommit(worktree: worktreeURL, commit: commit)
     }
@@ -1719,7 +1730,18 @@ public actor WorkspaceEngine {
     }
 
     public func suggestedGitAction() async -> SuggestedGitAction {
-        SuggestedGitActionResolver.resolve(await gitActionContext())
+        await suggestedGitStatus().action
+    }
+
+    /// Returns the suggested action and the PR that informed it from one state
+    /// gather. Keeping these together avoids a second `gh pr view` merely so a
+    /// sidebar can retain PR identity while the next action is commit or push.
+    public func suggestedGitStatus() async -> SuggestedGitStatus {
+        let context = await gitActionContext()
+        return SuggestedGitStatus(
+            action: SuggestedGitActionResolver.resolve(context),
+            pullRequest: context.pullRequest
+        )
     }
 
     /// Hands a failing CI run to the agent.

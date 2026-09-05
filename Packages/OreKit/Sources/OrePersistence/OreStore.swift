@@ -344,6 +344,26 @@ public actor OreStore {
         }
     }
 
+    /// The newest turn of a conversation without materialising the transcript:
+    /// one row, ordered the same way `turns(chatID:)` is, cheap enough for
+    /// every sidebar row to ask for its snippet line.
+    public func latestTurn(chatID: ChatID) throws -> TurnRecord? {
+        try writer.read { db in
+            try TurnRecord.fetchOne(
+                db,
+                sql: """
+                    SELECT turn.*
+                    FROM turn
+                    JOIN session ON session.id = turn.sessionID
+                    WHERE session.chatID = ?
+                    ORDER BY session.startedAt DESC, turn.ordinal DESC, turn.startedAt DESC
+                    LIMIT 1
+                    """,
+                arguments: [chatID.rawValue]
+            )
+        }
+    }
+
     /// The visible transcript belongs to the chat, not to any one provider
     /// incarnation. Sessions are ordered first so ordinals can restart at zero
     /// after a cross-harness handoff without scrambling history.

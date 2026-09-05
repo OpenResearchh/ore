@@ -208,18 +208,15 @@ struct LaunchBriefingOverlay: View {
             }
             .padding(OreTheme.Space.lg)
             .frame(minWidth: 340, maxWidth: 460, alignment: .leading)
-            // A solid panel, not translucent material: the briefing sits over
-            // an arbitrary transcript, and material let that noise bleed
-            // through until the text itself went murky.
-            .background(
-                OreTheme.Surface.content,
-                in: RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
+            // The same floating Liquid Glass as the HUD — the solid white
+            // panel this replaces predates the smoked-glass window and read as
+            // a hole punched in it. The old bleed-through worry is gone: glass
+            // blurs the transcript behind it, and the window is dark now, so
+            // the text stays crisp.
+            .oreGlassSurface(
+                .rect(cornerRadius: OreTheme.cardRadius),
+                elevation: .floating
             )
-            .overlay {
-                RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
-                    .stroke(OreTheme.hairline, lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.25), radius: 24, y: 8)
             .onTapGesture(perform: onDismiss)
         }
         .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.98)))

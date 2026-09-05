@@ -76,6 +76,7 @@ final class AppModel {
         var generation: UInt64
         var diffs: [FileDiff]
         var gitAction: SuggestedGitAction
+        var pullRequest: GitHubClient.PullRequest?
     }
     private(set) var diffCache: [WorkspaceID: DiffSnapshot] = [:]
 
@@ -1092,7 +1093,9 @@ final class AppModel {
         return chatID
     }
 
-    private func send(
+    // Internal, not private: the split column sends to its own conversation
+    // by ID — it cannot go through the active-chat convenience above.
+    func send(
         _ text: String,
         attachments: [Attachment] = [],
         effort: ReasoningEffort? = nil,
@@ -1148,6 +1151,25 @@ final class AppModel {
     func interrupt(_ id: WorkspaceID) {
         guard let chatID = activeChat(for: id)?.id else { return }
         Task { await client.send(.interruptChatTurn(id, chatID)) }
+    }
+
+    /// Interrupt a specific conversation — the split column's stop button,
+    /// which must not assume its chat is the active one.
+    func interrupt(_ id: WorkspaceID, chatID: ChatID) {
+        Task { await client.send(.interruptChatTurn(id, chatID)) }
+    }
+
+    /// A second conversation opened beside the active one, per workspace —
+    /// the reference design's split layout. Transient by design: a split is a
+    /// working arrangement for right now, not a document worth persisting.
+    var splitChat: [WorkspaceID: ChatID] = [:]
+
+    func openSplitChat(_ chatID: ChatID, in workspaceID: WorkspaceID) {
+        splitChat[workspaceID] = chatID
+    }
+
+    func closeSplitChat(in workspaceID: WorkspaceID) {
+        splitChat[workspaceID] = nil
     }
 
     /// Stops the assistant's own turn — the Escape key in voice mode. Goes
@@ -2026,6 +2048,12 @@ final class AppModel {
         cachedDiff(for: id)?.gitAction ?? .none
     }
 
+    /// The PR observed during the same state gather as `gitAction(for:)`.
+    /// It remains available when local edits make Commit the immediate action.
+    func pullRequest(for id: WorkspaceID) -> GitHubClient.PullRequest? {
+        cachedDiff(for: id)?.pullRequest
+    }
+
     var selectedGitAction: SuggestedGitAction {
         guard let id = selectedWorkspaceID else { return .none }
         return gitAction(for: id)
@@ -2225,6 +2253,10 @@ final class AppModel {
         try await client.suggestedGitAction(workspaceID: id)
     }
 
+    func loadGitStatus(for id: WorkspaceID) async throws -> SuggestedGitStatus {
+        try await client.suggestedGitStatus(workspaceID: id)
+    }
+
     func loadUnpushedCommits(for id: WorkspaceID) async -> [CommitInfo] {
         (try? await client.unpushedCommits(workspaceID: id)) ?? []
     }
@@ -2244,6 +2276,25 @@ final class AppModel {
     func loadTurnCheckpoints(for id: WorkspaceID) async -> [TurnCheckpoint] {
         guard let chatID = activeChat(for: id)?.id else { return [] }
         return (try? await client.turnCheckpoints(workspaceID: id, chatID: chatID)) ?? []
+    }
+
+    /// The sidebar row's snippet: the last thing said in the workspace's most
+    /// recently active conversation, flattened to one line. Nil when nothing
+    /// has been said yet, so a fresh workspace's row stays one line tall.
+    func lastTurnDigest(for id: WorkspaceID) async -> String? {
+        let recent = chats(for: id).max {
+            ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast)
+        }
+        guard let chatID = recent?.id else { return nil }
+        let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID)
+        guard let digest else { return nil }
+        let flattened = digest
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !flattened.isEmpty else { return nil }
+        return String(flattened.prefix(160))
     }
 
     func loadDiffFromCheckpoint(_ commit: String, for id: WorkspaceID) async throws -> [FileDiff] {
@@ -2292,11 +2343,13 @@ final class AppModel {
     @discardableResult
     func refreshDiff(for workspace: WorkspaceSummary) async throws -> DiffSnapshot {
         async let diffs = loadDiff(for: workspace.id)
-        async let action = loadGitAction(for: workspace.id)
+        async let gitStatus = loadGitStatus(for: workspace.id)
+        let status = try await gitStatus
         let snapshot = DiffSnapshot(
             generation: gitGeneration(for: workspace.id),
             diffs: try await diffs,
-            gitAction: try await action
+            gitAction: status.action,
+            pullRequest: status.pullRequest
         )
         // Reads race: the review pane refreshes on both workspace switch and
         // every git-status bump, and `prefetchDiff` runs more in the
@@ -2325,10 +2378,12 @@ final class AppModel {
     /// Cheap enough to call on turn boundaries and workspace switches: it is one
     /// `gh pr view` and a `git status`, and it never refetches the diff.
     func refreshGitAction(for workspaceID: WorkspaceID) async {
-        guard let action = try? await loadGitAction(for: workspaceID) else { return }
+        guard let status = try? await loadGitStatus(for: workspaceID) else { return }
         guard var snapshot = diffCache[workspaceID] else { return }
-        guard snapshot.gitAction != action else { return }
-        snapshot.gitAction = action
+        guard snapshot.gitAction != status.action
+            || snapshot.pullRequest != status.pullRequest else { return }
+        snapshot.gitAction = status.action
+        snapshot.pullRequest = status.pullRequest
         diffCache[workspaceID] = snapshot
     }
 

@@ -121,6 +121,9 @@ final class AssistantVoiceHUD {
         panel.ignoresMouseEvents = !actions
         position(panel, size: size)
         panel.orderFrontRegardless()
+        // The shadow is derived from the rendered shape; recompute it when the
+        // pill grows into the card layout (or back) so it hugs the new outline.
+        panel.invalidateShadow()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             panel.animator().alphaValue = 1
@@ -155,7 +158,16 @@ final class AssistantVoiceHUD {
         panel.level = .statusBar
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = false
+        // The HUD is a piece of ORE floating over someone else's app, and ORE
+        // is smoked glass now: pinned to dark so it matches the main window
+        // instead of whatever the host app's appearance is — which also keeps
+        // the accent-tinted Allow readable instead of washing out on a light
+        // page (white-on-pale-gray, as it did over Safari).
+        panel.appearance = NSAppearance(named: .darkAqua)
+        // The window server draws the shadow from the panel's opaque shape —
+        // the pill and card get the same native hug the system's HUDs have,
+        // which a SwiftUI .shadow can't wrap around an AppKit backdrop.
+        panel.hasShadow = true
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -183,12 +195,81 @@ final class AssistantVoiceHUD {
     }
 }
 
+/// True glass for a panel floating over *other apps*.
+///
+/// SwiftUI's `glassEffect` samples in-window content, and this panel is a clear
+/// window with nothing behind its views — over Safari it had nothing to
+/// refract, which is why the pill read as a flat grey blob rather than glass.
+/// The fix is AppKit's sandwich: an `NSVisualEffectView` in behind-window mode
+/// pulls the screen underneath into the window, and on macOS 26 an
+/// `NSGlassEffectView` in front of it bends that image with real lensing — the
+/// same construction as the system's own floating overlays. Before 26 the
+/// visual-effect layer alone carries the translucency.
+private struct HUDGlassBackdrop: NSViewRepresentable {
+    var cornerRadius: CGFloat
+
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.cornerRadius = cornerRadius
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
+
+        let visual = NSVisualEffectView()
+        // Same smoke as the main window's glass floor, not the popover stock —
+        // one material family everywhere ORE shows glass.
+        visual.material = .hudWindow
+        visual.blendingMode = .behindWindow
+        visual.state = .active
+        visual.autoresizingMask = [.width, .height]
+        visual.frame = container.bounds
+        container.addSubview(visual)
+
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.cornerRadius = cornerRadius
+            glass.autoresizingMask = [.width, .height]
+            glass.frame = container.bounds
+            container.addSubview(glass)
+        }
+        return container
+    }
+
+    func updateNSView(_ container: NSView, context: Context) {
+        container.layer?.cornerRadius = cornerRadius
+        if #available(macOS 26.0, *) {
+            for case let glass as NSGlassEffectView in container.subviews {
+                glass.cornerRadius = cornerRadius
+            }
+        }
+    }
+}
+
 private struct AssistantHUDView: View {
     var controller: VoiceAssistantController
     var model: AppModel?
     var display: AssistantVoiceHUD.DisplayState
 
     var body: some View {
+        // A single GlassEffectContainer so the pill, the answer card, and the
+        // glass buttons on it render as one pane of liquid glass — blending and
+        // morphing together as rows appear — rather than stacked sheets each
+        // blurring the one beneath. This is what turns the HUD from "material
+        // panels" into the coherent glass Apple's own overlays use.
+        Group {
+            if #available(macOS 26.0, *) {
+                GlassEffectContainer(spacing: 10) { stack }
+            } else {
+                stack
+            }
+        }
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeOut(duration: 0.2), value: display.showsActions)
+        .animation(.easeOut(duration: 0.2), value: controller.phase)
+    }
+
+    private var stack: some View {
         VStack(spacing: 8) {
             Spacer(minLength: 0)
             if display.showsVoiceRow {
@@ -200,10 +281,6 @@ private struct AssistantHUDView: View {
                 }
             }
         }
-        .padding(.bottom, 6)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.easeOut(duration: 0.2), value: display.showsActions)
-        .animation(.easeOut(duration: 0.2), value: controller.phase)
     }
 
     private var voicePill: some View {
@@ -237,9 +314,7 @@ private struct AssistantHUDView: View {
         }
         .padding(.horizontal, 16)
         .frame(width: 380 - 16, height: 44)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1))
-        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+        .background { HUDGlassBackdrop(cornerRadius: 22) }
     }
 
     private var micIsOpen: Bool {
@@ -391,12 +466,7 @@ private struct NeedsYouActionCard: View {
             }
         }
         .padding(.horizontal, 14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+        .background { HUDGlassBackdrop(cornerRadius: 16) }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
@@ -406,7 +476,7 @@ private struct NeedsYouActionCard: View {
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 20)
-                .background(Color.primary.opacity(0.06), in: Circle())
+                .background(OreTheme.glassControlFill, in: Circle())
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -449,7 +519,7 @@ private struct NeedsYouActionCard: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 11, weight: .semibold))
                     .frame(width: 26, height: 26)
-                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .background(OreTheme.glassControlFill, in: Circle())
                     .contentShape(Circle())
             }
             .menuStyle(.borderlessButton)
@@ -490,7 +560,7 @@ private struct NeedsYouActionCard: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 11, weight: .semibold))
                     .frame(width: 26, height: 26)
-                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .background(OreTheme.glassControlFill, in: Circle())
                     .contentShape(Circle())
             }
             .menuStyle(.borderlessButton)
@@ -505,20 +575,41 @@ private struct NeedsYouActionCard: View {
 private struct HUDActionButtonStyle: ButtonStyle {
     var prominent = false
 
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let label = configuration.label
             .font(.system(size: 12, weight: .semibold))
             .lineLimit(1)
             .foregroundStyle(prominent ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 12)
             .frame(height: 26)
-            .background(
-                prominent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.08)),
-                in: Capsule()
-            )
-            .contentShape(Capsule())
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+
+        if #available(macOS 26.0, *) {
+            // Real glass buttons, resting on the glass card and blending with it
+            // through the HUD's GlassEffectContainer: the prominent action takes
+            // an accent tint, the rest stay clear so one answer leads.
+            label
+                .glassEffect(
+                    prominent
+                        ? .regular.tint(Color.accentColor).interactive()
+                        : .regular.interactive(),
+                    in: .capsule
+                )
+                .contentShape(Capsule())
+                .scaleEffect(configuration.isPressed ? 0.97 : 1)
+                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+        } else {
+            label
+                .background(
+                    prominent
+                        ? AnyShapeStyle(Color.accentColor)
+                        : AnyShapeStyle(OreTheme.glassControlFill),
+                    in: Capsule()
+                )
+                .contentShape(Capsule())
+                .scaleEffect(configuration.isPressed ? 0.97 : 1)
+                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+        }
     }
 }
 
@@ -587,8 +678,8 @@ private struct InterruptHint: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(Capsule().fill(Color.primary.opacity(0.08)))
-            .overlay(Capsule().stroke(Color.primary.opacity(0.10), lineWidth: 1))
+            .background(Capsule().fill(OreTheme.glassControlFill))
+            .overlay(Capsule().stroke(OreTheme.glassControlStroke, lineWidth: 1))
             .transition(.opacity)
     }
 }

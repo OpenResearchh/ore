@@ -99,6 +99,21 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
     }
 }
 
+/// The result of gathering a workspace's shipping state once.
+///
+/// The pull request travels with the derived action so UI surfaces can show
+/// durable PR identity even when a more immediate local step (commit or push)
+/// temporarily becomes the suggested action.
+public struct SuggestedGitStatus: Sendable, Hashable {
+    public var action: SuggestedGitAction
+    public var pullRequest: GitHubClient.PullRequest?
+
+    public init(action: SuggestedGitAction, pullRequest: GitHubClient.PullRequest?) {
+        self.action = action
+        self.pullRequest = pullRequest
+    }
+}
+
 /// Composer text for shipping actions that the agent should carry out with its
 /// own tools — inspect the diff, write the message, then run git/`gh`.
 public enum GitShipPrompt: Sendable {

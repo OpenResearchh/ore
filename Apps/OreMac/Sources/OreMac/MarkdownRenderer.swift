@@ -1,6 +1,35 @@
 import AppKit
 import Markdown
 
+/// Inline token (file chip, url chip, @-mention, inline code) colors, resolved
+/// at draw time per appearance. These strings render in two very different
+/// rooms: the main window's smoked glass (always dark) and the assistant
+/// window (system appearance). The old constants — accent text on an
+/// accent-at-8% wash — were designed for white paper; over dark glass they
+/// collapsed into an unreadable navy-on-navy blob.
+extension NSColor {
+    private static func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    /// Token text: the system accent on paper, lifted toward white on glass
+    /// where the raw accent sinks into the dark.
+    static let oreInlineChipText = NSColor(name: nil) { appearance in
+        guard isDark(appearance) else { return .controlAccentColor }
+        return NSColor.controlAccentColor.blended(withFraction: 0.45, of: .white)
+            ?? .controlAccentColor
+    }
+
+    /// Token fill: an accent wash on paper, a neutral white lift on glass —
+    /// neutral because a dark-accent wash adds no contrast over dark glass.
+    static let oreInlineChipFill = NSColor(name: nil) { appearance in
+        guard isDark(appearance) else {
+            return NSColor.controlAccentColor.withAlphaComponent(0.08)
+        }
+        return NSColor.white.withAlphaComponent(0.12)
+    }
+}
+
 /// Renders an agent's markdown into an `NSAttributedString`.
 ///
 /// Agents write markdown constantly — headings, bullet lists, inline code, and
@@ -114,9 +143,9 @@ struct MarkdownRenderer {
             // subtle fill — reads as a file token rather than a raw blue link.
             result.addAttributes([
                 .link: url,
-                .foregroundColor: NSColor.controlAccentColor,
+                .foregroundColor: NSColor.oreInlineChipText,
                 .font: NSFont.monospacedSystemFont(ofSize: baseFont.pointSize * 0.92, weight: .medium),
-                .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
+                .backgroundColor: NSColor.oreInlineChipFill,
                 .underlineStyle: 0,
             ], range: match.range)
         }
@@ -155,7 +184,7 @@ struct MarkdownRenderer {
         let result = NSMutableAttributedString()
         if let icon = NSImage(systemSymbolName: linkSymbolName(for: url), accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: baseFont.pointSize * 0.92, weight: .medium))?
-            .withSymbolConfiguration(.init(paletteColors: [.controlAccentColor])) {
+            .withSymbolConfiguration(.init(paletteColors: [.oreInlineChipText])) {
             icon.isTemplate = false
             let attachment = NSTextAttachment()
             attachment.image = icon
@@ -170,8 +199,8 @@ struct MarkdownRenderer {
         ))
         result.addAttributes([
             .link: url,
-            .foregroundColor: NSColor.controlAccentColor,
-            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.08),
+            .foregroundColor: NSColor.oreInlineChipText,
+            .backgroundColor: NSColor.oreInlineChipFill,
             .underlineStyle: 0,
         ], range: NSRange(location: 0, length: result.length))
         return result
@@ -529,7 +558,7 @@ struct MarkdownRenderer {
                     // Quiet and semantic: inline code should read as code, not
                     // as a neon warning label inside an otherwise calm answer.
                     .foregroundColor: textColor,
-                    .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.075),
+                    .backgroundColor: NSColor.oreInlineChipFill,
                 ]
             )
         }

@@ -220,9 +220,7 @@ private struct AssistantHUDView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             if controller.phase == .listening {
-                Text(controller.usesFinishPhrase
-                     ? "Say “\(VoiceFinishPhrase.spoken)” to send"
-                     : "Release to send")
+                Text(listeningCaption)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -246,6 +244,14 @@ private struct AssistantHUDView: View {
 
     private var micIsOpen: Bool {
         controller.phase == .listening || controller.phase == .answering
+    }
+
+    /// "Say the phrase" normally; the near-miss correction when the user is
+    /// trying and the recognizer keeps almost hearing it.
+    private var listeningCaption: String {
+        guard controller.usesFinishPhrase else { return "Release to send" }
+        if let hint = controller.finishHint { return hint }
+        return "Say “\(controller.finishPhraseSpoken)” to send"
     }
 
     private var voiceIcon: String {

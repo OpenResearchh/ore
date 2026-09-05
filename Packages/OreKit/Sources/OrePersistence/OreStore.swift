@@ -141,9 +141,9 @@ public actor OreStore {
     /// Sidebar order: pinned first, then most recently active. A workspace the
     /// user pinned is one they're coming back to; recency handles the rest.
     ///
-    /// The assistant workspace is excluded by default so every existing caller
-    /// — the sidebar, name uniqueness, engine startup — keeps seeing only the
-    /// user's own workspaces without knowing the assistant exists.
+    /// Product-owned workspaces (assistant, dream) are excluded by default so
+    /// every existing caller — the sidebar, name uniqueness, engine startup —
+    /// keeps seeing only the user's own workspaces.
     public func workspaces(
         includeArchived: Bool = false,
         includeAssistant: Bool = false
@@ -154,7 +154,7 @@ public actor OreStore {
                 request = request.filter(Column("isArchived") == false)
             }
             if !includeAssistant {
-                request = request.filter(Column("kind") != WorkspaceKind.assistant.rawValue)
+                request = request.filter(Column("kind") == WorkspaceKind.standard.rawValue)
             }
             return try request
                 .order(
@@ -866,5 +866,291 @@ public actor OreStore {
                 .filter(Column("filePath") == filePath)
                 .deleteAll(db)
         }
+    }
+
+    // MARK: - Dream Mode
+
+    public func saveDreamRun(_ record: DreamRunRecord) throws {
+        try writer.write { db in try record.save(db) }
+    }
+
+    public func dreamRun(_ id: DreamRunID) throws -> DreamRunRecord? {
+        try writer.read { db in try DreamRunRecord.fetchOne(db, key: id.rawValue) }
+    }
+
+    public func latestDreamRun() throws -> DreamRunRecord? {
+        try writer.read { db in
+            try DreamRunRecord
+                .order(Column("createdAt").desc)
+                .fetchOne(db)
+        }
+    }
+
+    public func activeDreamRun() throws -> DreamRunRecord? {
+        try writer.read { db in
+            try DreamRunRecord.fetchOne(
+                db,
+                sql: """
+                SELECT * FROM dreamRun
+                WHERE state IN ('planned', 'dreaming', 'paused', 'windingDown')
+                ORDER BY createdAt DESC
+                LIMIT 1
+                """
+            )
+        }
+    }
+
+    public func saveDreamTask(_ record: DreamTaskRecord) throws {
+        try writer.write { db in try record.save(db) }
+    }
+
+    public func dreamTask(_ id: DreamTaskID) throws -> DreamTaskRecord? {
+        try writer.read { db in try DreamTaskRecord.fetchOne(db, key: id.rawValue) }
+    }
+
+    public func dreamTasks(runID: DreamRunID) throws -> [DreamTaskRecord] {
+        try writer.read { db in
+            try DreamTaskRecord
+                .filter(Column("runID") == runID.rawValue)
+                .order(Column("createdAt").asc)
+                .fetchAll(db)
+        }
+    }
+
+    public func saveDreamFinding(_ record: DreamFindingRecord) throws {
+        try writer.write { db in try record.save(db) }
+    }
+
+    public func dreamFinding(_ id: DreamFindingID) throws -> DreamFindingRecord? {
+        try writer.read { db in try DreamFindingRecord.fetchOne(db, key: id.rawValue) }
+    }
+
+    public func dreamFinding(dedupeKey: String) throws -> DreamFindingRecord? {
+        try writer.read { db in
+            try DreamFindingRecord
+                .filter(Column("dedupeKey") == dedupeKey)
+                .order(Column("lastSeenAt").desc)
+                .fetchOne(db)
+        }
+    }
+
+    public func dreamFindings(statuses: [DreamFindingStatus] = DreamFindingStatus.allCases) throws -> [DreamFindingRecord] {
+        try writer.read { db in
+            let placeholders = statuses.map { _ in "?" }.joined(separator: ", ")
+            return try DreamFindingRecord.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM dreamFinding
+                WHERE status IN (\(placeholders))
+                ORDER BY createdAt DESC
+                """,
+                arguments: StatementArguments(statuses.map(\.rawValue))
+            )
+        }
+    }
+
+    public func appendDreamLedger(_ record: DreamLedgerRecord) throws {
+        try writer.write { db in
+            var record = record
+            try record.insert(db)
+        }
+    }
+
+    public func dreamLedgerTokens(runID: DreamRunID) throws -> Int {
+        try writer.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(SUM(tokens), 0) FROM dreamLedger WHERE runID = ?",
+                arguments: [runID.rawValue]
+            ) ?? 0
+        }
+    }
+
+    public func dreamLedgerTokens(since: Date) throws -> Int {
+        try writer.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(SUM(tokens), 0) FROM dreamLedger WHERE createdAt >= ?",
+                arguments: [since]
+            ) ?? 0
+        }
+    }
+
+    public func dreamFindings(runID: DreamRunID) throws -> [DreamFindingRecord] {
+        try writer.read { db in
+            try DreamFindingRecord
+                .filter(Column("runID") == runID.rawValue)
+                .order(Column("createdAt").asc)
+                .fetchAll(db)
+        }
+    }
+
+    public func dreamKindAcceptance() throws -> [DreamKindAcceptance] {
+        try writer.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT
+                    dreamTask.repositoryPath AS repositoryPath,
+                    dreamTask.kind AS kind,
+                    SUM(CASE WHEN dreamFinding.status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN dreamFinding.status = 'rejected' THEN 1 ELSE 0 END) AS rejected
+                FROM dreamFinding
+                JOIN dreamTask ON dreamTask.id = dreamFinding.taskID
+                WHERE dreamFinding.status IN ('accepted', 'rejected')
+                GROUP BY dreamTask.repositoryPath, dreamTask.kind
+                """
+            )
+            return rows.compactMap { row in
+                guard let kind = DreamKind(rawValue: row["kind"]) else { return nil }
+                return DreamKindAcceptance(
+                    repositoryPath: row["repositoryPath"],
+                    kind: kind,
+                    accepted: Int(row["accepted"] as Int64),
+                    rejected: Int(row["rejected"] as Int64)
+                )
+            }
+        }
+    }
+
+    public func resurfaceDeferredDreamFindings(now: Date = Date()) throws {
+        try writer.write { db in
+            try db.execute(
+                sql: """
+                UPDATE dreamFinding
+                SET status = 'new', deferredUntil = NULL, lastSeenAt = ?
+                WHERE status = 'deferred'
+                  AND deferredUntil IS NOT NULL
+                  AND deferredUntil <= ?
+                """,
+                arguments: [now, now]
+            )
+        }
+    }
+
+    public func expireStaleDreamFindings(
+        now: Date = Date(),
+        olderThan: TimeInterval = DreamRetention.findingDays
+    ) throws {
+        let cutoff = now.addingTimeInterval(-olderThan)
+        try writer.write { db in
+            try db.execute(
+                sql: """
+                UPDATE dreamFinding
+                SET status = 'expired', lastSeenAt = ?
+                WHERE status = 'new'
+                  AND createdAt < ?
+                """,
+                arguments: [now, cutoff]
+            )
+        }
+    }
+
+    /// 14-day turn activity per user repository, plus whether any pinned
+    /// workspace on that repo is sitting untouched.
+    public func dreamRepositoryActivity(since: Date) throws -> [DreamRepositoryActivity] {
+        try writer.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT
+                    repository.path AS repositoryPath,
+                    repository.name AS repositoryName,
+                    COALESCE(activity.turnCount, 0) AS turnCount,
+                    activity.lastTurnAt AS lastTurnAt,
+                    EXISTS(
+                        SELECT 1 FROM workspace
+                        WHERE workspace.repositoryPath = repository.path
+                          AND workspace.kind = 'standard'
+                          AND workspace.isArchived = 0
+                          AND workspace.isPinned = 1
+                    ) AS isPinned
+                FROM repository
+                LEFT JOIN (
+                    SELECT
+                        workspace.repositoryPath AS repositoryPath,
+                        COUNT(*) AS turnCount,
+                        MAX(turn.startedAt) AS lastTurnAt
+                    FROM turn
+                    JOIN session ON session.id = turn.sessionID
+                    JOIN workspace ON workspace.id = session.workspaceID
+                    WHERE workspace.kind = 'standard'
+                      AND turn.startedAt > ?
+                    GROUP BY workspace.repositoryPath
+                ) AS activity ON activity.repositoryPath = repository.path
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM workspace
+                    WHERE workspace.repositoryPath = repository.path
+                      AND workspace.kind = 'assistant'
+                )
+                ORDER BY turnCount DESC, repositoryName ASC
+                """,
+                arguments: [since]
+            )
+            return rows.map { row in
+                DreamRepositoryActivity(
+                    repositoryPath: row["repositoryPath"],
+                    repositoryName: row["repositoryName"],
+                    turnCount: row["turnCount"],
+                    lastTurnAt: row["lastTurnAt"],
+                    isPinned: (row["isPinned"] as Int64) != 0
+                )
+            }
+        }
+    }
+
+    /// Hour-of-day histogram of the user's own turns, used to recommend quiet
+    /// hours. Computed off the render loop on purpose.
+    public func quietHoursRecommendation(now: Date = Date()) throws -> QuietHoursRecommendation? {
+        let since = now.addingTimeInterval(-14 * 24 * 3600)
+        let hours: [Int] = try writer.read { db in
+            try Int.fetchAll(
+                db,
+                sql: """
+                SELECT CAST(strftime('%H', turn.startedAt) AS INTEGER)
+                FROM turn
+                JOIN session ON session.id = turn.sessionID
+                JOIN workspace ON workspace.id = session.workspaceID
+                WHERE workspace.kind = 'standard'
+                  AND turn.promptOrigin = 'user'
+                  AND turn.startedAt > ?
+                """,
+                arguments: [since]
+            )
+        }
+        guard hours.count >= 20 else { return nil }
+        var counts = Array(repeating: 0, count: 24)
+        for hour in hours {
+            guard (0..<24).contains(hour) else { continue }
+            counts[hour] += 1
+        }
+        // Six-hour window with the fewest turns.
+        var bestStart = 1
+        var bestSum = Int.max
+        for start in 0..<24 {
+            var sum = 0
+            for offset in 0..<6 {
+                sum += counts[(start + offset) % 24]
+            }
+            if sum < bestSum {
+                bestSum = sum
+                bestStart = start
+            }
+        }
+        let end = (bestStart + 6) % 24
+        let startMinutes = bestStart * 60
+        let endMinutes = end * 60
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mm a"
+        func clock(_ minutes: Int) -> String {
+            let comps = DateComponents(hour: minutes / 60, minute: minutes % 60)
+            let date = Calendar.current.date(from: comps) ?? Date()
+            return formatter.string(from: date)
+        }
+        return QuietHoursRecommendation(
+            startMinutes: startMinutes,
+            endMinutes: endMinutes,
+            reason: "You're rarely active \(clock(startMinutes))–\(clock(endMinutes))"
+        )
     }
 }

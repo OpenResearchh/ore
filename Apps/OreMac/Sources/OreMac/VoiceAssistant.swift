@@ -5,16 +5,35 @@ import OreProtocol
 
 /// A deliberately unusual spoken terminator for hands-free requests.
 ///
-/// Detection is suffix-only and token-based: punctuation and hyphens do not
-/// matter, but ordinary prose containing the words earlier in the request does.
-/// "Yep" is the one narrow ASR accommodation for "yip"; accepting broader
-/// near-matches would turn a safety mechanism into a false-submit hazard.
+/// Detection is suffix-only, token-based, and tiered. Exact means the
+/// historical rule or a variant the user enrolled through tuning — the
+/// normal settle applies. Fuzzy means one recognizer slip away: a slot from
+/// the curated confusion table, a merged token caught by edit distance on
+/// the joined suffix, a dropped or stuttered repetition — it needs words
+/// before it and a doubled settle, so a bare near-phrase never submits.
+/// Anything looser is at most a near-miss: surfaced as a hint, never sent.
 enum VoiceFinishPhrase {
-    static let spoken = "yip yap yip yip"
-    static let vocabulary = ["yip", "yap", "yep", spoken]
+    static let spoken = FinishPhraseModel.standard.spoken
+    static let vocabulary = FinishPhraseModel.standard.vocabulary
+
+    enum Confidence: Equatable {
+        case exact
+        case fuzzy
+    }
 
     struct Match: Equatable {
         let request: String
+        let confidence: Confidence
+        /// Normalized phrase evidence, kept separate from the request so a
+        /// revised ASR suffix restarts settling even when the request is stable.
+        let signature: String
+    }
+
+    struct Evaluation: Equatable {
+        let match: Match?
+        let nearMiss: Bool
+
+        static let none = Evaluation(match: nil, nearMiss: false)
     }
 
     private struct Token {
@@ -22,20 +41,218 @@ enum VoiceFinishPhrase {
         let range: Range<String.Index>
     }
 
-    static func match(in text: String) -> Match? {
-        let tokens = tokens(in: text)
-        guard tokens.count >= 4 else { return nil }
-        let suffix = Array(tokens.suffix(4))
-        let yip = Set(["yip", "yep"])
-        guard yip.contains(suffix[0].value),
-              suffix[1].value == "yap",
-              yip.contains(suffix[2].value),
-              yip.contains(suffix[3].value)
-        else { return nil }
+    static func match(in text: String, model: FinishPhraseModel = .standard) -> Match? {
+        evaluate(in: text, model: model).match
+    }
 
-        let request = String(text[..<suffix[0].range.lowerBound])
+    static func evaluate(
+        in text: String,
+        model: FinishPhraseModel = .standard
+    ) -> Evaluation {
+        let tokens = tokens(in: text)
+        let n = model.canonicalTokens.count
+        guard n > 0, !tokens.isEmpty else { return .none }
+
+        // Exact: a complete variant the user approved during tuning, or the
+        // slot rule as shipped. Long variants go first so all phrase debris is
+        // excised when their tail also happens to look canonical.
+        for variant in model.enrolledVariants.sorted(by: { $0.count > $1.count })
+        where !variant.isEmpty && tokens.count >= variant.count {
+            let window = Array(tokens.suffix(variant.count))
+            if window.map(\.value) == variant {
+                return matched(.exact, window: window, in: text)
+            }
+        }
+
+        // The historical stock rule may stand alone — an empty request never
+        // sends, so the bare phrase remains the spoken way to close the mic.
+        if tokens.count >= n {
+            let window = Array(tokens.suffix(n))
+            if window.indices.allSatisfy({ model.exactSlotContains(window[$0].value, slot: $0) }) {
+                return matched(.exact, window: window, in: text)
+            }
+        }
+        // Fuzzy tiers all require real words before the phrase: someone
+        // merely saying "yep yep…" into an open mic must never end the
+        // session, and phrase debris alone is not a request.
+
+        // One slot off, from the curated confusion table.
+        if tokens.count > n {
+            let window = Array(tokens.suffix(n))
+            let fuzzySlots = window.indices.filter {
+                model.fuzzySlotContains(window[$0].value, slot: $0)
+                    && !model.exactSlotContains(window[$0].value, slot: $0)
+            }
+            if fuzzySlots.count == 1,
+               window.indices.allSatisfy({ model.fuzzySlotContains(window[$0].value, slot: $0) }),
+               let evaluation = fuzzyMatched(window: window, in: text, model: model) {
+                return evaluation
+            }
+        }
+        // A stutter: the exact phrase plus one or two extra phrase tokens.
+        // Longest window first, so the whole stutter is excised from the
+        // request rather than half of it.
+        for extra in [2, 1] where tokens.count > n + extra {
+            let window = Array(tokens.suffix(n + extra))
+            let head = Array(window.prefix(n))
+            let tail = window.dropFirst(n)
+            if head.indices.allSatisfy({ model.exactSlotContains(head[$0].value, slot: $0) }),
+               tail.allSatisfy({ model.exactSlotContains($0.value, slot: n - 1) }),
+               let evaluation = fuzzyMatched(window: window, in: text, model: model) {
+                return evaluation
+            }
+        }
+        // A dropped final repetition — recognizers love collapsing "yip yip".
+        // Only when the phrase actually ends in a repeat.
+        if n >= 3, model.canonicalTokens[n - 1] == model.canonicalTokens[n - 2],
+           tokens.count > n - 1 {
+            let window = Array(tokens.suffix(n - 1))
+            if window.indices.allSatisfy({ model.exactSlotContains(window[$0].value, slot: $0) }),
+               let evaluation = fuzzyMatched(window: window, in: text, model: model) {
+                return evaluation
+            }
+        }
+        // Merged or slipped tokens: bounded edit distance on the joined
+        // suffix ("yipyap yip yip", "yip yep yip yip"). First letter must
+        // hold and the window grows from tightest, so a real word just
+        // before the phrase stays in the request.
+        let joinedTargets = [model.canonicalTokens.joined()]
+        for m in 1...min(n + 2, tokens.count) {
+            guard tokens.count > m else { break }
+            let window = Array(tokens.suffix(m))
+            let joined = window.map(\.value).joined()
+            // Repeated assent is common prose, not a finish attempt. It is
+            // intentionally a near-miss even though changing the middle
+            // "yep" to "yap" is only one character edit.
+            guard !window.allSatisfy({ $0.value == "yep" }) else { continue }
+            let sameShapeMismatchCount = window.count == n
+                ? window.indices.filter {
+                    !model.exactSlotContains(window[$0].value, slot: $0)
+                }.count
+                : 0
+            guard window.count != n || sameShapeMismatchCount == 1 else { continue }
+            for target in joinedTargets
+            where joined.first == target.first
+                && abs(joined.count - target.count) <= 2
+                && FinishPhraseMatching.editDistance(joined, target, limit: 2) <= 2 {
+                if let evaluation = fuzzyMatched(window: window, in: text, model: model) {
+                    return evaluation
+                }
+            }
+        }
+
+        return Evaluation(
+            match: nil,
+            nearMiss: isNearMiss(tokens: tokens, model: model, joinedTargets: joinedTargets)
+        )
+    }
+
+    private static func matched(
+        _ confidence: Confidence,
+        window: [Token],
+        in text: String
+    ) -> Evaluation {
+        guard let first = window.first else { return .none }
+        let request = String(text[..<first.range.lowerBound])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Match(request: request)
+        return Evaluation(
+            match: Match(
+                request: request,
+                confidence: confidence,
+                signature: window.map(\.value).joined(separator: " ")
+            ),
+            nearMiss: false
+        )
+    }
+
+    /// A fuzzy window only counts when what precedes it holds at least one
+    /// word that is not itself phrase vocabulary — a bare or stuttered
+    /// near-phrase must neither submit nor leave its debris as the request.
+    private static func fuzzyMatched(
+        window: [Token],
+        in text: String,
+        model: FinishPhraseModel
+    ) -> Evaluation? {
+        guard let first = window.first else { return nil }
+        let request = String(text[..<first.range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestTokens = tokens(in: request).map(\.value)
+        let phraseTokens = model.phraseTokens
+        guard requestTokens.contains(where: { !phraseTokens.contains($0) })
+        else { return nil }
+        return Evaluation(
+            match: Match(
+                request: request,
+                confidence: .fuzzy,
+                signature: window.map(\.value).joined(separator: " ")
+            ),
+            nearMiss: false
+        )
+    }
+
+    /// The transcript with trailing phrase debris removed — used when a
+    /// silence auto-finish fires after a garbled, unmatched finish attempt,
+    /// so "run the tests yip yap" sends "run the tests", not the noise.
+    static func strippingTrailingPhraseArtifacts(
+        _ text: String,
+        model: FinishPhraseModel = .standard
+    ) -> String {
+        let tokens = tokens(in: text)
+        guard !tokens.isEmpty else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let phraseTokens = model.phraseTokens
+        var keep = tokens.count
+        // Only the tail can be debris; never eat into the request proper.
+        let floor = max(0, tokens.count - model.canonicalTokens.count - 2)
+        while keep > floor {
+            let token = tokens[keep - 1].value
+            let isArtifact = phraseTokens.contains(token)
+                || phraseTokens.contains { candidate in
+                    candidate.count >= 3 && token.count >= 3
+                        && token.first == candidate.first
+                        && FinishPhraseMatching.editDistance(token, candidate, limit: 1) <= 1
+                }
+            guard isArtifact else { break }
+            keep -= 1
+        }
+        // A lone phrase-like word may be legitimate request content ("open the
+        // app"). Only a run of at least two tokens is credible finish debris.
+        guard tokens.count - keep >= 2 else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard keep > 0 else { return "" }
+        return String(text[..<tokens[keep].range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Close enough to be the user trying, not close enough to send: at
+    /// least half the slots line up, or the joined suffix is within twice
+    /// the fuzzy budget. Drives the "almost — say it once more" hint.
+    private static func isNearMiss(
+        tokens: [Token],
+        model: FinishPhraseModel,
+        joinedTargets: [String]
+    ) -> Bool {
+        let n = model.canonicalTokens.count
+        let window = Array(tokens.suffix(n))
+        let offset = n - window.count
+        var hits = 0
+        for (index, token) in window.enumerated()
+        where model.fuzzySlotContains(token.value, slot: index + offset) {
+            hits += 1
+        }
+        if hits >= 2 { return true }
+        for m in 1...min(n + 2, tokens.count) {
+            let joined = tokens.suffix(m).map(\.value).joined()
+            for target in joinedTargets
+            where joined.first == target.first
+                && abs(joined.count - target.count) <= 4
+                && FinishPhraseMatching.editDistance(joined, target, limit: 4) <= 4 {
+                return true
+            }
+        }
+        return false
     }
 
     private static func tokens(in text: String) -> [Token] {
@@ -71,19 +288,56 @@ struct HandsFreeListeningGuard {
     enum Action: Equatable {
         case none
         case finish(String)
+        /// Silence auto-send is one second away — the controller plays a
+        /// soft cue; any speech calls it off.
+        case silenceWarning
+        /// The opt-in pause elapsed with words on the table. The payload has
+        /// already had trailing phrase debris stripped.
+        case finishAfterSilence(String)
         case timeout
     }
 
     static let finishSettle = Duration.milliseconds(350)
+    /// A one-slip fuzzy match earns double the settle: a weaker signal gets
+    /// more time to either firm up into the exact phrase or dissolve.
+    static let fuzzySettle = Duration.milliseconds(700)
     static let noSpeechTimeout = Duration.seconds(15)
     static let maximumDuration = Duration.seconds(180)
 
-    private let startedAt: ContinuousClock.Instant
-    private var finishCandidate: String?
-    private var finishCandidateSince: ContinuousClock.Instant?
+    /// How many consecutive polls a near-miss must survive before it is
+    /// worth telling the user about — one volatile hypothesis is noise.
+    static let nearMissStablePolls = 3
 
-    init(startedAt: ContinuousClock.Instant) {
+    /// How far ahead of the silence auto-send the warning cue plays.
+    static let silenceWarningLead = Duration.seconds(1)
+
+    private let startedAt: ContinuousClock.Instant
+    private let model: FinishPhraseModel
+    /// Opt-in: how long the *words* must hold still before the session
+    /// sends without a finish phrase. Nil (the default) disables it.
+    private let silenceAutoFinish: Duration?
+    private var finishCandidateKey: String?
+    private var finishCandidateSince: ContinuousClock.Instant?
+    private var nearMissStreak = 0
+    private var nearMissCandidateKey: String?
+    private var lastContentKey = ""
+    private var lastContentChangeAt: ContinuousClock.Instant?
+    private var silenceWarningIssued = false
+
+    /// True while the user seems to be trying the phrase and the recognizer
+    /// keeps not quite producing it. Read after `evaluate`; informational
+    /// only — a near-miss never submits.
+    private(set) var nearMissHint = false
+    private(set) var silenceWarningActive = false
+
+    init(
+        startedAt: ContinuousClock.Instant,
+        model: FinishPhraseModel = .standard,
+        silenceAutoFinish: Duration? = nil
+    ) {
         self.startedAt = startedAt
+        self.model = model
+        self.silenceAutoFinish = silenceAutoFinish
     }
 
     mutating func evaluate(
@@ -92,21 +346,55 @@ struct HandsFreeListeningGuard {
         isFinal: Bool = false
     ) -> Action {
         let current = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let match = VoiceFinishPhrase.match(in: current) {
+        let contentKey = Self.normalizedWords(in: current)
+        if contentKey != lastContentKey {
+            lastContentKey = contentKey
+            lastContentChangeAt = contentKey.isEmpty ? nil : instant
+            silenceWarningIssued = false
+            silenceWarningActive = false
+        } else if !contentKey.isEmpty, lastContentChangeAt == nil {
+            lastContentChangeAt = instant
+        }
+
+        let evaluation = VoiceFinishPhrase.evaluate(in: current, model: model)
+        if evaluation.match != nil {
+            nearMissStreak = 0
+            nearMissCandidateKey = nil
+            nearMissHint = false
+        } else if evaluation.nearMiss {
+            if nearMissCandidateKey == contentKey {
+                nearMissStreak += 1
+            } else {
+                nearMissCandidateKey = contentKey
+                nearMissStreak = 1
+            }
+            if nearMissStreak >= Self.nearMissStablePolls { nearMissHint = true }
+        } else {
+            nearMissStreak = 0
+            nearMissCandidateKey = nil
+            nearMissHint = false
+        }
+        if let match = evaluation.match {
             // A final recognizer result has already passed a stronger stability
             // boundary than the polling settle delay.
-            if isFinal { return .finish(match.request) }
-            if finishCandidate == current {
+            if isFinal, match.confidence == .exact { return .finish(match.request) }
+            // Settle is keyed on the words that would be sent, not the raw
+            // transcript: cosmetic churn does not reset the clock, but either
+            // a changed request word or changed phrase hypothesis still does.
+            let key = Self.settleKey(for: match)
+            let required = match.confidence == .exact
+                ? Self.finishSettle : Self.fuzzySettle
+            if finishCandidateKey == key {
                 if let since = finishCandidateSince,
-                   instant - since >= Self.finishSettle {
+                   instant - since >= required {
                     return .finish(match.request)
                 }
             } else {
-                finishCandidate = current
+                finishCandidateKey = key
                 finishCandidateSince = instant
             }
         } else {
-            finishCandidate = nil
+            finishCandidateKey = nil
             finishCandidateSince = nil
         }
 
@@ -116,7 +404,34 @@ struct HandsFreeListeningGuard {
         if instant - startedAt >= Self.maximumDuration {
             return .timeout
         }
+        if let silenceAutoFinish, !contentKey.isEmpty,
+           let changedAt = lastContentChangeAt {
+            let quietFor = instant - changedAt
+            if quietFor >= silenceAutoFinish {
+                silenceWarningActive = false
+                let request = VoiceFinishPhrase.strippingTrailingPhraseArtifacts(
+                    current, model: model
+                )
+                if !request.isEmpty { return .finishAfterSilence(request) }
+            } else if !silenceWarningIssued,
+                      quietFor + Self.silenceWarningLead >= silenceAutoFinish {
+                silenceWarningIssued = true
+                silenceWarningActive = true
+                return .silenceWarning
+            }
+        }
         return .none
+    }
+
+    private static func normalizedWords(in text: String) -> String {
+        FinishPhraseMatching.words(in: text).joined(separator: " ")
+    }
+
+    /// Case, punctuation, and spacing churn collapse; lexical changes on
+    /// either side of the phrase boundary restart the safety window.
+    private static func settleKey(for match: VoiceFinishPhrase.Match) -> String {
+        let confidence = match.confidence == .exact ? "exact" : "fuzzy"
+        return "\(normalizedWords(in: match.request))|\(match.signature)|\(confidence)"
     }
 }
 
@@ -195,16 +510,34 @@ final class VoiceAssistantController {
         !UserDefaults.standard.bool(forKey: VoiceHotkeyMonitor.holdToTalkKey)
     }
 
+    /// The phrase the HUD should tell the user to say — tuned or stock.
+    var finishPhraseSpoken: String { handsFreePhraseModel.spoken }
+
     /// HUD and chimes only: speak the answer to a spoken question, not progress.
     static let quietModeKey = "ore.voice.quietMode"
+    static let silenceAutoSendKey = "ore.voice.silenceAutoSend"
+    private static let silenceAutoSendDelay = Duration.seconds(3)
 
     private var quietMode: Bool {
         UserDefaults.standard.bool(forKey: Self.quietModeKey)
     }
 
+    private var silenceAutoSendEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.silenceAutoSendKey)
+    }
+
     weak var model: AppModel?
 
     private let voice = VoiceInputController()
+    /// The finish-phrase rules for the session currently listening, loaded
+    /// when the mic opens.
+    private var handsFreePhraseModel: FinishPhraseModel = .standard
+    /// A gentle correction shown in the HUD when the user is close to the
+    /// finish phrase but the recognizer keeps not quite producing it.
+    private(set) var finishHint: String?
+    private var finishLogEnabled = false
+    private var finishLogStartedAt: ContinuousClock.Instant?
+    private var finishLogEntries: [FinishPhraseDebugLog.Entry] = []
     private var startTask: Task<Void, Never>?
     private var handsFreeTask: Task<Void, Never>?
     private var stillWorkingTask: Task<Void, Never>?
@@ -306,6 +639,7 @@ final class VoiceAssistantController {
             // The words are dropped rather than sent — the user changed their
             // mind mid-sentence, which is the whole reason they reached for the
             // key instead of releasing the chord.
+            flushFinishLog(outcome: "cancel")
             if voice.isActive { voice.stop() }
             model?.narration.setMicActive(false)
             phase = .idle
@@ -361,9 +695,17 @@ final class VoiceAssistantController {
 
     private func openMic() {
         guard let model, phase == .armed, !voice.isActive else { return }
+        // The phrase model is read once per session, so tuning mid-session
+        // can't change the rules under an open microphone.
+        let phraseModel = FinishPhraseStore.load() ?? .standard
+        handsFreePhraseModel = phraseModel
+        finishHint = nil
+        finishLogEnabled = FinishPhraseDebugLog.isEnabled
+        finishLogStartedAt = nil
+        finishLogEntries = []
         // Prime the recognizer with the names it will otherwise mangle.
         var names = projectNames()
-        if usesFinishPhrase { names += VoiceFinishPhrase.vocabulary }
+        if usesFinishPhrase { names += phraseModel.vocabulary }
         voice.vocabulary = names
         phase = .listening
         // Ducking: the assistant must not talk over the user, and its TTS
@@ -383,6 +725,7 @@ final class VoiceAssistantController {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard !Task.isCancelled, let self, self.phase == .listening else { return }
                 if case .error = self.voice.status {
+                    self.flushFinishLog(outcome: "error")
                     self.closeListeningWithoutSending(playCue: false)
                     return
                 }
@@ -392,7 +735,12 @@ final class VoiceAssistantController {
                     // than the no-speech window. Start that clock only once
                     // audio is really flowing.
                     guard self.voice.isListening else { continue }
-                    guardState = HandsFreeListeningGuard(startedAt: now)
+                    guardState = HandsFreeListeningGuard(
+                        startedAt: now,
+                        model: self.handsFreePhraseModel,
+                        silenceAutoFinish: self.silenceAutoSendEnabled
+                            ? Self.silenceAutoSendDelay : nil
+                    )
                 }
                 guard var next = guardState else { continue }
                 let recognitionEnded = !self.voice.isActive
@@ -402,20 +750,94 @@ final class VoiceAssistantController {
                     isFinal: recognitionEnded
                 )
                 guardState = next
+                self.noteFinishProgress(
+                    action: action,
+                    nearMiss: next.nearMissHint,
+                    silenceWarning: next.silenceWarningActive,
+                    at: now
+                )
                 switch action {
                 case .none:
                     if recognitionEnded {
+                        self.flushFinishLog(outcome: "ended")
                         self.closeListeningWithoutSending(playCue: true)
                         return
                     }
                     continue
                 case .finish(let request):
+                    self.flushFinishLog(outcome: "finish")
+                    self.finish(spokenOverride: request)
+                case .silenceWarning:
+                    self.playCue(named: "Tink", volume: 0.12)
+                    continue
+                case .finishAfterSilence(let request):
+                    self.flushFinishLog(outcome: "silence")
                     self.finish(spokenOverride: request)
                 case .timeout:
+                    self.flushFinishLog(outcome: "timeout")
                     self.closeListeningWithoutSending(playCue: true)
                 }
                 return
             }
+        }
+    }
+
+    /// Feeds the HUD's near-miss hint and the opt-in diagnostic log, once
+    /// per guard poll. The hint appears while the user seems to be trying
+    /// the phrase and disappears the moment they say something else.
+    private func noteFinishProgress(
+        action: HandsFreeListeningGuard.Action,
+        nearMiss: Bool,
+        silenceWarning: Bool,
+        at now: ContinuousClock.Instant
+    ) {
+        if silenceWarning {
+            finishHint = "Sending in one second — keep talking to cancel"
+        } else if nearMiss {
+            if finishHint == nil {
+                finishHint = "Almost — say “\(handsFreePhraseModel.spoken)” once more"
+            }
+        } else {
+            finishHint = nil
+        }
+
+        guard finishLogEnabled else { return }
+        if finishLogStartedAt == nil { finishLogStartedAt = now }
+        let transcript = voice.transcript
+        let saw = switch action {
+        case .finish: "finish"
+        case .silenceWarning: "silenceWarning"
+        case .finishAfterSilence: "silenceFinish"
+        case .timeout: "timeout"
+        case .none: nearMiss ? "nearMiss" : "none"
+        }
+        // One entry per change, not one per poll: the transcript is the
+        // diagnostic payload, and it holds still most of the time.
+        if let last = finishLogEntries.last,
+           last.suffix == FinishPhraseDebugLog.suffix(of: transcript), last.saw == saw { return }
+        let elapsed = now - (finishLogStartedAt ?? now)
+        finishLogEntries.append(FinishPhraseDebugLog.Entry(
+            ms: Int(elapsed / .milliseconds(1)),
+            suffix: FinishPhraseDebugLog.suffix(of: transcript),
+            saw: saw
+        ))
+    }
+
+    /// Ships the session's log to disk (off the main actor) and drops the
+    /// hint. Harmless when logging is off or nothing was heard.
+    private func flushFinishLog(outcome: String) {
+        finishHint = nil
+        guard finishLogEnabled, !finishLogEntries.isEmpty else { return }
+        let session = FinishPhraseDebugLog.Session(
+            endedAt: Date(),
+            outcome: outcome,
+            recognizer: voice.recognizerRoute?.rawValue,
+            contextApplied: voice.contextualBiasApplied,
+            entries: finishLogEntries
+        )
+        finishLogEntries = []
+        Task.detached(priority: .utility) {
+            FinishPhraseDebugLog.append(session)
         }
     }
 
@@ -500,6 +922,7 @@ final class VoiceAssistantController {
         handsFreeTask = nil
         if voice.isActive { voice.stop() }
         model?.narration.setMicActive(false)
+        finishHint = nil
         phase = .idle
         if shouldPlay { playCue(named: "Pop", volume: 0.18) }
     }

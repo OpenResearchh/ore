@@ -84,6 +84,16 @@ public enum CoreCommand: Sendable, Codable {
     /// confirmation id from `CoreEvent.assistantConfirmationRequested`.
     case resolveAssistantConfirmation(String, AssistantConfirmationDecision)
 
+    // Dream Mode
+    case updateDreamSettings(DreamSettings)
+    case updateDreamEnvironment(DreamEnvironmentSnapshot)
+    /// Manual "Dream now". Bypasses idle/quiet-hours/AC gates; still honors
+    /// the night token cap, excluded-repo list, and research-only tool policy.
+    case startDreamRun(manual: Bool, repositoryPath: String?)
+    case abortDreamRun
+    case resolveDreamFinding(DreamFindingID, DreamFindingResolution)
+    case listDreamFindings
+
     // Diagnostics
     case probeHarnesses
     /// Resend the current snapshot — used on reconnect, and by a fresh window.
@@ -155,6 +165,10 @@ public enum MessageOrigin: String, Sendable, Codable, Hashable, CaseIterable {
     /// would bury what the user actually said under a wall of "finished a
     /// turn" and "SKIP".
     case watch
+    /// An unattended Dream Mode research turn. Not the user's words, not the
+    /// assistant speaking for them — overnight work that must not title chats,
+    /// compact conversations, or show up in the fleet digest as activity.
+    case dream
 }
 
 public struct SendMessageRequest: Sendable, Codable {

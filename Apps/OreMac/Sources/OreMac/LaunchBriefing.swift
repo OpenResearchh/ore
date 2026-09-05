@@ -30,7 +30,8 @@ struct LaunchBriefing: Equatable {
         workspaces: [WorkspaceSummary],
         lastSeenAt: Date?,
         now: Date = Date(),
-        userName: String? = nil
+        userName: String? = nil,
+        dreamFindingCount: Int = 0
     ) -> LaunchBriefing {
         let greeting = greetingLine(now: now, userName: userName)
         let active = workspaces.filter { !$0.isArchived }
@@ -105,6 +106,15 @@ struct LaunchBriefing: Equatable {
                     : "\(conflicted.count) workspaces conflict with their base branch",
                 isAttention: true
             ))
+        }
+        if dreamFindingCount > 0 {
+            lines.insert(Line(
+                id: "dreams",
+                icon: "moon.stars",
+                text: dreamFindingCount == 1
+                    ? "ORE dreamed last night — 1 finding to review"
+                    : "ORE dreamed last night — \(dreamFindingCount) findings to review"
+            ), at: 0)
         }
         if lines.isEmpty {
             lines.append(Line(

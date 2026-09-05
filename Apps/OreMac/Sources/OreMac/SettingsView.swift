@@ -25,10 +25,20 @@ struct SettingsView: View {
     @AppStorage(NarrationEngine.fleetSwitchKey) private var fleetNarration = true
     @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
     @AppStorage(VoiceAssistantController.quietModeKey) private var quietMode = false
+    @AppStorage(VoiceAssistantController.silenceAutoSendKey) private var silenceAutoSend = false
     @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
+    @AppStorage(DreamSettingsStore.enabled) private var dreamsEnabled = false
+    @AppStorage(DreamSettingsStore.quietStart) private var quietStart = 60
+    @AppStorage(DreamSettingsStore.quietEnd) private var quietEnd = 420
+    @AppStorage(DreamSettingsStore.idleMinutes) private var idleMinutes = 20
+    @AppStorage(DreamSettingsStore.requireACPower) private var requireACPower = true
+    @AppStorage(DreamSettingsStore.preventSleep) private var preventSleep = false
+    @AppStorage(DreamSettingsStore.nightTokenCap) private var nightTokenCap = 50_000
+    @AppStorage(DreamSettingsStore.headroomFraction) private var headroomFraction = 0.25
+    @AppStorage(DreamSettingsStore.copySecrets) private var copySecrets = false
 
     @State private var selectedHarness: HarnessKind = .claudeCode
     @State private var authenticatingHarness: HarnessKind?
@@ -36,6 +46,10 @@ struct SettingsView: View {
     /// Mirrors the login-item state. See `refreshLaunchAtLogin` for why this is
     /// cached rather than read live.
     @State private var launchesAtLogin = false
+    @State private var showsPhraseTuning = false
+    /// Cached: `FinishPhraseStore.currentSpoken` decodes JSON, and this body
+    /// re-runs every display cycle. Refreshed when the tuning sheet closes.
+    @State private var finishPhraseSpoken = FinishPhraseStore.currentSpoken
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "General"
@@ -44,6 +58,7 @@ struct SettingsView: View {
         case projects = "Projects"
         case agents = "Agents"
         case environment = "Environment"
+        case dreams = "Dreams"
         var id: String { rawValue }
         var icon: String {
             switch self {
@@ -53,6 +68,7 @@ struct SettingsView: View {
             case .projects: "folder"
             case .agents: "cpu"
             case .environment: "terminal"
+            case .dreams: "moon.stars"
             }
         }
         var detail: String {
@@ -63,6 +79,7 @@ struct SettingsView: View {
             case .projects: "Per-project ore.toml: scripts, files to copy, branch prefix, and default agent."
             case .agents: "See the coding harnesses ORE can reach, their authentication, and models."
             case .environment: "Understand where work lives and what every terminal and agent inherits."
+            case .dreams: "Overnight research while this Mac is idle. Off by default, read-only, budgeted."
             }
         }
     }
@@ -176,6 +193,7 @@ struct SettingsView: View {
         case .projects: ProjectsSettings(repositories: appModel.repositories)
         case .agents: agents
         case .environment: environment
+        case .dreams: dreams
         }
     }
 
@@ -228,7 +246,7 @@ struct SettingsView: View {
         if holdToTalk && !legacyHoldDictation {
             return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, keep holding while you speak, then release to send."
         }
-        return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(VoiceFinishPhrase.spoken).”"
+        return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(finishPhraseSpoken).”"
     }
 
     private var general: some View {
@@ -318,12 +336,31 @@ struct SettingsView: View {
                     }
                 }
                 Divider()
+                SettingsRow(
+                    "Finish phrase",
+                    detail: "“\(finishPhraseSpoken)” ends a hands-free request. Tune it against your own voice — the recognizer's actual transcriptions become accepted variants — or choose different words."
+                ) {
+                    Button("Tune…") { showsPhraseTuning = true }
+                        .disabled(appModel.voiceAssistant.phase != .idle)
+                }
+                Divider()
+                Toggle("Send after 3 seconds of silence", isOn: $silenceAutoSend)
+                    .disabled(holdToTalk || legacyHoldDictation)
+                Text("Optional backstop for hands-free requests. A soft cue plays one second before sending; speaking again cancels the countdown. Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
                 Toggle("Hold ⇧⌥ dictates into the composer instead", isOn: $legacyHoldDictation)
                 Text("Restores the pre-assistant gesture: holding the chord in another app pulls ORE frontmost and dictates into the focused composer, instead of talking to the assistant.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .onAppear { hotkey.refreshTrust() }
+            .sheet(isPresented: $showsPhraseTuning) {
+                finishPhraseSpoken = FinishPhraseStore.currentSpoken
+            } content: {
+                FinishPhraseTuningSheet()
+            }
         }
     }
 
@@ -585,6 +622,187 @@ struct SettingsView: View {
                     .foregroundStyle(.tertiary)
             }
         }
+    }
+
+    private var dreams: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: "Overnight research", icon: "moon.stars") {
+                Toggle("Enable Dream Mode", isOn: $dreamsEnabled)
+                Text("While you sleep, ORE reviews a project, hunts for bugs, and audits dependencies. Research only — it never pushes, never opens a PR, and never spends the quota you need in the morning. Off until you turn it on.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Like the shoemaker's elves: work happens overnight, and you review it in the morning.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            SettingsCard(title: "Sleep", icon: "bolt.fill") {
+                sleepStatusCopy
+                Toggle("Keep Mac awake on AC during quiet hours", isOn: $preventSleep)
+                    .disabled(!dreamsEnabled)
+                Text("Only while plugged in. The display may still sleep. ORE never holds the Mac awake on battery. If this is off, overnight dreams only run if the Mac happens to stay awake — use Dream now from the Dreams window anytime. ⌥⌘D opens Dreams.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Only dream while plugged in", isOn: $requireACPower)
+                    .disabled(!dreamsEnabled)
+            }
+
+            SettingsCard(title: "When", icon: "clock") {
+                SettingsRow("Quiet hours start", detail: "Local time") {
+                    DatePicker(
+                        "",
+                        selection: quietStartDate,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+                SettingsRow("Quiet hours end", detail: "Local time") {
+                    DatePicker(
+                        "",
+                        selection: quietEndDate,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+                if let recommendation = appModel.dreamInbox.quietHoursRecommendation {
+                    Button(recommendation.reason) {
+                        quietStart = recommendation.startMinutes
+                        quietEnd = recommendation.endMinutes
+                        appModel.pushDreamSettings()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                SettingsRow("Idle for", detail: "No keyboard or mouse") {
+                    Stepper("\(idleMinutes) min", value: $idleMinutes, in: 5...120, step: 5)
+                        .frame(width: 140)
+                }
+            }
+
+            SettingsCard(title: "Budget", icon: "gauge") {
+                SettingsRow("Night token cap", detail: "Hard stop for the whole night") {
+                    TextField("50000", value: $nightTokenCap, format: .number)
+                        .frame(width: 100)
+                }
+                SettingsRow("Morning headroom", detail: "Reserved so morning quota survives") {
+                    Picker("", selection: $headroomFraction) {
+                        Text("10%").tag(0.10)
+                        Text("25%").tag(0.25)
+                        Text("40%").tag(0.40)
+                    }
+                    .labelsHidden()
+                    .frame(width: 90)
+                }
+                Text("Dreams may spend \(Int(Double(nightTokenCap) * (1 - headroomFraction))) tokens tonight. A run that hits the cap writes up findings and stops.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsCard(title: "Safety", icon: "lock.shield") {
+                Toggle("Copy .env and secrets into dream worktrees", isOn: $copySecrets)
+                Text("Off: research dreams run without secrets. On: copies whatever ore.toml lists under [files] copy, the same as a normal workspace.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsCard(title: "Excluded projects", icon: "eye.slash") {
+                if appModel.repositories.isEmpty {
+                    Text("Add a project first, then you can keep private repos out of overnight research.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(appModel.repositories, id: \.self) { path in
+                        Toggle(URL(fileURLWithPath: path).lastPathComponent, isOn: excludedRepoBinding(path))
+                    }
+                    Text("Excluded projects are never dreamed about, including Dream now.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onChange(of: dreamsEnabled) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: preventSleep) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: requireACPower) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: quietStart) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: quietEnd) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: idleMinutes) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: nightTokenCap) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: headroomFraction) { _, _ in appModel.pushDreamSettings() }
+        .onChange(of: copySecrets) { _, _ in appModel.pushDreamSettings() }
+        .onAppear { appModel.refreshDreamSleepStatus() }
+    }
+
+    @ViewBuilder
+    private var sleepStatusCopy: some View {
+        switch appModel.dreamSleepStatus {
+        case .macMaySleep:
+            Text("Your Mac will likely sleep overnight. Dreams only run while it is awake.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .keepAwakePausedOnBattery:
+            Text("Keep awake is paused — plug in to run overnight.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .keepAwakeActive:
+            Text("ORE will keep this Mac awake during quiet hours while plugged in.")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case .opportunistic:
+            Text("Dreams run opportunistically while the Mac happens to be awake.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .disabled:
+            Text("Dream Mode is off. Overnight research will not start.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var quietStartDate: Binding<Date> {
+        Binding(
+            get: { Self.date(fromMinutes: quietStart) },
+            set: { quietStart = Self.minutes(from: $0) }
+        )
+    }
+
+    private var quietEndDate: Binding<Date> {
+        Binding(
+            get: { Self.date(fromMinutes: quietEnd) },
+            set: { quietEnd = Self.minutes(from: $0) }
+        )
+    }
+
+    private func excludedRepoBinding(_ path: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                (UserDefaults.standard.stringArray(forKey: DreamSettingsStore.excludedRepos) ?? [])
+                    .contains(path)
+            },
+            set: { excluded in
+                var paths = Set(UserDefaults.standard.stringArray(forKey: DreamSettingsStore.excludedRepos) ?? [])
+                if excluded {
+                    paths.insert(path)
+                } else {
+                    paths.remove(path)
+                }
+                UserDefaults.standard.set(Array(paths).sorted(), forKey: DreamSettingsStore.excludedRepos)
+                appModel.pushDreamSettings()
+            }
+        )
+    }
+
+    private static func date(fromMinutes minutes: Int) -> Date {
+        var components = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        components.hour = minutes / 60
+        components.minute = minutes % 60
+        return Calendar.current.date(from: components) ?? Date()
+    }
+
+    private static func minutes(from date: Date) -> Int {
+        Calendar.current.component(.hour, from: date) * 60
+            + Calendar.current.component(.minute, from: date)
     }
 
     /// The agent pinned for new chats, or nil while they still follow the workspace.

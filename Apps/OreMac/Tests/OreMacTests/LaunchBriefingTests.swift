@@ -67,6 +67,18 @@ struct LaunchBriefingTests {
         #expect(briefing.lines[0].text == "All quiet — 1 workspace ready")
     }
 
+    @Test func dreamFindingsLeadTheMorningCard() {
+        let briefing = LaunchBriefing.compose(
+            workspaces: [workspace("Quiet", status: .idle, activity: now)],
+            lastSeenAt: now.addingTimeInterval(-3600),
+            now: now,
+            userName: nil,
+            dreamFindingCount: 3
+        )
+        #expect(briefing.lines.map(\.id) == ["dreams"])
+        #expect(briefing.lines[0].text == "ORE dreamed last night — 3 findings to review")
+    }
+
     @Test func manyNamesCollapseToACount() {
         let briefing = LaunchBriefing.compose(
             workspaces: (1...5).map {

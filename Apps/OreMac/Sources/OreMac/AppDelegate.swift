@@ -90,6 +90,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             ],
             intentIdentifiers: []
         ),
+        UNNotificationCategory(
+            identifier: NotificationCategory.dreams,
+            actions: [
+                UNNotificationAction(
+                    identifier: NotificationAction.openDreams,
+                    title: "Open Dreams"
+                ),
+            ],
+            intentIdentifiers: []
+        ),
     ] }
 
     func userNotificationCenter(
@@ -210,6 +220,7 @@ enum NotificationCategory {
     static let assistantConfirmation = "ore.category.assistantConfirmation"
     static let agentQuestion = "ore.category.agentQuestion"
     static let toolPermission = "ore.category.toolPermission"
+    static let dreams = "ore.category.dreams"
 }
 
 enum NotificationAction {
@@ -219,6 +230,7 @@ enum NotificationAction {
     static let reply = "ore.action.reply"
     static let allowPermission = "ore.action.allowPermission"
     static let denyPermission = "ore.action.denyPermission"
+    static let openDreams = "ore.action.openDreams"
 }
 
 extension Notification.Name {

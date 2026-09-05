@@ -41,6 +41,14 @@ public enum CoreEvent: Sendable, Codable {
     /// conversation and `chatAdded` also fires for side chats the assistant
     /// opens for itself — following those would move the user mid-answer.
     case assistantConversationCompacted(WorkspaceID, from: ChatID, to: ChatID)
+
+    // Dream Mode — overnight research. The Dreams window is the only surface;
+    // these never drive the sidebar.
+    case dreamRunStateChanged(DreamRunSummary)
+    case dreamTaskUpdated(DreamTaskSummary)
+    case dreamFindingAdded(DreamFindingSummary)
+    case dreamFindingUpdated(DreamFindingSummary)
+    case dreamInboxUpdated(DreamInboxSnapshot)
 }
 
 /// A prompt handed to a chat, described well enough for a client to draw it
@@ -169,11 +177,13 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
 ///
 /// `.assistant` marks the product-owned assistant workspace: one per user,
 /// hidden from the sidebar and every picker, surfaced only through the
-/// Assistant activity window and voice mode. It runs the same engine as any
-/// other workspace — being hidden is a client concern, not an engine one.
+/// Assistant activity window and voice mode. `.dream` is the same idea for
+/// overnight research worktrees — many per user, never mixed with active work.
+/// Both run the same engine; being hidden is a client concern.
 public enum WorkspaceKind: String, Sendable, Codable, Hashable {
     case standard
     case assistant
+    case dream
 }
 
 /// Everything the sidebar needs to render one row, in one struct — the sidebar
@@ -211,6 +221,10 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
     public var kind: WorkspaceKind?
 
     public var isAssistant: Bool { kind == .assistant }
+    public var isDream: Bool { kind == .dream }
+    /// User-facing workspaces only. Assistant and dream rows ride the snapshot
+    /// tagged by kind so dedicated windows can find them; the sidebar must not.
+    public var isStandard: Bool { kind == nil || kind == .standard }
 
     public init(
         id: WorkspaceID,

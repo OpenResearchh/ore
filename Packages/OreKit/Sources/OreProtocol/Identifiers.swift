@@ -60,3 +60,18 @@ public struct QuestionID: OreIdentifier {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+public struct DreamRunID: OreIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+public struct DreamTaskID: OreIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+public struct DreamFindingID: OreIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}

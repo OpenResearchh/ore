@@ -50,8 +50,9 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     /// The user typed this name. When set, automatic research-identity and
     /// first-prompt renaming leave it alone.
     public var isNameUserSet: Bool
-    /// `standard` or `assistant` — see `WorkspaceKind`. A column rather than a
-    /// flag so a third kind never means a second migration of the same shape.
+    /// `standard`, `assistant`, or `dream` — see `WorkspaceKind`. A column
+    /// rather than a flag so a new kind never means a second migration of the
+    /// same shape.
     public var kind: String
 
     public init(
@@ -655,5 +656,226 @@ public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableR
     public var paths: [String] {
         guard let data = attachmentPaths.data(using: .utf8) else { return [] }
         return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+}
+
+public struct DreamRunRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "dreamRun"
+
+    public var id: String
+    public var scheduledFor: Date
+    public var state: String
+    public var trigger: String
+    public var agendaJSON: String
+    public var reportJSON: String?
+    public var why: String
+    public var abortReason: String?
+    public var tokenBudget: Int
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: DreamRunID,
+        scheduledFor: Date = Date(),
+        state: DreamRunState,
+        trigger: DreamRunTrigger,
+        agendaJSON: String = "[]",
+        reportJSON: String? = nil,
+        why: String,
+        abortReason: String? = nil,
+        tokenBudget: Int = 0,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id.rawValue
+        self.scheduledFor = scheduledFor
+        self.state = state.rawValue
+        self.trigger = trigger.rawValue
+        self.agendaJSON = agendaJSON
+        self.reportJSON = reportJSON
+        self.why = why
+        self.abortReason = abortReason
+        self.tokenBudget = tokenBudget
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    public var runID: DreamRunID { DreamRunID(rawValue: id) }
+    public var runState: DreamRunState { DreamRunState(rawValue: state) ?? .planned }
+    public var runTrigger: DreamRunTrigger { DreamRunTrigger(rawValue: trigger) ?? .schedule }
+}
+
+public struct DreamTaskRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "dreamTask"
+
+    public var id: String
+    public var runID: String
+    public var repositoryPath: String
+    public var kind: String
+    public var priorityScore: Double
+    public var state: String
+    public var why: String
+    public var workspaceID: String?
+    public var chatID: String?
+    public var harness: String?
+    public var model: String?
+    public var tokensUsed: Int
+    public var turnCount: Int
+    public var failureReason: String?
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: DreamTaskID,
+        runID: DreamRunID,
+        repositoryPath: String,
+        kind: DreamKind,
+        priorityScore: Double,
+        state: DreamTaskState,
+        why: String,
+        workspaceID: WorkspaceID? = nil,
+        chatID: ChatID? = nil,
+        harness: HarnessKind? = nil,
+        model: String? = nil,
+        tokensUsed: Int = 0,
+        turnCount: Int = 0,
+        failureReason: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id.rawValue
+        self.runID = runID.rawValue
+        self.repositoryPath = repositoryPath
+        self.kind = kind.rawValue
+        self.priorityScore = priorityScore
+        self.state = state.rawValue
+        self.why = why
+        self.workspaceID = workspaceID?.rawValue
+        self.chatID = chatID?.rawValue
+        self.harness = harness?.rawValue
+        self.model = model
+        self.tokensUsed = tokensUsed
+        self.turnCount = turnCount
+        self.failureReason = failureReason
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    public var taskID: DreamTaskID { DreamTaskID(rawValue: id) }
+    public var dreamRunID: DreamRunID { DreamRunID(rawValue: runID) }
+    public var dreamKind: DreamKind { DreamKind(rawValue: kind) ?? .review }
+    public var taskState: DreamTaskState { DreamTaskState(rawValue: state) ?? .pending }
+}
+
+public struct DreamFindingRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "dreamFinding"
+
+    public var id: String
+    public var taskID: String
+    public var runID: String
+    public var repositoryPath: String
+    public var kind: String
+    public var title: String
+    public var summary: String
+    public var evidenceJSON: String
+    public var confidence: Double
+    public var severity: String
+    public var branchName: String?
+    public var diffSnapshot: String?
+    public var status: String
+    public var rejectReason: String?
+    public var deferredUntil: Date?
+    public var dedupeKey: String
+    public var why: String
+    public var workspaceID: String?
+    public var chatID: String?
+    public var createdAt: Date
+    public var lastSeenAt: Date
+
+    public init(
+        id: DreamFindingID,
+        taskID: DreamTaskID,
+        runID: DreamRunID,
+        repositoryPath: String,
+        kind: DreamFindingKind,
+        title: String,
+        summary: String,
+        evidenceJSON: String = "[]",
+        confidence: Double,
+        severity: DreamFindingSeverity,
+        branchName: String? = nil,
+        diffSnapshot: String? = nil,
+        status: DreamFindingStatus = .new,
+        rejectReason: String? = nil,
+        deferredUntil: Date? = nil,
+        dedupeKey: String,
+        why: String,
+        workspaceID: WorkspaceID? = nil,
+        chatID: ChatID? = nil,
+        createdAt: Date = Date(),
+        lastSeenAt: Date = Date()
+    ) {
+        self.id = id.rawValue
+        self.taskID = taskID.rawValue
+        self.runID = runID.rawValue
+        self.repositoryPath = repositoryPath
+        self.kind = kind.rawValue
+        self.title = title
+        self.summary = summary
+        self.evidenceJSON = evidenceJSON
+        self.confidence = confidence
+        self.severity = severity.rawValue
+        self.branchName = branchName
+        self.diffSnapshot = diffSnapshot
+        self.status = status.rawValue
+        self.rejectReason = rejectReason
+        self.deferredUntil = deferredUntil
+        self.dedupeKey = dedupeKey
+        self.why = why
+        self.workspaceID = workspaceID?.rawValue
+        self.chatID = chatID?.rawValue
+        self.createdAt = createdAt
+        self.lastSeenAt = lastSeenAt
+    }
+
+    public var findingID: DreamFindingID { DreamFindingID(rawValue: id) }
+
+    public var evidence: [DreamEvidence] {
+        guard let data = evidenceJSON.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([DreamEvidence].self, from: data)) ?? []
+    }
+}
+
+public struct DreamLedgerRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "dreamLedger"
+
+    public var id: Int64?
+    public var runID: String
+    public var taskID: String?
+    public var harness: String
+    public var tokens: Int
+    public var turns: Int
+    public var createdAt: Date
+
+    public init(
+        id: Int64? = nil,
+        runID: DreamRunID,
+        taskID: DreamTaskID? = nil,
+        harness: HarnessKind,
+        tokens: Int,
+        turns: Int,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.runID = runID.rawValue
+        self.taskID = taskID?.rawValue
+        self.harness = harness.rawValue
+        self.tokens = tokens
+        self.turns = turns
+        self.createdAt = createdAt
+    }
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
     }
 }

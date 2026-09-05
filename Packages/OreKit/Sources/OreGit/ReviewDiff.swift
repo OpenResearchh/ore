@@ -98,3 +98,41 @@ public enum DiffCommentFile {
         return comments.count
     }
 }
+
+/// On-disk dream findings. The MCP server appends here; the core ingests into
+/// SQLite when the dream task completes — the file is a staging area, not the
+/// source of truth.
+public enum DreamFindingFile {
+    public static let fileName = "ore-dream-findings.json"
+
+    public static func url(in worktree: URL) -> URL {
+        worktree
+            .appendingPathComponent(".context", isDirectory: true)
+            .appendingPathComponent(fileName)
+    }
+
+    public static func load(in worktree: URL) -> [PostedDreamFinding] {
+        let url = url(in: worktree)
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([PostedDreamFinding].self, from: data)) ?? []
+    }
+
+    public static func save(_ findings: [PostedDreamFinding], in worktree: URL) throws {
+        let url = url(in: worktree)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(findings)
+        try data.write(to: url, options: .atomic)
+    }
+
+    @discardableResult
+    public static func append(
+        _ finding: PostedDreamFinding, in worktree: URL
+    ) throws -> Int {
+        var findings = load(in: worktree)
+        findings.append(finding)
+        try save(findings, in: worktree)
+        return findings.count
+    }
+}

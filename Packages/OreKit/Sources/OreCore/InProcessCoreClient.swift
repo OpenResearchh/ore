@@ -18,7 +18,7 @@ public actor InProcessCoreClient: CoreClient {
 
     let store: OreStore
     private let harnessRegistry: HarnessRegistry
-    private let worktreeRoot: URL?
+    let worktreeRoot: URL?
     private let allowAPIKeyFallback: Bool
 
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
@@ -51,6 +51,12 @@ public actor InProcessCoreClient: CoreClient {
     var assistantFailedHarnesses: [ChatID: Set<HarnessKind>] = [:]
     var assistantFailoverInFlight: Set<ChatID> = []
     var assistantFailoverAt: [ChatID: ContinuousClock.Instant] = [:]
+
+    var dreamSettings = DreamSettings.default
+    var dreamEnvironment: DreamEnvironmentSnapshot?
+    var dreamSchedulerState = DreamScheduler.State()
+    var dreamWorkerTask: Task<Void, Never>?
+    var dreamHarnessParkedUntil: [HarnessKind: Date] = [:]
 
     public init(
         store: OreStore,
@@ -260,6 +266,24 @@ public actor InProcessCoreClient: CoreClient {
         case .resolveAssistantConfirmation(let id, let decision):
             resolveAssistantConfirmation(id: id, decision: decision)
 
+        case .updateDreamSettings(let settings):
+            try await applyDreamSettings(settings)
+
+        case .updateDreamEnvironment(let snapshot):
+            try await applyDreamEnvironment(snapshot)
+
+        case .startDreamRun(let manual, let repositoryPath):
+            try await beginDreamRun(manual: manual, repositoryPath: repositoryPath)
+
+        case .abortDreamRun:
+            try await abortActiveDreamRun()
+
+        case .resolveDreamFinding(let id, let resolution):
+            try await resolveDreamFinding(id, resolution)
+
+        case .listDreamFindings:
+            try await publishDreamInbox()
+
         case .probeHarnesses:
             async let probes = harnessRegistry.probeAll()
             async let catalogs = harnessRegistry.discoverAllModels()
@@ -298,6 +322,7 @@ public actor InProcessCoreClient: CoreClient {
         for record in try await store.workspaces() {
             _ = try? await makeEngine(for: record)
         }
+        try await restoreOrphanedDreams()
         try await resync(nil)
 
         Task { [weak self] in
@@ -412,7 +437,7 @@ public actor InProcessCoreClient: CoreClient {
     /// `/tmp` is a symlink to `/private/tmp`, and a home directory can be too,
     /// so "add the repo, then make a workspace in it" would otherwise fail on a
     /// foreign key the user has no way to understand.
-    private func canonicalRepositoryURL(_ path: String) async throws -> URL {
+    func canonicalRepositoryURL(_ path: String) async throws -> URL {
         let expanded = FilePath.expandingTildeURL(path).standardizedFileURL
 
         // `git rev-parse --show-toplevel` both resolves symlinks and turns a
@@ -655,7 +680,7 @@ public actor InProcessCoreClient: CoreClient {
         }
     }
 
-    private func deleteWorkspace(_ id: WorkspaceID, deleteBranch: Bool) async throws {
+    func deleteWorkspace(_ id: WorkspaceID, deleteBranch: Bool) async throws {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
@@ -788,7 +813,7 @@ public actor InProcessCoreClient: CoreClient {
     }
 
     @discardableResult
-    private func makeEngine(for record: WorkspaceRecord) async throws -> WorkspaceEngine {
+    func makeEngine(for record: WorkspaceRecord) async throws -> WorkspaceEngine {
         if let existing = engines[record.workspaceID] { return existing }
 
         let git = try gitClient(for: record.repositoryPath)
@@ -814,6 +839,10 @@ public actor InProcessCoreClient: CoreClient {
                 // The Assistant is the product's own agent. A rate-limited or
                 // dead CLI must not mute it while another harness is ready.
                 // Project tabs keep their harness; only this workspace moves.
+                await self.noteDreamHarnessRateLimit(
+                    harness: HarnessKind(rawValue: record.harness) ?? .claudeCode,
+                    event: routed.event
+                )
                 if engine.isAssistantWorkspace {
                     await self.considerAssistantFailover(
                         chatID: routed.chatID, event: routed.event
@@ -932,7 +961,7 @@ public actor InProcessCoreClient: CoreClient {
 
     // MARK: - Helpers
 
-    private func gitClient(for path: String) throws -> GitClient {
+    func gitClient(for path: String) throws -> GitClient {
         if let existing = gitClients[path] { return existing }
         let client = try GitClient(repositoryURL: URL(fileURLWithPath: path))
         gitClients[path] = client
@@ -1080,7 +1109,7 @@ public actor InProcessCoreClient: CoreClient {
         var blocks: [String] = []
         for (id, engine) in engines {
             let summary = await engine.summary()
-            if summary.isAssistant { continue }
+            if !summary.isStandard { continue }
             let chats = (try? await engine.chatSummaries(includeClosed: false)) ?? []
             let focused = await engine.focusedChatIDValue()
             if let focused {
@@ -1147,7 +1176,7 @@ public actor InProcessCoreClient: CoreClient {
         var workspaces: [AssistantTaskRouter.Workspace] = []
         for (id, engine) in engines {
             let summary = await engine.summary()
-            if summary.isAssistant { continue }
+            if !summary.isStandard { continue }
             let chats = (try? await engine.chatSummaries(includeClosed: true)) ?? []
             let focused = await engine.focusedChatIDValue()
             if let focused {
@@ -1201,7 +1230,7 @@ public actor InProcessCoreClient: CoreClient {
         let wanted = URL(fileURLWithPath: path).standardizedFileURL
         for (id, engine) in engines {
             let summary = await engine.summary()
-            if summary.isAssistant { continue }
+            if !summary.isStandard { continue }
             let repo = URL(fileURLWithPath: summary.repositoryPath).standardizedFileURL
             guard repo == wanted else { continue }
             let git = await engine.liveGitStatus()
@@ -1334,7 +1363,9 @@ private extension CoreCommand {
         case .resync(let id):
             return id
         case .addRepository, .createWorkspace, .probeHarnesses,
-             .resolveAssistantConfirmation:
+             .resolveAssistantConfirmation, .updateDreamSettings,
+             .updateDreamEnvironment, .startDreamRun, .abortDreamRun,
+             .resolveDreamFinding, .listDreamFindings:
             return nil
         }
     }

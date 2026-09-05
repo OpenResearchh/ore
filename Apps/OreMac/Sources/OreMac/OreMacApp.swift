@@ -119,6 +119,7 @@ struct OreMacApp: App {
             CommandGroup(after: .toolbar) {
                 // ⌥⌘A opens the assistant's activity window from anywhere.
                 OpenAssistantCommand()
+                OpenDreamsCommand().environment(model)
 
                 Button("Command Palette") { isShowingPalette = true }
                     .keyboardShortcut("k", modifiers: .command)
@@ -221,6 +222,12 @@ struct OreMacApp: App {
         }
         .defaultSize(width: 560, height: 700)
 
+        Window("Dreams", id: "dreams") {
+            DreamReviewWindow()
+                .environment(model)
+        }
+        .defaultSize(width: 920, height: 640)
+
         // The always-there ORE: fleet status, inline approvals, and the
         // assistant — alive with every window closed.
         MenuBarExtra {
@@ -256,8 +263,30 @@ private struct OpenAssistantCommand: View {
     }
 }
 
+private struct OpenDreamsCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Group {
+            Button("Dreams") { openWindow(id: "dreams") }
+                .keyboardShortcut("d", modifiers: [.command, .option])
+            Button("Dream now") {
+                model.startDreamNow()
+                openWindow(id: "dreams")
+            }
+        }
+        .onChange(of: model.pendingDreamsOpen) { _, wanted in
+            guard wanted else { return }
+            openWindow(id: "dreams")
+            model.consumePendingDreamsOpen()
+        }
+    }
+}
+
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
     @Binding var isShowingNewWorkspace: Bool
     @Binding var isShowingPalette: Bool
     @Binding var isShowingFilePalette: Bool
@@ -311,6 +340,11 @@ struct RootView: View {
             }
         }
         .animation(.easeOut(duration: 0.25), value: model.launchBriefing == nil)
+        .onChange(of: model.pendingDreamsOpen) { _, wanted in
+            guard wanted else { return }
+            openWindow(id: "dreams")
+            model.consumePendingDreamsOpen()
+        }
         .sheet(isPresented: $isShowingNewWorkspace) { NewWorkspaceSheet() }
         .sheet(isPresented: $isShowingPalette) { CommandPalette() }
         .sheet(isPresented: $isShowingFilePalette) {

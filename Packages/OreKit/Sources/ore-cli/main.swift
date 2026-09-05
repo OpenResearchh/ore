@@ -463,7 +463,7 @@ struct CommandLineOptions {
             let argument = arguments[index]
             if argument.hasPrefix("--") {
                 // Flags take no value; everything else consumes the next word.
-                let isFlag = ["--raw", "--full", "--auto-allow", "--delete-branch"]
+                let isFlag = ["--raw", "--full", "--auto-allow", "--delete-branch", "--assistant", "--dream"]
                     .contains(argument)
                 index = arguments.index(index, offsetBy: isFlag ? 1 : 2)
             } else {

@@ -146,7 +146,7 @@ struct FleetWatcher: Sendable, Equatable {
     /// own workspace are not part of the fleet the user is watching.
     @discardableResult
     mutating func observe(_ workspace: WorkspaceSummary, now: Date = Date()) -> [FleetMilestone] {
-        guard !workspace.isArchived, !workspace.isAssistant else {
+        guard !workspace.isArchived, !workspace.isAssistant, !workspace.isDream else {
             signals.removeValue(forKey: workspace.id)
             return []
         }

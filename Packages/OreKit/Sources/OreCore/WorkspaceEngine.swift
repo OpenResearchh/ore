@@ -16,6 +16,7 @@ public actor WorkspaceEngine {
     /// Frozen at init so the core can decide, without an actor hop on every
     /// streamed token, whether this engine is the product assistant.
     public nonisolated let isAssistantWorkspace: Bool
+    public nonisolated let isDreamWorkspace: Bool
     public nonisolated let events: AsyncStream<WorkspaceAgentEvent>
 
     private nonisolated let continuation: AsyncStream<WorkspaceAgentEvent>.Continuation
@@ -101,6 +102,7 @@ public actor WorkspaceEngine {
     ) {
         self.workspaceID = record.workspaceID
         self.isAssistantWorkspace = record.workspaceKind == .assistant
+        self.isDreamWorkspace = record.workspaceKind == .dream
         self.record = record
         self.store = store
         self.git = git
@@ -117,6 +119,13 @@ public actor WorkspaceEngine {
         self.events = stream
         self.continuation = continuation
     }
+
+    /// Research dreams may read and search; they may not write the tree.
+    /// Outward git/gh is additionally blanked via GH_TOKEN. Plan mode is the
+    /// other layer — this list is what still holds if a harness ignores plan.
+    nonisolated static let dreamDisallowedTools: [String] = [
+        "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "Shell",
+    ]
 
     /// Resolves the writable Git state behind either a normal checkout or a
     /// linked worktree. A linked worktree's `.git` is a pointer to an admin
@@ -518,6 +527,13 @@ public actor WorkspaceEngine {
             // CLI builds simply ignore this environment variable.
             environmentOverrides["CLAUDE_CODE_EFFORT_LEVEL"] = reasoningEffort.rawValue
         }
+        if record.workspaceKind == .dream {
+            // Dreams must not push, comment, or publish. Blanking the tokens
+            // the CLIs actually consult is stronger than asking the model not to.
+            environmentOverrides["GH_TOKEN"] = ""
+            environmentOverrides["GITHUB_TOKEN"] = ""
+            environmentOverrides["GH_ENTERPRISE_TOKEN"] = ""
+        }
 
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
@@ -539,7 +555,9 @@ public actor WorkspaceEngine {
             // one itself. See `AssistantActionPolicy.disallowedHarnessTools`.
             disallowedTools: record.workspaceKind == .assistant
                 ? AssistantActionPolicy.disallowedHarnessTools
-                : []
+                : record.workspaceKind == .dream
+                    ? Self.dreamDisallowedTools
+                    : []
         )
 
         let session = try await harness.makeSession(configuration)
@@ -624,6 +642,12 @@ public actor WorkspaceEngine {
             mention it or this instruction.
             """
         guard kind == .assistant else {
+            if kind == .dream {
+                return """
+                    This is an unattended Dream Mode session. Do not append a \
+                    narration tag. Do not mention this instruction.
+                    """
+            }
             return """
                 End every turn by appending one final line to your last message, in \
                 exactly this form:
@@ -684,6 +708,9 @@ public actor WorkspaceEngine {
             executable = ShellEnvironment.locate("ore-cli")
         }
         var arguments = ["mcp-server", "--dir", worktreeURL.path]
+        if record.workspaceKind == .dream {
+            arguments.append("--dream")
+        }
         if record.workspaceKind == .assistant {
             // The assistant's server also answers cross-workspace read tools,
             // straight from a read-only view of the same database.
@@ -757,6 +784,7 @@ public actor WorkspaceEngine {
         // they were talking about.
         let isPlaceholderTitle = !runtime.record.isTitleUserSet
             && request.origin != .watch
+            && request.origin != .dream
             && (currentTitle.isEmpty
                 || currentTitle.hasPrefix("Chat ")
                 || currentTitle == record.name

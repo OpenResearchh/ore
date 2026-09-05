@@ -384,6 +384,94 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v11.dreams") { db in
+            try db.create(table: "dreamRun") { table in
+                table.primaryKey("id", .text)
+                table.column("scheduledFor", .datetime).notNull()
+                table.column("state", .text).notNull()
+                table.column("trigger", .text).notNull()
+                table.column("agendaJSON", .text).notNull().defaults(to: "[]")
+                table.column("reportJSON", .text)
+                table.column("why", .text).notNull().defaults(to: "")
+                table.column("abortReason", .text)
+                table.column("tokenBudget", .integer).notNull().defaults(to: 0)
+                table.column("createdAt", .datetime).notNull()
+                table.column("updatedAt", .datetime).notNull()
+            }
+
+            try db.create(table: "dreamTask") { table in
+                table.primaryKey("id", .text)
+                table.column("runID", .text).notNull()
+                    .references("dreamRun", onDelete: .cascade)
+                table.column("repositoryPath", .text).notNull()
+                table.column("kind", .text).notNull()
+                table.column("priorityScore", .double).notNull().defaults(to: 0)
+                table.column("state", .text).notNull()
+                table.column("why", .text).notNull().defaults(to: "")
+                table.column("workspaceID", .text)
+                table.column("chatID", .text)
+                table.column("harness", .text)
+                table.column("model", .text)
+                table.column("tokensUsed", .integer).notNull().defaults(to: 0)
+                table.column("turnCount", .integer).notNull().defaults(to: 0)
+                table.column("failureReason", .text)
+                table.column("createdAt", .datetime).notNull()
+                table.column("updatedAt", .datetime).notNull()
+            }
+            try db.create(
+                index: "dreamTask_on_runID",
+                on: "dreamTask",
+                columns: ["runID"]
+            )
+
+            try db.create(table: "dreamFinding") { table in
+                table.primaryKey("id", .text)
+                table.column("taskID", .text).notNull()
+                    .references("dreamTask", onDelete: .cascade)
+                table.column("runID", .text).notNull()
+                    .references("dreamRun", onDelete: .cascade)
+                table.column("repositoryPath", .text).notNull()
+                table.column("kind", .text).notNull()
+                table.column("title", .text).notNull()
+                table.column("summary", .text).notNull()
+                table.column("evidenceJSON", .text).notNull().defaults(to: "[]")
+                table.column("confidence", .double).notNull().defaults(to: 0.5)
+                table.column("severity", .text).notNull().defaults(to: "info")
+                table.column("branchName", .text)
+                table.column("diffSnapshot", .text)
+                table.column("status", .text).notNull().defaults(to: "new")
+                table.column("rejectReason", .text)
+                table.column("deferredUntil", .datetime)
+                table.column("dedupeKey", .text).notNull()
+                table.column("why", .text).notNull().defaults(to: "")
+                table.column("workspaceID", .text)
+                table.column("chatID", .text)
+                table.column("createdAt", .datetime).notNull()
+                table.column("lastSeenAt", .datetime).notNull()
+            }
+            try db.create(
+                index: "dreamFinding_on_dedupeKey",
+                on: "dreamFinding",
+                columns: ["dedupeKey"]
+            )
+            try db.create(
+                index: "dreamFinding_on_status",
+                on: "dreamFinding",
+                columns: ["status", "createdAt"]
+            )
+
+            try db.create(table: "dreamLedger") { table in
+                table.autoIncrementedPrimaryKey("id")
+                table.column("runID", .text).notNull()
+                    .references("dreamRun", onDelete: .cascade)
+                table.column("taskID", .text)
+                table.column("harness", .text).notNull()
+                table.column("tokens", .integer).notNull()
+                table.column("turns", .integer).notNull().defaults(to: 0)
+                table.column("createdAt", .datetime).notNull()
+            }
+        }
+
         return migrator
     }
 }

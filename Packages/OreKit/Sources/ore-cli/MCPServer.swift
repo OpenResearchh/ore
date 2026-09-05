@@ -41,7 +41,10 @@ func runMCPServer(options: CommandLineOptions) async {
                 "serverInfo": ["name": "ore", "version": "0.1.0"],
             ]
         case "tools/list":
-            result = ["tools": annotateToolDefinitions(toolDefinitions() + assistant.toolDefinitions())]
+            result = ["tools": annotateToolDefinitions(
+                toolDefinitions(includeDreamFindings: options.flag("--dream"))
+                    + assistant.toolDefinitions()
+            )]
         case "tools/call":
             let params = request["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
@@ -49,7 +52,12 @@ func runMCPServer(options: CommandLineOptions) async {
             if assistant.handles(name) {
                 result = await assistant.call(name, arguments: arguments)
             } else {
-                result = await callORETool(name, arguments: arguments, directory: directory)
+                result = await callORETool(
+                    name,
+                    arguments: arguments,
+                    directory: directory,
+                    allowDreamFindings: options.flag("--dream")
+                )
             }
         default:
             writeMCP(["jsonrpc": "2.0", "id": id ?? NSNull(), "error": [
@@ -61,7 +69,8 @@ func runMCPServer(options: CommandLineOptions) async {
     }
 }
 
-private func toolDefinitions() -> [[String: Any]] { [
+private func toolDefinitions(includeDreamFindings: Bool) -> [[String: Any]] {
+    var tools: [[String: Any]] = [
     [
         "name": "GetWorkspaceDiff",
         "description": "Read the current git diff for this ORE workspace, matching the Review pane: this branch versus its base, including untracked files.",
@@ -96,7 +105,29 @@ private func toolDefinitions() -> [[String: Any]] { [
             "required": ["question"],
         ],
     ],
-] }
+    ]
+    if includeDreamFindings {
+        tools.append([
+            "name": "PostDreamFinding",
+            "description": "Post a finding from an unattended Dream Mode research session. Use this instead of describing findings in prose. Post at most 3 findings per session. If nothing is solid, post nothing.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "title": ["type": "string", "description": "One short sentence."],
+                    "summary": ["type": "string", "description": "Markdown the user should read in the morning."],
+                    "kind": ["type": "string", "description": "issue | bug | dependencyIssue | featureProposal | insight"],
+                    "confidence": ["type": "number", "description": "0–1. Be honest; 0.5 is maybe."],
+                    "severity": ["type": "string", "description": "info | warning | error"],
+                    "filePath": ["type": "string", "description": "Optional path relative to the worktree."],
+                    "line": ["type": "integer", "description": "Optional line number for the evidence."],
+                    "note": ["type": "string", "description": "Optional extra evidence note."],
+                ],
+                "required": ["title", "summary"],
+            ],
+        ])
+    }
+    return tools
+}
 
 /// MCP clients use tool annotations as approval hints. Without them, a client
 /// has to treat a harmless review read the same as a workspace mutation and may
@@ -147,7 +178,7 @@ private struct MCPToolAnnotation {
         "GetWorkspaceDiff", "GetDiffComments",
     ]
     private static let nonDestructiveLocalWriteTools: Set<String> = [
-        "PostDiffComment", "AskUserQuestion", "WriteMemory",
+        "PostDiffComment", "PostDreamFinding", "AskUserQuestion", "WriteMemory",
         "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort",
         "RenameChat", "ReopenChat", "OpenWorkspace", "AnswerChatQuestion",
     ]
@@ -177,7 +208,10 @@ private struct MCPToolAnnotation {
 }
 
 private func callORETool(
-    _ name: String, arguments: [String: Any], directory: URL
+    _ name: String,
+    arguments: [String: Any],
+    directory: URL,
+    allowDreamFindings: Bool
 ) async -> [String: Any] {
     let text: String
     switch name {
@@ -192,6 +226,14 @@ private func callORETool(
         }
     case "PostDiffComment":
         text = postDiffComment(arguments: arguments, directory: directory)
+    case "PostDreamFinding":
+        guard allowDreamFindings else {
+            return [
+                "content": [["type": "text", "text": "PostDreamFinding is only available in Dream Mode worktrees."]],
+                "isError": true,
+            ]
+        }
+        text = postDreamFinding(arguments: arguments, directory: directory)
     case "AskUserQuestion":
         let question = arguments["question"] as? String ?? "The agent has a question."
         let inbox = directory.appendingPathComponent(".context/ore-questions.txt")
@@ -239,6 +281,44 @@ private func postDiffComment(arguments: [String: Any], directory: URL) -> String
         return "Recorded finding #\(count) on \(filePath):\(startLine)-\(endLine)."
     } catch {
         return "Could not record the comment: \(error)"
+    }
+}
+
+private func postDreamFinding(arguments: [String: Any], directory: URL) -> String {
+    let title = arguments["title"] as? String ?? ""
+    let summary = arguments["summary"] as? String ?? ""
+    guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+        return "PostDreamFinding needs title and summary."
+    }
+    let confidence = (arguments["confidence"] as? Double)
+        ?? (arguments["confidence"] as? Int).map(Double.init)
+        ?? (arguments["confidence"] as? NSNumber)?.doubleValue
+    let line = (arguments["line"] as? Int)
+        ?? (arguments["line"] as? Double).map(Int.init)
+    let path = arguments["filePath"] as? String
+    let note = arguments["note"] as? String
+    var evidence: [DreamEvidence] = []
+    if path != nil || line != nil || (note?.isEmpty == false) {
+        evidence.append(DreamEvidence(path: path, line: line, note: note))
+    }
+    let finding = PostedDreamFinding(
+        kind: arguments["kind"] as? String,
+        title: title,
+        summary: summary,
+        confidence: confidence,
+        severity: arguments["severity"] as? String,
+        evidence: evidence.isEmpty ? nil : evidence
+    )
+    do {
+        let count = try DreamFindingFile.append(finding, in: directory)
+        if count > 3 {
+            return "Recorded finding #\(count). Stop posting — the morning inbox only keeps the first 3."
+        }
+        return "Recorded finding #\(count): \(title)"
+    } catch {
+        return "Could not record the finding: \(error)"
     }
 }
 

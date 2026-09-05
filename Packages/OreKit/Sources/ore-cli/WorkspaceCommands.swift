@@ -355,6 +355,10 @@ actor CoreEventPrinter {
 
         case .assistantConfirmationResolved, .assistantUIAction:
             break
+
+        case .dreamRunStateChanged, .dreamTaskUpdated,
+             .dreamFindingAdded, .dreamFindingUpdated, .dreamInboxUpdated:
+            break
         }
     }
 

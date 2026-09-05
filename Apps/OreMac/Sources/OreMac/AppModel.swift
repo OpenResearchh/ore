@@ -23,6 +23,13 @@ final class AppModel {
     /// out of ⌘1–9, and away from every picker — the Assistant window is the
     /// only surface that reads it.
     private(set) var assistantWorkspace: WorkspaceSummary?
+    /// Hidden overnight-research worktrees. The Dreams window is the only
+    /// surface that should mention them.
+    private(set) var dreamWorkspaces: [WorkspaceSummary] = []
+    private(set) var dreamInbox = DreamInboxSnapshot()
+    private(set) var dreamSleepStatus: DreamSleepStatus = .disabled
+    @ObservationIgnored
+    private var dreamMonitor: DreamEnvironmentMonitor?
     /// Pending "may the assistant do this?" questions, newest last. Rendered
     /// as cards in the Assistant window; the core times them out (denying)
     /// after two minutes.
@@ -168,6 +175,7 @@ final class AppModel {
         }
         restoreScheduledContinuations()
         startFleetAwareness()
+        startDreamMode()
         NotificationCenter.default.addObserver(
             forName: .oreOpenFromNotification,
             object: nil,
@@ -175,8 +183,13 @@ final class AppModel {
         ) { [weak self] notification in
             let workspace = notification.userInfo?["workspaceID"] as? String
             let chat = notification.userInfo?["chatID"] as? String
+            let openDreams = notification.userInfo?["openDreams"] as? String == "1"
             Task { @MainActor in
-                self?.openFromNotification(workspaceID: workspace, chatID: chat)
+                self?.openFromNotification(
+                    workspaceID: workspace,
+                    chatID: chat,
+                    openDreams: openDreams
+                )
             }
         }
         NotificationCenter.default.addObserver(
@@ -249,6 +262,8 @@ final class AppModel {
         eventTask?.cancel()
         flushTask?.cancel()
         fleetTickTask?.cancel()
+        dreamMonitor?.stop()
+        dreamMonitor = nil
         for task in continuationTasks.values { task.cancel() }
         continuationTasks.removeAll()
         await client.shutdown()
@@ -338,7 +353,8 @@ final class AppModel {
         let briefing = LaunchBriefing.compose(
             workspaces: sortedWorkspaces,
             lastSeenAt: lastSeenAt,
-            userName: LaunchBriefing.firstName(from: NSFullUserName())
+            userName: LaunchBriefing.firstName(from: NSFullUserName()),
+            dreamFindingCount: dreamInbox.newFindingCount
         )
         launchBriefing = briefing
 
@@ -506,6 +522,7 @@ final class AppModel {
         chatID: ChatID
     ) {
         guard proactiveWatchEnabled, assistantWorkspace != nil else { return }
+        if dreamWorkspaces.contains(where: { $0.id == workspaceID }) { return }
         let place = "\(workspaceName(workspaceID))"
             + (chatSummaries.first { $0.id == chatID }.map { " / \($0.title)" } ?? "")
 
@@ -902,6 +919,7 @@ final class AppModel {
 
     var attentionCount: Int {
         workspaces.filter { !$0.isArchived && $0.needsAttention }.count
+            + dreamInbox.newFindingCount
     }
 
     // MARK: - Commands
@@ -936,6 +954,114 @@ final class AppModel {
             branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
         ))
         return true
+    }
+
+    // MARK: - Dream Mode
+
+    private(set) var pendingDreamsOpen = false
+
+    func consumePendingDreamsOpen() {
+        pendingDreamsOpen = false
+    }
+
+    func startDreamNow(repositoryPath: String? = nil) {
+        let path = repositoryPath ?? selectedWorkspace?.repositoryPath
+        Task { await client.send(.startDreamRun(manual: true, repositoryPath: path)) }
+        pendingDreamsOpen = true
+    }
+
+    func abortDreamRun() {
+        Task { await client.send(.abortDreamRun) }
+    }
+
+    func resolveDreamFinding(_ id: DreamFindingID, _ resolution: DreamFindingResolution) {
+        Task { await client.send(.resolveDreamFinding(id, resolution)) }
+    }
+
+    func revealDreamEvidence(_ evidence: DreamEvidence, for finding: DreamFindingSummary) {
+        guard let relative = evidence.path, !relative.isEmpty else { return }
+        let worktreePath = dreamWorkspaces.first { $0.id == finding.workspaceID }?.worktreePath
+            ?? workspaces.first { $0.id == finding.workspaceID }?.worktreePath
+        if let worktreePath {
+            let url = URL(fileURLWithPath: worktreePath).appendingPathComponent(relative)
+            if FileManager.default.fileExists(atPath: url.path) {
+                NSWorkspace.shared.open(url)
+                return
+            }
+        }
+        let repoRoot = URL(fileURLWithPath: finding.repositoryPath).appendingPathComponent(relative)
+        if FileManager.default.fileExists(atPath: repoRoot.path) {
+            NSWorkspace.shared.open(repoRoot)
+        }
+    }
+
+    func pushDreamSettings() {
+        let settings = DreamSettingsStore.load()
+        Task { await client.send(.updateDreamSettings(settings)) }
+        refreshDreamSleepStatus()
+        dreamMonitor?.push(
+            isSleepImminent: false,
+            isDreaming: dreamInbox.run?.state == .dreaming
+        )
+    }
+
+    private func startDreamMode() {
+        let monitor = DreamEnvironmentMonitor(client: client)
+        dreamMonitor = monitor
+        monitor.start()
+        pushDreamSettings()
+        Task { await client.send(.listDreamFindings) }
+    }
+
+    private func upsertDream(_ summary: WorkspaceSummary) {
+        if let index = dreamWorkspaces.firstIndex(where: { $0.id == summary.id }) {
+            dreamWorkspaces[index] = summary
+        } else {
+            dreamWorkspaces.append(summary)
+        }
+    }
+
+    private func upsertDreamFinding(_ finding: DreamFindingSummary) {
+        var findings = dreamInbox.findings
+        if let index = findings.firstIndex(where: { $0.id == finding.id }) {
+            findings[index] = finding
+        } else {
+            findings.insert(finding, at: 0)
+        }
+        dreamInbox.findings = findings
+    }
+
+    func refreshDreamSleepStatus() {
+        dreamSleepStatus = dreamMonitor?.currentSleepStatus
+            ?? DreamScheduler.sleepStatus(
+                settings: DreamSettingsStore.load(),
+                environment: DreamEnvironmentSnapshot(
+                    secondsSinceInput: DreamEnvironmentMonitor.secondsSinceInput(),
+                    isOnACPower: DreamEnvironmentMonitor.isOnACPower()
+                ),
+                isDreaming: dreamInbox.run?.state == .dreaming
+            )
+    }
+
+    private var notifiedDreamRunIDs: Set<String> = []
+
+    private func maybeNotifyDreamFinished(_ run: DreamRunSummary) {
+        guard run.state == .completed || run.state == .interrupted else { return }
+        guard notifiedDreamRunIDs.insert(run.id.rawValue).inserted else { return }
+        let count = dreamInbox.newFindingCount
+        let projects = Set(dreamInbox.findings.filter { $0.status == .new }.map(\.repositoryName)).count
+        let body: String
+        if count == 0 {
+            body = "ORE dreamed last night and found nothing worth waking you for."
+        } else {
+            body = "ORE dreamed about \(projects) project\(projects == 1 ? "" : "s") — \(count) finding\(count == 1 ? "" : "s")"
+        }
+        postNotification(
+            title: "Dreams",
+            body: body,
+            category: NotificationCategory.dreams,
+            extraInfo: ["openDreams": "1"]
+        )
     }
 
     /// Returns the chat the message actually went to, which the assistant's
@@ -2004,7 +2130,12 @@ final class AppModel {
         send(row.text, attachments: row.attachments, to: workspaceID, chatID: chatID)
     }
 
-    func openFromNotification(workspaceID: String?, chatID: String?) {
+    func openFromNotification(workspaceID: String?, chatID: String?, openDreams: Bool = false) {
+        if openDreams {
+            pendingDreamsOpen = true
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
         if let workspaceID {
             selectedWorkspaceID = WorkspaceID(rawValue: workspaceID)
             showChatInCenter(WorkspaceID(rawValue: workspaceID))
@@ -2517,7 +2648,8 @@ final class AppModel {
         switch event {
         case .snapshot(let snapshot):
             assistantWorkspace = snapshot.workspaces.first(where: \.isAssistant)
-            workspaces = snapshot.workspaces.filter { !$0.isAssistant }
+            dreamWorkspaces = snapshot.workspaces.filter(\.isDream)
+            workspaces = snapshot.workspaces.filter(\.isStandard)
             for workspace in snapshot.workspaces {
                 workspaceLive.seed(workspace)
             }
@@ -2547,8 +2679,12 @@ final class AppModel {
 
         case .workspaceAdded(let summary):
             workspaceLive.seed(summary)
-            guard !summary.isAssistant else {
+            if summary.isAssistant {
                 assistantWorkspace = summary
+                break
+            }
+            if summary.isDream {
+                upsertDream(summary)
                 break
             }
             upsert(summary)
@@ -2557,8 +2693,12 @@ final class AppModel {
             prefetchDiff(for: summary)
 
         case .workspaceUpdated(let summary):
-            guard !summary.isAssistant else {
+            if summary.isAssistant {
                 assistantWorkspace = summary
+                break
+            }
+            if summary.isDream {
+                upsertDream(summary)
                 break
             }
             upsert(summary)
@@ -2591,6 +2731,27 @@ final class AppModel {
                 UserDefaults.standard.removeObject(forKey: "\(key).\(id.rawValue)")
             }
             if selectedWorkspaceID == id { selectedWorkspaceID = sortedWorkspaces.first?.id }
+            dreamWorkspaces.removeAll { $0.id == id }
+
+        case .dreamRunStateChanged(let run):
+            var inbox = dreamInbox
+            inbox.run = run
+            dreamInbox = inbox
+            refreshDreamSleepStatus()
+            maybeNotifyDreamFinished(run)
+
+        case .dreamTaskUpdated:
+            break
+
+        case .dreamFindingAdded(let finding):
+            upsertDreamFinding(finding)
+
+        case .dreamFindingUpdated(let finding):
+            upsertDreamFinding(finding)
+
+        case .dreamInboxUpdated(let inbox):
+            dreamInbox = inbox
+            refreshDreamSleepStatus()
 
         case .assistantConfirmationRequested(let confirmation):
             assistantConfirmations.append(confirmation)
@@ -2654,10 +2815,20 @@ final class AppModel {
             // deliberately instead: by New Conversation, or by a compaction.
             // Ephemeral chats (the find bar's answers) are never focused: the
             // whole point is that no tab appears and the user stays put.
-            if !isEphemeral,
-               chat.workspaceID != assistantWorkspace?.id
-                || assistantConversationsAwaitingFocus.remove(chat.workspaceID) != nil {
-                selectChat(chat.id, in: chat.workspaceID)
+            if !isEphemeral {
+                let isAssistantChat = chat.workspaceID == assistantWorkspace?.id
+                let isDreamChat = dreamWorkspaces.contains { $0.id == chat.workspaceID }
+                let shouldFocus: Bool
+                if isDreamChat {
+                    shouldFocus = false
+                } else if isAssistantChat {
+                    shouldFocus = assistantConversationsAwaitingFocus.remove(chat.workspaceID) != nil
+                } else {
+                    shouldFocus = true
+                }
+                if shouldFocus {
+                    selectChat(chat.id, in: chat.workspaceID)
+                }
             }
             if var pending = pendingNewChatMessages[chat.workspaceID], !pending.isEmpty {
                 let message = pending.removeFirst()
@@ -2905,6 +3076,7 @@ final class AppModel {
             return
         }
         collectWatchEvent(event, workspaceID: workspaceID, chatID: chatID)
+        if dreamWorkspaces.contains(where: { $0.id == workspaceID }) { return }
         let origin = narrationOrigin(workspaceID: workspaceID, chatID: chatID)
         // Needs-you events have two possible voice owners: ambient tab
         // narration, or the hands-free assistant flow that opens the mic for
@@ -3316,6 +3488,10 @@ final class AppModel {
                 permissionID, decision: decision,
                 for: workspaceID, chatID: chatID
             )
+
+        case NotificationAction.openDreams:
+            pendingDreamsOpen = true
+            NSApp.activate(ignoringOtherApps: true)
 
         default:
             break

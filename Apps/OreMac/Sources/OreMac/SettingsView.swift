@@ -25,6 +25,7 @@ struct SettingsView: View {
     @AppStorage(NarrationEngine.fleetSwitchKey) private var fleetNarration = true
     @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
     @AppStorage(VoiceAssistantController.quietModeKey) private var quietMode = false
+    @AppStorage(VoiceAssistantController.silenceAutoSendKey) private var silenceAutoSend = false
     @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
@@ -45,6 +46,10 @@ struct SettingsView: View {
     /// Mirrors the login-item state. See `refreshLaunchAtLogin` for why this is
     /// cached rather than read live.
     @State private var launchesAtLogin = false
+    @State private var showsPhraseTuning = false
+    /// Cached: `FinishPhraseStore.currentSpoken` decodes JSON, and this body
+    /// re-runs every display cycle. Refreshed when the tuning sheet closes.
+    @State private var finishPhraseSpoken = FinishPhraseStore.currentSpoken
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "General"
@@ -241,7 +246,7 @@ struct SettingsView: View {
         if holdToTalk && !legacyHoldDictation {
             return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, keep holding while you speak, then release to send."
         }
-        return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(VoiceFinishPhrase.spoken).”"
+        return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(finishPhraseSpoken).”"
     }
 
     private var general: some View {
@@ -331,12 +336,31 @@ struct SettingsView: View {
                     }
                 }
                 Divider()
+                SettingsRow(
+                    "Finish phrase",
+                    detail: "“\(finishPhraseSpoken)” ends a hands-free request. Tune it against your own voice — the recognizer's actual transcriptions become accepted variants — or choose different words."
+                ) {
+                    Button("Tune…") { showsPhraseTuning = true }
+                        .disabled(appModel.voiceAssistant.phase != .idle)
+                }
+                Divider()
+                Toggle("Send after 3 seconds of silence", isOn: $silenceAutoSend)
+                    .disabled(holdToTalk || legacyHoldDictation)
+                Text("Optional backstop for hands-free requests. A soft cue plays one second before sending; speaking again cancels the countdown. Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Divider()
                 Toggle("Hold ⇧⌥ dictates into the composer instead", isOn: $legacyHoldDictation)
                 Text("Restores the pre-assistant gesture: holding the chord in another app pulls ORE frontmost and dictates into the focused composer, instead of talking to the assistant.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .onAppear { hotkey.refreshTrust() }
+            .sheet(isPresented: $showsPhraseTuning) {
+                finishPhraseSpoken = FinishPhraseStore.currentSpoken
+            } content: {
+                FinishPhraseTuningSheet()
+            }
         }
     }
 

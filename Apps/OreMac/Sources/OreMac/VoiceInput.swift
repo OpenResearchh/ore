@@ -264,6 +264,11 @@ enum VoiceDictationFormatter {
 @MainActor
 @Observable
 final class VoiceInputController {
+    enum RecognizerRoute: String, Codable, Sendable {
+        case speechAnalyzer
+        case speechRecognizer
+    }
+
     enum Status: Equatable {
         case idle
         case requestingPermission
@@ -277,6 +282,12 @@ final class VoiceInputController {
 
     private(set) var status: Status = .idle
     private(set) var transcript: String = ""
+    private(set) var recognizerRoute: RecognizerRoute?
+    private(set) var contextualBiasApplied = false
+    /// Every dictation surface owns a controller, but macOS exposes one input
+    /// device. A process-wide lease turns accidental overlap into a visible,
+    /// recoverable error instead of two analyzers racing over the same mic.
+    private static var activeOwner: ObjectIdentifier?
     /// Smoothed microphone loudness, 0…1 — fast attack, slow release, so the
     /// composer's smoke breathes with the voice instead of flickering with it.
     private(set) var audioLevel: Double = 0
@@ -301,11 +312,11 @@ final class VoiceInputController {
     private var analyzerStop: (@Sendable () async -> Void)?
 
     /// Names the recognizer should be primed to hear — workspace and repo
-    /// names, which are exactly the words general English models get wrong.
-    /// Set before `start()`. The `SFSpeechRecognizer` path takes these as
-    /// contextual strings; the macOS 26 on-device transcriber exposes no
-    /// biasing hook yet, so its transcripts rely on `VoiceVocabulary`'s
-    /// post-pass correction instead.
+    /// names, which are exactly the words general English models get wrong,
+    /// plus the hands-free finish phrase. Set before `start()`. The
+    /// `SFSpeechRecognizer` path takes these as contextual strings; the
+    /// macOS 26 on-device transcriber takes them via `AnalysisContext`.
+    /// `VoiceVocabulary`'s post-pass correction remains the backstop.
     var vocabulary: [String] = []
 
     init() {
@@ -321,8 +332,16 @@ final class VoiceInputController {
 
     func start() {
         guard !isActive else { return }
+        let owner = ObjectIdentifier(self)
+        guard Self.activeOwner == nil || Self.activeOwner == owner else {
+            status = .error("Another voice session is already using the microphone.")
+            return
+        }
+        Self.activeOwner = owner
         assembler.reset()
         transcript = ""
+        recognizerRoute = nil
+        contextualBiasApplied = false
         audioLevel = 0
         status = .requestingPermission
         runTask = Task { await run() }
@@ -333,6 +352,7 @@ final class VoiceInputController {
         runTask = nil
         Task { await tearDownCapture() }
         audioLevel = 0
+        releaseMicrophoneLease()
         if case .error = status { return }
         status = .idle
     }
@@ -350,6 +370,7 @@ final class VoiceInputController {
     }
 
     private func run() async {
+        defer { releaseMicrophoneLease() }
         do {
             let allowed = await AVAudioApplication.requestRecordPermission()
             guard allowed else {
@@ -388,8 +409,14 @@ final class VoiceInputController {
         await tearDownCapture()
     }
 
+    private func releaseMicrophoneLease() {
+        let owner = ObjectIdentifier(self)
+        if Self.activeOwner == owner { Self.activeOwner = nil }
+    }
+
     @available(macOS 26.0, *)
     private func runOnDeviceDictation() async throws {
+        recognizerRoute = .speechAnalyzer
         let transcriber: DictationTranscriber
         let analyzer: SpeechAnalyzer
         let bestFormat: AVAudioFormat?
@@ -416,6 +443,20 @@ final class VoiceInputController {
             analyzer = SpeechAnalyzer(modules: [transcriber])
             bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
             try await analyzer.prepareToAnalyze(in: bestFormat)
+        }
+
+        // Bias the general English model toward this user's proper nouns and
+        // the deliberately unusual finish phrase. Best-effort: a failed
+        // setContext just means this session continues with unbiased text.
+        if !vocabulary.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = vocabulary
+            do {
+                try await analyzer.setContext(context)
+                contextualBiasApplied = true
+            } catch {
+                contextualBiasApplied = false
+            }
         }
 
         // Starting AVAudioEngine is synchronous and slow the first time; on the
@@ -472,6 +513,7 @@ final class VoiceInputController {
     }
 
     private func runSpeechRecognizer() async throws {
+        recognizerRoute = .speechRecognizer
         // `@Sendable` is load-bearing: without it the closure inherits this
         // class's MainActor isolation, and TCC delivers it on a background
         // queue — the runtime isolation check then kills the app (SIGTRAP in
@@ -498,6 +540,7 @@ final class VoiceInputController {
         request.addsPunctuation = true
         if !vocabulary.isEmpty {
             request.contextualStrings = vocabulary
+            contextualBiasApplied = true
         }
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true

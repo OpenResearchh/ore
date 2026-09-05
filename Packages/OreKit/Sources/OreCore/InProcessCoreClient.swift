@@ -988,6 +988,10 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).suggestedGitAction()
     }
 
+    public func suggestedGitStatus(workspaceID: WorkspaceID) async throws -> SuggestedGitStatus {
+        try await engine(for: workspaceID).suggestedGitStatus()
+    }
+
     /// Commits not yet on the upstream (or, without one, not on the base).
     public func unpushedCommits(workspaceID: WorkspaceID) async throws -> [CommitInfo] {
         try await engine(for: workspaceID).unpushedCommits()
@@ -1009,6 +1013,10 @@ public actor InProcessCoreClient: CoreClient {
 
     public func turnCheckpoints(workspaceID: WorkspaceID, chatID: ChatID) async throws -> [TurnCheckpoint] {
         try await engine(for: workspaceID).turnCheckpoints(chatID: chatID)
+    }
+
+    public func lastTurnDigest(workspaceID: WorkspaceID, chatID: ChatID) async throws -> String? {
+        try await engine(for: workspaceID).lastTurnDigest(chatID: chatID)
     }
 
     public func diffFromCheckpoint(

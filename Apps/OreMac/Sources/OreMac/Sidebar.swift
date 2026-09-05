@@ -1,3 +1,4 @@
+import OreGit
 import OreProtocol
 import SwiftUI
 
@@ -221,6 +222,11 @@ struct Sidebar: View {
         // own background lets that show through. A manual glassEffect here would
         // fight the system chrome, so it's intentionally gone.
         .scrollContentBackground(.hidden)
+        // No resting track: under "always show scroll bars" the legacy track
+        // is an opaque strip down the glass, and macOS `List` ignores
+        // `.scrollIndicators` — the probe reaches the AppKit scroller directly.
+        .scrollIndicators(.hidden)
+        .background(OreListScrollerOverlay())
         .safeAreaInset(edge: .top, spacing: 0) {
             if !model.sortedWorkspaces.isEmpty {
                 filterTabs
@@ -245,10 +251,11 @@ struct Sidebar: View {
             .padding(.leading, OreTheme.Space.md)
             .padding(.trailing, OreTheme.Space.xs)
             .frame(height: OreTheme.RowHeight.bar)
-            .background(.bar)
-            .overlay(alignment: .top) {
-                Rectangle().fill(OreTheme.hairline).frame(height: 1)
-            }
+            // No bar, no hairline: the system sidebar is already Liquid Glass
+            // on macOS 26, and layering a second material over it is exactly
+            // the glass-on-glass stacking Apple warns against. The connected
+            // pill carries its own glass; rows scrolling under pick up the
+            // system's scroll-edge treatment.
         }
         .alert("Rename Workspace", isPresented: Binding(
             get: { renameWorkspace != nil },
@@ -740,6 +747,10 @@ private struct WorkspaceRow: View {
     var shortcutIndex: Int?
     let onRename: () -> Void
     @State private var isHovering = false
+    /// The mock's chat-list texture: each idle row carries a one-line snippet
+    /// of the last exchange, loaded lazily the way portraits are. Status still
+    /// outranks it — a row that needs you says so, not what was said last.
+    @State private var digest: String?
 
     var body: some View {
         HStack(spacing: OreTheme.Space.sm) {
@@ -762,6 +773,13 @@ private struct WorkspaceRow: View {
                         .foregroundStyle(isSelected ? .white : Color.primary)
                         .lineLimit(1)
 
+                    if let pullRequestState {
+                        SidebarPullRequestBadge(
+                            state: pullRequestState,
+                            isSelected: isSelected
+                        )
+                    }
+
                     Spacer(minLength: 4)
 
                     if let activity = workspace.lastActivity {
@@ -781,8 +799,8 @@ private struct WorkspaceRow: View {
                                 .font(.system(size: 9))
                                 .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.secondary)
                         }
-                        if let statusLine {
-                            Text(statusLine)
+                        if let secondLineText {
+                            Text(secondLineText)
                                 .font(.system(size: 12))
                                 .foregroundStyle(
                                     isSelected ? Color.white.opacity(0.85)
@@ -845,6 +863,24 @@ private struct WorkspaceRow: View {
         .frame(minHeight: 44)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+        // Re-fetched only when the workspace actually has new activity, so the
+        // sidebar never polls; a quiet row costs one query per turn completed.
+        .task(id: digestKey) {
+            digest = await model.lastTurnDigest(for: workspace.id)
+        }
+    }
+
+    /// Identity for the snippet load: a new turn moves `lastActivity`, which
+    /// re-runs the task; anything else leaves the cached line alone.
+    private var digestKey: String {
+        "\(workspace.id.rawValue)-\(workspace.lastActivity?.timeIntervalSinceReferenceDate ?? 0)"
+    }
+
+    /// Status wins the second line; the conversation snippet fills it the rest
+    /// of the time, which is what makes the list read like the mock's chat
+    /// list instead of a table of idle machines.
+    private var secondLineText: String? {
+        statusLine ?? digest
     }
 
     private var effectiveStatus: AgentStatus {
@@ -889,10 +925,89 @@ private struct WorkspaceRow: View {
 
     private var git: GitStatusSummary { model.gitChrome(for: workspace.id) }
 
+    private var pullRequestState: SidebarPullRequestState? {
+        SidebarPullRequestState(pullRequest: model.pullRequest(for: workspace.id))
+    }
+
     private var hasSecondLine: Bool {
-        statusLine != nil
+        secondLineText != nil
             || workspace.stackedOn != nil
             || git.insertions > 0
             || git.deletions > 0
+    }
+}
+
+enum SidebarPullRequestState: Equatable {
+    case open(number: Int)
+    case merged(number: Int)
+
+    init?(number: Int, state: String) {
+        switch state.uppercased() {
+        case "OPEN": self = .open(number: number)
+        case "MERGED": self = .merged(number: number)
+        default: return nil
+        }
+    }
+
+    init?(pullRequest: GitHubClient.PullRequest?) {
+        guard let pullRequest else { return nil }
+        self.init(number: pullRequest.number, state: pullRequest.state)
+    }
+
+    var number: Int {
+        switch self {
+        case .open(let number), .merged(let number): return number
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .open: return "arrow.triangle.pull"
+        case .merged: return "arrow.triangle.merge"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .open(let number): return "Pull request #\(number) is open"
+        case .merged(let number): return "Pull request #\(number) was merged"
+        }
+    }
+}
+
+private struct SidebarPullRequestBadge: View {
+    let state: SidebarPullRequestState
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 2.5) {
+            Image(systemName: state.icon)
+                .font(.system(size: 8, weight: .semibold))
+            Text("#\(state.number)")
+                .font(.system(size: 9, weight: .semibold, design: .rounded).monospacedDigit())
+        }
+        .foregroundStyle(foreground)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(tone.opacity(isSelected ? 0.2 : 0.1), in: Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(foreground.opacity(isSelected ? 0.7 : 0.55), lineWidth: 0.75)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.help)
+        .help(state.help)
+    }
+
+    private var tone: Color {
+        switch state {
+        case .open: return Color(nsColor: .systemGreen)
+        case .merged: return Color(nsColor: .systemPurple)
+        }
+    }
+
+    private var foreground: Color {
+        isSelected ? .white : tone
     }
 }

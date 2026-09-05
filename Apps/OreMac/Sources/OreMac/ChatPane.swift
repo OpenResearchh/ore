@@ -80,10 +80,21 @@ struct ChatPane: View {
     /// matcher skips these paths for the rest of the session, which restores
     /// the spoken words to the quote and keeps the tag from committing.
     @State private var voiceCanceledFilePaths: Set<String> = []
+    /// The floating dock's measured height, fed into the transcript's bottom
+    /// content inset so rows can scroll clear of the glass above them.
+    @State private var dockHeight: CGFloat = 0
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
+
+    /// The split partner, validated against the live tab list — a chat closed
+    /// out from under the split must fold the column, not strand it.
+    private var resolvedSplitChatID: ChatID? {
+        guard let id = model.splitChat[workspace.id] else { return nil }
+        guard model.chats(for: workspace.id).contains(where: { $0.id == id }) else { return nil }
+        return id
+    }
 
     /// The draft's attachments, stored on the chat rather than in this view's
     /// `@State` so switching tabs restores chips and mention pills instead of
@@ -96,7 +107,48 @@ struct ChatPane: View {
 
     var body: some View {
         GeometryReader { geometry in
-            VStack(spacing: 0) {
+            // The tab strip floats *over* the conversation — Apple's content-
+            // under-chrome: the transcript extends to the window's top edge and
+            // rows slide beneath the tab pills, held apart at rest by the
+            // scroll view's head inset. Documents and the split column keep
+            // their own headers, so they are simply laid out below the strip.
+            ZStack(alignment: .top) {
+                // The presence roster ("Claude is working · Cursor is idle")
+                // lives in the bottom dock bar now — see `bottomDock`.
+
+                // The centre column shows either a chat transcript or — when a file
+                // tab is active — that file's diff, opened from the review list.
+                // With a split open it shares the width evenly with a second,
+                // lighter conversation column — the reference design's
+                // side-by-side chats.
+                HStack(spacing: 0) {
+                    Group {
+                        if let filePath = model.activeFilePath[workspace.id] {
+                            DiffDocumentView(workspace: workspace, path: filePath)
+                                .padding(.top, OreTheme.RowHeight.bar)
+                        } else {
+                            // Own view identity so transcript/composer observation
+                            // (ChatState, live git, voice) does not rebuild the tab bar.
+                            ChatConversationColumn {
+                                chatBody(paneHeight: geometry.size.height)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    if let splitID = resolvedSplitChatID {
+                        // The reference design's seam: a live accent line, not a
+                        // hairline — the one place a divider is the point.
+                        Rectangle()
+                            .fill(Color.accentColor.opacity(0.55))
+                            .frame(width: 2)
+                        SplitChatColumn(workspace: workspace, chatID: splitID)
+                            .padding(.top, OreTheme.RowHeight.bar)
+                            .frame(maxWidth: .infinity)
+                            .id(splitID)
+                    }
+                }
+
                 ChatTabBar(
                     workspace: workspace,
                     availableWidth: geometry.size.width,
@@ -106,26 +158,21 @@ struct ChatPane: View {
                     isSearching: $isSearching,
                     searchFocusRequest: $searchFocusRequest
                 )
-
-                // The presence roster ("Claude is working · Cursor is idle")
-                // lives in the bottom dock bar now — see `bottomDock`.
-
-                // The centre column shows either a chat transcript or — when a file
-                // tab is active — that file's diff, opened from the review list.
-                if let filePath = model.activeFilePath[workspace.id] {
-                    DiffDocumentView(workspace: workspace, path: filePath)
-                } else {
-                    // Own view identity so transcript/composer observation
-                    // (ChatState, live git, voice) does not rebuild the tab bar.
-                    ChatConversationColumn {
-                        chatBody(paneHeight: geometry.size.height)
-                    }
-                }
+                // No scrim. A full-width gradient here ended in hard
+                // rectangular edges — the "square shadow" against the
+                // inspector's seam. Legibility over scrolled rows is the tabs'
+                // own job now: every pill carries its own glass backdrop (see
+                // `OreNavigationSelection`), which is also how the system's
+                // floating tab groups solve this.
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(OreTheme.Surface.content)
+        // No opaque fill. The transcript scrolls directly over the window's
+        // glass base (`OreWindowGlassBase`), which is what lets the tab strip's
+        // bar material, the floating composer, and the HUD refract wallpaper
+        // light instead of flat white — prose stays legible for the same
+        // reason sidebar labels do: the base material is the system's own.
         // Workspace identity lives in the window's title bar now, not a 58pt
         // header that repeated the tab title. The toolbar band was empty anyway.
         .navigationTitle(workspace.name)
@@ -320,6 +367,9 @@ struct ChatPane: View {
                         composerFocused = true
                     }
                 )
+                // Centered in the part of the pane the floating dock leaves
+                // uncovered, so its suggestion chips never hide behind glass.
+                .padding(.bottom, dockHeight)
             } else {
                 TranscriptHost(
                     chat: chat,
@@ -333,11 +383,50 @@ struct ChatPane: View {
                     onToggleActivity: { toggleActivity($0) },
                     onOpenFile: { openAgentFile($0) },
                     onTurnAction: { turn, action in handleTurnAction(turn, action) },
-                    scrollAnchor: scrollAnchor
+                    scrollAnchor: scrollAnchor,
+                    // A hair of air between the newest row and the dock's glass.
+                    bottomInset: dockHeight + OreTheme.Space.sm,
+                    // …and head room under the floating tab strip, so the top
+                    // row rests below the pills while scrolled rows slide
+                    // underneath them.
+                    topInset: OreTheme.RowHeight.bar + OreTheme.Space.sm
                 )
                 .equatable()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .bottomTrailing) { jumpToLatestOverlay }
+                // The scroll-edge treatment, done on the content instead of
+                // the chrome: rows dissolve as they slide up toward the tab
+                // pills. A mask is clipped to this pane by construction, so —
+                // unlike the scrim rectangle it replaces — it cannot print an
+                // edge against the inspector, and full-contrast text can never
+                // sit level with the pills or the window title.
+                .mask {
+                    VStack(spacing: 0) {
+                        LinearGradient(
+                            colors: [.clear, .black],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: OreTheme.RowHeight.bar + OreTheme.Space.sm)
+                        Color.black
+                        // The dock is translucent by design, but transcript
+                        // prose must not remain readable through an alert or
+                        // the composer while the reader scrolls. The resting
+                        // bottom inset already keeps the newest row above this
+                        // boundary; this fade handles rows moving underneath
+                        // it, preserving the wallpaper refraction without
+                        // mixing two layers of text.
+                        LinearGradient(
+                            colors: [.black, .clear],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: dockHeight + OreTheme.Space.sm)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    // Riding above the floating dock, not behind it.
+                    jumpToLatestOverlay.padding(.bottom, dockHeight)
+                }
             }
             // The "agent is working" state now lives on the composer itself
             // (an animated border plus an inline status row), so there is no
@@ -351,7 +440,12 @@ struct ChatPane: View {
 
     @ViewBuilder
     private func chatBody(paneHeight: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        // The transcript fills the column and the dock *floats over its foot*
+        // on glass — rows scroll underneath the composer, which is what gives
+        // Liquid Glass something to refract. Stacking the composer below the
+        // transcript put its glass over a flat fill, where it read as matte.
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
             if isSearching {
                 TranscriptSearchBar(
                     anchor: scrollAnchor,
@@ -360,6 +454,8 @@ struct ChatPane: View {
                     onAskTabs: { model.askAcrossTabs($0, in: workspace.id) },
                     onClose: closeSearch
                 )
+                // Below the floating tab strip, not underneath it.
+                .padding(.top, OreTheme.RowHeight.bar)
                 // The reply streams right here — no tab appears, focus never
                 // moves. The chat behind it is ephemeral and dies with the bar.
                 if let answers = model.answersChat(in: workspace.id) {
@@ -383,7 +479,13 @@ struct ChatPane: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
                 .clipped()
+            }
 
+            // The dock: everything that talks to the user right now, floating
+            // over the transcript. Its measured height drives the scroll's
+            // bottom inset, so the newest row always rests just above the
+            // glass rather than hiding behind it.
+            VStack(spacing: 0) {
             // Anything blocking the agent sits directly above the composer,
             // where the user is already looking. AskUserQuestion and
             // ExitPlanMode are both a permission gate *and* a dedicated card;
@@ -510,7 +612,26 @@ struct ChatPane: View {
             } else {
                 composer(paneHeight: paneHeight)
             }
+            }
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ComposerDockHeightKey.self,
+                        value: proxy.size.height
+                    )
+                }
+            )
+            // The dock's cards declare transitions, but nothing *drove* them:
+            // with no animation bound to these state changes, a suggestion
+            // chip vanished in a single frame, the measured dock height
+            // snapped, and the transcript's inset — pinned to it — jumped with
+            // a visible jerk. Animating the dock lets the height glide, and
+            // the scroll inset follows it frame by frame.
+            .animation(.easeOut(duration: 0.18), value: composerSuggestion?.id)
+            .animation(.easeOut(duration: 0.18), value: chat.pendingQuestion?.id)
+            .animation(.easeOut(duration: 0.18), value: chat.draftComments.isEmpty)
         }
+        .onPreferenceChange(ComposerDockHeightKey.self) { dockHeight = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .layoutPriority(1)
         .task(id: chatSummary?.id) {
@@ -780,6 +901,23 @@ struct ChatPane: View {
                         .id("chat:\(tab.id.rawValue)")
                         .contextMenu {
                             Button("Rename…") { beginRenaming(tab) }
+                            Menu("Copy for Another Tab") {
+                                Button("Short Transcript · Last 3 Turns") {
+                                    copyTranscript(tab, length: .short)
+                                }
+                                Button("Long Transcript · Everything") {
+                                    copyTranscript(tab, length: .full)
+                                }
+                            }
+                            if model.splitChat[workspace.id] == tab.id {
+                                Button("Close Split") {
+                                    model.closeSplitChat(in: workspace.id)
+                                }
+                            } else {
+                                Button("Open in Split") {
+                                    model.openSplitChat(tab.id, in: workspace.id)
+                                }
+                            }
                             if model.chats(for: workspace.id).count > 1 {
                                 Button("Close") { requestCloseChat(tab) }
                             }
@@ -816,12 +954,20 @@ struct ChatPane: View {
         // occupying a row of their own. Overlaying (instead of an HStack sibling)
         // means they don't skew the tabs off-centre.
         .overlay(alignment: .trailing) {
+            // A glass capsule instead of a rectangular bar patch: tabs sliding
+            // underneath stay readable through the blur, and the cluster reads
+            // as one floating control group the way Apple gathers toolbar
+            // buttons on shared glass.
             trailingControls
                 .padding(.horizontal, OreTheme.Space.xs)
-                .background(.bar)
+                .oreGlassSurface(.capsule, elevation: .inset)
+                .padding(.trailing, OreTheme.Space.xs)
         }
         .frame(height: OreTheme.RowHeight.bar)
-        .background(.bar)
+        // No full-width bar fill. The strip sits directly on the window's glass
+        // base, so tabs read as floating glass pills — the selected one is cut
+        // from real Liquid Glass in `OreNavigationSelection` — rather than as a
+        // browser-style opaque header welded to the window.
     }
 
     /// Width reserved at *each* edge of the strip: the trailing side holds the
@@ -853,6 +999,20 @@ struct ChatPane: View {
     private func shortTitle(_ title: String) -> String {
         let first = title.split(separator: " ").first.map(String.init) ?? title
         return String(first.prefix(12))
+    }
+
+    /// Copies context without choosing a destination on the user's behalf.
+    /// They can switch to any tab and paste; long pastes automatically use the
+    /// composer's existing attachment treatment instead of flooding the field.
+    private func copyTranscript(_ tab: ChatSummary, length: TabTranscriptCopy.Length) {
+        let text = TabTranscriptCopy.render(
+            tabTitle: tab.title,
+            agentName: tab.harness.displayName,
+            rows: model.chat(for: tab.id).rows,
+            length: length
+        )
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func fileTabLabel(_ path: String) -> some View {
@@ -940,8 +1100,12 @@ struct ChatPane: View {
         .overlay(alignment: .bottom) {
             // A solid accent underline is the single unambiguous "you are here"
             // marker: with several dim tabs, opacity alone is too subtle to pick
-            // the active one out at a glance.
-            if isSelected {
+            // the active one out at a glance. On macOS 26 the selected tab is a
+            // tinted Liquid Glass pill — its own marker — and an underline over
+            // real glass reads as a sticker, so it's reserved for the fallback.
+            if #available(macOS 26.0, *) {
+                EmptyView()
+            } else if isSelected {
                 RoundedRectangle(cornerRadius: 1.5)
                     .fill(Color.accentColor)
                     .frame(height: 2.5)
@@ -1104,7 +1268,7 @@ struct ChatPane: View {
                     }
                 }
                 .padding(4)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
             if !mentionSuggestions.isEmpty {
@@ -1145,9 +1309,7 @@ struct ChatPane: View {
                 }
                 .padding(4)
                 .fixedSize(horizontal: false, vertical: true)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(OreTheme.hairline))
-                .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
+                .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
             if voice.isActive || voiceSettle != nil {
@@ -4499,6 +4661,15 @@ struct QuestionOptionList: View {
 /// Shared with the Assistant window, which needs the same equality discipline
 /// for the same reason: its composer is a sibling of the transcript, so without
 /// this every keystroke would re-derive and re-diff every row.
+/// The floating dock's height, measured where it is laid out and delivered to
+/// the transcript's scroll inset — the two must agree or rows hide behind glass.
+private struct ComposerDockHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct TranscriptHost: View, Equatable {
     var chat: ChatState
     var worktreePath: String
@@ -4514,6 +4685,13 @@ struct TranscriptHost: View, Equatable {
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TranscriptView.TurnAction) -> Void
     var scrollAnchor: TranscriptScrollAnchor
+    /// Foot clearance for the floating composer dock — see `TranscriptView`.
+    /// Defaults to the resting inset for hosts whose composer does not float
+    /// (the assistant window).
+    var bottomInset: CGFloat = 12
+    /// Head clearance for the floating tab strip; plain default for hosts
+    /// without floating top chrome.
+    var topInset: CGFloat = 10
 
     /// Compared on identity-bearing inputs only.
     ///
@@ -4548,6 +4726,8 @@ struct TranscriptHost: View, Equatable {
             && lhs.searchQuery == rhs.searchQuery
             && lhs.persistenceKey == rhs.persistenceKey
             && lhs.canFork == rhs.canFork
+            && lhs.bottomInset == rhs.bottomInset
+            && lhs.topInset == rhs.topInset
             && lhs.expandedActivityGroups == rhs.expandedActivityGroups
     }
 
@@ -4569,8 +4749,19 @@ struct TranscriptHost: View, Equatable {
             // Passing the reference registers no observation — only the button
             // below reads `isAwayFromBottom`, so the transcript is not rebuilt
             // when the reader scrolls away.
-            scrollAnchor: scrollAnchor
+            scrollAnchor: scrollAnchor,
+            bottomInset: bottomInset,
+            topInset: topInset
         )
+        // An NSViewRepresentable keeps its coordinator when only its inputs
+        // change. Without an explicit conversation identity, switching tabs
+        // reused the previous tab's scroll policy; if that reader had stopped
+        // part-way up, the newly selected chat also opened part-way up even
+        // though saved-offset restoration was disabled. A fresh coordinator
+        // starts in bottom-following mode and also keeps row caches, pending
+        // reloads, and scroll callbacks owned by the conversation that made
+        // them.
+        .id(persistenceKey)
     }
 
     private var displayRows: [TranscriptRow] {

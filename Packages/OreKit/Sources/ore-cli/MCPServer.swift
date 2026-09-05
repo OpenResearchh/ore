@@ -181,13 +181,18 @@ private struct MCPToolAnnotation {
         "PostDiffComment", "PostDreamFinding", "AskUserQuestion", "WriteMemory",
         "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode", "SetChatEffort",
         "RenameChat", "ReopenChat", "OpenWorkspace", "AnswerChatQuestion",
+        "SetComposerDraft", "TagComposerFile", "RenameWorkspace", "SetWorkspacePinned",
+        "RestoreWorkspace", "AddDiffComment", "MarkFileViewed", "UpdateQueuedMessage",
     ]
     private static let destructiveTools: Set<String> = [
         "DeleteMemory", "CloseChat", "InterruptChatTurn", "Commit", "ArchiveWorkspace",
-        "ResolveChatPermission",
+        "ResolveChatPermission", "UntagComposerFile", "ClearComposerTags", "DeleteWorkspace",
+        "RevertChatToCheckpoint", "DeleteQueuedMessage", "MergePullRequest",
+        "ContinueAfterMerge", "PullDefaultBranch", "ResolveConflict", "ResolveConflictHunk",
     ]
     private static let openWorldTools: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "Push", "CreatePullRequest",
+        "CreateGitHubRepository", "RetargetPullRequest", "RerunFailedChecks",
     ]
 
     private static let readOnly = Self(
@@ -335,7 +340,7 @@ private final class AssistantToolServer {
     private var store: OreStore?
 
     fileprivate static let readOnlyToolNames: Set<String> = [
-        "ListWorkspaces", "ListChats", "WorkspaceStatus",
+        "ListWorkspaces", "ListChats", "ListChatCheckpoints", "WorkspaceStatus",
         "SearchTranscripts", "GetTranscriptTail",
         "ListMemory", "ReadMemory",
     ]
@@ -349,6 +354,15 @@ private final class AssistantToolServer {
         "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
+        "SetComposerDraft", "TagComposerFile", "UntagComposerFile", "ClearComposerTags",
+        "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
+        "RetryLastTurn", "AddRepository",
+        "RenameWorkspace", "SetWorkspacePinned", "RestoreWorkspace", "DeleteWorkspace",
+        "AddDiffComment", "MarkFileViewed", "RevertChatToCheckpoint",
+        "UpdateQueuedMessage", "DeleteQueuedMessage",
+        "CreateGitHubRepository", "RetargetPullRequest", "MergePullRequest",
+        "ContinueAfterMerge", "PullDefaultBranch", "ResolveConflict",
+        "ResolveConflictHunk", "RerunFailedChecks",
     ]
     fileprivate static let readOnlyBridgeToolNames: Set<String> = [
         "ListHarnesses", "GetAppState", "RouteTask",
@@ -386,6 +400,18 @@ private final class AssistantToolServer {
                         "workspaceID": ["type": "string"],
                     ],
                     "required": ["workspaceID"],
+                ],
+            ],
+            [
+                "name": "ListChatCheckpoints",
+                "description": "List the restorable turn checkpoints for one chat, newest first. Use the returned turnID with RevertChatToCheckpoint.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                    ],
+                    "required": ["workspaceID", "chatID"],
                 ],
             ],
             [
@@ -668,6 +694,221 @@ private final class AssistantToolServer {
                 ],
             ],
             [
+                "name": "SetComposerDraft",
+                "description": "Stage text in a chat tab's composer without sending it — the same box the user types into. The tab is brought to the front and focused so they can edit and press send. Replaces the current draft unless append=true. This does not send anything: use SendPromptToProject to actually hand work to the agent. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "text": ["type": "string"],
+                        "append": ["type": "boolean", "description": "Add to the existing draft instead of replacing it. Default false."],
+                    ],
+                    "required": ["workspaceID", "chatID", "text"],
+                ],
+            ],
+            [
+                "name": "TagComposerFile",
+                "description": "Tag a workspace file onto a chat tab's composer — the same as the user typing @file or attaching one. The file must exist in that workspace's worktree; pass `path` relative to the worktree root (e.g. \"src/main.swift\"). It appears as a chip above the composer and travels with the next message. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "path": ["type": "string", "description": "Workspace-relative path of the file to tag."],
+                    ],
+                    "required": ["workspaceID", "chatID", "path"],
+                ],
+            ],
+            [
+                "name": "UntagComposerFile",
+                "description": "Remove one tagged file from a chat tab's composer, matched by its path or display name. No-ops if that file isn't tagged. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "path": ["type": "string", "description": "Path or name of the tagged file to remove."],
+                    ],
+                    "required": ["workspaceID", "chatID", "path"],
+                ],
+            ],
+            [
+                "name": "ClearComposerTags",
+                "description": "Remove every tagged file from a chat tab's composer at once — the whole shelf of chips. Files ORE copied in (pasted images, dropped files) are deleted from the worktree; plain references are just dropped. Pass clearDraft=true to also empty the draft text. Runs without confirmation.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "workspaceID": ["type": "string"],
+                        "chatID": ["type": "string"],
+                        "clearDraft": ["type": "boolean", "description": "Also clear the composer's draft text. Default false."],
+                    ],
+                    "required": ["workspaceID", "chatID"],
+                ],
+            ],
+            [
+                "name": "OpenFile",
+                "description": "Open a workspace file as a centre-column tab, the same as clicking it in the Review pane. mode is diff, source, or preview (markdown). Pass line to jump to that line in source. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "path": stringProperty("Workspace-relative path of the file to open."),
+                    "mode": ["type": "string", "enum": ["diff", "source", "preview"]],
+                    "line": ["type": "integer", "description": "1-based line to reveal in source."],
+                ], required: ["workspaceID", "path"]),
+            ],
+            [
+                "name": "CloseFile",
+                "description": "Close a centre-column file tab. No-ops if that file is not open. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "path": stringProperty(),
+                ], required: ["workspaceID", "path"]),
+            ],
+            [
+                "name": "RespondToPlan",
+                "description": "Approve or reject a project tab's pending plan — the same Approve / Reject buttons on the plan card. Only use when the user told you the decision. Optional feedback is included with the decision, including any review comments already on the diff. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "chatID": stringProperty(),
+                    "approve": ["type": "boolean"],
+                    "feedback": stringProperty("Optional notes to send with the decision."),
+                ], required: ["workspaceID", "chatID", "approve"]),
+            ],
+            [
+                "name": "HandoffPlan",
+                "description": "Copy a pending plan into a new tab's composer, unsent, so the user can pick a different harness or edit before sending. The source tab keeps its plan card. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "chatID": stringProperty(),
+                ], required: ["workspaceID", "chatID"]),
+            ],
+            [
+                "name": "RetryLastTurn",
+                "description": "Resend the last user prompt on a tab — the same Retry button after a failed or interrupted turn. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "chatID": stringProperty(),
+                ], required: ["workspaceID", "chatID"]),
+            ],
+            [
+                "name": "AddRepository",
+                "description": "Register a local git repository with ORE so workspaces can be created in it. Path must be the repository root (or inside it). Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "path": stringProperty("Local filesystem path of the git repository."),
+                ], required: ["path"]),
+            ],
+            [
+                "name": "RenameWorkspace",
+                "description": "Rename a workspace, exactly like editing its name in the sidebar. Runs without confirmation.",
+                "inputSchema": objectSchema(
+                    ["workspaceID": stringProperty(), "name": stringProperty()],
+                    required: ["workspaceID", "name"]
+                ),
+            ],
+            [
+                "name": "SetWorkspacePinned",
+                "description": "Pin or unpin a workspace in the sidebar. Runs without confirmation.",
+                "inputSchema": objectSchema(
+                    ["workspaceID": stringProperty(), "pinned": ["type": "boolean"]],
+                    required: ["workspaceID", "pinned"]
+                ),
+            ],
+            [
+                "name": "RestoreWorkspace",
+                "description": "Restore an archived workspace and its preserved working state. Runs without confirmation because archiving remains available as its inverse.",
+                "inputSchema": workspaceSchema(),
+            ],
+            [
+                "name": "DeleteWorkspace",
+                "description": "Permanently delete an archived workspace. The workspace must already be archived. Its branch is preserved unless deleteBranch=true. Always requires the user's consequential-action confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "deleteBranch": ["type": "boolean", "description": "Also delete the git branch. Default false."],
+                ], required: ["workspaceID"]),
+            ],
+            [
+                "name": "AddDiffComment",
+                "description": "Add a review comment anchored to a workspace diff. It will travel with the next prompt just like a comment created in the Review pane. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(), "path": stringProperty(),
+                    "startLine": ["type": "integer"], "endLine": ["type": "integer"],
+                    "body": stringProperty(), "context": stringProperty(),
+                ], required: ["workspaceID", "path", "startLine", "body"]),
+            ],
+            [
+                "name": "MarkFileViewed",
+                "description": "Mark a changed file viewed at a particular content hash, or unview it with viewed=false. Runs without confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(), "path": stringProperty(),
+                    "viewed": ["type": "boolean"],
+                    "contentHash": ["type": "string", "description": "Required when viewed=true; use the hash reported by the diff surface."],
+                ], required: ["workspaceID", "path"]),
+            ],
+            [
+                "name": "RevertChatToCheckpoint",
+                "description": "Restore both the working tree and one chat's transcript to the state before a turn. Use a checkpoint-capable turnID from WorkspaceStatus. Requires confirmation because later files and conversation are removed from the active branch.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(), "chatID": stringProperty(),
+                    "turnID": stringProperty(),
+                ], required: ["workspaceID", "chatID", "turnID"]),
+            ],
+            [
+                "name": "UpdateQueuedMessage",
+                "description": "Edit a prompt waiting behind a running turn. Use queuedMessageID from WorkspaceStatus. Runs without confirmation.",
+                "inputSchema": queuedMessageSchema(includingText: true),
+            ],
+            [
+                "name": "DeleteQueuedMessage",
+                "description": "Remove a prompt waiting behind a running turn before it is sent. Use queuedMessageID from WorkspaceStatus. Runs without an extra confirmation because the prompt has not executed and can be re-created.",
+                "inputSchema": queuedMessageSchema(includingText: false),
+            ],
+            [
+                "name": "CreateGitHubRepository",
+                "description": "Create and publish a GitHub repository for a local-only project. Requires confirmation because it creates remote state.",
+                "inputSchema": workspaceSchema(),
+            ],
+            [
+                "name": "RetargetPullRequest",
+                "description": "Change an open pull request's base branch. Requires confirmation because it mutates remote review state.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(), "number": ["type": "integer"],
+                    "base": stringProperty(),
+                ], required: ["workspaceID", "number", "base"]),
+            ],
+            [
+                "name": "MergePullRequest",
+                "description": "Merge the workspace's open pull request with merge, squash, or rebase. Requires confirmation.",
+                "inputSchema": objectSchema([
+                    "workspaceID": stringProperty(),
+                    "method": ["type": "string", "enum": ["merge", "squash", "rebase"]],
+                ], required: ["workspaceID"]),
+            ],
+            [
+                "name": "ContinueAfterMerge",
+                "description": "After a PR merges, update the default branch and restart this worktree on a fresh branch. Requires confirmation because it changes git history and the checked-out branch.",
+                "inputSchema": workspaceSchema(),
+            ],
+            [
+                "name": "PullDefaultBranch",
+                "description": "Fast-forward the repository's local default branch from origin without switching the worktree onto it. Requires confirmation.",
+                "inputSchema": workspaceSchema(),
+            ],
+            [
+                "name": "ResolveConflict",
+                "description": "Resolve and stage an entire conflicted file by accepting ours or theirs. Requires confirmation because it replaces file contents.",
+                "inputSchema": conflictSchema(hunk: false),
+            ],
+            [
+                "name": "ResolveConflictHunk",
+                "description": "Resolve one conflict hunk by accepting ours or theirs. Requires confirmation because it replaces file contents.",
+                "inputSchema": conflictSchema(hunk: true),
+            ],
+            [
+                "name": "RerunFailedChecks",
+                "description": "Rerun the latest failed GitHub workflow checks for the workspace branch. Requires confirmation because it starts remote jobs.",
+                "inputSchema": workspaceSchema(),
+            ],
+            [
                 "name": "OpenWorkspace",
                 "description": "Bring a workspace (optionally a specific chat tab) to the front of the ORE window so the user can see it. Runs without confirmation.",
                 "inputSchema": [
@@ -725,6 +966,50 @@ private final class AssistantToolServer {
                 ],
             ],
         ]
+    }
+
+    private func stringProperty(_ description: String? = nil) -> [String: Any] {
+        var property: [String: Any] = ["type": "string"]
+        property["description"] = description
+        return property
+    }
+
+    private func objectSchema(
+        _ properties: [String: [String: Any]], required: [String]
+    ) -> [String: Any] {
+        ["type": "object", "properties": properties, "required": required]
+    }
+
+    private func workspaceSchema() -> [String: Any] {
+        objectSchema(["workspaceID": stringProperty()], required: ["workspaceID"])
+    }
+
+    private func queuedMessageSchema(includingText: Bool) -> [String: Any] {
+        var properties: [String: [String: Any]] = [
+            "workspaceID": stringProperty(),
+            "chatID": stringProperty(),
+            "queuedMessageID": ["type": "integer"],
+        ]
+        var required = ["workspaceID", "chatID", "queuedMessageID"]
+        if includingText {
+            properties["text"] = stringProperty()
+            required.append("text")
+        }
+        return objectSchema(properties, required: required)
+    }
+
+    private func conflictSchema(hunk: Bool) -> [String: Any] {
+        var properties: [String: [String: Any]] = [
+            "workspaceID": stringProperty(),
+            "path": stringProperty(),
+            "side": ["type": "string", "enum": ["ours", "theirs"]],
+        ]
+        var required = ["workspaceID", "path", "side"]
+        if hunk {
+            properties["startLine"] = ["type": "integer"]
+            required.append("startLine")
+        }
+        return objectSchema(properties, required: required)
     }
 
     func call(_ name: String, arguments: [String: Any]) async -> [String: Any] {
@@ -855,6 +1140,7 @@ private final class AssistantToolServer {
                     "baseBranch": record.baseBranch,
                     "harness": record.harness,
                     "isArchived": record.isArchived,
+                    "isPinned": record.isPinned,
                     "hasUnread": record.hasUnread,
                 ]
                 entry["model"] = record.model
@@ -880,6 +1166,28 @@ private final class AssistantToolServer {
                 return entry
             })
 
+        case "ListChatCheckpoints":
+            let workspaceID = try requireWorkspaceID(arguments)
+            guard let rawChatID = arguments["chatID"] as? String, !rawChatID.isEmpty else {
+                return "ListChatCheckpoints needs chatID."
+            }
+            let chatID = ChatID(rawValue: rawChatID)
+            guard let chat = try await store.chat(chatID),
+                  chat.workspaceID == workspaceID.rawValue
+            else { return "That chat does not belong to the requested workspace." }
+            return json(try await store.turns(chatID: chatID).reversed().compactMap {
+                turn -> [String: Any]? in
+                guard turn.checkpointCommit != nil else { return nil }
+                var entry: [String: Any] = [
+                    "turnID": turn.id,
+                    "ordinal": turn.ordinal,
+                    "startedAt": iso(turn.startedAt),
+                ]
+                entry["prompt"] = turn.prompt.map { String($0.prefix(300)) }
+                entry["summary"] = turn.summary
+                return entry
+            })
+
         case "WorkspaceStatus":
             let workspaceID = try requireWorkspaceID(arguments)
             guard let record = try await store.workspace(workspaceID) else {
@@ -887,14 +1195,26 @@ private final class AssistantToolServer {
             }
             var chats: [[String: Any]] = []
             for chat in try await store.chats(workspaceID: workspaceID) {
+                let queued = try await store.queuedMessages(chatID: chat.chatID)
                 var entry: [String: Any] = [
                     "id": chat.id,
                     "title": chat.title,
                     "isClosed": chat.isClosed,
-                    "queuedMessages": try await store.queuedMessages(chatID: chat.chatID).count,
+                    "queuedMessages": queued.compactMap { message -> [String: Any]? in
+                        guard let id = message.id else { return nil }
+                        return [
+                            "id": id,
+                            "text": message.text,
+                            "createdAt": iso(message.createdAt),
+                        ]
+                    },
                 ]
                 if let last = try await store.turns(chatID: chat.chatID).last {
-                    var turn: [String: Any] = ["startedAt": iso(last.startedAt)]
+                    var turn: [String: Any] = [
+                        "id": last.id,
+                        "startedAt": iso(last.startedAt),
+                        "hasCheckpoint": last.checkpointCommit != nil,
+                    ]
                     turn["prompt"] = last.prompt.map { String($0.prefix(300)) }
                     turn["outcome"] = last.outcome
                     turn["summary"] = last.summary

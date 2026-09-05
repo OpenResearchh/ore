@@ -8,6 +8,35 @@ import OrePersistence
 import OreProtocol
 import UserNotifications
 
+/// Turns the review annotations collected beside a diff into plan-decision
+/// feedback. A plan replaces the ordinary composer while it awaits a decision,
+/// so these comments have to travel with Approve or Reject rather than waiting
+/// for a later message that may never be sent.
+enum PlanDecisionFeedback {
+    static func combining(
+        _ feedback: String,
+        comments: [DiffCommentReference]
+    ) -> String {
+        var sections: [String] = []
+        let note = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !note.isEmpty { sections.append(note) }
+        guard !comments.isEmpty else { return sections.joined(separator: "\n\n") }
+
+        sections.append("Review comments on the current diff:")
+        for comment in comments {
+            let location = comment.startLine == comment.endLine
+                ? "\(comment.filePath):\(comment.startLine)"
+                : "\(comment.filePath):\(comment.startLine)-\(comment.endLine)"
+            var section = "**\(location)**\n\(comment.body)"
+            if let context = comment.context, !context.isEmpty {
+                section += "\n\n```\n\(context)\n```"
+            }
+            sections.append(section)
+        }
+        return sections.joined(separator: "\n\n")
+    }
+}
+
 /// The app's view state.
 ///
 /// One `@Observable` object holding what every surface reads. It is the only
@@ -2225,6 +2254,104 @@ final class AppModel {
         )
     }
 
+    // MARK: - Assistant composer actions
+    //
+    // The assistant drives the composer the way the user does — staging text and
+    // file tags for review, never sending on its own. Each reveals the tab first
+    // so the change happens in front of the user, then reuses the same injection
+    // and attachment persistence the composer's own gestures use.
+
+    /// Stage (or extend) a tab's draft text on the assistant's behalf.
+    private func applyAssistantComposerDraft(
+        _ workspaceID: WorkspaceID, _ chatID: ChatID, text: String, append: Bool
+    ) {
+        guard let summary = chatSummaries.first(where: { $0.id == chatID }) else { return }
+        reveal(workspaceID: workspaceID, chatID: chatID)
+        let next: String
+        if append {
+            let existing = pendingDrafts[chatID]?.1 ?? summary.draftText
+            next = existing.isEmpty
+                ? text
+                : existing + (existing.hasSuffix("\n") ? "" : "\n") + text
+        } else {
+            next = text
+        }
+        injectComposerText(next, into: summary)
+    }
+
+    /// Tag a workspace file onto a tab's composer, deduped by path.
+    private func applyAssistantComposerTag(
+        _ workspaceID: WorkspaceID, _ chatID: ChatID, relativePath: String, displayName: String
+    ) {
+        reveal(workspaceID: workspaceID, chatID: chatID)
+        let current = chat(for: chatID).draftAttachments
+        guard !current.contains(where: { $0.relativePath == relativePath }) else { return }
+        persistDraftAttachments(
+            current + [Attachment(relativePath: relativePath, displayName: displayName)],
+            for: chatID
+        )
+    }
+
+    /// Drop one tagged file, matched by exact path, trailing path, or name.
+    private func applyAssistantComposerUntag(
+        _ workspaceID: WorkspaceID, _ chatID: ChatID, reference: String
+    ) {
+        reveal(workspaceID: workspaceID, chatID: chatID)
+        let current = chat(for: chatID).draftAttachments
+        let next = current.filter { attachment in
+            let matches = attachment.relativePath == reference
+                || attachment.displayName == reference
+                || attachment.relativePath.hasSuffix("/" + reference)
+            if matches { deleteCopiedAttachment(attachment, in: workspaceID) }
+            return !matches
+        }
+        guard next.count != current.count else { return }
+        persistDraftAttachments(next, for: chatID)
+    }
+
+    /// Clear every tagged file — and optionally the draft — from a tab.
+    private func applyAssistantComposerClear(
+        _ workspaceID: WorkspaceID, _ chatID: ChatID, clearDraft: Bool
+    ) {
+        reveal(workspaceID: workspaceID, chatID: chatID)
+        for attachment in chat(for: chatID).draftAttachments {
+            deleteCopiedAttachment(attachment, in: workspaceID)
+        }
+        persistDraftAttachments([], for: chatID)
+        if clearDraft, let summary = chatSummaries.first(where: { $0.id == chatID }) {
+            injectComposerText("", into: summary)
+        }
+    }
+
+    /// Open a file tab the way the Review pane does: reveal the workspace, then
+    /// honour `mode` (or the path's usual view), and a line jump always uses source.
+    private func applyAssistantOpenFile(
+        _ workspaceID: WorkspaceID, path: String, mode: String?, line: Int?
+    ) {
+        reveal(workspaceID: workspaceID)
+        if let line {
+            openSourceFile(path, in: workspaceID, line: line)
+            return
+        }
+        let presentation = mode.flatMap(FilePresentationMode.init(rawValue:))
+            ?? FilePresentationMode.preferred(forPath: path)
+        openFile(path, in: workspaceID, mode: presentation)
+    }
+
+    /// Delete only ORE's own copies (pasted images, dropped files under
+    /// `.context/attachments/`) — a chip pointing at a file that already lived in
+    /// the workspace is just a reference, and removing the tag must not delete it.
+    /// Mirrors `ChatPane.deleteCopiedFile`.
+    private func deleteCopiedAttachment(_ attachment: Attachment, in workspaceID: WorkspaceID) {
+        guard attachment.relativePath.hasPrefix(".context/attachments/"),
+              !attachment.relativePath.contains(".."),
+              let worktreePath = workspaces.first(where: { $0.id == workspaceID })?.worktreePath
+        else { return }
+        try? FileManager.default.removeItem(
+            at: attachment.fileURL(worktreePath: worktreePath)
+        )
+    }
+
     func remoteBranches(for id: WorkspaceID) async -> [String] {
         await client.remoteBranches(workspaceID: id)
     }
@@ -2833,6 +2960,29 @@ final class AppModel {
                 reveal(workspaceID: id)
             case .revealChat(let id, let chatID):
                 reveal(workspaceID: id, chatID: chatID)
+            case .setComposerDraft(let id, let chatID, let text, let append):
+                applyAssistantComposerDraft(id, chatID, text: text, append: append)
+            case .tagComposerFile(let id, let chatID, let relativePath, let displayName):
+                applyAssistantComposerTag(
+                    id, chatID, relativePath: relativePath, displayName: displayName
+                )
+            case .untagComposerFile(let id, let chatID, let reference):
+                applyAssistantComposerUntag(id, chatID, reference: reference)
+            case .clearComposerTags(let id, let chatID, let clearDraft):
+                applyAssistantComposerClear(id, chatID, clearDraft: clearDraft)
+            case .openFile(let id, let path, let mode, let line):
+                applyAssistantOpenFile(id, path: path, mode: mode, line: line)
+            case .closeFile(let id, let path):
+                reveal(workspaceID: id)
+                closeDiffFile(path, in: id)
+            case .respondToPlan(let id, let chatID, let approve, let feedback):
+                respondToPlan(
+                    chatID: chatID, workspaceID: id, approve: approve, feedback: feedback
+                )
+            case .handoffPlan(let id, let chatID):
+                if case .proposal(let markdown, _) = chat(for: chatID).plan {
+                    handoffPlan(markdown, in: id)
+                }
             }
 
         case .promptSubmitted(let id, let chatID, let submission):
@@ -3295,12 +3445,16 @@ final class AppModel {
         } else {
             requestID = nil
         }
+        // The plan card owns pending review comments while it is visible. Drain
+        // them into this decision before dismissing the card so they cannot be
+        // stranded behind the now-restored composer.
+        let comments = chat.takeDraftComments()
+        let note = PlanDecisionFeedback.combining(feedback, comments: comments)
         chat.dismissPlan()
         tabNeedsYou.removeAll {
             if case .plan(let item) = $0, item.chatID == chatID { return true }
             return false
         }
-        let note = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
         if let requestID {
             resolvePermission(
                 requestID,

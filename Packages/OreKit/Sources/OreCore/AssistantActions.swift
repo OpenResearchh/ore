@@ -1,4 +1,5 @@
 import Foundation
+import OreGit
 import OrePersistence
 import OreProtocol
 
@@ -6,9 +7,9 @@ import OreProtocol
 ///
 /// Tiered so a clear instruction runs without ceremony: everything reversible
 /// and contained runs automatically, only consequential actions confirm (and a
-/// confirmation can be widened to "this task" or "always"), and destructive
-/// ones aren't exposed at all. Enforced app-side — the model never sees this
-/// table, it only sees results.
+/// confirmation can be widened to "this task" or "always"), including the
+/// destructive controls the UI exposes. Enforced app-side — the model never
+/// sees this table, it only sees results.
 enum AssistantActionPolicy {
     enum Tier {
         case auto
@@ -26,7 +27,17 @@ enum AssistantActionPolicy {
              "ListHarnesses", "GetAppState", "RouteTask",
              "SetChatModel", "SwitchChatHarness", "SetChatEffort",
              "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
-             "AnswerChatQuestion":
+             "AnswerChatQuestion",
+             "RenameWorkspace", "SetWorkspacePinned", "RestoreWorkspace",
+             "AddDiffComment", "MarkFileViewed",
+             "UpdateQueuedMessage", "DeleteQueuedMessage",
+             // Composer prep is the safest thing here: it only stages text and
+             // file tags for the user to review and send. Nothing leaves the
+             // machine, nothing runs, and the user still presses send.
+             "SetComposerDraft", "TagComposerFile", "UntagComposerFile",
+             "ClearComposerTags",
+             "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
+             "RetryLastTurn", "AddRepository":
             return .auto
 
         case "SetChatPermissionMode":
@@ -43,6 +54,14 @@ enum AssistantActionPolicy {
         case "Push": return .confirm(.push)
         case "CreatePullRequest": return .confirm(.createPullRequest)
         case "ArchiveWorkspace": return .confirm(.archiveWorkspace)
+        case "DeleteWorkspace": return .confirm(.deleteWorkspace)
+        case "RevertChatToCheckpoint", "ResolveConflict", "ResolveConflictHunk":
+            return .confirm(.rewriteWorkspace)
+        case "MergePullRequest", "RetargetPullRequest", "ContinueAfterMerge",
+             "PullDefaultBranch":
+            return .confirm(.changeGitHistory)
+        case "CreateGitHubRepository", "RerunFailedChecks":
+            return .confirm(.remoteRepository)
 
         default:
             return .deny("The assistant can't perform \(tool).")
@@ -55,6 +74,15 @@ enum AssistantActionPolicy {
         "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
+        "SetComposerDraft", "TagComposerFile", "UntagComposerFile", "ClearComposerTags",
+        "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
+        "RetryLastTurn", "AddRepository",
+        "RenameWorkspace", "SetWorkspacePinned", "RestoreWorkspace", "DeleteWorkspace",
+        "AddDiffComment", "MarkFileViewed", "RevertChatToCheckpoint",
+        "UpdateQueuedMessage", "DeleteQueuedMessage",
+        "CreateGitHubRepository", "RetargetPullRequest", "MergePullRequest",
+        "ContinueAfterMerge", "PullDefaultBranch", "ResolveConflict",
+        "ResolveConflictHunk", "RerunFailedChecks",
     ]
 
     /// The harness tools the assistant is launched without.
@@ -539,6 +567,314 @@ extension InProcessCoreClient {
             )
             return "Answered."
 
+        case "SetComposerDraft":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            guard let text = arguments["text"]?.stringValue else {
+                throw AssistantActionError.badRequest("SetComposerDraft needs text.")
+            }
+            let append = arguments["append"]?.boolValue ?? false
+            continuation.yield(.assistantUIAction(
+                .setComposerDraft(workspaceID, chatID, text: text, append: append)
+            ))
+            return append
+                ? "Added that to the composer. The user reviews and sends it."
+                : "Put that in the composer. The user reviews and sends it."
+
+        case "TagComposerFile":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            guard let rawPath = arguments["path"]?.stringValue, !rawPath.isEmpty else {
+                throw AssistantActionError.badRequest(
+                    "TagComposerFile needs `path`, a file relative to the workspace root."
+                )
+            }
+            let file = try await resolveWorkspaceFile(rawPath, workspaceID: workspaceID)
+            continuation.yield(.assistantUIAction(.tagComposerFile(
+                workspaceID, chatID, relativePath: file.relativePath, displayName: file.displayName
+            )))
+            return "Tagged \(file.displayName) on the composer."
+
+        case "UntagComposerFile":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            guard let reference = arguments["path"]?.stringValue, !reference.isEmpty else {
+                throw AssistantActionError.badRequest(
+                    "UntagComposerFile needs `path`, the tagged file's path or name."
+                )
+            }
+            continuation.yield(.assistantUIAction(
+                .untagComposerFile(workspaceID, chatID, reference: reference)
+            ))
+            return "Removed \(reference) from the composer's tags if it was there."
+
+        case "ClearComposerTags":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            let clearDraft = arguments["clearDraft"]?.boolValue ?? false
+            continuation.yield(.assistantUIAction(
+                .clearComposerTags(workspaceID, chatID, clearDraft: clearDraft)
+            ))
+            return clearDraft
+                ? "Cleared the composer's tagged files and its draft text."
+                : "Cleared the composer's tagged files."
+
+        case "OpenFile":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let rawPath = arguments["path"]?.stringValue, !rawPath.isEmpty else {
+                throw AssistantActionError.badRequest(
+                    "OpenFile needs `path`, a file relative to the workspace root."
+                )
+            }
+            let file = try await resolveWorkspaceFile(rawPath, workspaceID: workspaceID)
+            let mode = arguments["mode"]?.stringValue
+            if let mode, !["diff", "source", "preview"].contains(mode) {
+                throw AssistantActionError.badRequest(
+                    "OpenFile mode must be diff, source, or preview."
+                )
+            }
+            let line = arguments["line"]?.intValue
+            if let line, line < 1 {
+                throw AssistantActionError.badRequest("OpenFile line must be a positive integer.")
+            }
+            continuation.yield(.assistantUIAction(.openFile(
+                workspaceID, relativePath: file.relativePath, mode: mode, line: line
+            )))
+            let how = mode ?? "the usual view"
+            if let line {
+                return "Opened \(file.displayName) at line \(line)."
+            }
+            return "Opened \(file.displayName) as \(how)."
+
+        case "CloseFile":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let path = arguments["path"]?.stringValue, !path.isEmpty else {
+                throw AssistantActionError.badRequest("CloseFile needs `path`.")
+            }
+            continuation.yield(.assistantUIAction(.closeFile(workspaceID, relativePath: path)))
+            return "Closed \(path) if it was open as a file tab."
+
+        case "RespondToPlan":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            guard let approve = arguments["approve"]?.boolValue else {
+                throw AssistantActionError.badRequest(
+                    "RespondToPlan needs approve=true or false."
+                )
+            }
+            try await requirePendingPlan(workspaceID: workspaceID, chatID: chatID)
+            let feedback = arguments["feedback"]?.stringValue ?? ""
+            continuation.yield(.assistantUIAction(.respondToPlan(
+                workspaceID, chatID, approve: approve, feedback: feedback
+            )))
+            return approve
+                ? "Approved the plan."
+                : "Rejected the plan."
+
+        case "HandoffPlan":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            try await requirePendingPlan(workspaceID: workspaceID, chatID: chatID)
+            continuation.yield(.assistantUIAction(.handoffPlan(workspaceID, chatID)))
+            return "Copied the plan into a new tab's composer for the user to send."
+
+        case "RetryLastTurn":
+            let (workspaceID, chatID) = try await requireOpenChat(arguments)
+            let turns = (try? await store.turns(chatID: chatID)) ?? []
+            guard let turn = turns.last(where: {
+                $0.origin == .user && !($0.prompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }), let prompt = turn.prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+            else {
+                throw AssistantActionError.badRequest(
+                    "That tab has no previous user prompt to retry."
+                )
+            }
+            let sent = try await engine(for: workspaceID).send(SendMessageRequest(
+                workspaceID: workspaceID,
+                chatID: chatID,
+                text: prompt,
+                attachments: turn.attachments,
+                origin: .agent
+            ))
+            return sent
+                ? "Retried the last prompt. The project's agent is working on it."
+                : "The agent was mid-turn, so the retry was queued and will run next."
+
+        case "AddRepository":
+            guard let path = arguments["path"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty
+            else {
+                throw AssistantActionError.badRequest(
+                    "AddRepository needs `path`, the local git repository to add."
+                )
+            }
+            try await addRepository(path: path)
+            return "Added the repository at \(path)."
+
+        case "RenameWorkspace":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let name = arguments["name"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty
+            else { throw AssistantActionError.badRequest("RenameWorkspace needs a name.") }
+            try await engine(for: workspaceID).rename(name, userInitiated: true)
+            markListMutation()
+            return "Renamed the workspace to \"\(name)\"."
+
+        case "SetWorkspacePinned":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let pinned = arguments["pinned"]?.boolValue else {
+                throw AssistantActionError.badRequest("SetWorkspacePinned needs pinned=true or false.")
+            }
+            try await engine(for: workspaceID).setPinned(pinned)
+            markListMutation()
+            return pinned ? "Pinned the workspace." : "Unpinned the workspace."
+
+        case "RestoreWorkspace":
+            let workspaceID = try requireWorkspace(arguments)
+            guard try await store.workspace(workspaceID)?.isArchived == true else {
+                throw AssistantActionError.badRequest("That workspace is not archived.")
+            }
+            try await unarchiveWorkspace(workspaceID)
+            return "Restored the workspace and its preserved working state."
+
+        case "DeleteWorkspace":
+            let workspaceID = try requireWorkspace(arguments)
+            guard try await store.workspace(workspaceID)?.isArchived == true else {
+                throw AssistantActionError.badRequest(
+                    "Only archived workspaces can be permanently deleted. Archive it first."
+                )
+            }
+            let deleteBranch = arguments["deleteBranch"]?.boolValue ?? false
+            try await deleteWorkspace(workspaceID, deleteBranch: deleteBranch)
+            return deleteBranch
+                ? "Permanently deleted the workspace and its branch."
+                : "Permanently deleted the workspace. The branch was preserved."
+
+        case "AddDiffComment":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let path = arguments["path"]?.stringValue, !path.isEmpty,
+                  let startLine = arguments["startLine"]?.intValue, startLine > 0,
+                  let body = arguments["body"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty
+            else {
+                throw AssistantActionError.badRequest(
+                    "AddDiffComment needs path, a positive startLine, and body."
+                )
+            }
+            let endLine = max(startLine, arguments["endLine"]?.intValue ?? startLine)
+            try await engine(for: workspaceID).addDiffComment(DiffCommentReference(
+                filePath: path, startLine: startLine, endLine: endLine,
+                body: body, context: arguments["context"]?.stringValue
+            ))
+            return "Added a review comment on \(path):\(startLine)."
+
+        case "MarkFileViewed":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let path = arguments["path"]?.stringValue, !path.isEmpty else {
+                throw AssistantActionError.badRequest("MarkFileViewed needs path.")
+            }
+            if arguments["viewed"]?.boolValue ?? true {
+                guard let hash = arguments["contentHash"]?.stringValue, !hash.isEmpty else {
+                    throw AssistantActionError.badRequest(
+                        "MarkFileViewed needs contentHash when viewed=true."
+                    )
+                }
+                try await store.markViewed(ViewedFileRecord(
+                    workspaceID: workspaceID, filePath: path, contentHash: hash
+                ))
+                return "Marked \(path) as viewed at that content hash."
+            }
+            try await store.unmarkViewed(workspaceID: workspaceID, filePath: path)
+            return "Marked \(path) as not viewed."
+
+        case "RevertChatToCheckpoint":
+            let workspaceID = try requireWorkspace(arguments)
+            let chatID = try requireChat(arguments)
+            guard let raw = arguments["turnID"]?.stringValue, !raw.isEmpty else {
+                throw AssistantActionError.badRequest("RevertChatToCheckpoint needs turnID.")
+            }
+            try await engine(for: workspaceID).revert(
+                to: TurnID(rawValue: raw), chatID: chatID
+            )
+            return "Restored the workspace and conversation to before that turn."
+
+        case "UpdateQueuedMessage":
+            let (_, queuedID) = try await requireQueuedMessage(arguments)
+            guard let text = arguments["text"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+            else { throw AssistantActionError.badRequest("UpdateQueuedMessage needs text.") }
+            try await store.updateQueuedMessage(id: queuedID, text: text)
+            return "Updated the queued message."
+
+        case "DeleteQueuedMessage":
+            let (_, queuedID) = try await requireQueuedMessage(arguments)
+            try await store.deleteQueuedMessage(id: queuedID)
+            return "Removed the queued message before it was sent."
+
+        case "CreateGitHubRepository":
+            let workspaceID = try requireWorkspace(arguments)
+            try await createGitHubRepo(workspaceID)
+            return "Created and published the GitHub repository."
+
+        case "RetargetPullRequest":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let number = arguments["number"]?.intValue, number > 0,
+                  let base = arguments["base"]?.stringValue, !base.isEmpty
+            else {
+                throw AssistantActionError.badRequest(
+                    "RetargetPullRequest needs a positive PR number and base branch."
+                )
+            }
+            try await retargetPullRequest(workspaceID, number: number, base: base)
+            return "Retargeted pull request #\(number) to \(base)."
+
+        case "MergePullRequest":
+            let workspaceID = try requireWorkspace(arguments)
+            let method = arguments["method"]?.stringValue ?? "squash"
+            guard ["merge", "squash", "rebase"].contains(method) else {
+                throw AssistantActionError.badRequest("method must be merge, squash, or rebase.")
+            }
+            try await mergePullRequest(workspaceID, method: method)
+            return "Merged the pull request using \(method)."
+
+        case "ContinueAfterMerge":
+            let workspaceID = try requireWorkspace(arguments)
+            try await engine(for: workspaceID).continueAfterMerge()
+            try await resync(workspaceID)
+            return "Started a fresh workspace branch from the updated default branch."
+
+        case "PullDefaultBranch":
+            let workspaceID = try requireWorkspace(arguments)
+            try await engine(for: workspaceID).pullDefaultBranch()
+            try await resync(workspaceID)
+            return "Updated the repository's local default branch."
+
+        case "ResolveConflict", "ResolveConflictHunk":
+            let workspaceID = try requireWorkspace(arguments)
+            guard let path = arguments["path"]?.stringValue, !path.isEmpty,
+                  let rawSide = arguments["side"]?.stringValue,
+                  let side = ConflictSide(rawValue: rawSide)
+            else {
+                throw AssistantActionError.badRequest(
+                    "Conflict resolution needs path and side=ours or theirs."
+                )
+            }
+            let workspaceEngine = try await engine(for: workspaceID)
+            if request.tool == "ResolveConflictHunk" {
+                guard let startLine = arguments["startLine"]?.intValue, startLine > 0 else {
+                    throw AssistantActionError.badRequest(
+                        "ResolveConflictHunk needs a positive startLine."
+                    )
+                }
+                try await workspaceEngine.resolveConflictHunk(
+                    path: path, startLine: startLine, side: side
+                )
+            } else {
+                try await workspaceEngine.resolveConflict(path: path, side: side)
+            }
+            try await resync(workspaceID)
+            return "Accepted \(rawSide) for \(path)"
+                + (request.tool == "ResolveConflictHunk" ? " at that conflict hunk." : ".")
+
+        case "RerunFailedChecks":
+            let workspaceID = try requireWorkspace(arguments)
+            try await engine(for: workspaceID).rerunFailedChecks()
+            return "Requested a rerun of the latest failed checks."
+
         case "OpenWorkspace":
             let workspaceID = try requireWorkspace(arguments)
             if let chatID = arguments["chatID"]?.stringValue.map(ChatID.init(rawValue:)) {
@@ -600,6 +936,108 @@ extension InProcessCoreClient {
             )
         }
         return ChatID(rawValue: raw)
+    }
+
+    /// Queue row ids are database-global, so require the workspace and chat as
+    /// ownership checks instead of letting an old id mutate another tab.
+    private func requireQueuedMessage(
+        _ arguments: JSONValue
+    ) async throws -> (ChatID, Int64) {
+        let workspaceID = try requireWorkspace(arguments)
+        let chatID = try requireChat(arguments)
+        guard let rawID = arguments["queuedMessageID"]?.intValue, rawID > 0 else {
+            throw AssistantActionError.badRequest(
+                "queuedMessageID must be a positive integer from WorkspaceStatus."
+            )
+        }
+        let id = Int64(rawID)
+        guard let row = try await store.queuedMessages(chatID: chatID).first(where: {
+            $0.id == id && $0.workspaceID == workspaceID.rawValue
+        }) else {
+            throw AssistantActionError.badRequest(
+                "That queued message is no longer pending on this tab. Refresh WorkspaceStatus."
+            )
+        }
+        guard row.chatID == chatID.rawValue else {
+            throw AssistantActionError.badRequest("That queued message belongs to another tab.")
+        }
+        return (chatID, id)
+    }
+
+    /// A workspace + open chat pair for the composer tools. Composer edits are
+    /// fire-and-forget UI actions that no-op silently against a stale target, so
+    /// the truthful answer to the model comes from validating here: the chat
+    /// exists, it belongs to that workspace, and it is not closed (a closed tab
+    /// has no composer on screen to change).
+    private func requireOpenChat(
+        _ arguments: JSONValue
+    ) async throws -> (WorkspaceID, ChatID) {
+        let workspaceID = try requireWorkspace(arguments)
+        let chatID = try requireChat(arguments)
+        guard let record = try await store.chat(chatID) else {
+            throw AssistantActionError.badRequest(
+                "No chat \(chatID.rawValue) exists — get a chatID from ListChats or app state."
+            )
+        }
+        guard record.workspaceID == workspaceID.rawValue else {
+            throw AssistantActionError.badRequest(
+                "Chat \(chatID.rawValue) isn't in workspace \(workspaceID.rawValue)."
+            )
+        }
+        guard !record.isClosed else {
+            throw AssistantActionError.badRequest(
+                "That tab is closed — ReopenChat before touching its composer."
+            )
+        }
+        return (workspaceID, chatID)
+    }
+
+    /// A plan the user (or this assistant, on their instruction) can still
+    /// decide. Without this check the UI action would no-op and the model
+    /// would be told it approved something that was not on screen.
+    private func requirePendingPlan(
+        workspaceID: WorkspaceID,
+        chatID: ChatID
+    ) async throws {
+        let workspaceEngine = try await engine(for: workspaceID)
+        let pending = await workspaceEngine.pendingInput()
+        guard pending.contains(where: { $0.chatID == chatID && $0.kind == "plan" }) else {
+            throw AssistantActionError.badRequest(
+                "No plan is awaiting a decision on that tab. Refresh app state."
+            )
+        }
+    }
+
+    /// Resolve a file the model wants to tag to a worktree-relative path, and
+    /// prove it exists. Accepts a workspace-relative path or an absolute one, but
+    /// never escapes the worktree — a tag is a reference into the user's project,
+    /// not a handle on arbitrary disk.
+    private func resolveWorkspaceFile(
+        _ path: String,
+        workspaceID: WorkspaceID
+    ) async throws -> (relativePath: String, displayName: String) {
+        guard let record = try await store.workspace(workspaceID) else {
+            throw AssistantActionError.badRequest("No workspace \(workspaceID.rawValue).")
+        }
+        let worktree = URL(fileURLWithPath: record.worktreePath).standardizedFileURL
+        let candidate = (path.hasPrefix("/")
+            ? URL(fileURLWithPath: path)
+            : worktree.appendingPathComponent(path)).standardizedFileURL
+        let root = worktree.path.hasSuffix("/") ? worktree.path : worktree.path + "/"
+        guard candidate.path.hasPrefix(root) else {
+            throw AssistantActionError.badRequest(
+                "\(path) is outside the workspace — tag files inside the worktree."
+            )
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            throw AssistantActionError.badRequest(
+                "No file at \(path) in \(record.name). Tag a file that exists in the worktree."
+            )
+        }
+        return (String(candidate.path.dropFirst(root.count)), candidate.lastPathComponent)
     }
 
     /// Follow-ups that change code must name the tab when the workspace has
@@ -1051,6 +1489,48 @@ extension InProcessCoreClient {
             return "Change the permission mode\(place)"
         case "SetChatEffort": return "Change reasoning effort\(place)"
         case "RenameChat": return "Rename a chat tab\(place)"
+        case "SetComposerDraft":
+            return (request.arguments["append"]?.boolValue == true
+                ? "Add text to the composer" : "Put text in the composer") + place
+        case "TagComposerFile":
+            let file = request.arguments["path"]?.stringValue ?? "a file"
+            return "Tag \(file) on the composer\(place)"
+        case "UntagComposerFile": return "Remove a tagged file from the composer\(place)"
+        case "ClearComposerTags": return "Clear the composer's tagged files\(place)"
+        case "OpenFile":
+            let file = request.arguments["path"]?.stringValue ?? "a file"
+            return "Open \(file)\(place)"
+        case "CloseFile": return "Close a file tab\(place)"
+        case "RespondToPlan":
+            return (request.arguments["approve"]?.boolValue == false
+                ? "Reject the plan" : "Approve the plan") + place
+        case "HandoffPlan": return "Handoff the plan to a new tab\(place)"
+        case "RetryLastTurn": return "Retry the last prompt\(place)"
+        case "AddRepository":
+            let path = request.arguments["path"]?.stringValue ?? "a repository"
+            return "Add the repository at \(path)"
+        case "RenameWorkspace": return "Rename the workspace\(place)"
+        case "SetWorkspacePinned":
+            return (request.arguments["pinned"]?.boolValue == true ? "Pin" : "Unpin")
+                + " the workspace\(place)"
+        case "RestoreWorkspace": return "Restore the archived workspace\(place)"
+        case "DeleteWorkspace":
+            return (request.arguments["deleteBranch"]?.boolValue == true
+                ? "Permanently delete the workspace and branch"
+                : "Permanently delete the workspace") + place
+        case "AddDiffComment": return "Add a diff review comment\(place)"
+        case "MarkFileViewed": return "Change reviewed-file state\(place)"
+        case "RevertChatToCheckpoint": return "Rewind the workspace to a turn checkpoint\(place)"
+        case "UpdateQueuedMessage": return "Edit a queued prompt\(place)"
+        case "DeleteQueuedMessage": return "Remove a queued prompt\(place)"
+        case "CreateGitHubRepository": return "Create a GitHub repository\(place)"
+        case "RetargetPullRequest": return "Retarget a pull request\(place)"
+        case "MergePullRequest": return "Merge the pull request\(place)"
+        case "ContinueAfterMerge": return "Start a fresh branch after merge\(place)"
+        case "PullDefaultBranch": return "Update the local default branch\(place)"
+        case "ResolveConflict": return "Resolve a conflicted file\(place)"
+        case "ResolveConflictHunk": return "Resolve a conflict hunk\(place)"
+        case "RerunFailedChecks": return "Rerun failed checks\(place)"
         case "CloseChat": return "Close a chat tab\(place)"
         case "ReopenChat": return "Reopen a chat tab\(place)"
         case "InterruptChatTurn": return "Stop the agent\(place)"

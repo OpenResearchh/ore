@@ -348,7 +348,7 @@ public actor InProcessCoreClient: CoreClient {
         continuation.yield(.modelCatalogUpdated(harness, models))
     }
 
-    private func resync(_ id: WorkspaceID?) async throws {
+    func resync(_ id: WorkspaceID?) async throws {
         let revision = listRevision
         if let id {
             let engine = try await engine(for: id)
@@ -417,7 +417,7 @@ public actor InProcessCoreClient: CoreClient {
 
     // MARK: - Repositories
 
-    private func addRepository(path: String) async throws {
+    func addRepository(path: String) async throws {
         let root = try await canonicalRepositoryURL(path)
         let git = try gitClient(for: root.path)
 
@@ -649,7 +649,7 @@ public actor InProcessCoreClient: CoreClient {
         return total
     }
 
-    private func unarchiveWorkspace(_ id: WorkspaceID) async throws {
+    func unarchiveWorkspace(_ id: WorkspaceID) async throws {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
@@ -738,7 +738,7 @@ public actor InProcessCoreClient: CoreClient {
     /// means GitHub's default branch is the base — the branch PRs target — and
     /// leaves the workspace's own branch to the normal "Publish branch" step
     /// that follows once a remote exists.
-    private func createGitHubRepo(_ id: WorkspaceID) async throws {
+    func createGitHubRepo(_ id: WorkspaceID) async throws {
         let (record, _, _) = try await workspaceAndGit(id)
         let name = (record.repositoryPath as NSString).lastPathComponent
         let github = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
@@ -782,14 +782,14 @@ public actor InProcessCoreClient: CoreClient {
         return await github.pullRequest(forBranch: record.branch)?.url
     }
 
-    private func retargetPullRequest(_ id: WorkspaceID, number: Int, base: String) async throws {
+    func retargetPullRequest(_ id: WorkspaceID, number: Int, base: String) async throws {
         let (record, _, _) = try await workspaceAndGit(id)
         try await GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
             .retargetPullRequest(number: number, to: base)
         try await resync(id)
     }
 
-    private func mergePullRequest(_ id: WorkspaceID, method: String) async throws {
+    func mergePullRequest(_ id: WorkspaceID, method: String) async throws {
         let (record, _, _) = try await workspaceAndGit(id)
         let github = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
         guard let pr = await github.pullRequest(forBranch: record.branch) else {
@@ -1152,6 +1152,17 @@ public actor InProcessCoreClient: CoreClient {
                 }
                 if chat.isTurnActive { chip += " turn-active" }
                 if focused == chat.id { chip += " [focused]" }
+                // The composer's staged (unsent) text, so the assistant can see
+                // what SetComposerDraft would replace and answer "what's in the
+                // box" truthfully. Tagged files are UI-only state the core never
+                // sees, so they are deliberately not reported here.
+                let draft = chat.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !draft.isEmpty {
+                    let oneLine = draft.replacingOccurrences(of: "\n", with: " ")
+                    let clipped = oneLine.count > 80
+                        ? String(oneLine.prefix(80)) + "…" : oneLine
+                    chip += " draft=\"\(clipped)\""
+                }
                 lines.append(chip)
             }
             for pending in await engine.pendingInput() {

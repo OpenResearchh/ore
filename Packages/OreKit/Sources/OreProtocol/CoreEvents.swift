@@ -26,6 +26,9 @@ public enum CoreEvent: Sendable, Codable {
     case agent(WorkspaceID, ChatID, AgentEvent)
     case gitStatusChanged(WorkspaceID, GitStatusSummary)
     case harnessProbeCompleted([HarnessProbeResult])
+    /// An upgrade check finished for every installed harness. Carries the
+    /// whole set so a client never has to merge partial results.
+    case harnessUpdatesChecked([HarnessUpdateStatus])
     case modelCatalogUpdated(HarnessKind, [AgentModel])
     case commandFailed(CommandFailure)
 
@@ -86,15 +89,20 @@ public struct CoreSnapshot: Sendable, Codable {
     public var workspaces: [WorkspaceSummary]
     public var chats: [ChatSummary]
     public var harnesses: [HarnessProbeResult]
+    /// Empty until the first check completes — a window that opens mid-check
+    /// simply has nothing to offer yet, and the event fills it in.
+    public var harnessUpdates: [HarnessUpdateStatus]
 
     public init(
         workspaces: [WorkspaceSummary],
         chats: [ChatSummary] = [],
-        harnesses: [HarnessProbeResult]
+        harnesses: [HarnessProbeResult],
+        harnessUpdates: [HarnessUpdateStatus] = []
     ) {
         self.workspaces = workspaces
         self.chats = chats
         self.harnesses = harnesses
+        self.harnessUpdates = harnessUpdates
     }
 }
 

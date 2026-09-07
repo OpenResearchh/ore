@@ -47,6 +47,9 @@ func runWorkspaceCommand(_ command: String, options: CommandLineOptions) async {
         await client.send(.addRepository(path: path))
         await settle()
 
+    case "new-project":
+        await createProject(client, options: options)
+
     case "workspaces":
         await listWorkspaces(client, printer: printer)
 
@@ -142,6 +145,25 @@ private func listWorkspaces(_ client: InProcessCoreClient, printer: CoreEventPri
             + (changes > 0 ? "  ·  \(changes) changed" : "")
             + (workspace.stackedOn != nil ? "  ·  stacked" : ""))
     }
+}
+
+private func createProject(_ client: InProcessCoreClient, options: CommandLineOptions) async {
+    guard let name = options.value(for: "--name") ?? options.positional.first else {
+        usage("new-project <name> [--parent <dir>] [--no-workspace] "
+            + "[--harness claude|codex] [--model <id>] [--prompt <text>]")
+        return
+    }
+    await client.send(.createProject(CreateProjectRequest(
+        name: name,
+        parentDirectory: options.value(for: "--parent"),
+        createWorkspace: !options.flag("--no-workspace"),
+        workspaceName: options.value(for: "--workspace-name"),
+        harness: options.harnessKind,
+        model: options.value(for: "--model"),
+        initialPrompt: options.value(for: "--prompt")
+    )))
+    // git init plus a worktree and an optional setup script.
+    await settle(seconds: 8)
 }
 
 private func createWorkspace(_ client: InProcessCoreClient, options: CommandLineOptions) async {
@@ -337,7 +359,7 @@ actor CoreEventPrinter {
         case .gitStatusChanged(let id, let status):
             latest[id]?.gitStatus = status
 
-        case .harnessProbeCompleted, .modelCatalogUpdated:
+        case .harnessProbeCompleted, .harnessUpdatesChecked, .modelCatalogUpdated:
             break
 
         case .commandFailed(let failure):

@@ -49,7 +49,74 @@ final class GitHubUpdater {
         case idle
         case downloading
         case installing
+        /// Staged and scheduled; the only thing left is this process exiting.
+        case restarting
         case failed(String)
+    }
+
+    /// What the swap script was asked to install, written to disk before the
+    /// quit so the *next* launch can say whether it actually landed. Without
+    /// it a restart is a memory wipe: the new build comes up with a fresh
+    /// updater that has no idea an install was ever in flight.
+    struct PendingRestart: Codable, Equatable, Sendable {
+        var version: String
+        var title: String
+        var releaseURL: URL
+    }
+
+    /// The side effects of installing, injected so the lifecycle above them —
+    /// download, stage, quit, reconcile — is testable without a network, a
+    /// disk image, or a process that really exits.
+    struct Hooks: Sendable {
+        /// Downloads the release's installer asset; returns the archive on disk.
+        var download: @Sendable (Available) async throws -> URL
+        /// Unpacks the archive and schedules the post-quit swap script.
+        var schedule: @Sendable (URL) async throws -> Void
+        /// Asks the app to quit (the swap script is waiting on this pid).
+        var requestQuit: @Sendable () -> Void
+        /// Leaves without the graceful handshake, when the polite ask didn't take.
+        var forceQuit: @Sendable () -> Void
+        /// How the restart watchdog waits.
+        var wait: @Sendable (Duration) async -> Void
+
+        static let live = Hooks(
+            download: { release in
+                let work = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("ore-update-\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: work, withIntermediateDirectories: true
+                )
+                guard let archive = await downloadInstaller(release, into: work) else {
+                    try? FileManager.default.removeItem(at: work)
+                    try Task.checkCancellation()
+                    throw GitHubUpdateError.downloadFailed
+                }
+                return archive
+            },
+            schedule: { archive in
+                let work = archive.deletingLastPathComponent()
+                let replacement = try await unpackApp(from: archive, into: work)
+                try scheduleReplaceAndRelaunch(
+                    from: replacement,
+                    replacing: installDestination(currentBundle: Bundle.main.bundleURL)
+                )
+            },
+            // `assumeIsolated`: only ever called from `finishInstall`, which
+            // is main-actor isolated.
+            requestQuit: { MainActor.assumeIsolated { NSApp.terminate(nil) } },
+            forceQuit: {
+                MainActor.assumeIsolated {
+                    // `exit` skips `applicationWillTerminate`, so the one
+                    // thing that handshake does which nothing else does —
+                    // killing terminal shells, which have no session to close
+                    // them — happens here instead. An orphaned shell survives
+                    // the swap still holding the old bundle open.
+                    TerminalRegistry.shared.closeAll()
+                    exit(0)
+                }
+            },
+            wait: { try? await Task.sleep(for: $0) }
+        )
     }
 
     private(set) var available: Available?
@@ -58,26 +125,55 @@ final class GitHubUpdater {
     /// `Later` hides the popup for this session; the menu item stays so the
     /// user can still install without another launch.
     private(set) var dismissed = false
+    /// Set on the first launch after an update landed, so the restart ends in
+    /// a confirmation the user dismisses rather than in silence.
+    private(set) var completedVersion: String?
     /// The in-flight install, kept so Cancel can actually stop the download
     /// rather than leaving the user trapped behind a disabled modal.
     private var installTask: Task<Void, Never>?
 
+    private let hooks: Hooks
+    private let defaults: UserDefaults
+    private let version: @Sendable () -> String
+
+    /// How long the app gets to quit on its own before the update stops being
+    /// polite about it. Longer than `AppDelegate`'s shutdown deadline, so the
+    /// graceful path always gets its full turn first.
+    static let quitDeadline: Duration = .seconds(12)
+
+    static let pendingRestartKey = "ore.update.pendingRestart"
+
     /// `owner/repo` this build updates from.
     nonisolated static let repository = "OpenResearchh/ore"
 
-    var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            ?? "0.0.0"
+    init(
+        hooks: Hooks = .live,
+        defaults: UserDefaults = .standard,
+        version: @escaping @Sendable () -> String = {
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+                ?? "0.0.0"
+        }
+    ) {
+        self.hooks = hooks
+        self.defaults = defaults
+        self.version = version
     }
 
+    var currentVersion: String { version() }
+
     var isInstalling: Bool {
-        phase == .downloading || phase == .installing
+        switch phase {
+        case .downloading, .installing, .restarting: return true
+        case .idle, .failed: return false
+        }
     }
 
     /// The in-window prompt: shown when a newer release is waiting, while an
-    /// install is in flight, or after a failed attempt the user hasn't dismissed.
+    /// install is in flight, after a failed attempt the user hasn't dismissed,
+    /// or to confirm the update that just landed.
     var showsPrompt: Bool {
-        available != nil && (!dismissed || isInstalling || isFailed)
+        if completedVersion != nil { return true }
+        return available != nil && (!dismissed || isInstalling || isFailed)
     }
 
     var isFailed: Bool {
@@ -89,7 +185,7 @@ final class GitHubUpdater {
     /// build. Safe to call on launch and from the menu; failures are silent —
     /// an update check that can't reach GitHub shouldn't nag.
     func check() async {
-        guard !isChecking else { return }
+        guard !isChecking, !isInstalling else { return }
         isChecking = true
         defer { isChecking = false }
 
@@ -98,7 +194,16 @@ final class GitHubUpdater {
             available = nil
             return
         }
-        if available != release {
+        applyCheckResult(release)
+    }
+
+    /// Records a newer release, split from `check()` for the network-free half.
+    func applyCheckResult(_ release: Available) {
+        // Compared by version, not by whole record: a check that lands after
+        // `reconcilePendingRestart` reported a failed install fills in the
+        // asset details for the retry without wiping the message explaining
+        // why there is one.
+        if available?.version != release.version {
             dismissed = false
             phase = .idle
         }
@@ -107,7 +212,13 @@ final class GitHubUpdater {
 
     func dismiss() {
         dismissed = true
+        completedVersion = nil
         if case .failed = phase { phase = .idle }
+    }
+
+    /// Clears the "you're now on vX" confirmation shown after a restart.
+    func acknowledgeCompletion() {
+        completedVersion = nil
     }
 
     /// Downloads the release, replaces this app bundle, and relaunches.
@@ -119,31 +230,50 @@ final class GitHubUpdater {
             return
         }
         dismissed = false
+        completedVersion = nil
         phase = .downloading
-        installTask = Task {
-            do {
-                let work = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("ore-update-\(UUID().uuidString)", isDirectory: true)
-                try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-                guard let archive = await Self.downloadInstaller(available, into: work) else {
-                    try? FileManager.default.removeItem(at: work)
-                    guard !Task.isCancelled else { return }
-                    throw GitHubUpdateError.downloadFailed
-                }
-                // Past here the swap is seconds away; `.installing` is also
-                // what pins the prompt's buttons, so the cancellable window
-                // ends at the download.
-                phase = .installing
-                let replacement = try await Self.unpackApp(from: archive, into: work)
-                try Self.scheduleReplaceAndRelaunch(
-                    from: replacement,
-                    replacing: Self.installDestination(currentBundle: Bundle.main.bundleURL)
-                )
-                NSApp.terminate(nil)
-            } catch {
-                phase = Task.isCancelled ? .idle : .failed(error.localizedDescription)
-            }
+        installTask = Task { await runInstall(available) }
+    }
+
+    /// The install lifecycle, split out from `install()` so it can be driven
+    /// with stub hooks.
+    func runInstall(_ release: Available) async {
+        do {
+            let archive = try await hooks.download(release)
+            try Task.checkCancellation()
+            // Past here the swap is seconds away; `.installing` is also what
+            // pins the prompt's buttons, so the cancellable window ends at
+            // the download.
+            phase = .installing
+            try await hooks.schedule(archive)
+            await finishInstall(release)
+        } catch {
+            phase = Task.isCancelled ? .idle : .failed(error.localizedDescription)
         }
+    }
+
+    /// Quits so the swap script — which is blocked on this pid — can finish.
+    ///
+    /// This is the step that used to strand the popup. The staged update was
+    /// fine and the script was fine; the app simply never exited, so the swap
+    /// never ran and the modal sat on its spinner until the user quit by
+    /// hand. So the quit is now watched: if the graceful ask hasn't taken us
+    /// down by the deadline, we leave the hard way, because a staged update
+    /// with a live old process is the one state nothing can recover from.
+    func finishInstall(_ release: Available) async {
+        phase = .restarting
+        recordPendingRestart(for: release)
+        hooks.requestQuit()
+        await hooks.wait(Self.quitDeadline)
+        guard phase == .restarting else { return }
+        hooks.forceQuit()
+        // Only reached when `forceQuit` didn't (a test double, or a platform
+        // that refused): say so instead of spinning, since quitting by hand
+        // now finishes the same update.
+        phase = .failed(
+            "ORE couldn't quit to finish installing "
+                + "\(Self.displayVersion(release.version)). Quit and reopen ORE to apply it."
+        )
     }
 
     /// Stops an in-flight download and puts the prompt back to rest. Only the
@@ -154,6 +284,50 @@ final class GitHubUpdater {
         installTask = nil
         phase = .idle
         dismissed = true
+    }
+
+    // MARK: - Restart handoff
+
+    private func recordPendingRestart(for release: Available) {
+        let pending = PendingRestart(
+            version: release.version, title: release.title, releaseURL: release.releaseURL
+        )
+        guard let data = try? JSONEncoder().encode(pending) else { return }
+        defaults.set(data, forKey: Self.pendingRestartKey)
+        // The escalation above leaves through `exit`, which skips the normal
+        // flush; an unwritten record is a restart nobody can account for.
+        defaults.synchronize()
+    }
+
+    /// Settles the record the previous launch left behind. Call once at
+    /// startup, before `check()`: an update that landed is acknowledged, and
+    /// one that didn't is reported — rather than reappearing as a plain
+    /// "update available" that hides the fact the last attempt went nowhere.
+    func reconcilePendingRestart() {
+        guard let data = defaults.data(forKey: Self.pendingRestartKey) else { return }
+        defaults.removeObject(forKey: Self.pendingRestartKey)
+        guard let pending = try? JSONDecoder().decode(PendingRestart.self, from: data) else {
+            return
+        }
+        dismissed = false
+        guard Self.isNewer(pending.version, than: currentVersion) else {
+            // The running build, not the tag we asked for: they agree in the
+            // normal case, and where they don't, what's actually running is
+            // the honest thing to report.
+            completedVersion = currentVersion
+            available = nil
+            phase = .idle
+            return
+        }
+        // Still on the old build: the swap never ran. `check()` will fill the
+        // asset details back in so "Try Again" is a real retry.
+        available = Available(
+            version: pending.version, title: pending.title, releaseURL: pending.releaseURL
+        )
+        phase = .failed(
+            "ORE downloaded \(Self.displayVersion(pending.version)) but the install "
+                + "didn't finish. Try again."
+        )
     }
 
     // MARK: - Version comparison
@@ -410,6 +584,14 @@ final class GitHubUpdater {
     /// The swap script: wait out the app, replace the bundle, relaunch, clean
     /// up. `launchctl remove` SIGTERMs its own job, so it must be the last
     /// line — anything after it never runs.
+    ///
+    /// The wait is bounded and escalates. `while kill -0` alone made this
+    /// script hostage to a quit that never completed: the app sat in
+    /// terminate-later limbo, the script slept forever, and the update landed
+    /// only whenever the user next quit by hand — which is exactly what "it
+    /// upgraded, but only after I restarted it myself" looked like. The app
+    /// has its own watchdog now; this is the backstop for the case where even
+    /// that can't get the process out.
     nonisolated static func relaunchScript(
         newApp: URL,
         destination: URL,
@@ -422,7 +604,18 @@ final class GitHubUpdater {
         let staging = shellQuote(newApp.deletingLastPathComponent().path)
         return """
         #!/bin/bash
-        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done
+        PID=\(pid)
+        wait_for_exit() {
+          deadline=$((SECONDS + $1))
+          while /bin/kill -0 "$PID" 2>/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
+            /bin/sleep 0.2
+          done
+          return 0
+        }
+        wait_for_exit \(gracefulQuitSeconds) || /bin/kill -TERM "$PID" 2>/dev/null
+        wait_for_exit \(terminateSeconds) || /bin/kill -KILL "$PID" 2>/dev/null
+        wait_for_exit \(killSeconds)
         /bin/sleep 0.3
         /bin/rm -rf \(dst)
         /usr/bin/ditto \(src) \(dst)
@@ -433,6 +626,13 @@ final class GitHubUpdater {
         /bin/launchctl remove \(shellQuote(label))
         """
     }
+
+    /// How long the script gives each stage of getting the old app out: its
+    /// own quit, then SIGTERM, then SIGKILL. The first is generous because a
+    /// normal quit stops agents and flushes drafts.
+    nonisolated static let gracefulQuitSeconds = 25
+    nonisolated static let terminateSeconds = 10
+    nonisolated static let killSeconds = 5
 
     nonisolated static func shellQuote(_ path: String) -> String {
         "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
@@ -563,61 +763,97 @@ struct GitHubUpdatePrompt: View {
     @Environment(GitHubUpdater.self) private var updater
 
     var body: some View {
-        if updater.showsPrompt, let available = updater.available {
+        if updater.showsPrompt {
             ZStack {
                 Color.black.opacity(0.32)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
 
-                VStack(alignment: .leading, spacing: OreTheme.Space.md) {
-                    HStack(spacing: OreTheme.Space.sm) {
-                        Image(systemName: updater.isInstalling
-                            ? "arrow.down.circle"
-                            : "arrow.down.app.fill")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                        Text(title)
-                            .font(.system(size: OreTheme.Font.display, weight: .semibold))
-                    }
-
-                    Text(message(for: available))
-                        .font(.system(size: OreTheme.Font.title))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if updater.isInstalling {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-
-                    HStack(spacing: OreTheme.Space.sm) {
-                        Spacer()
-                        // A download must stay escapable: this was the modal
-                        // that trapped the whole app when an install wedged.
-                        // Only the brief final swap disables the way out.
-                        Button(updater.phase == .downloading ? "Cancel" : "Later") {
-                            if updater.phase == .downloading {
-                                updater.cancelInstall()
-                            } else {
-                                updater.dismiss()
-                            }
-                        }
-                            .buttonStyle(OreSecondaryButtonStyle())
-                            .keyboardShortcut(.cancelAction)
-                            .disabled(updater.phase == .installing)
-
-                        Button(actionTitle(for: available)) { updater.install() }
-                            .buttonStyle(OrePrimaryButtonStyle())
-                            .keyboardShortcut(.defaultAction)
-                            .disabled(updater.isInstalling)
-                    }
+                if let completed = updater.completedVersion {
+                    completionCard(completed)
+                } else if let available = updater.available {
+                    card(for: available)
                 }
-                .frame(width: 420, alignment: .leading)
-                .oreCard(padding: OreTheme.Space.lg, radius: 16)
             }
             .transition(.opacity)
             .animation(.smooth(duration: 0.25), value: updater.showsPrompt)
         }
+    }
+
+    /// The first thing the new build shows after a successful restart: the
+    /// update reported itself finished instead of just being gone.
+    private func completionCard(_ version: String) -> some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.md) {
+            HStack(spacing: OreTheme.Space.sm) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("ORE is up to date")
+                    .font(.system(size: OreTheme.Font.display, weight: .semibold))
+            }
+
+            Text("Updated to \(GitHubUpdater.displayVersion(version)).")
+                .font(.system(size: OreTheme.Font.title))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Done") { updater.acknowledgeCompletion() }
+                    .buttonStyle(OrePrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .frame(width: 420, alignment: .leading)
+        .oreCard(padding: OreTheme.Space.lg, radius: 16)
+    }
+
+    private func card(for available: GitHubUpdater.Available) -> some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.md) {
+            HStack(spacing: OreTheme.Space.sm) {
+                Image(systemName: updater.isInstalling
+                    ? "arrow.down.circle"
+                    : "arrow.down.app.fill")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text(title)
+                    .font(.system(size: OreTheme.Font.display, weight: .semibold))
+            }
+
+            Text(message(for: available))
+                .font(.system(size: OreTheme.Font.title))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if updater.isInstalling {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            HStack(spacing: OreTheme.Space.sm) {
+                Spacer()
+                // A download must stay escapable: this was the modal
+                // that trapped the whole app when an install wedged.
+                // Only the brief final swap disables the way out.
+                Button(updater.phase == .downloading ? "Cancel" : "Later") {
+                    if updater.phase == .downloading {
+                        updater.cancelInstall()
+                    } else {
+                        updater.dismiss()
+                    }
+                }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(updater.phase == .installing || updater.phase == .restarting)
+
+                Button(actionTitle(for: available)) { updater.install() }
+                    .buttonStyle(OrePrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(updater.isInstalling)
+            }
+        }
+        .frame(width: 420, alignment: .leading)
+        .oreCard(padding: OreTheme.Space.lg, radius: 16)
     }
 
     private var title: String {
@@ -632,7 +868,9 @@ struct GitHubUpdatePrompt: View {
         case .downloading:
             return "Downloading \(version)…"
         case .installing:
-            return "Installing and restarting…"
+            return "Installing \(version)…"
+        case .restarting:
+            return "Restarting to finish installing \(version)…"
         case .failed(let detail):
             return detail
         case .idle:
@@ -645,6 +883,8 @@ struct GitHubUpdatePrompt: View {
         case .downloading:
             return "Downloading…"
         case .installing:
+            return "Installing…"
+        case .restarting:
             return "Restarting…"
         case .failed:
             return "Try Again"
@@ -673,6 +913,7 @@ struct GitHubUpdateCommand: View {
         switch updater.phase {
         case .downloading: return "Downloading \(version)…"
         case .installing: return "Installing \(version)…"
+        case .restarting: return "Restarting to finish \(version)…"
         default: return "Update to \(version)"
         }
     }

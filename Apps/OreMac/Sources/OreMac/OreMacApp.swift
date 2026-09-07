@@ -66,6 +66,13 @@ struct OreMacApp: App {
             // NavigationSplitView instead of crushing labels and controls.
             .frame(minWidth: 1_080, minHeight: 650)
             .task {
+                // First, ahead of anything that can await on the user: this
+                // settles whatever the last launch staged, so an update that
+                // landed gets its confirmation and one that didn't gets
+                // reported, rather than coming back as a fresh "update
+                // available" that says nothing about the attempt the user
+                // already sat through.
+                githubUpdater.reconcilePendingRestart()
                 model.start()
                 // Tap ⌥⌘ anywhere to dictate. Without Accessibility this still
                 // works while ORE is frontmost, so it is never dead.
@@ -768,9 +775,11 @@ struct RootView: View {
                 .frame(maxWidth: 560)
                 .oreCard(padding: 12, radius: 14)
             }
+            HarnessUpdateBanner()
         }
         .padding(.top, OreTheme.Space.sm)
         .animation(.smooth(duration: 0.3), value: model.banners.count)
+        .animation(.smooth(duration: 0.3), value: model.pendingHarnessUpdates.count)
     }
 }
 

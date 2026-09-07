@@ -53,6 +53,10 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     case rewriteWorkspace
     /// Create or update state on a remote hosting provider.
     case remoteRepository
+    /// Install a new version of one of the user's agent CLIs. Consequential
+    /// because it replaces software outside ORE's own tree, on the user's
+    /// machine, with whatever the vendor is publishing right now.
+    case updateHarnessCLI
 
     public var displayName: String {
         switch self {
@@ -66,6 +70,7 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
         case .changeGitHistory: "Change git history"
         case .rewriteWorkspace: "Rewrite workspace files"
         case .remoteRepository: "Change remote repository state"
+        case .updateHarnessCLI: "Update an agent CLI"
         }
     }
 }

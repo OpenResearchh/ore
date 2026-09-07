@@ -21,10 +21,11 @@ enum AssistantActionPolicy {
         switch tool {
         // Reversible, contained, and usually the very thing the user just
         // asked for. Prompting on these is how an assistant becomes paperwork.
-        // ListHarnesses / GetAppState are pure reads that happen to need the
+        // Fleet/state tools are pure reads that happen to need the
         // app process. Memory writes stay in the MCP process.
         case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
-             "ListHarnesses", "GetAppState", "RouteTask",
+             "ListHarnesses", "GetExecutionOptions", "CheckHarnessUpdates",
+             "GetAppState", "RouteTask",
              "SetChatModel", "SwitchChatHarness", "SetChatEffort",
              "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
              "AnswerChatQuestion",
@@ -37,7 +38,11 @@ enum AssistantActionPolicy {
              "SetComposerDraft", "TagComposerFile", "UntagComposerFile",
              "ClearComposerTags",
              "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
-             "RetryLastTurn", "AddRepository":
+             // A new project is a new directory and a first commit, both of
+             // them the user's own request and neither of them reaching
+             // anything that already exists — the same tier as the
+             // CreateWorkspace it usually ends in.
+             "RetryLastTurn", "AddRepository", "CreateProject":
             return .auto
 
         case "SetChatPermissionMode":
@@ -62,6 +67,11 @@ enum AssistantActionPolicy {
             return .confirm(.changeGitHistory)
         case "CreateGitHubRepository", "RerunFailedChecks":
             return .confirm(.remoteRepository)
+        // Installs software on the user's machine. The tool description tells
+        // the model to only reach for it when asked; the confirmation is what
+        // actually holds when it reaches anyway.
+        case "UpdateHarnessCLI":
+            return .confirm(.updateHarnessCLI)
 
         default:
             return .deny("The assistant can't perform \(tool).")
@@ -71,12 +81,14 @@ enum AssistantActionPolicy {
     static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
+        "GetExecutionOptions",
+        "CheckHarnessUpdates", "UpdateHarnessCLI",
         "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
         "SetComposerDraft", "TagComposerFile", "UntagComposerFile", "ClearComposerTags",
         "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
-        "RetryLastTurn", "AddRepository",
+        "RetryLastTurn", "AddRepository", "CreateProject",
         "RenameWorkspace", "SetWorkspacePinned", "RestoreWorkspace", "DeleteWorkspace",
         "AddDiffComment", "MarkFileViewed", "RevertChatToCheckpoint",
         "UpdateQueuedMessage", "DeleteQueuedMessage",
@@ -370,12 +382,14 @@ extension InProcessCoreClient {
                 )
             }
             let repository = try await resolveRepository(arguments["repository"]?.stringValue)
-            let harness = try resolveHarness(arguments["harness"]?.stringValue)
+            let harness = try resolveExecutionHarness(arguments["harness"]?.stringValue)
+                ?? fallbackHarness()
+            try validateModel(arguments["model"]?.stringValue, for: harness)
             let record = try await createWorkspace(CreateWorkspaceRequest(
                 repositoryPath: repository.path,
                 name: arguments["name"]?.stringValue ?? "",
                 seed: try resolveSeed(arguments),
-                harness: harness ?? .claudeCode,
+                harness: harness,
                 model: arguments["model"]?.stringValue,
                 initialPrompt: arguments["prompt"]?.stringValue,
                 promptOrigin: .agent,
@@ -388,7 +402,10 @@ extension InProcessCoreClient {
 
         case "CreateChat":
             let workspaceID = try requireWorkspace(arguments)
-            let harness = try resolveHarness(arguments["harness"]?.stringValue)
+            let harness = try resolveExecutionHarness(arguments["harness"]?.stringValue)
+            if let harness {
+                try validateModel(arguments["model"]?.stringValue, for: harness)
+            }
             let mode = arguments["permissionMode"]?.stringValue
                 .flatMap(PermissionMode.init(rawValue:)) ?? .default
             let chat = try await engine(for: workspaceID).createChat(CreateChatRequest(
@@ -433,6 +450,46 @@ extension InProcessCoreClient {
         case "ListHarnesses":
             return harnessCatalogText()
 
+        case "GetExecutionOptions":
+            guard let task = arguments["task"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !task.isEmpty
+            else {
+                throw AssistantActionError.badRequest(
+                    "GetExecutionOptions needs the complete user goal as task."
+                )
+            }
+            return try await executionOptionsText(
+                task: task,
+                workspaceReference: arguments["workspaceID"]?.stringValue,
+                chatReference: arguments["chatID"]?.stringValue
+            )
+
+        case "CheckHarnessUpdates":
+            // The user asking "is anything out of date?" wants today's answer,
+            // not the one cached at launch.
+            await checkHarnessUpdates(force: true)
+            return harnessUpdateText()
+
+        case "UpdateHarnessCLI":
+            guard let harness = try resolveInstalledHarness(arguments["harness"]?.stringValue) else {
+                throw AssistantActionError.badRequest(
+                    "UpdateHarnessCLI needs a harness: claude, codex, or cursor."
+                )
+            }
+            let before = harnessUpdateStatus(harness)?.installedVersion
+            try await updateHarnessCLI(harness)
+            let after = harnessUpdateStatus(harness)?.installedVersion
+            guard let after else {
+                return "\(harness.displayName) updated, but it didn't report a version afterwards."
+            }
+            if let before, before == after {
+                // The command succeeded and nothing moved — usually a channel
+                // that hasn't published yet. Saying "updated" here would be a
+                // lie the user discovers the next time the card reappears.
+                return "\(harness.displayName) is still v\(after) — its install channel has nothing newer."
+            }
+            return "\(harness.displayName) is now v\(after)."
+
         case "GetAppState":
             return await assistantAppStateText()
 
@@ -448,6 +505,11 @@ extension InProcessCoreClient {
         case "SetChatModel":
             let workspaceID = try requireWorkspace(arguments)
             let chatID = try requireChat(arguments)
+            guard let record = try await store.chat(chatID),
+                  record.workspaceID == workspaceID.rawValue,
+                  let harness = HarnessKind(rawValue: record.harness)
+            else { throw AssistantActionError.badRequest("That chat does not exist in the workspace.") }
+            try validateModel(arguments["model"]?.stringValue, for: harness)
             let chat = try await engine(for: workspaceID).setModel(
                 chatID: chatID, model: arguments["model"]?.stringValue
             )
@@ -456,10 +518,11 @@ extension InProcessCoreClient {
         case "SwitchChatHarness":
             let workspaceID = try requireWorkspace(arguments)
             let chatID = try requireChat(arguments)
-            let harness = try resolveHarness(arguments["harness"]?.stringValue)
+            let harness = try resolveExecutionHarness(arguments["harness"]?.stringValue)
             guard let harness else {
                 throw AssistantActionError.badRequest("SwitchChatHarness needs a harness.")
             }
+            try validateModel(arguments["model"]?.stringValue, for: harness)
             let chat = try await engine(for: workspaceID).switchHarness(
                 chatID: chatID, harness: harness, model: arguments["model"]?.stringValue
             )
@@ -704,6 +767,39 @@ extension InProcessCoreClient {
             }
             try await addRepository(path: path)
             return "Added the repository at \(path)."
+
+        case "CreateProject":
+            guard let name = arguments["name"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty
+            else {
+                throw AssistantActionError.badRequest(
+                    "CreateProject needs `name`, what the new project is called."
+                )
+            }
+            let harness = try resolveExecutionHarness(arguments["harness"]?.stringValue)
+                ?? fallbackHarness()
+            try validateModel(arguments["model"]?.stringValue, for: harness)
+            let project = try await createProject(CreateProjectRequest(
+                name: name,
+                parentDirectory: arguments["parentDirectory"]?.stringValue,
+                createWorkspace: arguments["createWorkspace"]?.boolValue ?? true,
+                workspaceName: arguments["workspaceName"]?.stringValue,
+                harness: harness,
+                model: arguments["model"]?.stringValue,
+                initialPrompt: arguments["prompt"]?.stringValue,
+                promptOrigin: .agent,
+                branchPrefix: arguments["branchPrefix"]?.stringValue
+            ))
+            guard let workspace = project.workspace else {
+                return "Created an empty repository \"\(project.repositoryName)\" at "
+                    + "\(project.repositoryPath) on \(project.defaultBranch), and registered "
+                    + "it with ORE. No workspace was opened."
+            }
+            return "Created the project \"\(project.repositoryName)\" at "
+                + "\(project.repositoryPath) and opened workspace \"\(workspace.name)\" "
+                + "(id \(workspace.id)) on branch \(workspace.branch)."
+                + (arguments["prompt"]?.stringValue == nil
+                    ? "" : " The initial prompt was sent to its agent.")
 
         case "RenameWorkspace":
             let workspaceID = try requireWorkspace(arguments)
@@ -1199,6 +1295,32 @@ extension InProcessCoreClient {
     /// mysterious dead tab ten minutes later.
     private func resolveHarness(_ reference: String?) throws -> HarnessKind? {
         guard let reference, !reference.isEmpty else { return nil }
+        let kind = try parseHarness(reference)
+        guard harnessProbes.first(where: { $0.kind == kind })?.isReady ?? false else {
+            let ready = harnessProbes.filter(\.isReady).map(\.kind.rawValue)
+            throw AssistantActionError.badRequest(
+                "\(kind.displayName) isn't ready on this Mac. Ready: "
+                    + (ready.isEmpty ? "none yet — ask again in a moment" : ready.joined(separator: ", "))
+            )
+        }
+        return kind
+    }
+
+    /// Updating an installed CLI does not require its provider session to be
+    /// authenticated or enabled. Requiring full readiness here would prevent
+    /// a signed-out user from repairing an old CLI before signing back in.
+    private func resolveInstalledHarness(_ reference: String?) throws -> HarnessKind? {
+        guard let reference, !reference.isEmpty else { return nil }
+        let kind = try parseHarness(reference)
+        guard harnessProbes.first(where: { $0.kind == kind })?.isInstalled ?? false else {
+            throw AssistantActionError.badRequest(
+                "\(kind.displayName) isn't installed on this Mac."
+            )
+        }
+        return kind
+    }
+
+    private func parseHarness(_ reference: String) throws -> HarnessKind {
         let kind: HarnessKind? = switch reference.lowercased() {
         case "claude", "claudecode", "claude-code": .claudeCode
         case "codex": .codex
@@ -1208,14 +1330,61 @@ extension InProcessCoreClient {
         guard let kind else {
             throw AssistantActionError.badRequest("Unknown harness \"\(reference)\".")
         }
-        guard harnessProbes.first(where: { $0.kind == kind })?.isReady ?? false else {
-            let ready = harnessProbes.filter(\.isReady).map(\.kind.rawValue)
+        return kind
+    }
+
+    private func resolveExecutionHarness(_ reference: String?) throws -> HarnessKind? {
+        guard let kind = try resolveHarness(reference) else { return nil }
+        guard harnessRateLimit(kind)?.report.status != .exhausted else {
+            let quota = harnessRateLimit(kind)
+            let available = harnessProbes.filter { isHarnessUsable($0.kind) }.map(\.kind.rawValue)
             throw AssistantActionError.badRequest(
-                "\(kind.displayName) isn't ready on this Mac. Ready: "
-                    + (ready.isEmpty ? "none yet — ask again in a moment" : ready.joined(separator: ", "))
+                "\(kind.displayName) isn't currently usable. Its most recent provider report says the rate limit is exhausted"
+                    + quotaResetText(quota?.report.resetsAt) + ". Available: "
+                    + (available.isEmpty ? "none" : available.joined(separator: ", "))
+                    + ". Call GetExecutionOptions again before retrying."
             )
         }
         return kind
+    }
+
+    /// Availability-only fallback for old callers that omit the new MCP
+    /// decision step. This deliberately does not score the task: semantic
+    /// harness/model selection belongs to the Assistant LLM after it reads the
+    /// live inventory.
+    private func fallbackHarness() throws -> HarnessKind {
+        let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent]
+        if let usable = preferred.first(where: isHarnessUsable) { return usable }
+        throw AssistantActionError.badRequest(
+            "No agent harness is currently usable. Call GetExecutionOptions again after signing in, enabling a provider, or waiting for its reported quota reset."
+        )
+    }
+
+    private func isHarnessUsable(_ kind: HarnessKind) -> Bool {
+        guard harnessProbes.first(where: { $0.kind == kind })?.isReady == true else {
+            return false
+        }
+        return harnessRateLimit(kind)?.report.status != .exhausted
+    }
+
+    /// Reject an invented/stale id when live discovery gave us an authoritative
+    /// catalog. An empty catalog is not authoritative, so the provider default
+    /// remains legal rather than turning a metadata outage into a hard outage.
+    private func validateModel(_ model: String?, for harness: HarnessKind) throws {
+        guard let model, !model.isEmpty,
+              let models = modelCatalog[harness], !models.isEmpty,
+              !models.contains(where: { $0.id == model })
+        else { return }
+        throw AssistantActionError.badRequest(
+            "Model \"\(model)\" is not in \(harness.displayName)'s current catalog. Available model ids: "
+                + models.map(\.id).joined(separator: ", ")
+                + ". Call GetExecutionOptions again before retrying."
+        )
+    }
+
+    private func quotaResetText(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return " until approximately \(ISO8601DateFormatter().string(from: date))"
     }
 
     /// What's installed, signed in, and which models each agent offers —
@@ -1233,20 +1402,221 @@ extension InProcessCoreClient {
                 line += "installed but disabled"
             } else if probe.authState == .notAuthenticated {
                 line += "installed but not signed in"
+            } else if harnessRateLimit(probe.kind)?.report.status == .exhausted {
+                line += "connected but currently rate-limited"
             } else {
                 line += "ready"
                 if let version = probe.version { line += " (v\(version))" }
                 let models = modelCatalog[probe.kind] ?? []
                 if !models.isEmpty {
                     let described = models.map { model in
-                        model.id + (model.isDefault ? " (default)" : "")
+                        var value = model.id + (model.isDefault ? " (default)" : "")
+                        if !model.description.isEmpty { value += " [\(model.description)]" }
+                        if !model.supportedReasoningEfforts.isEmpty {
+                            value += " {effort=\(model.supportedReasoningEfforts.joined(separator: "/"))}"
+                        }
+                        if !model.supportedServiceTiers.isEmpty {
+                            value += " {tiers=\(model.supportedServiceTiers.joined(separator: "/"))}"
+                        }
+                        return value
                     }
                     line += " — models: " + described.joined(separator: ", ")
                 }
             }
+            if let capabilities = harnessRegistry.registered
+                .first(where: { $0.kind == probe.kind })?.capabilities {
+                line += " — capabilities: "
+                    + harnessCapabilityText(capabilities)
+            }
+            if let limit = harnessRateLimit(probe.kind) {
+                line += " — latest rate-limit signal: \(limit.report.status.rawValue)"
+                    + (limit.report.window.map { " (\($0))" } ?? "")
+                    + quotaResetText(limit.report.resetsAt)
+            } else {
+                line += " — rate-limit signal: none observed (capacity unknown)"
+            }
             if let diagnostic = probe.diagnostic { line += " — note: \(diagnostic)" }
+            if let update = harnessUpdates.first(where: { $0.kind == probe.kind }),
+               update.isUpdateAvailable,
+               let latest = update.latestVersion {
+                line += " — update available: v\(latest)"
+            }
             lines.append(line)
         }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A complete, point-in-time decision packet for the Assistant model. It
+    /// supplies facts and constraints rather than a keyword-scored winner: the
+    /// LLM can understand the user's full goal better than a local classifier.
+    private func executionOptionsText(
+        task: String,
+        workspaceReference: String?,
+        chatReference: String?
+    ) async throws -> String {
+        let workspaceID = workspaceReference.map(WorkspaceID.init(rawValue:))
+        var targetChat: ChatRecord?
+        if let chatReference, !chatReference.isEmpty {
+            let chatID = ChatID(rawValue: chatReference)
+            guard let chat = try await store.chat(chatID) else {
+                throw AssistantActionError.badRequest("No chat has id \(chatReference).")
+            }
+            if let workspaceID, chat.workspaceID != workspaceID.rawValue {
+                throw AssistantActionError.badRequest(
+                    "Chat \(chatReference) does not belong to workspace \(workspaceID.rawValue)."
+                )
+            }
+            targetChat = chat
+        }
+        if let workspaceID, try await store.workspace(workspaceID) == nil {
+            throw AssistantActionError.badRequest(
+                "No workspace has id \(workspaceID.rawValue)."
+            )
+        }
+
+        var lines = [
+            "LIVE EXECUTION OPTIONS",
+            "Task: \(task)",
+            "Snapshot: \(ISO8601DateFormatter().string(from: Date()))",
+        ]
+        if let chat = targetChat {
+            lines.append(
+                "Current chat: id=\(chat.id); harness=\(chat.harness); "
+                    + "model=\(chat.model ?? "provider default"); "
+                    + "effort=\(chat.reasoningEffort ?? "default"); "
+                    + "state=\(chat.isClosed ? "closed" : "open")"
+            )
+        } else if let workspaceID, let workspace = try await store.workspace(workspaceID) {
+            lines.append(
+                "Current workspace: id=\(workspace.id); harness=\(workspace.harness); "
+                    + "model=\(workspace.model ?? "provider default"); "
+                    + "state=\(workspace.isArchived ? "archived" : "active")"
+            )
+        } else {
+            lines.append("Current target: new or not yet resolved")
+        }
+
+        let registered = harnessRegistry.registered
+        let capabilities = Dictionary(
+            uniqueKeysWithValues: registered.map { ($0.kind, $0.capabilities) }
+        )
+        let kinds = Set(registered.map(\.kind) + harnessProbes.map(\.kind))
+            .sorted { $0.rawValue < $1.rawValue }
+        if kinds.isEmpty {
+            lines.append("\nNo harness integrations are registered in this ORE build.")
+        }
+
+        for kind in kinds {
+            let probe = harnessProbes.first(where: { $0.kind == kind })
+            let limit = harnessRateLimit(kind)
+            let exhausted = limit?.report.status == .exhausted
+            let usable = probe?.isReady == true && !exhausted
+            lines.append("\nHARNESS \(kind.rawValue) (\(kind.displayName))")
+            lines.append("usable-now: \(usable ? "yes" : "no")")
+            if let probe {
+                lines.append("installed: \(probe.isInstalled ? "yes" : "no")")
+                lines.append("enabled: \(probe.isEnabled == false ? "no" : "yes")")
+                lines.append("authentication: \(probe.authState.rawValue)")
+                if let path = probe.executablePath { lines.append("executable: \(path)") }
+                if let version = probe.version { lines.append("version: \(version)") }
+                if let diagnostic = probe.diagnostic { lines.append("diagnostic: \(diagnostic)") }
+            } else {
+                lines.append("probe: pending or unavailable")
+            }
+            if let limit {
+                let observed = ISO8601DateFormatter().string(from: limit.observedAt)
+                lines.append(
+                    "rate-limit: \(limit.report.status.rawValue)"
+                        + (limit.report.window.map { "; window=\($0)" } ?? "")
+                        + (limit.report.resetsAt.map {
+                            "; resets=\(ISO8601DateFormatter().string(from: $0))"
+                        } ?? "")
+                        + "; observed=\(observed); source-chat=\(limit.chatID.rawValue)"
+                )
+            } else {
+                lines.append(
+                    "rate-limit: not reported; capacity is unknown, not guaranteed available (providers report quota during live sessions)"
+                )
+            }
+            if let value = capabilities[kind] {
+                lines.append("capabilities: \(harnessCapabilityText(value))")
+                lines.append("experimental: \(kind.isExperimental ? "yes" : "no")")
+            }
+            let models = modelCatalog[kind] ?? []
+            if models.isEmpty {
+                lines.append(
+                    "models: live catalog unavailable; provider default may be used, but do not invent a model id"
+                )
+            } else {
+                lines.append("models:")
+                for model in models {
+                    var row = "- id=\(model.id); name=\(model.displayName)"
+                    if model.isDefault { row += "; default=yes" }
+                    if !model.description.isEmpty { row += "; strengths=\(model.description)" }
+                    row += "; efforts=" + (model.supportedReasoningEfforts.isEmpty
+                        ? "provider default" : model.supportedReasoningEfforts.joined(separator: ","))
+                    row += "; service-tiers=" + (model.supportedServiceTiers.isEmpty
+                        ? "provider default" : model.supportedServiceTiers.joined(separator: ","))
+                    lines.append(row)
+                }
+            }
+        }
+
+        lines.append(contentsOf: [
+            "\nSELECTION CONTRACT FOR THE ASSISTANT",
+            "- You choose semantically from this complete snapshot; ORE has not keyword-scored or preselected a winner.",
+            "- Treat an explicit user harness/model as a constraint when usable. If it is unavailable, explain that and choose a usable fallback.",
+            "- Exclude harnesses that are not ready or have an active exhausted report. A warning is usable but favors a healthy fallback for long work.",
+            "- For an existing conversation, preserve its current configuration when it remains capable; for a new independent tab, choose the best fit for this task.",
+            "- Match task needs to model strengths and harness capabilities. Use only exact model ids and supported effort/service-tier values shown above.",
+            "- Keep one fallback on a different usable provider. If execution rejects the choice or availability changes, call GetExecutionOptions again and retry with that fallback.",
+            "- Briefly state the chosen harness/model and the task-specific reason before orchestrating.",
+        ])
+        return lines.joined(separator: "\n")
+    }
+
+    private func harnessCapabilityText(_ value: HarnessCapabilities) -> String {
+        [
+            "plan=\(yesNo(value.supportsPlanMode))",
+            "steering=\(yesNo(value.supportsSteering))",
+            "interrupt=\(yesNo(value.supportsInterrupt))",
+            "resume=\(yesNo(value.supportsResume))",
+            "fork=\(yesNo(value.supportsSessionFork))",
+            "thinking-stream=\(yesNo(value.supportsThinkingStream))",
+            "partial-messages=\(yesNo(value.supportsPartialMessages))",
+            "runtime-permissions=\(yesNo(value.supportsRuntimePermissionModeChange))",
+            "custom-tools=\(yesNo(value.supportsCustomTools))",
+            "permission-model=\(value.permissionModel.rawValue)",
+            "usage=\(value.usageGranularity.rawValue)",
+        ].joined(separator: ", ")
+    }
+
+    private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
+
+    /// The upgrade situation for every installed CLI, in the assistant's voice.
+    ///
+    /// Reports what it knows rather than what it wishes: a channel it couldn't
+    /// reach says so, so the model never reads silence as "up to date".
+    private func harnessUpdateText() -> String {
+        guard !harnessUpdates.isEmpty else {
+            return "No harness update check has completed yet — ask again in a few seconds."
+        }
+        var lines: [String] = []
+        for status in harnessUpdates {
+            var line = "\(status.kind.rawValue): "
+            if let failure = status.failure {
+                line += "couldn't check — \(failure)"
+            } else if status.isUpdateAvailable {
+                line += "v\(status.installedVersion ?? "?") → v\(status.latestVersion ?? "?") available"
+                if let command = status.updateCommand { line += " (upgrades with `\(command)`)" }
+            } else {
+                line += "up to date (v\(status.installedVersion ?? "?"))"
+            }
+            lines.append(line)
+        }
+        lines.append(
+            "Only call UpdateHarnessCLI when the user has actually asked to upgrade."
+        )
         return lines.joined(separator: "\n")
     }
 
@@ -1480,6 +1850,17 @@ extension InProcessCoreClient {
         case "OpenWorkspace": return "Show\(place.isEmpty ? " a workspace" : place) on screen"
         case "GetAppState": return "Read the live app state"
         case "RouteTask": return "Recommend where a request should land"
+        case "GetExecutionOptions": return "Inspect live agent and model options"
+        case "CheckHarnessUpdates": return "Check the agent CLIs for updates"
+        case "UpdateHarnessCLI":
+            let harness = (try? resolveInstalledHarness(request.arguments["harness"]?.stringValue))
+                .flatMap { $0 }
+            guard let harness else { return "Update an agent CLI" }
+            let status = harnessUpdateStatus(harness)
+            guard let latest = status?.latestVersion, status?.isUpdateAvailable == true else {
+                return "Update the \(harness.displayName) CLI"
+            }
+            return "Update the \(harness.displayName) CLI to v\(latest)"
         case "SetChatModel": return "Change the model\(place)"
         case "SwitchChatHarness": return "Switch the harness\(place)"
         case "SetChatPermissionMode":
@@ -1509,6 +1890,9 @@ extension InProcessCoreClient {
         case "AddRepository":
             let path = request.arguments["path"]?.stringValue ?? "a repository"
             return "Add the repository at \(path)"
+        case "CreateProject":
+            let name = request.arguments["name"]?.stringValue ?? "a project"
+            return "Start a new project “\(name)”"
         case "RenameWorkspace": return "Rename the workspace\(place)"
         case "SetWorkspacePinned":
             return (request.arguments["pinned"]?.boolValue == true ? "Pin" : "Unpin")

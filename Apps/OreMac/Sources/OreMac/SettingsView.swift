@@ -546,6 +546,7 @@ struct SettingsView: View {
 
                 Divider()
                 SettingsValueRow(label: "Version", value: probe(for: selectedHarness)?.version ?? "Not detected")
+                harnessUpdateRow
                 SettingsValueRow(label: "Provider", value: selectedHarness.displayName)
                 SettingsValueRow(label: "Login method", value: loginMethod)
                 SettingsValueRow(label: "Executable", value: probe(for: selectedHarness)?.executablePath ?? selectedHarness.defaultExecutableName, monospaced: true)
@@ -584,6 +585,54 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    /// The upgrade half of the Version row: what the install channel is
+    /// publishing, and the button that installs it. Silent until the first
+    /// check lands, so the pane never shows an empty "Update" affordance.
+    @ViewBuilder
+    private var harnessUpdateRow: some View {
+        if let status = appModel.harnessUpdate(for: selectedHarness) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Update").foregroundStyle(.secondary).frame(width: 110, alignment: .leading)
+                if status.isUpdateAvailable, let latest = status.latestVersion {
+                    Text("v\(latest) available")
+                    Button(action: { appModel.updateHarnessCLI(selectedHarness) }) {
+                        if isUpdatingSelectedHarness {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Updating…")
+                            }
+                        } else {
+                            Text("Update now")
+                        }
+                    }
+                    .disabled(isUpdatingSelectedHarness)
+                    .help(status.updateCommand.map { "Runs \($0) in your login shell" }
+                        ?? "Install the latest CLI")
+                } else if let failure = status.failure {
+                    Text(failure).foregroundStyle(.secondary)
+                } else {
+                    Text("Up to date").foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            if let update = appModel.harnessCLIUpdate,
+               update.kind == selectedHarness,
+               !update.isRunning,
+               let error = update.error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var isUpdatingSelectedHarness: Bool {
+        appModel.harnessCLIUpdate?.kind == selectedHarness
+            && appModel.harnessCLIUpdate?.isRunning == true
     }
 
     private var environment: some View {

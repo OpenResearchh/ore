@@ -819,6 +819,46 @@ struct AssistantBridgeTests {
         }
     }
 
+    @Test func createProjectMakesAndRegistersANewRepositoryWithoutConfirmation() async throws {
+        try await BridgeHarness.run { harness in
+            let projects = harness.fixture.root
+                .appendingPathComponent("projects", isDirectory: true)
+            let before = try await harness.store.repositories().count
+
+            let response = try harness.callBridge(
+                tool: "CreateProject",
+                arguments: [
+                    "name": .string("LACE"),
+                    "parentDirectory": .string(projects.path),
+                    "createWorkspace": .bool(false),
+                ]
+            )
+
+            #expect(response.ok)
+            #expect(response.result?.contains("LACE") == true)
+            #expect(try await harness.store.repositories().count == before + 1)
+            #expect(FileManager.default.fileExists(
+                atPath: projects.appendingPathComponent("LACE/.git").path
+            ))
+
+            // Auto tier: the user is not asked to confirm starting the project
+            // they just asked for, but it is still audited.
+            let audit = try await harness.store.assistantActions()
+            #expect(audit.first?.tool == "CreateProject")
+            #expect(audit.first?.decision == "auto")
+        }
+    }
+
+    @Test func createProjectWithoutANameFailsHelpfully() async throws {
+        try await BridgeHarness.run { harness in
+            let response = try harness.callBridge(
+                tool: "CreateProject", arguments: ["name": .string("  ")]
+            )
+            #expect(!response.ok)
+            #expect(response.error?.contains("name") == true)
+        }
+    }
+
     @Test func getAppStateRunsWithoutConfirmation() async throws {
         try await BridgeHarness.run { harness in
 

@@ -162,6 +162,9 @@ private struct MCPToolAnnotation {
             || AssistantToolServer.readOnlyBridgeToolNames.contains(name) {
             return .readOnly
         }
+        if readOnlyOpenWorldTools.contains(name) {
+            return .readOnlyOpenWorld
+        }
         if nonDestructiveLocalWriteTools.contains(name) {
             return .localWrite
         }
@@ -190,13 +193,23 @@ private struct MCPToolAnnotation {
         "RevertChatToCheckpoint", "DeleteQueuedMessage", "MergePullRequest",
         "ContinueAfterMerge", "PullDefaultBranch", "ResolveConflict", "ResolveConflictHunk",
     ]
+    /// Changes nothing, but the answer comes from a vendor registry rather than
+    /// from ORE — a client that gates network reads should still see that.
+    private static let readOnlyOpenWorldTools: Set<String> = [
+        "CheckHarnessUpdates",
+    ]
     private static let openWorldTools: Set<String> = [
-        "CreateWorkspace", "CreateChat", "SendPromptToProject", "Push", "CreatePullRequest",
+        "CreateWorkspace", "CreateProject", "CreateChat", "SendPromptToProject",
+        "Push", "CreatePullRequest",
         "CreateGitHubRepository", "RetargetPullRequest", "RerunFailedChecks",
+        "UpdateHarnessCLI",
     ]
 
     private static let readOnly = Self(
         readOnly: true, destructive: false, idempotent: true, openWorld: false
+    )
+    private static let readOnlyOpenWorld = Self(
+        readOnly: true, destructive: false, idempotent: true, openWorld: true
     )
     private static let localWrite = Self(
         readOnly: false, destructive: false, idempotent: false, openWorld: false
@@ -351,12 +364,14 @@ private final class AssistantToolServer {
     private static let actionToolNames: Set<String> = [
         "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
         "Commit", "Push", "CreatePullRequest", "ArchiveWorkspace", "ListHarnesses",
+        "GetExecutionOptions",
+        "CheckHarnessUpdates", "UpdateHarnessCLI",
         "GetAppState", "RouteTask", "SetChatModel", "SwitchChatHarness", "SetChatPermissionMode",
         "SetChatEffort", "RenameChat", "CloseChat", "ReopenChat", "InterruptChatTurn",
         "ResolveChatPermission", "AnswerChatQuestion",
         "SetComposerDraft", "TagComposerFile", "UntagComposerFile", "ClearComposerTags",
         "OpenFile", "CloseFile", "RespondToPlan", "HandoffPlan",
-        "RetryLastTurn", "AddRepository",
+        "RetryLastTurn", "AddRepository", "CreateProject",
         "RenameWorkspace", "SetWorkspacePinned", "RestoreWorkspace", "DeleteWorkspace",
         "AddDiffComment", "MarkFileViewed", "RevertChatToCheckpoint",
         "UpdateQueuedMessage", "DeleteQueuedMessage",
@@ -365,7 +380,7 @@ private final class AssistantToolServer {
         "ResolveConflictHunk", "RerunFailedChecks",
     ]
     fileprivate static let readOnlyBridgeToolNames: Set<String> = [
-        "ListHarnesses", "GetAppState", "RouteTask",
+        "ListHarnesses", "GetExecutionOptions", "GetAppState", "RouteTask",
     ]
 
     init(enabled: Bool, databaseURL: URL, homeURL: URL) {
@@ -493,15 +508,15 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateWorkspace",
-                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. If that repository already has a project worktree and you omit seed (or pass seed=default), ORE reuses the existing worktree instead of forking — a restarted session is not a new project. Pass seed=branch, seed=pr, or seed=issue when the user asked for isolation or a new worktree. Forking beside a dirty sibling asks the user first. Pass `prompt` to start its agent on a task immediately. Match the user's usual harness/model for this kind of work (check other workspaces and your memory); omit both to use ORE's defaults. Use this for a new branch/worktree, not for a new tab on an existing worktree (that is CreateChat).",
+                "description": "Create a new workspace (an isolated git worktree with its own agent) in one of the user's repositories. If that repository already has a project worktree and you omit seed (or pass seed=default), ORE reuses the existing worktree instead of forking — a restarted session is not a new project. Pass seed=branch, seed=pr, or seed=issue when the user asked for isolation or a new worktree. Forking beside a dirty sibling asks the user first. Pass `prompt` to start its agent on a task immediately. Before creating work, call GetExecutionOptions and pass the harness/model you chose. If omitted, ORE uses an availability-only compatibility fallback, not task-aware selection. Use this for a new branch/worktree, not for a new tab on an existing worktree (that is CreateChat).",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "repository": ["type": "string", "description": "Repository name or path. Optional when the user has exactly one."],
                         "name": ["type": "string", "description": "Workspace name. Omit for an auto-generated one."],
                         "prompt": ["type": "string", "description": "Initial task for the workspace's agent."],
-                        "harness": ["type": "string", "description": "claude | codex | cursor — must be ready per ListHarnesses. Omit for the default."],
-                        "model": ["type": "string", "description": "A model id from ListHarnesses for the chosen harness. Omit for its default."],
+                        "harness": ["type": "string", "description": "claude | codex | cursor, selected after GetExecutionOptions."],
+                        "model": ["type": "string", "description": "An exact live model id from GetExecutionOptions."],
                         "seed": ["type": "string", "description": "default | branch | workspace | issue | pr. Omit for the default branch."],
                         "seedRef": ["type": "string", "description": "Branch name, parent workspace id, or GitHub issue/PR number — required for non-default seeds."],
                         "branchPrefix": ["type": "string"],
@@ -510,7 +525,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreateChat",
-                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation. Use for work that belongs on this worktree but is unrelated to any existing tab's conversation. Continuing existing work belongs in its own tab via SendPromptToProject(chatID:). Give it a short, specific title. Do not use this for a new git worktree — that is CreateWorkspace.",
+                "description": "Open a new chat tab in a workspace, optionally sending it a first prompt. Runs without confirmation. Call GetExecutionOptions with the task and workspaceID first, reason over its complete live inventory, and pass the selected harness/model/effort. Use for work that belongs on this worktree but is unrelated to any existing tab's conversation. Continuing existing work belongs in its own tab via SendPromptToProject(chatID:). Give it a short, specific title. Do not use this for a new git worktree — that is CreateWorkspace.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -528,7 +543,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SendPromptToProject",
-                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. Queues automatically if that agent is mid-turn. Runs without confirmation. Write `text` as a full brief, not a relay of the user's words: goal in one line, concrete context you gathered (branch, recent turns, file/PR names), what done looks like — and quote the user's original phrasing at the end. Pass chatID whenever the workspace has more than one open tab; omitting it is refused rather than guessed.",
+                "description": "Send a prompt to a workspace's own agent — the main way to delegate work the user asked for. For a new task or suspected provider problem, call GetExecutionOptions with workspaceID/chatID first and use SwitchChatHarness, SetChatModel, or SetChatEffort if its live evidence supports a change. Runs without confirmation. Write `text` as a full brief, not a relay of the user's words: goal in one line, concrete context you gathered (branch, recent turns, file/PR names), what done looks like — and quote the user's original phrasing at the end. Pass chatID whenever the workspace has more than one open tab; omitting it is refused rather than guessed.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -543,8 +558,34 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "ListHarnesses",
-                "description": "Which agent CLIs are installed, signed in, and what models each offers. Consult before choosing a harness/model for CreateWorkspace, or when a provider seems rate-limited or broken.",
+                "description": "The complete live execution inventory: every connected agent CLI's readiness, constraints, capabilities, models, model strengths, reasoning levels, and service tiers. Use it to understand or explain ORE's selection and provider availability.",
                 "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "GetExecutionOptions",
+                "description": "Decision support for choosing an agent. Returns every registered harness and currently discovered model with connection/auth readiness, observed rate-limit state and reset, strengths, constraints, capabilities, reasoning efforts, service tiers, and optional current-tab continuity context. It does not preselect a winner: reason over the full user goal, choose the best usable fit plus a cross-provider fallback, then pass exact ids to the orchestration tools. Call again after an availability or rate-limit failure.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "task": ["type": "string", "description": "The complete user goal and relevant constraints, not a short keyword label."],
+                        "workspaceID": ["type": "string", "description": "Optional target workspace for continuity context."],
+                        "chatID": ["type": "string", "description": "Optional existing tab for current harness/model context."],
+                    ],
+                    "required": ["task"],
+                ],
+            ],
+            [
+                "name": "CheckHarnessUpdates",
+                "description": "Ask each installed agent CLI's install channel (Homebrew, npm, or the vendor's installer) whether a newer version is published. Use when the user asks whether their agents are up to date, or before UpdateHarnessCLI. Reports channels it couldn't reach rather than claiming everything is current.",
+                "inputSchema": ["type": "object", "properties": [:]],
+            ],
+            [
+                "name": "UpdateHarnessCLI",
+                "description": "Install the latest version of one agent CLI through whatever channel installed it. Only call this when the user has explicitly asked to upgrade a harness — never on your own initiative, and never as a fix for an error you are guessing at. The user is asked to confirm. It can take a couple of minutes; running tabs keep their current binary and new sessions pick up the new one.",
+                "inputSchema": objectSchema(
+                    ["harness": stringProperty("claude | codex | cursor")],
+                    required: ["harness"]
+                ),
             ],
             [
                 "name": "GetAppState",
@@ -553,7 +594,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "RouteTask",
-                "description": "Recommend where a user request should land before you CreateChat, CreateWorkspace, or SendPromptToProject. Pass the user's request as `utterance`. Returns action (sendExistingTab | createChat | createWorkspace | assistantChat | clarify), optional workspaceID/chatID, confidence, a short reason, and a single `question` when two destinations still fit. Follow high-confidence results; ask the question instead of guessing.",
+                "description": "Recommend where a request should land: an existing tab, a new tab, a new workspace, or the Assistant itself. Returns destination action/ids/confidence and a clarifying question when ambiguous. After resolving the destination, call GetExecutionOptions to choose how the task should run.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -796,6 +837,20 @@ private final class AssistantToolServer {
                 "inputSchema": objectSchema([
                     "path": stringProperty("Local filesystem path of the git repository."),
                 ], required: ["path"]),
+            ],
+            [
+                "name": "CreateProject",
+                "description": "Start a brand-new project that does not exist yet: creates an empty local git repository with an initial commit, registers it with ORE, and opens its first workspace with an agent. Use this when the user names a project they have no repository for (\"start a new project called LACE\"). Use AddRepository instead when the code already exists on this Mac, and CreateWorkspace when the repository is already registered. Pass `prompt` to put the new project's agent straight to work. Call GetExecutionOptions first and pass the selected harness/model.",
+                "inputSchema": objectSchema([
+                    "name": stringProperty("What the project is called. Becomes its folder name."),
+                    "parentDirectory": stringProperty("Directory to create the project folder in. Omit for ORE's own repository library."),
+                    "createWorkspace": ["type": "boolean", "description": "Open the first workspace on it. Default true."],
+                    "workspaceName": stringProperty("Name for that first workspace. Omit to name it after the project."),
+                    "harness": stringProperty("claude | codex | cursor, selected after GetExecutionOptions."),
+                    "model": stringProperty("An exact live model id from GetExecutionOptions."),
+                    "prompt": stringProperty("Initial task for the new project's agent, as a full brief."),
+                    "branchPrefix": stringProperty(),
+                ], required: ["name"]),
             ],
             [
                 "name": "RenameWorkspace",

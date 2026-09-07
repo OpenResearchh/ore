@@ -13,6 +13,7 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
     let kind: HarnessKind
     var capabilities: HarnessCapabilities
     let models: [AgentModel]
+    let probeResult: HarnessProbeResult?
     let supportsAuxiliarySessions = false
 
     /// Sessions handed out so far, so a test can drive them.
@@ -33,15 +34,21 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
             supportsRuntimePermissionModeChange: true,
             permissionModel: .interactiveCallback
         ),
-        models: [AgentModel] = []
+        models: [AgentModel] = [],
+        probeResult: HarnessProbeResult? = nil
     ) {
         self.kind = kind
         self.capabilities = capabilities
         self.models = models
+        self.probeResult = probeResult
     }
 
     func probe() async -> HarnessProbeResult {
-        HarnessProbeResult(
+        if var probeResult {
+            probeResult.kind = kind
+            return probeResult
+        }
+        return HarnessProbeResult(
             kind: kind, executablePath: "/fake/\(kind.rawValue)",
             version: "fake", authState: .authenticated
         )

@@ -5,6 +5,12 @@ import OrePersistence
 import OreProtocol
 import OreSupport
 
+struct HarnessRateLimitObservation: Sendable, Equatable {
+    var report: RateLimitReport
+    var observedAt: Date
+    var chatID: ChatID
+}
+
 /// The core, as the Mac app sees it.
 ///
 /// Everything crosses this boundary as `CoreCommand` in and `CoreEvent` out —
@@ -17,7 +23,9 @@ public actor InProcessCoreClient: CoreClient {
     nonisolated let continuation: AsyncStream<CoreEvent>.Continuation
 
     let store: OreStore
-    private let harnessRegistry: HarnessRegistry
+    /// Internal so the Assistant action layer can describe every registered
+    /// harness alongside its live probe/model inventory.
+    let harnessRegistry: HarnessRegistry
     let worktreeRoot: URL?
     private let allowAPIKeyFallback: Bool
 
@@ -25,7 +33,16 @@ public actor InProcessCoreClient: CoreClient {
     private var engineTasks: [WorkspaceID: [Task<Void, Never>]] = [:]
     private var gitClients: [String: GitClient] = [:]
     var harnessProbes: [HarnessProbeResult] = []
+    var harnessUpdates: [HarnessUpdateStatus] = []
+    private var lastHarnessUpdateCheck: Date?
+    /// The check awaits the network, and the actor releases between awaits, so
+    /// launch and a Refresh click can otherwise overlap on the same registries.
+    private var harnessUpdateCheckInFlight = false
     var modelCatalog: [HarnessKind: [AgentModel]] = [:]
+    /// Most recent provider quota signal seen on any tab for each harness.
+    /// Providers emit these during sessions rather than through discovery, so
+    /// the MCP inventory also reports when no observation exists.
+    var harnessRateLimits: [HarnessKind: HarnessRateLimitObservation] = [:]
 
     /// Invalidates whole-list reads that suspended while a workspace or chat
     /// mutation completed. Actor isolation does not make an async method
@@ -97,6 +114,9 @@ public actor InProcessCoreClient: CoreClient {
         switch command {
         case .addRepository(let path):
             try await addRepository(path: path)
+
+        case .createProject(let request):
+            _ = try await createProject(request)
 
         case .createWorkspace(let request):
             try await createWorkspace(request)
@@ -294,6 +314,9 @@ public actor InProcessCoreClient: CoreClient {
             }
             await reconcileAssistantConfiguration()
 
+        case .checkHarnessUpdates(let force):
+            await checkHarnessUpdates(force: force)
+
         case .resync(let id):
             try await resync(id)
         }
@@ -334,6 +357,10 @@ public actor InProcessCoreClient: CoreClient {
                 await self.recordModels(models, for: harness)
             }
             await self.reconcileAssistantConfiguration()
+            // Behind the probe, and behind everything the user is waiting for:
+            // whether Codex shipped a point release is never worth a slower
+            // launch, and the card can appear a second late.
+            await self.checkHarnessUpdates(force: false)
         }
     }
 
@@ -346,6 +373,51 @@ public actor InProcessCoreClient: CoreClient {
         guard !models.isEmpty else { return }
         modelCatalog[harness] = models
         continuation.yield(.modelCatalogUpdated(harness, models))
+    }
+
+    /// How long a check holds. Agent CLIs ship most days, not most minutes, and
+    /// every window that opens would otherwise re-hit three registries.
+    static let harnessUpdateCheckInterval: TimeInterval = 6 * 60 * 60
+
+    /// Asks each installed harness's install channel for its published version.
+    ///
+    /// Network work, so it runs concurrently and swallows its own failures: a
+    /// harness whose registry is unreachable reports that on its status row and
+    /// nothing else in the app notices.
+    func checkHarnessUpdates(force: Bool) async {
+        guard !harnessUpdateCheckInFlight else { return }
+        if !force, let last = lastHarnessUpdateCheck,
+           Date().timeIntervalSince(last) < Self.harnessUpdateCheckInterval {
+            return
+        }
+        let installed = harnessProbes.filter(\.isInstalled)
+        guard !installed.isEmpty else { return }
+
+        harnessUpdateCheckInFlight = true
+        defer { harnessUpdateCheckInFlight = false }
+
+        let statuses = await withTaskGroup(of: HarnessUpdateStatus.self) { group in
+            for probe in installed {
+                group.addTask {
+                    await HarnessUpdateChecker.check(
+                        kind: probe.kind,
+                        installedVersion: probe.version,
+                        executablePath: probe.executablePath
+                    )
+                }
+            }
+            var results: [HarnessUpdateStatus] = []
+            for await status in group { results.append(status) }
+            return results
+        }
+        // Only a check that actually reached a channel spends the throttle. A
+        // laptop that launched offline should find out when it reconnects, not
+        // in six hours.
+        if statuses.contains(where: { $0.failure == nil }) {
+            lastHarnessUpdateCheck = Date()
+        }
+        harnessUpdates = statuses.sorted { $0.kind.rawValue < $1.kind.rawValue }
+        continuation.yield(.harnessUpdatesChecked(harnessUpdates))
     }
 
     func resync(_ id: WorkspaceID?) async throws {
@@ -377,7 +449,10 @@ public actor InProcessCoreClient: CoreClient {
             }
         }
         let snapshot = CoreSnapshot(
-            workspaces: summaries, chats: chats, harnesses: harnessProbes
+            workspaces: summaries,
+            chats: chats,
+            harnesses: harnessProbes,
+            harnessUpdates: harnessUpdates
         )
         #if DEBUG
         if let hook = beforeSnapshotEmission {
@@ -427,6 +502,54 @@ public actor InProcessCoreClient: CoreClient {
             defaultBranch: await git.defaultBranch()
         ))
         try await resync(nil)
+    }
+
+    /// What `createProject` made, for the caller that has to describe it.
+    struct CreatedProject: Sendable {
+        var repositoryPath: String
+        var repositoryName: String
+        var defaultBranch: String
+        var workspace: WorkspaceRecord?
+    }
+
+    /// Start a project that doesn't exist yet: create the repository, register
+    /// it, and open its first workspace.
+    ///
+    /// Registration goes through `addRepository` rather than straight to the
+    /// store so the new path is canonicalized exactly like every other one —
+    /// `~/ore` under a symlinked home, or a `/tmp` fixture, otherwise gets
+    /// stored one way and looked up another, and the workspace that follows
+    /// fails its foreign key.
+    @discardableResult
+    func createProject(_ request: CreateProjectRequest) async throws -> CreatedProject {
+        let parent = request.parentDirectory
+            .map { FilePath.expandingTildeURL($0).standardizedFileURL }
+            ?? OreHome.directory.appendingPathComponent("repositories", isDirectory: true)
+
+        let created = try await RepositoryInitializer.create(name: request.name, in: parent)
+        try await addRepository(path: created.path.path)
+
+        var project = CreatedProject(
+            repositoryPath: created.path.path,
+            repositoryName: created.path.lastPathComponent,
+            defaultBranch: created.defaultBranch
+        )
+        guard request.createWorkspace else { return project }
+
+        project.workspace = try await createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: created.path.path,
+            // Falling back to the project's own name rather than nothing: an
+            // empty name makes a worktree literally called "workspace", which
+            // tells the user nothing in a sidebar.
+            name: request.workspaceName ?? request.name,
+            seed: .defaultBranch,
+            harness: request.harness,
+            model: request.model,
+            initialPrompt: request.initialPrompt,
+            promptOrigin: request.promptOrigin,
+            branchPrefix: request.branchPrefix
+        ))
+        return project
     }
 
     /// The one true path for a repository.
@@ -836,6 +959,9 @@ public actor InProcessCoreClient: CoreClient {
                 await self.publishFromActiveEngine(
                     .agent(id, routed.chatID, routed.event), id: id, engine: engine
                 )
+                await self.recordHarnessRateLimit(
+                    chatID: routed.chatID, event: routed.event
+                )
                 // The Assistant is the product's own agent. A rate-limited or
                 // dead CLI must not mute it while another harness is ready.
                 // Project tabs keep their harness; only this workspace moves.
@@ -892,6 +1018,54 @@ public actor InProcessCoreClient: CoreClient {
 
         await engine.start()
         return engine
+    }
+
+    func recordHarnessRateLimit(chatID: ChatID, event: AgentEvent) async {
+        guard let chat = try? await store.chat(chatID),
+              let harness = HarnessKind(rawValue: chat.harness)
+        else { return }
+
+        let report: RateLimitReport
+        switch event {
+        case .rateLimit(let value):
+            report = value
+        case .turnCompleted(let result) where result.outcome != .failed:
+            // A successful turn is stronger evidence than an older exhausted
+            // snapshot, including one whose provider supplied no reset time.
+            harnessRateLimits.removeValue(forKey: harness)
+            return
+        case .sessionError, .turnCompleted:
+            guard AssistantFailoverPolicy.reason(for: event) == .rateLimited else { return }
+            let previous = harnessRateLimits[harness]?.report
+            report = RateLimitReport(
+                status: .exhausted,
+                window: previous?.window,
+                resetsAt: previous?.resetsAt
+            )
+        default:
+            return
+        }
+
+        harnessRateLimits[harness] = HarnessRateLimitObservation(
+            report: report, observedAt: Date(), chatID: chatID
+        )
+    }
+
+    /// Returns only a still-relevant observation. Warning/exhausted snapshots
+    /// expire at their provider reset time; allowed/unknown remain useful as
+    /// the latest observation but never exclude a harness.
+    func harnessRateLimit(
+        _ harness: HarnessKind,
+        now: Date = Date()
+    ) -> HarnessRateLimitObservation? {
+        guard let observation = harnessRateLimits[harness] else { return nil }
+        if (observation.report.status == .warning
+                || observation.report.status == .exhausted),
+           !observation.report.applies(at: now) {
+            harnessRateLimits.removeValue(forKey: harness)
+            return nil
+        }
+        return observation
     }
 
     /// A stopped engine still owns buffered AsyncStream elements. Validate its
@@ -1330,6 +1504,15 @@ public actor InProcessCoreClient: CoreClient {
             recordModels(models, for: harness)
         }
         await reconcileAssistantConfiguration()
+        // Re-check against the channel, not just the binary: this is what
+        // clears the update card, and what tells the user when an upgrade
+        // "succeeded" without actually moving the version.
+        await checkHarnessUpdates(force: true)
+    }
+
+    /// The upgrade situation for one harness, as of the last check.
+    public func harnessUpdateStatus(_ kind: HarnessKind) -> HarnessUpdateStatus? {
+        harnessUpdates.first { $0.kind == kind }
     }
 
     public struct WorkspaceEnvironment: Sendable, Hashable {
@@ -1381,7 +1564,8 @@ private extension CoreCommand {
             return id
         case .resync(let id):
             return id
-        case .addRepository, .createWorkspace, .probeHarnesses,
+        case .addRepository, .createProject, .createWorkspace, .probeHarnesses,
+             .checkHarnessUpdates,
              .resolveAssistantConfirmation, .updateDreamSettings,
              .updateDreamEnvironment, .startDreamRun, .abortDreamRun,
              .resolveDreamFinding, .listDreamFindings:

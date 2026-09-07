@@ -151,23 +151,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// fully staged and only the quit never finished. Past the deadline the
     /// remaining children are abandoned to their 3s-grace SIGKILL paths;
     /// a bounded quit beats a perfect one.
+    ///
+    /// The race is two independent tasks and a one-shot reply, not a task
+    /// group. A group awaits *every* child before it returns, so cancelling
+    /// the loser and falling out of the group still waited on the wedged
+    /// shutdown — `shutdown()` never checks for cancellation, so the deadline
+    /// bounded nothing and the quit hung exactly as before.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateLater }
         guard let model = MainActor.assumeIsolated({ AppModel.running() }) else {
             return .terminateNow
         }
         isTerminating = true
+        let gate = MainActor.assumeIsolated {
+            TerminationGate { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        let shutdown = Task { @MainActor in await model.shutdown() }
         Task { @MainActor in
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await model.shutdown() }
-                group.addTask { try? await Task.sleep(for: .seconds(8)) }
-                await group.next()
-                group.cancelAll()
-            }
-            sender.reply(toApplicationShouldTerminate: true)
+            await shutdown.value
+            gate.reply()
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.shutdownDeadline))
+            shutdown.cancel()
+            gate.reply()
         }
         return .terminateLater
     }
+
+    /// How long a graceful shutdown gets before the quit goes through anyway.
+    static let shutdownDeadline = 8
 
     /// Right-click on the dock icon: jump straight to whichever agents need
     /// you. The dock badge says how many; this menu says which. (State is
@@ -211,6 +224,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // left to be reparented when the app goes away.
         MainActor.assumeIsolated { TerminalRegistry.shared.closeAll() }
         NotificationCenter.default.post(name: .oreApplicationWillTerminate, object: nil)
+    }
+}
+
+/// Answers the terminate handshake exactly once.
+///
+/// Both racers in `applicationShouldTerminate` finish eventually — the wedged
+/// shutdown included, whenever it unwedges — and a second
+/// `reply(toApplicationShouldTerminate:)` for the same request is an AppKit
+/// programming error, so the second one has to be dropped.
+@MainActor
+final class TerminationGate {
+    private(set) var hasReplied = false
+    private let send: () -> Void
+
+    init(send: @escaping () -> Void) {
+        self.send = send
+    }
+
+    func reply() {
+        guard !hasReplied else { return }
+        hasReplied = true
+        send()
     }
 }
 

@@ -67,6 +67,9 @@ final class AppModel {
     /// when the user is in another app.
     private(set) var tabNeedsYou: [TabNeedsYou] = []
     private(set) var harnesses: [HarnessProbeResult] = []
+    /// What each installed agent CLI's install channel is publishing, from the
+    /// last check. Drives the update card and the Agents settings pane.
+    private(set) var harnessUpdates: [HarnessUpdateStatus] = []
     private(set) var modelCatalog: [HarnessKind: [AgentModel]] = [:]
     private(set) var repositories: [String] = []
     private(set) var isLoaded = false
@@ -956,6 +959,17 @@ final class AppModel {
 
     func addRepository(path: String) {
         Task { await client.send(.addRepository(path: path)) }
+    }
+
+    /// Start a project ORE has never seen: the core creates the repository,
+    /// registers it, and opens its first workspace. The repository list is
+    /// refreshed afterwards so a sheet left open ("Create another") can pick
+    /// the new project without reopening.
+    func createProject(_ request: CreateProjectRequest) {
+        Task {
+            await client.send(.createProject(request))
+            await refreshRepositories()
+        }
     }
 
     func createWorkspace(_ request: CreateWorkspaceRequest) {
@@ -2654,8 +2668,14 @@ final class AppModel {
         return (parts[0], parts[1])
     }
 
+    /// Re-detect the installed CLIs and re-ask their channels what's published.
+    /// Both, because a user pressing Refresh is asking about right now — and
+    /// the check runs second so it compares against the versions just probed.
     func refreshHarnesses() {
-        Task { await client.send(.probeHarnesses) }
+        Task {
+            await client.send(.probeHarnesses)
+            await client.send(.checkHarnessUpdates(force: true))
+        }
     }
 
     struct HarnessCLIUpdate: Equatable {
@@ -2668,22 +2688,76 @@ final class AppModel {
     /// Upgrade the chat's agent CLI, restart its session so the new binary
     /// is the one we spawn, then resend the last prompt.
     func updateHarnessCLI(for chat: ChatSummary) {
-        let kind = chat.harness
-        harnessCLIUpdate = HarnessCLIUpdate(kind: kind, isRunning: true, error: nil)
         Task {
-            do {
-                try await client.updateHarnessCLI(kind)
-                await client.send(.stopChatSession(chat.workspaceID, chat.id))
-                harnessCLIUpdate = nil
-                retryLastTurn(in: chat.workspaceID, chatID: chat.id)
-            } catch {
-                harnessCLIUpdate = HarnessCLIUpdate(
-                    kind: kind,
-                    isRunning: false,
-                    error: error.localizedDescription
-                )
-            }
+            guard await runHarnessCLIUpdate(chat.harness) else { return }
+            await client.send(.stopChatSession(chat.workspaceID, chat.id))
+            retryLastTurn(in: chat.workspaceID, chatID: chat.id)
         }
+    }
+
+    /// Upgrade one agent CLI on its own — the update card's button, and the
+    /// same path the assistant takes. Running sessions keep the binary they
+    /// launched with; the next one they start picks up the new version.
+    func updateHarnessCLI(_ kind: HarnessKind) {
+        Task { _ = await runHarnessCLIUpdate(kind) }
+    }
+
+    /// True when the upgrade landed. A failure is left on `harnessCLIUpdate`
+    /// for whichever surface is showing it, rather than thrown away into a log.
+    @discardableResult
+    private func runHarnessCLIUpdate(_ kind: HarnessKind) async -> Bool {
+        harnessCLIUpdate = HarnessCLIUpdate(kind: kind, isRunning: true, error: nil)
+        do {
+            try await client.updateHarnessCLI(kind)
+            harnessCLIUpdate = nil
+            return true
+        } catch {
+            harnessCLIUpdate = HarnessCLIUpdate(
+                kind: kind,
+                isRunning: false,
+                error: error.localizedDescription
+            )
+            return false
+        }
+    }
+
+    /// Harnesses with a published version newer than the installed one, minus
+    /// the ones the user has already waved off at that exact version.
+    var pendingHarnessUpdates: [HarnessUpdateStatus] {
+        HarnessUpdatePrompting.pending(
+            statuses: harnessUpdates,
+            dismissed: dismissedHarnessUpdates
+        )
+    }
+
+    /// The version of each harness the user has waved off, mirrored into
+    /// `UserDefaults` so it survives a relaunch. Held here as well because a
+    /// dismissal has to move the card out of the way immediately.
+    private var dismissedHarnessUpdates: [HarnessKind: String] = AppModel.loadDismissedHarnessUpdates()
+
+    func dismissHarnessUpdate(_ status: HarnessUpdateStatus) {
+        guard let latest = status.latestVersion else { return }
+        dismissedHarnessUpdates[status.kind] = latest
+        UserDefaults.standard.set(latest, forKey: Self.dismissedHarnessUpdateKey(status.kind))
+    }
+
+    func harnessUpdate(for kind: HarnessKind) -> HarnessUpdateStatus? {
+        harnessUpdates.first { $0.kind == kind }
+    }
+
+    private static func dismissedHarnessUpdateKey(_ kind: HarnessKind) -> String {
+        "ore.harnessUpdate.dismissed.\(kind.rawValue)"
+    }
+
+    private static func loadDismissedHarnessUpdates() -> [HarnessKind: String] {
+        var dismissed: [HarnessKind: String] = [:]
+        for kind in HarnessKind.allCases {
+            guard let version = UserDefaults.standard.string(
+                forKey: dismissedHarnessUpdateKey(kind)
+            ) else { continue }
+            dismissed[kind] = version
+        }
+        return dismissed
     }
 
     /// Starts the provider's own browser-based login. Credentials remain in
@@ -2843,6 +2917,7 @@ final class AppModel {
                 uniquingKeysWith: { _, last in last }
             )
             harnesses = snapshot.harnesses
+            if !snapshot.harnessUpdates.isEmpty { harnessUpdates = snapshot.harnessUpdates }
             // Priming, not observing: the fleet's state at launch is the
             // briefing's story, and the watcher must not narrate a night's
             // worth of drift as though it just happened.
@@ -3100,6 +3175,9 @@ final class AppModel {
 
         case .harnessProbeCompleted(let probes):
             harnesses = probes
+
+        case .harnessUpdatesChecked(let statuses):
+            harnessUpdates = statuses
 
         case .modelCatalogUpdated(let harness, let models):
             modelCatalog[harness] = models

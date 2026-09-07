@@ -57,6 +57,13 @@ public struct HarnessRegistry: Sendable {
             .sorted { $0.kind.rawValue < $1.kind.rawValue }
     }
 
+    /// Every integration ORE knows about, including one currently disabled by
+    /// policy. Decision-support surfaces need to explain that a harness exists
+    /// but is unavailable rather than silently omitting it from the fleet.
+    public var registered: [any AgentHarness] {
+        harnesses.values.sorted { $0.kind.rawValue < $1.kind.rawValue }
+    }
+
     /// Onboarding doctor: probes every harness at once, since each spawns a
     /// process and doing them in sequence is the difference between a snappy
     /// first run and a visibly slow one.

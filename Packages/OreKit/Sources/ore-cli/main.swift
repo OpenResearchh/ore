@@ -26,7 +26,7 @@ case "record":
     await runRecord(options: options)
 case "replay":
     runReplay(options: options)
-case "repos", "add-repo", "workspaces", "new", "say", "diff", "git-action",
+case "repos", "add-repo", "new-project", "workspaces", "new", "say", "diff", "git-action",
      "archive", "delete", "search", "turns", "revert":
     await runWorkspaceCommand(command, options: options)
 default:
@@ -69,6 +69,10 @@ func printUsage() {
     WORKSPACES  (drives the whole core, exactly as the Mac app does)
       ore-cli add-repo <path>
       ore-cli repos
+      ore-cli new-project <name> [--parent <dir>] [--no-workspace]
+                  [--harness claude|codex] [--model <id>] [--prompt <text>]
+          Create an empty local repository for a project that doesn't exist
+          yet, register it, and open its first workspace.
       ore-cli new --repo <path> --name <name> [--harness claude|codex]
                   [--branch <name> | --stack-on <workspace-id> | --issue <n>]
                   [--model <name>] [--prompt <text>]

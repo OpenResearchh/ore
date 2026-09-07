@@ -1,5 +1,6 @@
 import AppKit
 import OreGit
+import OrePersistence
 import OreProtocol
 import SwiftUI
 
@@ -29,10 +30,12 @@ struct NewWorkspaceSheet: View {
     @State private var seedItems: [GitHubClient.IssueListItem] = []
     @State private var localBranches: [String] = []
     @State private var isLoadingSeeds = false
+    @State private var projectName = ""
 
     private enum RepositorySource: String, CaseIterable, Identifiable {
         case local = "On this Mac"
         case github = "GitHub"
+        case newProject = "New project"
         var id: String { rawValue }
     }
 
@@ -68,7 +71,9 @@ struct NewWorkspaceSheet: View {
                 }
                 .pickerStyle(.segmented)
 
-                if repositorySource == .local {
+                if repositorySource == .newProject {
+                    newProjectFields
+                } else if repositorySource == .local {
                     Picker("Repository", selection: $repositoryPath) {
                         if model.repositories.isEmpty {
                             Text("No repositories yet").tag("")
@@ -119,10 +124,15 @@ struct NewWorkspaceSheet: View {
                     }
                 }
 
-                Picker("Start from", selection: $seedKind) {
-                    ForEach(SeedKind.allCases) { Text($0.title).tag($0) }
+                // A repository being created in this same action has exactly
+                // one commit on one branch, so there is nothing to start from
+                // but its default branch.
+                if repositorySource != .newProject {
+                    Picker("Start from", selection: $seedKind) {
+                        ForEach(SeedKind.allCases) { Text($0.title).tag($0) }
+                    }
+                    seedPicker
                 }
-                seedPicker
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("First message").font(.caption).foregroundStyle(.secondary)
@@ -185,6 +195,33 @@ struct NewWorkspaceSheet: View {
         .task(id: "\(repositoryPath)-\(seedKind.rawValue)") {
             await loadSeeds()
         }
+    }
+
+    /// Starting a project with no repository anywhere yet — the case the
+    /// other two sources can't serve, because both of them need code that
+    /// already exists.
+    @ViewBuilder
+    private var newProjectFields: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Project name", text: $projectName)
+                .textFieldStyle(.roundedBorder)
+            Text(projectDestinationDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Shown before the user commits, because "where did it put my project?"
+    /// is the first thing they'll ask afterwards.
+    private var projectDestinationDescription: String {
+        let trimmed = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "An empty git repository with one commit, created in ORE's project library."
+        }
+        let folder = RepositoryInitializer.directoryName(for: trimmed)
+        let library = OreHome.directory.appendingPathComponent("repositories", isDirectory: true)
+        return "Creates \(library.appendingPathComponent(folder).path) as a git repository "
+            + "with an initial commit, then opens a workspace on it."
     }
 
     @ViewBuilder
@@ -359,9 +396,14 @@ struct NewWorkspaceSheet: View {
     }
 
     private var canCreate: Bool {
-        repositorySource == .local
-            ? !repositoryPath.isEmpty
-            : !githubReference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        switch repositorySource {
+        case .local:
+            !repositoryPath.isEmpty
+        case .github:
+            !githubReference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .newProject:
+            !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     private func loadGitHub() async {
@@ -393,6 +435,30 @@ struct NewWorkspaceSheet: View {
         operationError = nil
         isCreating = true
         defer { isCreating = false }
+
+        // The core makes the repository and its first workspace in one command:
+        // the intermediate states — a repository with no workspace, a workspace
+        // request naming a path that doesn't exist yet — are not states this
+        // sheet should ever be able to leave the user in.
+        if repositorySource == .newProject {
+            model.createProject(CreateProjectRequest(
+                name: projectName.trimmingCharacters(in: .whitespacesAndNewlines),
+                workspaceName: name.isEmpty ? nil : name,
+                harness: harness,
+                model: modelName.isEmpty ? nil : modelName,
+                initialPrompt: prompt.isEmpty ? nil : prompt,
+                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+            ))
+            if createAnother {
+                chooseAnotherIdentity()
+                projectName = ""
+                prompt = ""
+            } else {
+                dismiss()
+            }
+            return
+        }
+
         let selectedRepository: String
         do {
             if repositorySource == .github {

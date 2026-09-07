@@ -10,6 +10,9 @@ import Foundation
 public enum CoreCommand: Sendable, Codable {
     // Repositories and workspaces
     case addRepository(path: String)
+    /// Create a brand-new empty local repository, register it, and (by default)
+    /// open its first workspace — starting a project that exists nowhere yet.
+    case createProject(CreateProjectRequest)
     case createWorkspace(CreateWorkspaceRequest)
     case archiveWorkspace(WorkspaceID)
     case unarchiveWorkspace(WorkspaceID)
@@ -96,8 +99,58 @@ public enum CoreCommand: Sendable, Codable {
 
     // Diagnostics
     case probeHarnesses
+    /// Ask each installed agent CLI's install channel whether a newer version
+    /// is published. Throttled unless `force`, so a launch and a menu click
+    /// don't both hit the registries.
+    case checkHarnessUpdates(force: Bool)
     /// Resend the current snapshot — used on reconnect, and by a fresh window.
     case resync(WorkspaceID?)
+}
+
+/// Starting a project ORE has never seen — no clone, no folder to point at.
+///
+/// Deliberately one command rather than "make a repo" followed by "add it"
+/// followed by "open a workspace": the intermediate states are all useless to
+/// the user, and each one is a way for the flow to strand a half-made project
+/// on disk that nothing in the app references.
+public struct CreateProjectRequest: Sendable, Codable {
+    public var name: String
+    /// Where the project folder is created. Nil means ORE's own repository
+    /// library, beside the clones it makes for GitHub projects.
+    public var parentDirectory: String?
+    /// Open the first workspace on the new repository. On by default: a project
+    /// with no workspace has no agent, which is not what "start a project"
+    /// means to anyone who asks for one.
+    public var createWorkspace: Bool
+    /// Name for that first workspace. Nil takes ORE's usual generated identity.
+    public var workspaceName: String?
+    public var harness: HarnessKind
+    public var model: String?
+    public var initialPrompt: String?
+    public var promptOrigin: MessageOrigin
+    public var branchPrefix: String?
+
+    public init(
+        name: String,
+        parentDirectory: String? = nil,
+        createWorkspace: Bool = true,
+        workspaceName: String? = nil,
+        harness: HarnessKind = .claudeCode,
+        model: String? = nil,
+        initialPrompt: String? = nil,
+        promptOrigin: MessageOrigin = .user,
+        branchPrefix: String? = nil
+    ) {
+        self.name = name
+        self.parentDirectory = parentDirectory
+        self.createWorkspace = createWorkspace
+        self.workspaceName = workspaceName
+        self.harness = harness
+        self.model = model
+        self.initialPrompt = initialPrompt
+        self.promptOrigin = promptOrigin
+        self.branchPrefix = branchPrefix
+    }
 }
 
 public struct CreateWorkspaceRequest: Sendable, Codable {

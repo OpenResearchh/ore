@@ -960,7 +960,10 @@ struct GitHubUpdaterVersionTests {
         let lines = script.split(separator: "\n").map(String.init)
         #expect(lines.first == "#!/bin/bash")
         #expect(lines.last == "/bin/launchctl remove 'dev.ore.relaunch.test'")
-        #expect(script.contains("while /bin/kill -0 123"))
+        // The wait on the app is bounded and escalates rather than sleeping
+        // forever on a quit that wedged; see `UpdateRestartTests`.
+        #expect(script.contains("PID=123"))
+        #expect(script.contains("wait_for_exit"))
         let ditto = lines.firstIndex { $0.hasPrefix("/usr/bin/ditto") }
         let clear = lines.firstIndex { $0.hasPrefix("/bin/rm -rf '/Applications") }
         let open = lines.firstIndex { $0.hasPrefix("/usr/bin/open") }

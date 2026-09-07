@@ -2273,6 +2273,20 @@ struct GitActionToolbar: View {
                 }
             }
 
+            // Red CI shouldn't dead-end the flow. The primary action still
+            // hands the failure to the agent; this is the escape hatch for a
+            // failure the user has already judged irrelevant. It opens the same
+            // MergeEditor as the normal merge, so the method choice is
+            // unchanged — the popover is anchored on the primary button above.
+            if action.mergeableDespiteChecks != nil {
+                Button("Merge anyway") { editor = .merge }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                    .disabled(model.isGitOpInFlight(workspace.id))
+                    .help("Merge this pull request despite the failing checks")
+                    .accessibilityLabel("Merge anyway")
+                    .accessibilityHint("Merge this pull request despite the failing checks")
+            }
+
             if case .merged = action {
                 Button("Archive") { model.requestArchive(workspace.id) }
                     .buttonStyle(OreSecondaryButtonStyle())

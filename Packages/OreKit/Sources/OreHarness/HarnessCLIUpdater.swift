@@ -20,14 +20,14 @@ public enum HarnessCLIUpdater {
     }
 
     public enum UpdateError: Error, Sendable, LocalizedError {
-        case commandFailed(command: String, exitCode: Int32, output: String)
+        case commandFailed(kind: HarnessKind, command: String, exitCode: Int32, output: String)
         case timedOut(command: String)
 
         public var errorDescription: String? {
             switch self {
-            case .commandFailed(_, let code, let output):
+            case .commandFailed(let kind, _, let code, let output):
                 let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let friendly = Self.permissionDeniedMessage(in: detail) {
+                if let friendly = Self.permissionDeniedMessage(for: kind, in: detail) {
                     return friendly
                 }
                 if detail.isEmpty { return "CLI update failed (exit \(code))." }
@@ -39,17 +39,25 @@ public enum HarnessCLIUpdater {
 
         /// npm's EACCES dump is useless in the composer; translate it into the
         /// action the user actually needs.
-        static func permissionDeniedMessage(in detail: String) -> String? {
+        ///
+        /// The remedy has to name the harness being updated. A hardcoded
+        /// formula told someone updating Claude Code to `brew install codex`,
+        /// which installs a different agent and leaves the broken CLI in place.
+        static func permissionDeniedMessage(for kind: HarnessKind, in detail: String) -> String? {
             let lower = detail.lowercased()
             guard lower.contains("eacces")
                 || lower.contains("permission denied")
                 || lower.contains("operation not permitted")
             else { return nil }
+            // Cursor has no formula, so offering Homebrew there would be a
+            // dead end; fall back to the ownership fix on its own.
+            let remedy = kind.brewFormula.map {
+                "Reinstall with Homebrew (`brew install \($0)`) or fix"
+            } ?? "Fix"
             return """
-            Could not update the CLI: this install is not writable by your user \
-            (often a root-owned `/usr/local` npm package). Reinstall with \
-            Homebrew (`brew install codex`) or fix ownership of the global npm \
-            prefix, then try again.
+            Could not update \(kind.displayName): this install is not writable \
+            by your user (often a root-owned `/usr/local` npm package). \
+            \(remedy) ownership of the install directory, then try again.
             """
         }
     }
@@ -96,7 +104,7 @@ public enum HarnessCLIUpdater {
     public static func update(kind: HarnessKind, executablePath: String?) async throws {
         let plan = plan(for: kind, executablePath: executablePath)
         let command = script(for: plan)
-        try await runLoginShell(command)
+        try await runLoginShell(command, kind: kind)
     }
 
     static func script(for plan: Plan) -> String {
@@ -114,7 +122,7 @@ public enum HarnessCLIUpdater {
 
     private static let cursorInstallURL = "https://cursor.com/install"
 
-    private static func runLoginShell(_ script: String) async throws {
+    private static func runLoginShell(_ script: String, kind: HarnessKind) async throws {
         let shell = ShellEnvironment.loginShellPath
         let process = try ChildProcess(
             executablePath: shell,
@@ -144,7 +152,9 @@ public enum HarnessCLIUpdater {
             throw UpdateError.timedOut(command: script)
         }
         if status != 0 {
-            throw UpdateError.commandFailed(command: script, exitCode: status, output: combined)
+            throw UpdateError.commandFailed(
+                kind: kind, command: script, exitCode: status, output: combined
+            )
         }
     }
 

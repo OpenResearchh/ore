@@ -83,6 +83,21 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
         }
     }
 
+    /// The PR number when merging is still a legitimate choice despite red CI.
+    ///
+    /// A failing run is not automatically a stop sign: the job may be one this
+    /// repository cannot run at all (an unpaid runner, an external service), or
+    /// a failure the user has already judged irrelevant. Without this the
+    /// failing state is a dead end whose only exit is an agent round-trip, and
+    /// on a repo where every run fails it is a permanent one.
+    ///
+    /// Conflicts are deliberately excluded — those genuinely cannot merge, so
+    /// offering the button there would just surface a GitHub error.
+    public var mergeableDespiteChecks: Int? {
+        if case .fixFailingChecks(let prNumber, _) = self { return prNumber }
+        return nil
+    }
+
     /// Prompt dropped into the composer when the user clicks Commit or Create PR.
     /// Nil for actions that still run git/`gh` directly.
     public var agentDraftPrompt: String? {

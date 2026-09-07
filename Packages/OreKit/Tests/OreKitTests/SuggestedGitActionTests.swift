@@ -100,6 +100,38 @@ struct SuggestedGitActionTests {
         #expect(action.delegatesToAgent)
     }
 
+    @Test func failingChecksStillOfferMergingAnyway() {
+        // Red CI is not always a stop sign — a repo whose runner never executes
+        // fails every check, which would otherwise make the agent hand-off the
+        // only exit from this state, permanently.
+        let action = SuggestedGitActionResolver.resolve(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("test", "FAILURE")])
+        ))
+        #expect(action.mergeableDespiteChecks == 7)
+    }
+
+    @Test func statesThatCannotMergeDoNotOfferIt() {
+        // Conflicts genuinely cannot merge, so the escape hatch would only
+        // surface a GitHub error.
+        let conflicted = SuggestedGitActionResolver.resolve(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(
+                mergeable: "CONFLICTING",
+                checks: [check("test", "FAILURE")]
+            )
+        ))
+        #expect(conflicted.mergeableDespiteChecks == nil)
+
+        // A green PR already has Merge as its primary action.
+        let green = SuggestedGitActionResolver.resolve(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("test", "SUCCESS")])
+        ))
+        #expect(green == .merge(prNumber: 7, isStacked: false))
+        #expect(green.mergeableDespiteChecks == nil)
+    }
+
     @Test func conflictsOutrankFailingChecks() {
         // A conflicted PR can't merge no matter what CI says, and asking the
         // agent to chase a test failure first wastes a turn.

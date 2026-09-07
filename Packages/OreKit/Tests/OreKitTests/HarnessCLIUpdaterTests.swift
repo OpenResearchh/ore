@@ -43,6 +43,7 @@ struct HarnessCLIUpdaterTests {
         npm error Error: EACCES: permission denied, rename '/usr/local/lib/node_modules/@openai/codex'
         """
         let error = HarnessCLIUpdater.UpdateError.commandFailed(
+            kind: .codex,
             command: "npm install -g '@openai/codex'@latest",
             exitCode: 1,
             output: raw
@@ -51,6 +52,35 @@ struct HarnessCLIUpdaterTests {
         #expect(message.contains("not writable by your user"))
         #expect(message.contains("brew install codex"))
         #expect(!message.contains("npm error"))
+    }
+
+    /// Shipped in v0.7.1: the Claude Code update card rendered
+    /// "Reinstall with Homebrew (`brew install codex`)", pointing the user at a
+    /// different agent's CLI. The remedy must name the harness that failed.
+    @Test func permissionDeniedNamesTheHarnessBeingUpdated() {
+        let raw = "Error: EACCES: permission denied, open '/usr/local/lib/node_modules'"
+        let error = HarnessCLIUpdater.UpdateError.commandFailed(
+            kind: .claudeCode,
+            command: "'/Users/someone/.local/bin/claude' update",
+            exitCode: 1,
+            output: raw
+        )
+        let message = error.errorDescription ?? ""
+        #expect(message.contains("brew install claude-code"))
+        #expect(!message.contains("codex"))
+    }
+
+    /// Cursor has no Homebrew formula, so the message must not offer one.
+    @Test func permissionDeniedWithoutAFormulaOmitsHomebrew() {
+        let error = HarnessCLIUpdater.UpdateError.commandFailed(
+            kind: .cursorAgent,
+            command: "curl -fsSL 'https://cursor.com/install' | bash",
+            exitCode: 1,
+            output: "permission denied"
+        )
+        let message = error.errorDescription ?? ""
+        #expect(!message.contains("brew install"))
+        #expect(message.contains("ownership of the install directory"))
     }
 
     @Test func cursorWithoutAKnownPathUsesTheVendorInstaller() {

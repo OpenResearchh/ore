@@ -1352,9 +1352,16 @@ extension InProcessCoreClient {
     /// decision step. This deliberately does not score the task: semantic
     /// harness/model selection belongs to the Assistant LLM after it reads the
     /// live inventory.
+    ///
+    /// An empty probe list means discovery has not reported yet, not that every
+    /// provider is down. Like `validateModel` below, treat that as
+    /// non-authoritative and keep the historical default legal, rather than
+    /// turning a discovery gap into a hard outage for a caller that never asked
+    /// for a specific harness.
     private func fallbackHarness() throws -> HarnessKind {
         let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent]
         if let usable = preferred.first(where: isHarnessUsable) { return usable }
+        guard !harnessProbes.isEmpty else { return .claudeCode }
         throw AssistantActionError.badRequest(
             "No agent harness is currently usable. Call GetExecutionOptions again after signing in, enabling a provider, or waiting for its reported quota reset."
         )

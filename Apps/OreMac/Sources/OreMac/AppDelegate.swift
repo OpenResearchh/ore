@@ -32,6 +32,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Apps are installed and removed while ORE is in the background, so
+    /// coming back is when to look again. The alternative — asking on every
+    /// redraw — is what the caches exist to stop.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        ExternalTools.refreshDiscoveredApps()
+        MainActor.assumeIsolated { AppIcons.forget() }
+    }
+
     // MARK: - Notification actions
 
     /// What a banner can do without the app being opened. Answering from the

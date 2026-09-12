@@ -146,13 +146,14 @@ struct AgentPromptVisibilityTests {
 
     // The queued row and the send that follows it share one submission id, so
     // the drained message is recognised as the row already on screen rather
-    // than added beneath it.
+    // than added beneath it — and that second announcement is what says this
+    // particular message is the one that left the queue.
     @Test func aQueuedPromptIsNotRedrawnWhenTheQueueLetsItThrough() {
         let state = ChatState()
         state.applyPromptSubmission(submission("later", id: "s7", isQueued: true))
         state.applyPromptSubmission(submission("later", id: "s7", isQueued: false))
 
         #expect(state.rows.count == 1)
-        #expect(state.rows[0].isQueued, "still queued until a turn claims it")
+        #expect(!state.rows[0].isQueued, "the engine said it went out")
     }
 }

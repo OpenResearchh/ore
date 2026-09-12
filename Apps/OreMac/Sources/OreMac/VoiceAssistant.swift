@@ -443,10 +443,53 @@ enum VoiceSpeechPolicy {
     /// Thinking…. Never spoken during a voice turn.
     static func shouldSpeakMilestones(quiet _: Bool) -> Bool { false }
 
+    /// The assistant's own opening sentence is not tool chatter: it is the
+    /// only mid-turn line that is about the user's actual task rather than
+    /// ORE's plumbing, and it lands in the gap where the user is waiting with
+    /// nothing to hear. Still yields to quiet mode, which exists for "don't
+    /// talk over what I'm listening to".
+    static func shouldSpeakOpener(quiet: Bool) -> Bool { !quiet }
+
     static func shouldSpeakNudge(quiet: Bool) -> Bool { !quiet }
     static func shouldSpeakPrompts(quiet: Bool) -> Bool { !quiet }
     static func shouldSpeakAcks(quiet: Bool) -> Bool { !quiet }
     static func shouldSpeakAnswers(quiet _: Bool) -> Bool { true }
+}
+
+/// Which turn a spoken question is waiting on.
+///
+/// The chat alone was not enough, and that was the bug. The assistant chat is
+/// shared: a fleet digest, a `.watch` follow-up, or something the user typed
+/// can already be streaming when a question is asked out loud, and its prose
+/// arrives tagged with the same chat. ORE would read the middle of that other
+/// turn's sentence aloud as though it were the answer — and then the real
+/// answer arrived with its opener already counted as spoken, so the one line
+/// worth hearing was the one skipped.
+///
+/// The rule is deliberately narrow: nothing in the chat belongs to the
+/// question until a turn *starts* after it was sent. That covers the queued
+/// case exactly, where the prompt sits behind an open turn whose events would
+/// otherwise be indistinguishable from the answer's.
+struct VoiceSpokenTurn: Equatable {
+    let chatID: ChatID
+    private(set) var turnID: TurnID?
+
+    init(chatID: ChatID) {
+        self.chatID = chatID
+    }
+
+    /// Claims the first turn to start after the send. Returns false for later
+    /// turns, which belong to whatever came next rather than to this question.
+    mutating func adopt(_ turn: TurnID) -> Bool {
+        guard turnID == nil else { return false }
+        turnID = turn
+        return true
+    }
+
+    /// Whether this turn's text, tools and completion may be spoken.
+    func owns(_ turn: TurnID) -> Bool {
+        turnID == turn
+    }
 }
 
 /// The global voice mode: hold ⇧⌥ anywhere, talk to the assistant, hear it
@@ -554,8 +597,18 @@ final class VoiceAssistantController {
     /// A chat rather than a flag: the assistant has several conversations now,
     /// and a fleet digest finishing in one must not be taken for the answer to
     /// a question asked in another.
-    private var awaitingSpokenReplyFrom: ChatID?
-    private var awaitingSpokenReply: Bool { awaitingSpokenReplyFrom != nil }
+    private var awaitingSpokenReplyFrom: ChatID? { awaitingSpokenTurn?.chatID }
+    private var awaitingSpokenReply: Bool { awaitingSpokenTurn != nil }
+
+    private var awaitingSpokenTurn: VoiceSpokenTurn?
+    /// The reply's prose as it streams, until its first sentence closes, and
+    /// the sentence once it has been spoken — kept so the finished answer can
+    /// avoid opening with a line the user has already heard.
+    private var openerBuffer = ""
+    private var spokenOpener: String?
+    /// If no sentence has closed inside this much prose, the reply is not
+    /// opening with one and the buffer stops growing.
+    private static let openerWindow = 1200
     private var lastVoiceInteraction: Date?
     /// Milestone throttling: the last phrase spoken and when, so a burst of
     /// tool calls narrates as a beat, not a commentary track.
@@ -583,19 +636,33 @@ final class VoiceAssistantController {
     /// leaving the confirmation to the window, the notification, or a chord.
     private static let answerWindow: Duration = .seconds(7)
 
-    /// AVSpeechSynthesizer can occasionally decline an utterance without
-    /// delivering either delegate ending. Do not let that missing callback
-    /// pin the global pill on "Speaking…" forever.
+    /// How often the pill re-checks whether the line it is showing is still
+    /// being spoken. Matches the narration engine's own ticker.
+    private static let speechWatchdogInterval: Duration = .seconds(1)
+
+    /// A voice can finish — or decline an utterance — without delivering
+    /// either delegate ending, and then nothing ever tells the assistant the
+    /// line is over. Do not let that missing callback pin the global pill on
+    /// "Speaking…" forever.
+    ///
+    /// This watches until it sees silence rather than checking once. A single
+    /// check a second after the phase changed only ever caught an utterance
+    /// that failed immediately: speech that started normally and lost its
+    /// ending ten seconds later found the watchdog long since returned, with
+    /// nothing left to re-arm it — `updateSpeechWatchdog` runs on phase
+    /// changes, and the stuck phase is precisely the one that never changes.
     private func updateSpeechWatchdog() {
         speechWatchdogTask?.cancel()
         speechWatchdogTask = nil
         guard phase == .speaking else { return }
         speechWatchdogTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled, let self, self.phase == .speaking,
-                  self.model?.narration.hasAudibleOrQueuedSpeech == false
-            else { return }
-            self.phase = self.awaitingSpokenReply ? .thinking : .idle
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.speechWatchdogInterval)
+                guard !Task.isCancelled, let self, self.phase == .speaking else { return }
+                guard self.model?.narration.hasAudibleOrQueuedSpeech == false else { continue }
+                self.phase = self.awaitingSpokenReply ? .thinking : .idle
+                return
+            }
         }
     }
 
@@ -645,7 +712,7 @@ final class VoiceAssistantController {
             phase = .idle
         case .thinking, .speaking:
             let waitingOn = awaitingSpokenReplyFrom
-            awaitingSpokenReplyFrom = nil
+            awaitingSpokenTurn = nil
             model?.narration.stopAll()
             // Only a turn we're actually waiting on: cutting off "Okay, going
             // ahead." shouldn't kill a turn the user didn't start by voice.
@@ -883,7 +950,15 @@ final class VoiceAssistantController {
             return
         }
 
-        if let needs = model.tabNeedsYou.first {
+        // The ask the user is actually answering: the one that was spoken and
+        // put on screen, not whichever happens to be first in the list. A
+        // spoken "yes" must never land on a permission the user has not seen
+        // — a second workspace raising a prompt mid-sentence used to steal
+        // the answer. `activeNeedsYouID` is cleared when the card is resolved
+        // or dismissed and when the answer window expires, so a stale one
+        // matches nothing and the words become an ordinary request instead.
+        if let active = activeNeedsYouID,
+           let needs = model.tabNeedsYou.first(where: { $0.id == active }) {
             switch needs {
             case .permission:
                 if let decision = Self.confirmationDecision(from: spoken) {
@@ -908,9 +983,14 @@ final class VoiceAssistantController {
             return
         }
         phase = .thinking
+        // A fresh reply gets a fresh opening sentence.
+        openerBuffer = ""
+        spokenOpener = nil
         // The chat the message actually reached, rather than whichever is
-        // active by the time the answer arrives.
-        awaitingSpokenReplyFrom = model.send(spoken, to: assistant.id)
+        // active by the time the answer arrives. Its turn is adopted when the
+        // agent starts one.
+        awaitingSpokenTurn = model.send(spoken, to: assistant.id)
+            .map { VoiceSpokenTurn(chatID: $0) }
         // A spoken "On it." talks over whatever the user is listening to.
         // The HUD already says Thinking…; a quiet close-mic cue is enough.
         playCue(named: "Pop", volume: 0.16)
@@ -956,13 +1036,46 @@ final class VoiceAssistantController {
     /// Tagged with the conversation they came from: only the one the user's
     /// question went to may answer it out loud.
     func observe(_ event: AgentEvent, chatID: ChatID) {
-        guard let model, awaitingSpokenReplyFrom == chatID else { return }
+        guard let model, var awaiting = awaitingSpokenTurn, awaiting.chatID == chatID else { return }
         switch event {
+        case .turnStarted(let started):
+            guard awaiting.adopt(started.turnID) else { return }
+            awaitingSpokenTurn = awaiting
+            // A fresh turn, a fresh opening sentence: anything buffered
+            // before this belonged to something else.
+            openerBuffer = ""
+            spokenOpener = nil
+
+        case .textDelta(let delta)
+            where delta.parentToolCallID == nil && awaiting.owns(delta.turnID):
+            // The assistant's own first sentence, spoken as soon as it closes.
+            // A subagent's nested prose is somebody else's voice and stays on
+            // the page.
+            guard spokenOpener == nil, openerBuffer.count < Self.openerWindow else { return }
+            openerBuffer += delta.text
+            guard let opener = AssistantOpener.firstSentence(of: openerBuffer) else { return }
+            spokenOpener = opener
+            guard VoiceSpeechPolicy.shouldSpeakOpener(quiet: quietMode) else { return }
+            // Milestone priority: it lands promptly, and the finished answer
+            // comes in on `.interrupt` and takes the floor from it if the turn
+            // beats the sentence to the end.
+            model.narration.speakAssistant(opener, chatID: chatID, priority: .milestone)
+            if phase == .thinking {
+                phase = .speaking
+                let token = cancelToken
+                model.narration.notifyWhenQuiet { [weak self] in
+                    guard let self, self.cancelToken == token,
+                          self.phase == .speaking, self.awaitingSpokenReply
+                    else { return }
+                    self.phase = .thinking
+                }
+            }
+
         case .toolCall(let call):
             // Mid-turn milestones, only for turns the user is waiting on by
             // ear. Progress priority: they thin out under load, never delay
             // the reply, and are dropped wholesale the moment a mic opens.
-            guard awaitingSpokenReply,
+            guard awaiting.owns(call.turnID),
                   let phrase = Self.milestone(for: call.name),
                   phrase != lastMilestone || Date().timeIntervalSince(lastMilestoneAt) > 20,
                   Date().timeIntervalSince(lastMilestoneAt) >= Self.milestoneGap
@@ -985,18 +1098,29 @@ final class VoiceAssistantController {
             }
 
         case .turnCompleted(let result):
-            awaitingSpokenReplyFrom = nil
+            // Only our own turn ends the wait. Another turn in this chat
+            // finishing — the one the question was queued behind, a digest
+            // that was already running — used to be spoken as the answer and
+            // left the real reply silent.
+            guard awaiting.owns(result.turnID) else { return }
+            awaitingSpokenTurn = nil
             stillWorkingTask?.cancel()
+            // A short turn's closing narration often opens with the very
+            // sentence already spoken on the way in; hearing it twice reads as
+            // a stutter.
+            let answer = AssistantOpener.removing(spokenOpener, from: result.narration)
             // The assistant's limit, not the ambient one: this line is the
             // answer to a question the user asked out loud, and how long it
             // runs is the question's business.
             let line = NarrationPhraser.spokenNarration(
-                result.narration, limit: NarrationPolicy.assistantAnswerLimit
+                answer, limit: NarrationPolicy.assistantAnswerLimit
             ) ?? "Done — the details are in the assistant window."
             speakKeepingHUD(line, chatID: chatID, limit: NarrationPolicy.assistantAnswerLimit)
 
         case .sessionError(let error):
-            awaitingSpokenReplyFrom = nil
+            // No turn to match on, and the session carrying our turn is the
+            // one that failed: the wait is over either way.
+            awaitingSpokenTurn = nil
             stillWorkingTask?.cancel()
             speakKeepingHUD(
                 "Something went wrong: \(error.message)", chatID: chatID
@@ -1195,6 +1319,12 @@ final class VoiceAssistantController {
               let item = model.tabNeedsYou.first(where: { $0.id == itemID })
         else { return }
         switch item {
+        case .permission(let payload)
+            where PermissionPresentation(request: payload.request).isAbbreviated:
+            // Nothing spoken can convey a multi-line command, so there is no
+            // "yes" here that means anything. Say where it is and leave it
+            // for the card, which can show the whole thing.
+            speakReviewInApp(for: item)
         case .permission:
             openPermissionWindow(for: item)
         case .question(let payload):
@@ -1202,6 +1332,17 @@ final class VoiceAssistantController {
         case .plan(let payload):
             openPlanWindow(for: item, payload: payload)
         }
+    }
+
+    /// The ask is real but not answerable by ear. No mic, and no active id —
+    /// a later "yes" must not find this waiting for it.
+    private func speakReviewInApp(for item: TabNeedsYou) {
+        guard let model, let chatID = model.assistantChatID else { return }
+        activeNeedsYouID = nil
+        acknowledge(
+            "That one's a long command — open ORE to read it before deciding.",
+            chatID: chatID
+        )
     }
 
     private func openPermissionWindow(for item: TabNeedsYou) {

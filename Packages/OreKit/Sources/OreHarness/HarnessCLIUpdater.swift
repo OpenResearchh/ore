@@ -40,24 +40,18 @@ public enum HarnessCLIUpdater {
         /// npm's EACCES dump is useless in the composer; translate it into the
         /// action the user actually needs.
         ///
-        /// The remedy has to name the harness being updated. A hardcoded
-        /// formula told someone updating Claude Code to `brew install codex`,
-        /// which installs a different agent and leaves the broken CLI in place.
+        /// Says what is wrong and nothing about how to fix it. The fix
+        /// depends on how that CLI was installed — which this does not know,
+        /// and which is why it used to be wrong: it named the harness's
+        /// Homebrew formula regardless, so a root-owned npm install was
+        /// answered with `brew install`, adding a second copy of the CLI
+        /// behind the broken one. `HarnessRepair` answers it instead, from
+        /// the install actually on disk.
         static func permissionDeniedMessage(for kind: HarnessKind, in detail: String) -> String? {
-            let lower = detail.lowercased()
-            guard lower.contains("eacces")
-                || lower.contains("permission denied")
-                || lower.contains("operation not permitted")
-            else { return nil }
-            // Cursor has no formula, so offering Homebrew there would be a
-            // dead end; fall back to the ownership fix on its own.
-            let remedy = kind.brewFormula.map {
-                "Reinstall with Homebrew (`brew install \($0)`) or fix"
-            } ?? "Fix"
+            guard HarnessUpdateFailure.isPermissionProblem(detail) else { return nil }
             return """
             Could not update \(kind.displayName): this install is not writable \
-            by your user (often a root-owned `/usr/local` npm package). \
-            \(remedy) ownership of the install directory, then try again.
+            by your user (often a root-owned `/usr/local` npm package).
             """
         }
     }
@@ -98,6 +92,71 @@ public enum HarnessCLIUpdater {
         case .cursorAgent:
             return .nativeInstaller(url: Self.cursorInstallURL)
         }
+    }
+
+    /// How the CLI at this path was installed, for advice that has to match
+    /// the install rather than the harness's preferred channel.
+    public static func installMethod(
+        for kind: HarnessKind, executablePath: String?
+    ) -> HarnessInstallMethod {
+        guard let executablePath else { return .unknown }
+        if isHomebrewPath(executablePath) { return .homebrew }
+        if isNativeUserBin(executablePath) { return .nativeUserBin }
+        if isNodeManagedPath(executablePath) { return .npm }
+        // A `/usr/local/bin` or `/opt/bin` entry that resolves to neither is
+        // most often a `sudo npm install -g` into the system prefix — the
+        // very thing that creates the root-owned tree this is diagnosing.
+        if kind.npmPackage != nil { return .npm }
+        return .unknown
+    }
+
+    /// What to tell the user when an update failed on permissions.
+    ///
+    /// Asks the environment for npm's and Homebrew's real prefixes, so a
+    /// privileged command names a directory that exists on *this* machine
+    /// rather than a plausible-looking guess.
+    public static func permissionRepair(
+        for kind: HarnessKind,
+        executablePath: String?
+    ) async -> HarnessRepair? {
+        let method = installMethod(for: kind, executablePath: executablePath)
+        async let npmPrefix = method == .npm ? readPrefix("npm config get prefix") : nil
+        async let brewPrefix = method == .homebrew ? readPrefix("brew --prefix") : nil
+        return HarnessRepair.forPermissionFailure(
+            kind: kind,
+            method: method,
+            executablePath: executablePath.map(resolvingSymlinks),
+            npmPrefix: await npmPrefix,
+            brewPrefix: await brewPrefix
+        )
+    }
+
+    /// Runs one short command on the login shell and returns its first line,
+    /// or nil if it isn't there. Nil is a usable answer: the repair falls
+    /// back to asking the shell itself at paste time.
+    private static func readPrefix(_ command: String) async -> String? {
+        guard let process = try? ChildProcess(
+            executablePath: ShellEnvironment.loginShellPath,
+            arguments: ShellEnvironment.commandArguments(
+                for: ShellEnvironment.loginShellPath, script: command
+            ),
+            workingDirectory: FileManager.default.homeDirectoryForCurrentUser,
+            environment: ShellEnvironment.childEnvironment()
+        ) else { return nil }
+        process.closeStandardInput()
+        let timer = Task {
+            try? await Task.sleep(for: .seconds(10))
+            guard !Task.isCancelled else { return }
+            await process.terminate(gracePeriod: .milliseconds(200))
+        }
+        let output = await process.stdoutChunks.collectText()
+        let status = await process.waitForExit()
+        timer.cancel()
+        guard status == 0 else { return nil }
+        let line = output.split(whereSeparator: \.isNewline).first.map(String.init)?
+            .trimmingCharacters(in: .whitespaces)
+        guard let line, line.hasPrefix("/") else { return nil }
+        return line
     }
 
     /// Runs the update on the user's login-shell PATH so nvm/brew/fnm resolve.
@@ -208,20 +267,3 @@ public enum HarnessCLIUpdater {
     }
 }
 
-extension HarnessKind {
-    var npmPackage: String? {
-        switch self {
-        case .claudeCode: return "@anthropic-ai/claude-code"
-        case .codex: return "@openai/codex"
-        case .cursorAgent: return nil
-        }
-    }
-
-    var brewFormula: String? {
-        switch self {
-        case .claudeCode: return "claude-code"
-        case .codex: return "codex"
-        case .cursorAgent: return nil
-        }
-    }
-}

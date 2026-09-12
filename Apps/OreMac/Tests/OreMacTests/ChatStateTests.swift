@@ -669,4 +669,102 @@ struct RateLimitExpiryTests {
         }
         #expect(state.rateLimit == nil)
     }
+
+    // MARK: - Several questions in one tool call
+
+    private func question(
+        _ id: String,
+        toolCall: String? = "call-1",
+        prompt: String = "Which branch?"
+    ) -> AgentQuestion {
+        AgentQuestion(
+            turnID: TurnID(rawValue: "t1"),
+            id: QuestionID(rawValue: id),
+            toolCallID: toolCall.map(ToolCallID.init(rawValue:)),
+            prompt: prompt
+        )
+    }
+
+    /// One `AskUserQuestion` call can carry several questions, and they
+    /// arrive as separate events. The second used to overwrite the first, so
+    /// the agent got one answer and silence about everything else it asked.
+    @Test func twoQuestionsInOneToolCallBothStayPending() {
+        let state = ChatState()
+        state.apply(.question(question("q1", prompt: "Which branch?")))
+        state.apply(.question(question("q2", prompt: "Squash the commits?")))
+        #expect(state.pendingQuestions.map(\.id.rawValue) == ["q1", "q2"])
+        // The oldest is the one on screen, so they are worked through in the
+        // order they were asked.
+        #expect(state.pendingQuestion?.id.rawValue == "q1")
+    }
+
+    @Test func answeringOneLeavesTheOtherWaitingWithTheAnswerRemembered() {
+        let state = ChatState()
+        state.apply(.question(question("q1")))
+        state.apply(.question(question("q2")))
+        state.recordAnswer("develop", for: QuestionID(rawValue: "q1"))
+
+        #expect(state.pendingQuestions.map(\.id.rawValue) == ["q2"])
+        #expect(state.questionAnswers[QuestionID(rawValue: "q1")] == "develop")
+        #expect(state.unansweredSiblings(of: question("q1")).map(\.id.rawValue) == ["q2"])
+    }
+
+    /// Out of order: answering the second question first must not make the
+    /// first one look answered.
+    @Test func answersMayArriveInAnyOrder() {
+        let state = ChatState()
+        state.apply(.question(question("q1")))
+        state.apply(.question(question("q2")))
+        state.recordAnswer("yes", for: QuestionID(rawValue: "q2"))
+
+        #expect(state.pendingQuestions.map(\.id.rawValue) == ["q1"])
+        #expect(state.unansweredSiblings(of: question("q2")).map(\.id.rawValue) == ["q1"])
+
+        state.recordAnswer("develop", for: QuestionID(rawValue: "q1"))
+        #expect(state.unansweredSiblings(of: question("q1")).isEmpty)
+    }
+
+    /// Questions from different tool calls are separate asks that happen to
+    /// be open at once, not a group.
+    @Test func questionsFromDifferentToolCallsAreNotSiblings() {
+        let state = ChatState()
+        state.apply(.question(question("q1", toolCall: "call-1")))
+        state.apply(.question(question("q2", toolCall: "call-2")))
+        #expect(state.unansweredSiblings(of: question("q1", toolCall: "call-1")).isEmpty)
+    }
+
+    /// Neither are two questions that merely both arrived without an id.
+    @Test func questionsWithoutAToolCallStandAlone() {
+        let state = ChatState()
+        state.apply(.question(question("q1", toolCall: nil)))
+        state.apply(.question(question("q2", toolCall: nil)))
+        #expect(state.unansweredSiblings(of: question("q1", toolCall: nil)).isEmpty)
+        #expect(state.questions(inToolCall: nil).isEmpty)
+    }
+
+    @Test func clearingTheGroupDropsBothTheQuestionsAndTheirAnswers() {
+        let state = ChatState()
+        state.apply(.question(question("q1")))
+        state.apply(.question(question("q2")))
+        state.recordAnswer("develop", for: QuestionID(rawValue: "q1"))
+        state.clearQuestions([QuestionID(rawValue: "q1"), QuestionID(rawValue: "q2")])
+
+        #expect(state.pendingQuestions.isEmpty)
+        #expect(state.questionAnswers.isEmpty)
+    }
+
+    /// A repeat of the same question — a reconnect, a snapshot replay — is
+    /// the same ask, not a second one, and must not resurrect one already
+    /// answered.
+    @Test func aRepeatedQuestionDoesNotStack() {
+        let state = ChatState()
+        state.apply(.question(question("q1")))
+        state.apply(.question(question("q1", prompt: "Which branch, really?")))
+        #expect(state.pendingQuestions.count == 1)
+        #expect(state.pendingQuestion?.prompt == "Which branch, really?")
+
+        state.recordAnswer("develop", for: QuestionID(rawValue: "q1"))
+        state.apply(.question(question("q1")))
+        #expect(state.pendingQuestions.isEmpty)
+    }
 }

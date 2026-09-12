@@ -6,6 +6,7 @@ import OreCore
 import OreGit
 import OrePersistence
 import OreProtocol
+import OreTelemetry
 import UserNotifications
 
 /// Turns the review annotations collected beside a diff into plan-decision
@@ -46,6 +47,26 @@ enum PlanDecisionFeedback {
 @MainActor
 @Observable
 final class AppModel {
+    static let automaticRoutinePermissionsKey = "ore.permissions.autoRoutine"
+    /// Whether ORE answers routine shell and read requests on the user's
+    /// behalf before they have said anything about it.
+    ///
+    /// Off. Reading the key with `object(forKey:) as? Bool != false` used to
+    /// make it on for everyone who had never chosen, which is not a default —
+    /// it's an unnoticed one. Running commands without asking is the kind of
+    /// thing a person opts into, so a fresh install asks, and Settings →
+    /// Agents explains what turning it on covers. `registerDefaults()` makes
+    /// this the registered value so every read can be a plain typed `bool`,
+    /// including a stored value of the wrong type.
+    static let automaticRoutinePermissionsDefault = false
+
+    /// Registered before any surface reads a preference, so "never chosen"
+    /// and "chosen false" resolve to the same behaviour everywhere.
+    static func registerDefaults() {
+        UserDefaults.standard.register(defaults: [
+            automaticRoutinePermissionsKey: automaticRoutinePermissionsDefault,
+        ])
+    }
     private(set) var workspaces: [WorkspaceSummary] = []
     /// The product-owned assistant workspace, routed out of `workspaces` at
     /// event intake. This is the single point that keeps it off the sidebar,
@@ -67,12 +88,34 @@ final class AppModel {
     /// when the user is in another app.
     private(set) var tabNeedsYou: [TabNeedsYou] = []
     private(set) var harnesses: [HarnessProbeResult] = []
+    /// Whether the probe has reported at least once. Distinct from
+    /// `harnesses.isEmpty`: "we have not looked yet" and "we looked and found
+    /// nothing" call for opposite behaviour in onboarding, and conflating
+    /// them makes the welcome screen tell people to install an agent they
+    /// already have for the first half-second of every launch.
+    private(set) var hasProbedHarnesses = false
     /// What each installed agent CLI's install channel is publishing, from the
     /// last check. Drives the update card and the Agents settings pane.
     private(set) var harnessUpdates: [HarnessUpdateStatus] = []
     private(set) var modelCatalog: [HarnessKind: [AgentModel]] = [:]
     private(set) var repositories: [String] = []
     private(set) var isLoaded = false
+
+    /// Repository paths in most-recently-worked order, for inferring which
+    /// project a new instruction is about. The sidebar already sorts projects
+    /// this way; this is the same reading, as data rather than layout.
+    var recentRepositories: [String] {
+        var seen = Set<String>()
+        return workspaces
+            .sorted { ($0.lastActivity ?? .distantPast) > ($1.lastActivity ?? .distantPast) }
+            .compactMap { seen.insert($0.repositoryPath).inserted ? $0.repositoryPath : nil }
+    }
+
+    /// The project the user is looking at. The strongest signal there is:
+    /// people ask for work in the thing already on screen.
+    var currentRepositoryPath: String? {
+        workspaces.first { $0.id == selectedWorkspaceID }?.repositoryPath
+    }
 
     var selectedWorkspaceID: WorkspaceID? {
         didSet {
@@ -127,6 +170,13 @@ final class AppModel {
     /// Draft text to drop into a chat that hasn't been published yet, so Commit
     /// / Create PR can open a tab without sending until the user hits return.
     private var pendingNewChatDrafts: [WorkspaceID: [String]] = [:]
+    /// The Review button's next chat claims incoming PostDiffComment findings.
+    private var pendingReviewCommentInbox: Set<WorkspaceID> = []
+    /// Workspace → the tab whose composer owns Review-posted comments.
+    private var reviewCommentInbox: [WorkspaceID: ChatID] = [:]
+    /// Comments the user dismissed from a tab. Kept so the Review poll cannot
+    /// put them back while the store delete is still in flight.
+    private var dismissedCommentKeys: [ChatID: Set<String>] = [:]
     /// Signals the visible composer to pick up a draft written from outside
     /// (toolbar Commit / Create PR) without waiting for a tab switch.
     private(set) var composerInjection: ComposerInjection?
@@ -160,8 +210,15 @@ final class AppModel {
         var detail: String?
     }
 
-    init(client: InProcessCoreClient) {
+    /// Anonymous usage analytics. Defaults to the no-op so every existing
+    /// test construction keeps compiling untouched, and so any code path that
+    /// forgets to pass one stays silent rather than reporting by accident.
+    let telemetry: any TelemetryRecorder
+    private var translator = TelemetryTranslator()
+
+    init(client: InProcessCoreClient, telemetry: any TelemetryRecorder = NoopTelemetry()) {
         self.client = client
+        self.telemetry = telemetry
     }
 
     // MARK: - Lifecycle
@@ -792,6 +849,7 @@ final class AppModel {
         if let existing = chatStates[id] { return existing }
         let state = ChatState()
         state.draftAttachments = Self.loadDraftAttachments(for: id)
+        state.replaceDraftComments(Self.loadDraftComments(for: id))
         chatStates[id] = state
         Task { await loadHistory(for: id) }
         return state
@@ -856,27 +914,36 @@ final class AppModel {
         }
         rows.sort { $0.createdAt < $1.createdAt }
         state.loadHistory(rows)
-        await pullDraftComments(for: id)
     }
 
-    /// Merge pending review comments (including ones an agent posted to the
-    /// JSON file) into this chat's draft list so they show as numbered anchors.
-    func pullDraftComments(for id: ChatID) async {
-        let workspaceID = chatOwners[id] ?? WorkspaceID(rawValue: id.rawValue)
-        await pullDraftComments(for: workspaceID, into: chat(for: id))
-    }
-
+    /// Merge newly posted review comments onto the Review tab that produced
+    /// them — never onto every chat, and never onto whichever tab is selected.
     func pullDraftComments(for workspaceID: WorkspaceID) async {
-        await pullDraftComments(for: workspaceID, into: chat(for: workspaceID))
-    }
-
-    private func pullDraftComments(for workspaceID: WorkspaceID, into state: ChatState) async {
         guard let comments = try? await client.pendingDiffComments(workspaceID: workspaceID) else {
             return
         }
-        for comment in comments where !state.draftComments.contains(comment) {
-            state.addDraftComment(comment)
+        let open = chats(for: workspaceID)
+        guard let ownerID = ReviewCommentInbox.owner(
+            reviewInbox: reviewInboxChatID(for: workspaceID),
+            busyChats: open.filter { chat(for: $0.id).isBusy }.map(\.id)
+        ) else { return }
+        let owner = chat(for: ownerID)
+        let others = open.compactMap { summary -> [DiffCommentReference]? in
+            guard summary.id != ownerID else { return nil }
+            return chat(for: summary.id).draftComments
         }
+        let dismissed = dismissedKeys(for: ownerID)
+        var added = false
+        for comment in comments
+        where ReviewCommentInbox.shouldAttach(
+            comment,
+            ownerComments: owner.draftComments,
+            otherChatsComments: others
+        ) && !dismissed.contains(comment.identityKey) {
+            owner.addDraftComment(comment)
+            added = true
+        }
+        if added { persistDraftComments(owner.draftComments, for: ownerID) }
     }
 
     private static func row(
@@ -977,6 +1044,12 @@ final class AppModel {
         if request.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             request.name = suggestedResearchIdentity().name
         }
+        // Reported here rather than from `.workspaceAdded`, because the
+        // request is the only place the chosen harness exists, and because
+        // `.workspaceAdded` cannot tell creating a workspace apart from one
+        // arriving in the snapshot at launch. Note `request.name` is never
+        // passed along — the user names these after what they are working on.
+        telemetry.record(translator.workspaceCreated(harness: request.harness))
         Task { await client.send(.createWorkspace(request)) }
     }
 
@@ -1149,6 +1222,7 @@ final class AppModel {
     ) {
         let state = chat(for: chatID)
         let comments = state.takeDraftComments()
+        persistDraftComments([], for: chatID)
         cancelScheduledContinuation(for: chatID)
         persistDraftAttachments([], for: chatID)
         // The text just left the composer, so any buffered copy of it is stale.
@@ -1238,11 +1312,15 @@ final class AppModel {
         Task { await client.send(.setChatEffort(chat.workspaceID, chat.id, effort)) }
     }
 
+    /// `automatic` is set only by the routine-approval path below, never by a
+    /// click: a request the user actually saw must not be recorded as one ORE
+    /// waved through.
     func resolvePermission(
         _ requestID: PermissionRequestID,
         decision: PermissionDecision,
         for id: WorkspaceID,
-        chatID: ChatID? = nil
+        chatID: ChatID? = nil,
+        automatic: AutomaticApproval? = nil
     ) {
         let resolvedChatID = chatID ?? activeChat(for: id)?.id
         guard let resolvedChatID else { return }
@@ -1252,14 +1330,17 @@ final class AppModel {
         voiceAssistant.permissionResolved(requestID)
         narration.cancelPermissionPrompt(requestID)
         chat(for: resolvedChatID).resolvePermission(requestID)
-        tabNeedsYou.removeAll {
-            switch $0 {
-            case .permission(let item): return item.request.id == requestID
-            case .plan(let item): return item.permissionRequestID == requestID
-            case .question: return false
-            }
+        retireNeedsYou(resolving: requestID)
+        Task {
+            await client.send(.resolveChatPermission(
+                id, resolvedChatID, requestID, decision, automatic: automatic
+            ))
         }
-        Task { await client.send(.resolveChatPermission(id, resolvedChatID, requestID, decision)) }
+    }
+
+    /// Drop every ask this permission was the gate for — see `NeedsYouPairing`.
+    private func retireNeedsYou(resolving requestID: PermissionRequestID) {
+        tabNeedsYou = NeedsYouPairing.remaining(tabNeedsYou, resolving: requestID)
     }
 
     /// The Allow/Deny card currently on screen, if the generic buttons own it.
@@ -1271,9 +1352,16 @@ final class AppModel {
         return permission
     }
 
+    /// ⇧⌘A from the composer, which approves without the card being focused.
+    ///
+    /// Refuses when the command runs past what the card shows collapsed: the
+    /// chord is a reflex, and there is no version of this shortcut that also
+    /// makes the user read the tail. They can expand the card and press ↩.
     func allowPendingPermission() {
         guard let workspaceID = selectedWorkspaceID,
-              let permission = actionablePermission else { return }
+              let permission = actionablePermission,
+              !PermissionPresentation(request: permission).isAbbreviated
+        else { return }
         resolvePermission(permission.id, decision: .allow, for: workspaceID)
     }
 
@@ -1287,6 +1375,18 @@ final class AppModel {
         )
     }
 
+    /// Answer a question from whichever surface the user reached for — the
+    /// transcript card, the floating HUD, the menu bar, the assistant window,
+    /// a notification reply or voice.
+    ///
+    /// Claude's AskUserQuestion is a permission-gated tool: its result is
+    /// whatever comes back through the `can_use_tool` reply. Allowing it echoed
+    /// the untouched input, so the agent read an empty "answered:" while the
+    /// real answer — sent separately as a user message — raced the still-open
+    /// control request and was dropped. The answer has to travel *through* the
+    /// permission reply. Every caller used to be on its own to know that, and
+    /// only two of six did; the routing lives here now so a question answered
+    /// from the HUD reaches the agent exactly as one answered in the window.
     func answerQuestion(
         _ questionID: QuestionID,
         answer: String,
@@ -1295,31 +1395,58 @@ final class AppModel {
     ) {
         let resolvedChatID = chatID ?? activeChat(for: id)?.id
         guard let resolvedChatID else { return }
-        chat(for: resolvedChatID).resolveQuestion(questionID)
+        let state = chat(for: resolvedChatID)
+        // The question as the agent asked it, which is what carries the tool
+        // call identity. An answer arriving for a question that is no longer
+        // pending — a stale notification, a second click — has no identity to
+        // pair on, and must not be allowed to resolve someone else's gate.
+        guard let question = state.pendingQuestions.first(where: { $0.id == questionID }) else {
+            return
+        }
+        let gate = NeedsYouPairing.gate(
+            forToolCall: question.toolCallID,
+            pendingPermission: state.pendingPermission
+        )
+        // Captured in ask order before the answer retires this one, so the
+        // reply reads back in the order the agent asked.
+        let siblings = state.questions(inToolCall: question.toolCallID)
+        let group = siblings.isEmpty ? [question] : siblings
+        state.recordAnswer(answer, for: questionID)
         tabNeedsYou.removeAll {
             if case .question(let item) = $0, item.question.id == questionID { return true }
             return false
         }
-        Task { await client.send(.answerChatQuestion(id, resolvedChatID, questionID, answer: answer)) }
-    }
+        guard let gate else {
+            Task { await client.send(.answerChatQuestion(id, resolvedChatID, questionID, answer: answer)) }
+            return
+        }
 
-    /// Answer a permission-gated question (Claude's AskUserQuestion) by returning
-    /// the answer *through* the tool-permission reply, which both delivers it as
-    /// the tool result and unblocks the turn — instead of allowing the tool (an
-    /// empty answer) and racing a separate, droppable user message.
-    func answerQuestion(
-        _ questionID: QuestionID,
-        viaPermission permissionID: PermissionRequestID,
-        answer: String,
-        for id: WorkspaceID
-    ) {
-        guard let chatID = activeChat(for: id)?.id else { return }
-        chat(for: chatID).resolveQuestion(questionID)
-        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let message = trimmed.isEmpty
-            ? "The user dismissed the question without choosing; continue."
-            : "The user answered your question: \"\(trimmed)\". Continue with this answer in mind."
-        resolvePermission(permissionID, decision: .deny(reason: message), for: id)
+        // One tool call, one reply. Siblings the user has not reached yet
+        // keep the gate open rather than being discarded — the agent asked
+        // three things and is entitled to three answers.
+        let waiting = state.unansweredSiblings(of: question)
+        let isDismissal = answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !waiting.isEmpty && !isDismissal { return }
+
+        // A dismissal ends the whole group. The user closing one card of a
+        // set is not going to answer the rest, and leaving the gate open
+        // would hang the turn with nothing on screen to unblock it.
+        let answered = group.map {
+            (question: $0, answer: state.questionAnswers[$0.id] ?? "")
+        }
+        let answeredIDs = group.map(\.id)
+        state.clearQuestions(answeredIDs)
+        let dropped = Set(answeredIDs)
+        tabNeedsYou.removeAll {
+            if case .question(let item) = $0 { return dropped.contains(item.question.id) }
+            return false
+        }
+        resolvePermission(
+            gate,
+            decision: .deny(reason: NeedsYouPairing.reply(for: answered)),
+            for: id,
+            chatID: resolvedChatID
+        )
     }
 
     func revert(to turnID: TurnID, in id: WorkspaceID) {
@@ -1332,8 +1459,10 @@ final class AppModel {
         initialMessage: String? = nil,
         draft: String? = nil,
         defaults: ChatDefaults? = nil,
-        model: String? = nil
+        model: String? = nil,
+        isReview: Bool = false
     ) {
+        if isReview { pendingReviewCommentInbox.insert(workspaceID) }
         if let initialMessage {
             pendingNewChatMessages[workspaceID, default: []].append(initialMessage)
         }
@@ -1839,6 +1968,88 @@ final class AppModel {
 
     private static func draftAttachmentsKey(for chatID: ChatID) -> String {
         "ore.draftAttachments.\(chatID.rawValue)"
+    }
+
+    func persistDraftComments(_ comments: [DiffCommentReference], for chatID: ChatID) {
+        chat(for: chatID).replaceDraftComments(comments)
+        let key = Self.draftCommentsKey(for: chatID)
+        if comments.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else if let data = try? JSONEncoder().encode(comments) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private static func loadDraftComments(for chatID: ChatID) -> [DiffCommentReference] {
+        let key = draftCommentsKey(for: chatID)
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([DiffCommentReference].self, from: data)) ?? []
+    }
+
+    private static func draftCommentsKey(for chatID: ChatID) -> String {
+        "ore.draftComments.\(chatID.rawValue)"
+    }
+
+    func reviewInboxChatID(for workspaceID: WorkspaceID) -> ChatID? {
+        if let cached = reviewCommentInbox[workspaceID] { return cached }
+        guard let raw = UserDefaults.standard.string(forKey: Self.reviewInboxKey(for: workspaceID))
+        else { return nil }
+        let id = ChatID(rawValue: raw)
+        reviewCommentInbox[workspaceID] = id
+        return id
+    }
+
+    func isReviewCommentInbox(_ chatID: ChatID, in workspaceID: WorkspaceID) -> Bool {
+        reviewInboxChatID(for: workspaceID) == chatID
+    }
+
+    private func rememberReviewInbox(_ chatID: ChatID, for workspaceID: WorkspaceID) {
+        reviewCommentInbox[workspaceID] = chatID
+        UserDefaults.standard.set(chatID.rawValue, forKey: Self.reviewInboxKey(for: workspaceID))
+    }
+
+    private static func reviewInboxKey(for workspaceID: WorkspaceID) -> String {
+        "ore.reviewCommentInbox.\(workspaceID.rawValue)"
+    }
+
+    /// Clear one chip. The store and JSON file must lose it too, or the
+    /// Review pane's one-second poll puts it right back.
+    func removeDraftComment(at index: Int, from chatID: ChatID, in workspaceID: WorkspaceID) {
+        let state = chat(for: chatID)
+        guard state.draftComments.indices.contains(index) else { return }
+        let removed = state.draftComments[index]
+        state.removeDraftComment(at: index)
+        rememberDismissed([removed], on: chatID)
+        persistDraftComments(state.draftComments, for: chatID)
+        Task { await client.send(.clearDiffComments(workspaceID, [removed])) }
+    }
+
+    func clearDraftComments(from chatID: ChatID, in workspaceID: WorkspaceID) {
+        let state = chat(for: chatID)
+        let removed = state.draftComments
+        guard !removed.isEmpty else { return }
+        state.clearDraftComments()
+        rememberDismissed(removed, on: chatID)
+        persistDraftComments([], for: chatID)
+        Task { await client.send(.clearDiffComments(workspaceID, removed)) }
+    }
+
+    private func dismissedKeys(for chatID: ChatID) -> Set<String> {
+        if let cached = dismissedCommentKeys[chatID] { return cached }
+        let stored = Set(UserDefaults.standard.stringArray(forKey: Self.dismissedCommentsKey(for: chatID)) ?? [])
+        dismissedCommentKeys[chatID] = stored
+        return stored
+    }
+
+    private func rememberDismissed(_ comments: [DiffCommentReference], on chatID: ChatID) {
+        var keys = dismissedKeys(for: chatID)
+        for comment in comments { keys.insert(comment.identityKey) }
+        dismissedCommentKeys[chatID] = keys
+        UserDefaults.standard.set(Array(keys), forKey: Self.dismissedCommentsKey(for: chatID))
+    }
+
+    private static func dismissedCommentsKey(for chatID: ChatID) -> String {
+        "ore.dismissedDiffComments.\(chatID.rawValue)"
     }
 
     // MARK: - Scheduled continuation after usage limits
@@ -2523,6 +2734,20 @@ final class AppModel {
         guard var snapshot = diffCache[workspaceID] else { return }
         guard snapshot.gitAction != status.action
             || snapshot.pullRequest != status.pullRequest else { return }
+
+        // A pull request appearing where there wasn't one is the value moment
+        // ORE exists to produce, so it is worth counting accurately.
+        //
+        // Counted on the nil → non-nil transition rather than when the user
+        // presses "Create pull request": a request that fails is not a pull
+        // request, and counting the intent would inflate the single number
+        // that says the product works. Reading it here also means a PR that
+        // already existed when the workspace was first loaded is not counted,
+        // because that path fills the snapshot in `refreshDiff` instead.
+        if snapshot.pullRequest == nil, status.pullRequest != nil {
+            telemetry.record(translator.pullRequestCreated())
+        }
+
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
         diffCache[workspaceID] = snapshot
@@ -2561,7 +2786,16 @@ final class AppModel {
     }
 
     func addDiffComment(_ reference: DiffCommentReference, for id: WorkspaceID) {
-        chat(for: id).addDraftComment(reference)
+        let state = chat(for: id)
+        state.addDraftComment(reference)
+        if let chatID = activeChat(for: id)?.id {
+            var keys = dismissedKeys(for: chatID)
+            if keys.remove(reference.identityKey) != nil {
+                dismissedCommentKeys[chatID] = keys
+                UserDefaults.standard.set(Array(keys), forKey: Self.dismissedCommentsKey(for: chatID))
+            }
+            persistDraftComments(state.draftComments, for: chatID)
+        }
         Task { await client.send(.addDiffComment(id, reference)) }
     }
 
@@ -2577,12 +2811,28 @@ final class AppModel {
         (try? await client.queuedMessages(chatID: chatID)) ?? []
     }
 
-    func updateQueuedMessage(_ id: Int64, text: String) async {
+    /// Edits a queued message, and the transcript row that is showing it.
+    ///
+    /// The row is the same message — it was drawn the moment the user pressed
+    /// send — so leaving it on the original text means the transcript shows
+    /// one thing and the agent is handed another.
+    func updateQueuedMessage(_ record: QueuedMessageRecord, text: String) async {
+        guard let id = record.id else { return }
         try? await client.updateQueuedMessage(id: id, text: text)
+        guard !record.submissionID.isEmpty, let chatID = record.chatID else { return }
+        chat(for: ChatID(rawValue: chatID))
+            .updateQueuedRow(submissionID: record.submissionID, text: text)
     }
 
-    func deleteQueuedMessage(_ id: Int64) async {
+    func deleteQueuedMessage(_ record: QueuedMessageRecord) async {
+        guard let id = record.id else { return }
         try? await client.deleteQueuedMessage(id: id)
+        // Retire the row too. A deleted message that stays in the transcript
+        // marked "queued" is not just cosmetic: it is what the next turn to
+        // start would otherwise claim as the message that was sent.
+        if !record.submissionID.isEmpty, let chatID = record.chatID {
+            chat(for: ChatID(rawValue: chatID)).removeQueuedRow(submissionID: record.submissionID)
+        }
         if let chat = selectedChatSummary {
             var updated = chat
             updated.queuedMessageCount = max(0, updated.queuedMessageCount - 1)
@@ -2682,6 +2932,9 @@ final class AppModel {
         var kind: HarnessKind
         var isRunning: Bool
         var error: String?
+        /// Filled in for a failure the user can actually fix — a root-owned
+        /// install — with commands matching how that CLI was installed.
+        var repair: HarnessRepair?
     }
     private(set) var harnessCLIUpdate: HarnessCLIUpdate?
 
@@ -2712,11 +2965,20 @@ final class AppModel {
             harnessCLIUpdate = nil
             return true
         } catch {
+            let message = error.localizedDescription
             harnessCLIUpdate = HarnessCLIUpdate(
-                kind: kind,
-                isRunning: false,
-                error: error.localizedDescription
+                kind: kind, isRunning: false, error: message
             )
+            // Only for the failure a command can fix, and only after it has
+            // happened: working out the repair asks the shell where npm and
+            // Homebrew keep their prefixes.
+            if HarnessUpdateFailure.isPermissionProblem(message) {
+                let repair = await client.harnessPermissionRepair(kind)
+                // Still the same failure, and not superseded by a retry.
+                if harnessCLIUpdate?.kind == kind, harnessCLIUpdate?.error == message {
+                    harnessCLIUpdate?.repair = repair
+                }
+            }
             return false
         }
     }
@@ -2841,7 +3103,10 @@ final class AppModel {
         }.value
     }
 
-    private nonisolated static func safeFileURL(root: String, relativePath: String) throws -> URL {
+    /// Internal rather than private: the binary-file preview needs the same
+    /// path-escape check before it reads an image off disk, and duplicating
+    /// a traversal guard is how one of the copies ends up wrong.
+    nonisolated static func safeFileURL(root: String, relativePath: String) throws -> URL {
         let rootURL = URL(fileURLWithPath: root).standardizedFileURL.resolvingSymlinksInPath()
         let url = rootURL.appendingPathComponent(relativePath).standardizedFileURL.resolvingSymlinksInPath()
         let prefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
@@ -2903,6 +3168,14 @@ final class AppModel {
         #if DEBUG
         UIFanoutProbe.record(event)
         #endif
+        // One funnel for analytics, in the same place and for the same reason
+        // as the probe above: every core event passes through here exactly
+        // once, so nothing has to be instrumented twice or kept in sync with
+        // a second dispatch path. The translator decides what, if anything,
+        // is worth reporting; most events produce nothing.
+        for reportable in translator.observe(event) {
+            telemetry.record(reportable)
+        }
         switch event {
         case .snapshot(let snapshot):
             assistantWorkspace = snapshot.workspaces.first(where: \.isAssistant)
@@ -3085,6 +3358,9 @@ final class AppModel {
             chatCreationsInFlight.remove(chat.workspaceID)
             chatOwners[chat.id] = chat.workspaceID
             upsertChat(chat)
+            if pendingReviewCommentInbox.remove(chat.workspaceID) != nil {
+                rememberReviewInbox(chat.id, for: chat.workspaceID)
+            }
             // Claim the ephemeral flag *by id* before anything else can react:
             // the title alone proved unreliable (the core may normalize it).
             let isEphemeral = pendingEphemeralWorkspaces.remove(chat.workspaceID) != nil
@@ -3175,6 +3451,7 @@ final class AppModel {
 
         case .harnessProbeCompleted(let probes):
             harnesses = probes
+            hasProbedHarnesses = true
 
         case .harnessUpdatesChecked(let statuses):
             harnessUpdates = statuses
@@ -3236,6 +3513,38 @@ final class AppModel {
         return AgentModelCatalog.merge(
             curated: curated,
             discovered: modelCatalog[harness] ?? []
+        )
+    }
+
+    /// The machine's side of "start work on this sentence".
+    ///
+    /// Lives here so the composer, the Advanced sheet and Start itself all
+    /// read one resolution rather than three that drift apart.
+    func launchInputs(
+        instruction: String,
+        harnessOverride: HarnessKind? = nil,
+        modelOverride: String? = nil,
+        repositoryOverride: String? = nil,
+        wantsNewProject: Bool = false,
+        localBranches: [String] = [],
+        explicitBranch: String? = nil
+    ) -> WorkspaceLaunchPlan.Inputs {
+        WorkspaceLaunchPlan.Inputs(
+            instruction: instruction,
+            readyHarnesses: readyHarnesses,
+            models: { [weak self] harness in
+                (self?.knownModels(for: harness) ?? [])
+                    .map { (id: $0.id, displayName: $0.displayName) }
+            },
+            repositories: repositories,
+            recents: recentRepositories,
+            current: currentRepositoryPath,
+            localBranches: localBranches,
+            harnessOverride: harnessOverride,
+            modelOverride: modelOverride,
+            repositoryOverride: repositoryOverride,
+            wantsNewProject: wantsNewProject,
+            explicitBranch: explicitBranch
         )
     }
 
@@ -3319,6 +3628,25 @@ final class AppModel {
 
     private func applyToChat(workspaceID: WorkspaceID, chatID: ChatID, event: AgentEvent) {
         chat(for: chatID).apply(event)
+        if case .permissionRequest(let request) = event,
+           UserDefaults.standard.bool(forKey: Self.automaticRoutinePermissionsKey),
+           let workspace = workspaces.first(where: { $0.id == workspaceID })
+                ?? (assistantWorkspace?.id == workspaceID ? assistantWorkspace : nil)
+                ?? dreamWorkspaces.first(where: { $0.id == workspaceID }),
+           let automatic = RoutinePermissionPolicy.automaticApproval(
+               for: request, workspacePath: workspace.worktreePath
+           ) {
+            // Remove the card optimistically and answer the harness. Only the
+            // positive-list policy above reaches here; uncertain or important
+            // work continues through the ordinary needs-you surfaces. The
+            // approval travels with the decision because this request never
+            // becomes a card — the transcript is its only record.
+            resolvePermission(
+                request.id, decision: .allow, for: workspaceID,
+                chatID: chatID, automatic: automatic
+            )
+            return
+        }
         // The assistant never joins the ambient notification/narration funnel
         // — its voice is the voice mode: replies to spoken requests are read
         // aloud by the controller, and everything else stays quiet.
@@ -3369,6 +3697,15 @@ final class AppModel {
         // both consume the event produced two back-to-back "quick checks".
         let assistantOwnsNarration: Bool
         switch event {
+        case .permissionRequest(let request) where Self.isQuestionGate(request):
+            // An AskUserQuestion gate is not an ask in its own right — it is
+            // the channel the answer to the accompanying question travels
+            // back through. Kept out of needs-you at intake, not merely
+            // filtered by each surface, because every surface that shows it
+            // offers Allow, and a bare Allow answers a question the user was
+            // never shown. `ChatState.pendingPermission` still holds it, so
+            // `answerQuestion` can route through it and retire it.
+            assistantOwnsNarration = false
         case .permissionRequest(let request):
             assistantOwnsNarration = noteTabNeedsYou(.permission(TabNeedsYou.Permission(
                 workspaceID: workspaceID, chatID: chatID, request: request
@@ -3390,13 +3727,9 @@ final class AppModel {
         switch event {
         case .permissionResolved(let resolution):
             voiceAssistant.permissionResolved(resolution.id)
-            tabNeedsYou.removeAll {
-                switch $0 {
-                case .permission(let item): return item.request.id == resolution.id
-                case .plan(let item): return item.permissionRequestID == resolution.id
-                case .question: return false
-                }
-            }
+            // Resolved elsewhere — the assistant over MCP, or another window.
+            // Retire the same set the local click would have.
+            retireNeedsYou(resolving: resolution.id)
         case .toolCall(let call)
             where PlanProposalPolicy.proceedsPastProposal(call.name):
             tabNeedsYou.removeAll {
@@ -3425,14 +3758,31 @@ final class AppModel {
         guard origin.isBackground || appInactive else { return }
         let place = origin.displayLabel ?? workspaceName(workspaceID)
         switch event {
+        case .permissionRequest(let request) where Self.isQuestionGate(request):
+            // The question itself notifies; its gate would be a second banner
+            // for the same ask, offering Allow as the answer.
+            break
         case .permissionRequest(let request):
+            // "kailash — Run a command: curl -s https://…". The banner is the
+            // only thing the user sees before deciding whether to come back,
+            // so it names the act, not the tool's codename over the agent's
+            // account of its own intent.
+            let content = PermissionPresentation(request: request)
+            var body = place + " — " + content.action
+                + (content.target.map { ": \(PermissionPresentation.clip($0, to: 120))" } ?? "")
+            if content.isAbbreviated {
+                body += " — " + (content.hiddenLineSummary ?? "shortened")
+                    + ". Open ORE to read it."
+            }
             postNotification(
                 title: "ORE needs you",
-                body: place + " wants to run \(request.toolName)."
-                    + (request.summary.map { " \($0)" } ?? ""),
+                body: body,
                 workspaceID: workspaceID,
                 chatID: chatID,
-                category: NotificationCategory.toolPermission,
+                // A banner that has clipped the command must not carry an
+                // Allow button: the whole basis for deciding is the part
+                // that did not fit. The plain banner still opens the chat.
+                category: content.isAbbreviated ? nil : NotificationCategory.toolPermission,
                 extraInfo: ["permissionID": request.id.rawValue]
             )
         case .question(let question):
@@ -3464,6 +3814,14 @@ final class AppModel {
         default:
             break
         }
+    }
+
+    /// Whether a permission request is the hidden half of an AskUserQuestion.
+    ///
+    /// The user answers the question; ORE answers the gate on their behalf
+    /// with what they said. Nothing may offer it as an Allow/Deny of its own.
+    static func isQuestionGate(_ request: PermissionRequest) -> Bool {
+        request.toolName == "AskUserQuestion"
     }
 
     @discardableResult
@@ -3527,6 +3885,7 @@ final class AppModel {
         // them into this decision before dismissing the card so they cannot be
         // stranded behind the now-restored composer.
         let comments = chat.takeDraftComments()
+        persistDraftComments([], for: chatID)
         let note = PlanDecisionFeedback.combining(feedback, comments: comments)
         chat.dismissPlan()
         tabNeedsYou.removeAll {
@@ -3671,6 +4030,7 @@ final class AppModel {
         coalescers.removeValue(forKey: chatID)
         lastBackgroundFlush.removeValue(forKey: chatID)
         chatStates.removeValue(forKey: chatID)
+        dismissedCommentKeys.removeValue(forKey: chatID)
         chatRenamesInFlight.remove(chatID)
         continuationTasks.removeValue(forKey: chatID)?.cancel()
         scheduledContinuations.removeValue(forKey: chatID)
@@ -3679,10 +4039,15 @@ final class AppModel {
             withIdentifiers: [Self.continuationNotificationID(for: chatID)]
         )
         for key in [
-            "ore.draftAttachments", "ore.chatScroll",
+            "ore.draftAttachments", "ore.draftComments",
+            "ore.dismissedDiffComments", "ore.chatScroll",
             "ore.reasoningEffort", "ore.fastMode",
         ] {
             UserDefaults.standard.removeObject(forKey: "\(key).\(chatID.rawValue)")
+        }
+        for (workspaceID, inbox) in reviewCommentInbox where inbox == chatID {
+            reviewCommentInbox[workspaceID] = nil
+            UserDefaults.standard.removeObject(forKey: Self.reviewInboxKey(for: workspaceID))
         }
     }
 
@@ -3743,27 +4108,7 @@ final class AppModel {
                       .trimmingCharacters(in: .whitespacesAndNewlines),
                   !text.isEmpty
             else { return }
-            let state = chat(for: chatID)
-            state.resolveQuestion(questionID)
-            // Claude's AskUserQuestion pairs the question with a permission
-            // gate; the answer has to travel through the permission reply or
-            // the turn stays blocked (see answerQuestion(_:viaPermission:)).
-            if let permission = state.pendingPermission,
-               permission.toolName == "AskUserQuestion" {
-                state.resolvePermission(permission.id)
-                Task {
-                    await client.send(.resolveChatPermission(
-                        workspaceID, chatID, permission.id,
-                        .deny(reason: "The user answered your question: \"\(text)\". Continue with this answer in mind.")
-                    ))
-                }
-            } else {
-                Task {
-                    await client.send(.answerChatQuestion(
-                        workspaceID, chatID, questionID, answer: text
-                    ))
-                }
-            }
+            answerQuestion(questionID, answer: text, for: workspaceID, chatID: chatID)
 
         case NotificationAction.allowPermission, NotificationAction.denyPermission:
             guard let workspaceID, let chatID,

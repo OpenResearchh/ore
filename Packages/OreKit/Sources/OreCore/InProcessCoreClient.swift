@@ -141,6 +141,9 @@ public actor InProcessCoreClient: CoreClient {
         case .addDiffComment(let id, let reference):
             try await engine(for: id).addDiffComment(reference)
 
+        case .clearDiffComments(let id, let references):
+            try await engine(for: id).clearDiffComments(references)
+
         case .markFileViewed(let id, let path, let contentHash):
             if let contentHash {
                 try await store.markViewed(ViewedFileRecord(
@@ -252,9 +255,9 @@ public actor InProcessCoreClient: CoreClient {
         case .resolvePermission(let id, let requestID, let decision):
             try await engine(for: id).resolvePermission(requestID, with: decision)
 
-        case .resolveChatPermission(let id, let chatID, let requestID, let decision):
+        case .resolveChatPermission(let id, let chatID, let requestID, let decision, let automatic):
             try await engine(for: id).resolvePermission(
-                requestID, with: decision, chatID: chatID
+                requestID, with: decision, chatID: chatID, automatic: automatic
             )
 
         case .answerQuestion(let id, let questionID, let answer):
@@ -1515,6 +1518,17 @@ public actor InProcessCoreClient: CoreClient {
         harnessUpdates.first { $0.kind == kind }
     }
 
+    /// What to run when an upgrade failed because something isn't writable.
+    ///
+    /// Asked for only after a failure, because answering it costs two short
+    /// shell calls (`npm config get prefix`, `brew --prefix`) and the answer
+    /// is only useful once there is something to repair.
+    public func harnessPermissionRepair(_ kind: HarnessKind) async -> HarnessRepair? {
+        let path = harnessProbes.first(where: { $0.kind == kind })?.executablePath
+            ?? ShellEnvironment.locate(kind.defaultExecutableName)
+        return await HarnessCLIUpdater.permissionRepair(for: kind, executablePath: path)
+    }
+
     public struct WorkspaceEnvironment: Sendable, Hashable {
         public var worktreePath: String
         public var runScript: String?
@@ -1533,7 +1547,8 @@ private extension CoreCommand {
              .startSession(let id, _):
             return id
         case .renameWorkspace(let id, _, _), .setWorkspacePinned(let id, _),
-             .addDiffComment(let id, _), .markFileViewed(let id, _, _),
+             .addDiffComment(let id, _), .clearDiffComments(let id, _),
+             .markFileViewed(let id, _, _),
              .commit(let id, _), .createGitHubRepo(let id), .push(let id),
              .createPullRequest(let id, _, _, _, _),
              .retargetPullRequest(let id, _, _), .mergePullRequest(let id, _),
@@ -1558,7 +1573,7 @@ private extension CoreCommand {
              .setChatEffort(let id, _, _),
              .startChatSession(let id, _, _), .stopChatSession(let id, _):
             return id
-        case .resolveChatPermission(let id, _, _, _),
+        case .resolveChatPermission(let id, _, _, _, _),
              .answerChatQuestion(let id, _, _, _),
              .revertChatToCheckpoint(let id, _, _):
             return id

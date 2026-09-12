@@ -25,6 +25,9 @@ public enum CoreCommand: Sendable, Codable {
 
     // Review and shipping
     case addDiffComment(WorkspaceID, DiffCommentReference)
+    /// Drop pending review comments the user dismissed from a tab's composer
+    /// so the Review pane poll cannot resurrect them.
+    case clearDiffComments(WorkspaceID, [DiffCommentReference])
     case markFileViewed(WorkspaceID, path: String, contentHash: String?)
     case commit(WorkspaceID, message: String)
     /// Create a GitHub repository for a local-only repo and publish it, so a
@@ -69,7 +72,13 @@ public enum CoreCommand: Sendable, Codable {
     /// use the same depth.
     case setChatEffort(WorkspaceID, ChatID, ReasoningEffort?)
     case resolvePermission(WorkspaceID, PermissionRequestID, PermissionDecision)
-    case resolveChatPermission(WorkspaceID, ChatID, PermissionRequestID, PermissionDecision)
+    /// `automatic` is set only when ORE answered under the user's
+    /// routine-approval setting, never when the user clicked. It travels with
+    /// the decision so the resolution the transcript records says who decided.
+    case resolveChatPermission(
+        WorkspaceID, ChatID, PermissionRequestID, PermissionDecision,
+        automatic: AutomaticApproval? = nil
+    )
     case answerQuestion(WorkspaceID, QuestionID, answer: String)
     case answerChatQuestion(WorkspaceID, ChatID, QuestionID, answer: String)
     /// Restore chat *and* working tree to the state before the given turn.
@@ -364,6 +373,12 @@ public struct DiffCommentReference: Sendable, Codable, Hashable {
         self.endLine = endLine
         self.body = body
         self.context = context
+    }
+
+    /// Stable identity shared by ingest, the composer, and dismiss — context
+    /// is display-only and must not fork the same finding into two comments.
+    public var identityKey: String {
+        "\(filePath):\(startLine):\(endLine):\(body)"
     }
 }
 

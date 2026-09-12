@@ -74,6 +74,11 @@ public actor GitHubClient {
             case defaultBranch = "default_branch"
             case pushedAt = "pushed_at"
         }
+
+        func matches(_ lowercasedNeedle: String) -> Bool {
+            nameWithOwner.lowercased().contains(lowercasedNeedle)
+                || (description?.lowercased().contains(lowercasedNeedle) ?? false)
+        }
     }
 
     /// Browser-based `gh` authentication. Flags remove every question the CLI
@@ -94,18 +99,40 @@ public actor GitHubClient {
     }
 
     /// Repositories the signed-in account can access: owned, organization, and
-    /// collaborator repositories. Pagination matters for established accounts.
-    public func repositories() async throws -> [Repository] {
-        let output = try await run([
-            "api", "--method", "GET", "user/repos",
-            "-f", "per_page=100", "-f", "sort=pushed", "-f", "direction=desc",
-            "--paginate", "--slurp",
-        ])
-        let data = Data(output.standardOutput.utf8)
-        if let pages = try? JSONDecoder().decode([[Repository]].self, from: data) {
-            return pages.flatMap { $0 }
+    /// collaborator repositories, most recently pushed first.
+    ///
+    /// Bounded on purpose. An unbounded `--paginate` over a large organisation
+    /// is dozens of API calls for a list the caller then truncates, which is
+    /// how the repository someone actually meant gets cut off. Pages are taken
+    /// one at a time and stop as soon as `limit` matches are in hand.
+    public func repositories(
+        matching query: String? = nil,
+        limit: Int = 50
+    ) async throws -> [Repository] {
+        let needle = query?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let pageSize = 100
+        // One page is enough to answer "what have I been working on"; a search
+        // may have to look past the most recent hundred, but never forever.
+        let maximumPages = (needle?.isEmpty ?? true) ? 1 : 5
+        var found: [Repository] = []
+
+        for page in 1...maximumPages {
+            let output = try await run([
+                "api", "--method", "GET", "user/repos",
+                "-f", "per_page=\(pageSize)", "-f", "page=\(page)",
+                "-f", "sort=pushed", "-f", "direction=desc",
+            ])
+            let batch = try JSONDecoder().decode(
+                [Repository].self, from: Data(output.standardOutput.utf8)
+            )
+            if let needle, !needle.isEmpty {
+                found += batch.filter { $0.matches(needle) }
+            } else {
+                found += batch
+            }
+            if batch.count < pageSize || found.count >= limit { break }
         }
-        return try JSONDecoder().decode([Repository].self, from: data)
+        return Array(found.prefix(limit))
     }
 
     /// Creates a GitHub repository from a local checkout and publishes it.

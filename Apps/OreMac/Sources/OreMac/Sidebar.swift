@@ -145,16 +145,20 @@ struct Sidebar: View {
                             .contentShape(Rectangle())
                             .onTapGesture { model.selectedWorkspaceID = workspace.id }
                             .listRowBackground(
-                                // The selected workspace is the reference
-                                // design's solid pill — one loud selection,
-                                // everything else stays quiet.
                                 model.selectedWorkspaceID == workspace.id
                                     ? AnyView(
                                         RoundedRectangle(
                                             cornerRadius: OreTheme.pillRadius,
                                             style: .continuous
                                         )
-                                        .fill(OreTheme.selectedProminentFill)
+                                        .fill(OreTheme.sidebarSelectedFill)
+                                        .overlay {
+                                            RoundedRectangle(
+                                                cornerRadius: OreTheme.pillRadius,
+                                                style: .continuous
+                                            )
+                                            .strokeBorder(OreTheme.selectedStroke, lineWidth: 0.75)
+                                        }
                                         .padding(.vertical, 2)
                                     )
                                     : AnyView(Color.clear)
@@ -759,7 +763,7 @@ private struct WorkspaceRow: View {
                 chats: chats,
                 size: 28,
                 identity: identity,
-                onProminentFill: isSelected
+                onProminentFill: false
             )
 
             VStack(alignment: .leading, spacing: 2) {
@@ -770,7 +774,7 @@ private struct WorkspaceRow: View {
                             weight: effectiveNeedsAttention ? .bold
                                 : workspace.hasUnread || isSelected ? .semibold : .regular
                         ))
-                        .foregroundStyle(isSelected ? .white : Color.primary)
+                        .foregroundStyle(Color.primary)
                         .lineLimit(1)
 
                     if let pullRequestState {
@@ -785,7 +789,7 @@ private struct WorkspaceRow: View {
                     if let activity = workspace.lastActivity {
                         Text(sidebarCompactAge(activity))
                             .font(.system(size: 10.5, design: .rounded).monospacedDigit())
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.75) : Color(.tertiaryLabelColor))
+                            .foregroundStyle(Color(.tertiaryLabelColor))
                     }
                 }
 
@@ -797,15 +801,12 @@ private struct WorkspaceRow: View {
                         if workspace.stackedOn != nil {
                             Image(systemName: "square.stack.3d.up")
                                 .font(.system(size: 9))
-                                .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.secondary)
+                                .foregroundStyle(Color.secondary)
                         }
                         if let secondLineText {
                             Text(secondLineText)
                                 .font(.system(size: 12))
-                                .foregroundStyle(
-                                    isSelected ? Color.white.opacity(0.85)
-                                        : effectiveNeedsAttention ? indicatorColor : Color.secondary
-                                )
+                                .foregroundStyle(effectiveNeedsAttention ? indicatorColor : Color.secondary)
                                 .lineLimit(1)
                         }
 
@@ -815,11 +816,11 @@ private struct WorkspaceRow: View {
                         HStack(spacing: 4) {
                             if git.insertions > 0 {
                                 Text("+\(git.insertions)")
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.added)
+                                    .foregroundStyle(OreTheme.added)
                             }
                             if git.deletions > 0 {
                                 Text("−\(git.deletions)")
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : OreTheme.removed)
+                                    .foregroundStyle(OreTheme.removed)
                             }
                         }
                         .font(.caption2.monospacedDigit())
@@ -844,7 +845,7 @@ private struct WorkspaceRow: View {
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(isSelected ? .white : Color.primary)
+                        .foregroundStyle(Color.primary)
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
                 }
@@ -1008,6 +1009,6 @@ private struct SidebarPullRequestBadge: View {
     }
 
     private var foreground: Color {
-        isSelected ? .white : tone
+        tone
     }
 }

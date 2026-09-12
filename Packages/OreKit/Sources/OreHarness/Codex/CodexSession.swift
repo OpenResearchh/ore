@@ -222,10 +222,19 @@ public actor CodexSession: AgentSession {
         Self.approvalPolicy(permissionMode: permissionMode)
     }
 
+    /// Only Bypass silences Codex.
+    ///
+    /// Accept Edits means "don't stop me for file edits", which the
+    /// `workspace-write` sandbox already delivers — it must not also mean "run
+    /// anything without asking". Mapping it to `never` did exactly that: Codex
+    /// stopped sending approval requests, so ORE's shell classifier, the
+    /// routine-approval setting and the `ore` MCP boundary were never consulted
+    /// and every command ran unasked, on the one harness where the Assistant's
+    /// own prompt promises the opposite.
     static func approvalPolicy(permissionMode: PermissionMode) -> String {
         switch permissionMode {
-        case .bypassPermissions, .acceptEdits: return "never"
-        case .plan, .default: return "on-request"
+        case .bypassPermissions: return "never"
+        case .plan, .default, .acceptEdits: return "on-request"
         }
     }
 

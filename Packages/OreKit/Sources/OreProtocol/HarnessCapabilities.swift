@@ -196,3 +196,28 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         self.diagnostic = diagnostic
     }
 }
+
+extension HarnessKind {
+    /// How this agent's CLI is distributed.
+    ///
+    /// Vocabulary rather than behaviour, which is why it lives here and not in
+    /// the harness layer: the Mac app has to name the install source too — to
+    /// tell a user whose update failed on permissions exactly what to run —
+    /// and it deliberately does not depend on `OreHarness`.
+    public var npmPackage: String? {
+        switch self {
+        case .claudeCode: return "@anthropic-ai/claude-code"
+        case .codex: return "@openai/codex"
+        case .cursorAgent: return nil
+        }
+    }
+
+    public var brewFormula: String? {
+        switch self {
+        case .claudeCode: return "claude-code"
+        case .codex: return "codex"
+        case .cursorAgent: return nil
+        }
+    }
+
+}

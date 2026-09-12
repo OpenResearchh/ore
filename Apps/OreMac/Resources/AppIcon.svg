@@ -1,25 +1,112 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- ORE: a cut stone with a lit core.
+       The previous icon put a pale stone on a copper tile, which read warm
+       overall and put its one bright element against a bright ground. This
+       inverts it: an almost-black tile so the Dock silhouette is
+       unmistakable, and the colour moved into the stone — cool grey on the
+       faces turned away from the light, molten amber on the ones catching it,
+       and the light source *inside*. That is what the name carries: rock with
+       something valuable lit up in the middle of it.
+       Twelve facets rather than four. Six would read as a flat hexagon;
+       twelve, each shaded a step apart around the ring, reads as a solid
+       turning in light.
+       At 16px — the menu bar, the Cmd-Tab strip — the facet shading does go to
+       mush, exactly as the old icon's comment warned. What survives there is
+       deliberately not the shading: it is the hexagonal outline against black
+       and the bright core at the centre, which is why both are drawn with hard
+       contrast rather than subtlety. -->
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#5B8DEF"/>
-      <stop offset="0.55" stop-color="#5A6BF6"/>
-      <stop offset="1" stop-color="#8250F4"/>
+    <!-- The tile. Near-black, warmed very slightly towards the bottom so it
+         does not look like a hole punched in the Dock. -->
+    <linearGradient id="tile" x1="512" y1="112" x2="512" y2="912" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1A1A21"/>
+      <stop offset="0.55" stop-color="#101014"/>
+      <stop offset="1" stop-color="#16110E"/>
     </linearGradient>
+
+    <!-- Top-down sheen, kept from the previous icon for the same reason:
+         without it a flat squircle looks like a sticker at 512pt. -->
     <linearGradient id="sheen" x1="0" y1="112" x2="0" y2="912" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
     </linearGradient>
+
+    <!-- The core, and the light it throws onto the tile behind the stone. -->
+    <radialGradient id="coreGlow" cx="512" cy="512" r="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFD27A" stop-opacity="0.50"/>
+      <stop offset="0.35" stop-color="#F0A03C" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#F0A03C" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="depth" cx="512" cy="512" r="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="0.62" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.30"/>
+    </radialGradient>
+    <radialGradient id="core" cx="512" cy="512" r="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.30" stop-color="#FFE9B0"/>
+      <stop offset="0.72" stop-color="#FFB545"/>
+      <stop offset="1" stop-color="#FFB545" stop-opacity="0"/>
+    </radialGradient>
   </defs>
 
-  <!-- App tile: a rounded squircle, the macOS way. -->
-  <rect x="112" y="112" width="800" height="800" rx="196" fill="url(#bg)"/>
+  <rect x="112" y="112" width="800" height="800" rx="196" fill="url(#tile)"/>
   <rect x="112" y="112" width="800" height="800" rx="196" fill="url(#sheen)"/>
 
-  <!-- Stacked layers = several agents running in parallel, each in its own
-       worktree. Drawn bottom-first so the top plate reads as the front one. -->
-  <g stroke="#3A46C8" stroke-opacity="0.28" stroke-width="6" stroke-linejoin="round">
-    <path d="M512 604 L716 706 L512 808 L308 706 Z" fill="#ffffff" fill-opacity="0.60"/>
-    <path d="M512 456 L716 558 L512 660 L308 558 Z" fill="#ffffff" fill-opacity="0.80"/>
-    <path d="M512 308 L716 410 L512 512 L308 410 Z" fill="#ffffff" fill-opacity="0.97"/>
+  <!-- Light spilling out of the stone, drawn before the stone covers it. -->
+  <circle cx="512" cy="512" r="340" fill="url(#coreGlow)"/>
+
+  <!-- Twelve facets: centre to vertex to edge-midpoint.
+       The shading deliberately does *not* ramp smoothly around the ring. A
+       smooth ramp is a colour wheel — the eye reads it as a pie chart, flat.
+       Real cut faces meet at angles, so neighbours catch the light very
+       differently; alternating light against dark within each sector is what
+       makes this read as a solid rather than a disc. -->
+  <g stroke="#000000" stroke-opacity="0.22" stroke-width="2" stroke-linejoin="round">
+    <path d="M512 512 L512 182 L655 264.5 Z" fill="#FBD79A"/>
+    <path d="M512 512 L655 264.5 L798 347 Z" fill="#C2762A"/>
+    <path d="M512 512 L798 347 L798 512 Z" fill="#EFA94F"/>
+    <path d="M512 512 L798 512 L798 677 Z" fill="#8E5219"/>
+    <path d="M512 512 L798 677 L655 759.5 Z" fill="#B06A24"/>
+    <path d="M512 512 L655 759.5 L512 842 Z" fill="#6E3F14"/>
+    <path d="M512 512 L512 842 L369 759.5 Z" fill="#3E4B60"/>
+    <path d="M512 512 L369 759.5 L226 677 Z" fill="#6F8098"/>
+    <path d="M512 512 L226 677 L226 512 Z" fill="#4B5A70"/>
+    <path d="M512 512 L226 512 L226 347 Z" fill="#9DAFC4"/>
+    <path d="M512 512 L226 347 L369 264.5 Z" fill="#7E90A8"/>
+    <path d="M512 512 L369 264.5 L512 182 Z" fill="#DCE7F2"/>
   </g>
+
+  <!-- Depth, in one element rather than twelve gradients: the stone is lit
+       from its own centre, so its outer edges fall away. Drawn as the hexagon
+       filled with a transparent-to-dark radial rather than clipped, because
+       the shape is already to hand. -->
+  <path d="M512 182 L798 347 L798 677 L512 842 L226 677 L226 347 Z" fill="url(#depth)"/>
+
+  <!-- The cut edges. A hairline of light along each ridge running out from the
+       core is what makes the facets read as folds rather than as a pie chart. -->
+  <g stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="2.5" stroke-linecap="round">
+    <line x1="512" y1="512" x2="512" y2="182"/>
+    <line x1="512" y1="512" x2="655" y2="264.5"/>
+    <line x1="512" y1="512" x2="798" y2="347"/>
+    <line x1="512" y1="512" x2="798" y2="512"/>
+    <line x1="512" y1="512" x2="798" y2="677"/>
+    <line x1="512" y1="512" x2="655" y2="759.5"/>
+    <line x1="512" y1="512" x2="512" y2="842"/>
+    <line x1="512" y1="512" x2="369" y2="759.5"/>
+    <line x1="512" y1="512" x2="226" y2="677"/>
+    <line x1="512" y1="512" x2="226" y2="512"/>
+    <line x1="512" y1="512" x2="226" y2="347"/>
+    <line x1="512" y1="512" x2="369" y2="264.5"/>
+  </g>
+
+  <!-- The silhouette. This and the core are the two things that survive 16px,
+       so both are drawn hard rather than subtly. -->
+  <path d="M512 182 L798 347 L798 677 L512 842 L226 677 L226 347 Z"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.30" stroke-width="4"
+        stroke-linejoin="round"/>
+
+  <!-- The core, last, over everything. -->
+  <circle cx="512" cy="512" r="58" fill="url(#core)"/>
+  <circle cx="512" cy="512" r="16" fill="#FFF6E0"/>
 </svg>

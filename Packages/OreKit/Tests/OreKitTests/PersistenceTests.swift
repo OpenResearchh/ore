@@ -429,6 +429,31 @@ struct PersistenceTests {
         #expect(try await store.pendingDiffComments(workspaceID: workspace.workspaceID).isEmpty)
     }
 
+    @Test func dismissingAPendingCommentDeletesOnlyThatOne() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store)
+        let keep = DiffCommentReference(
+            filePath: "Sources/App.swift", startLine: 10, endLine: 10, body: "keep"
+        )
+        let drop = DiffCommentReference(
+            filePath: "Sources/App.swift", startLine: 42, endLine: 42, body: "drop"
+        )
+        _ = try await store.addDiffComment(DiffCommentRecord(
+            workspaceID: workspace.workspaceID,
+            filePath: keep.filePath, startLine: keep.startLine, endLine: keep.endLine, body: keep.body
+        ))
+        _ = try await store.addDiffComment(DiffCommentRecord(
+            workspaceID: workspace.workspaceID,
+            filePath: drop.filePath, startLine: drop.startLine, endLine: drop.endLine, body: drop.body
+        ))
+
+        try await store.deletePendingDiffComments(
+            workspaceID: workspace.workspaceID, matching: [drop]
+        )
+        let pending = try await store.pendingDiffComments(workspaceID: workspace.workspaceID)
+        #expect(pending.map(\.body) == ["keep"])
+    }
+
     @Test func viewedStateIsKeyedByContentSoChangesResetIt() async throws {
         // A file the agent touches again must stop counting as reviewed.
         let store = try makeStore()

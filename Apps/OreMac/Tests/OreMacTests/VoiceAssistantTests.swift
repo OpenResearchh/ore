@@ -673,6 +673,68 @@ struct VoiceAssistantQuestionTests {
     }
 }
 
+/// Which turn a spoken question is allowed to hear back from.
+///
+/// The assistant chat is shared, so "an event from this chat" is not the same
+/// as "the answer to what I just asked". These are the cases where those two
+/// differ — and where ORE used to read another turn's prose aloud.
+struct VoiceSpokenTurnTests {
+    private let chat = ChatID(rawValue: "assistant")
+    private func turn(_ id: String) -> TurnID { TurnID(rawValue: id) }
+
+    @Test func nothingIsOursUntilATurnStarts() {
+        let awaiting = VoiceSpokenTurn(chatID: chat)
+
+        // A digest already streaming in the same chat when the question went
+        // out. Its text is not the answer, however much it looks like one.
+        #expect(!awaiting.owns(turn("already-running")))
+        #expect(awaiting.turnID == nil)
+    }
+
+    @Test func theFirstTurnToStartAfterTheQuestionIsTheAnswer() {
+        var awaiting = VoiceSpokenTurn(chatID: chat)
+
+        let adopted = awaiting.adopt(turn("answer"))
+
+        #expect(adopted)
+        #expect(awaiting.owns(turn("answer")))
+    }
+
+    /// The queued case: the spoken prompt sits behind an open turn, so the
+    /// turn that starts next is ours and the one it waited on never was.
+    @Test func aQueuedPromptAdoptsTheTurnThatEventuallyRunsIt() {
+        var awaiting = VoiceSpokenTurn(chatID: chat)
+        let queuedBehind = turn("digest")
+
+        #expect(!awaiting.owns(queuedBehind))
+        let adopted = awaiting.adopt(turn("answer"))
+        #expect(adopted)
+        #expect(!awaiting.owns(queuedBehind), "the turn we waited on is still not ours")
+        #expect(awaiting.owns(turn("answer")))
+    }
+
+    /// Whatever the user does next — types a follow-up, a watch digest fires
+    /// — starts its own turn, and that one is not being waited on by ear.
+    @Test func aLaterTurnInTheSameChatIsNotAdopted() {
+        var awaiting = VoiceSpokenTurn(chatID: chat)
+        _ = awaiting.adopt(turn("answer"))
+
+        let adoptedAgain = awaiting.adopt(turn("typed-follow-up"))
+
+        #expect(!adoptedAgain)
+        #expect(awaiting.owns(turn("answer")))
+        #expect(!awaiting.owns(turn("typed-follow-up")))
+    }
+
+    @Test func aStaleCompletionFromAnotherTurnIsNotTheAnswer() {
+        var awaiting = VoiceSpokenTurn(chatID: chat)
+        _ = awaiting.adopt(turn("answer"))
+
+        // The turn the question was queued behind finishing late.
+        #expect(!awaiting.owns(turn("digest")))
+    }
+}
+
 struct VoiceAssistantPermissionPromptTests {
     @Test func spokenPermissionKeepsTheRequestIdentity() {
         let id = PermissionRequestID(rawValue: "permission-42")

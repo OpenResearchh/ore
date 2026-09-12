@@ -50,13 +50,14 @@ struct HarnessCLIUpdaterTests {
         )
         let message = error.errorDescription ?? ""
         #expect(message.contains("not writable by your user"))
-        #expect(message.contains("brew install codex"))
         #expect(!message.contains("npm error"))
     }
 
     /// Shipped in v0.7.1: the Claude Code update card rendered
     /// "Reinstall with Homebrew (`brew install codex`)", pointing the user at a
-    /// different agent's CLI. The remedy must name the harness that failed.
+    /// different agent's CLI. The message names the harness that failed — and
+    /// no longer prescribes a channel at all, because the message does not
+    /// know which one this install came from. See `HarnessRepairTests`.
     @Test func permissionDeniedNamesTheHarnessBeingUpdated() {
         let raw = "Error: EACCES: permission denied, open '/usr/local/lib/node_modules'"
         let error = HarnessCLIUpdater.UpdateError.commandFailed(
@@ -66,21 +67,55 @@ struct HarnessCLIUpdaterTests {
             output: raw
         )
         let message = error.errorDescription ?? ""
-        #expect(message.contains("brew install claude-code"))
+        #expect(message.contains("Claude Code"))
         #expect(!message.contains("codex"))
+        #expect(!message.contains("brew install"), "the channel is the repair's business")
     }
 
-    /// Cursor has no Homebrew formula, so the message must not offer one.
-    @Test func permissionDeniedWithoutAFormulaOmitsHomebrew() {
-        let error = HarnessCLIUpdater.UpdateError.commandFailed(
-            kind: .cursorAgent,
-            command: "curl -fsSL 'https://cursor.com/install' | bash",
-            exitCode: 1,
-            output: "permission denied"
-        )
-        let message = error.errorDescription ?? ""
-        #expect(!message.contains("brew install"))
-        #expect(message.contains("ownership of the install directory"))
+    @Test func aPermissionFailureIsRecognisedHoweverItIsWorded() {
+        for output in [
+            "npm error code EACCES",
+            "Error: permission denied",
+            "mkdir: Operation not permitted",
+            "/usr/local/bin is not writable",
+            "cp: Read-only file system",
+        ] {
+            #expect(HarnessUpdateFailure.isPermissionProblem(output), "\(output)")
+        }
+        #expect(!HarnessUpdateFailure.isPermissionProblem("network timeout"))
+    }
+
+    // MARK: - Which install is being repaired
+
+    @Test func aHomebrewPathIsRecognisedAsHomebrew() {
+        #expect(HarnessCLIUpdater.installMethod(
+            for: .codex, executablePath: "/opt/homebrew/bin/codex"
+        ) == .homebrew)
+    }
+
+    @Test func aNodeManagedPathIsRecognisedAsNpm() {
+        #expect(HarnessCLIUpdater.installMethod(
+            for: .claudeCode,
+            executablePath: "/Users/me/.nvm/versions/node/v22.0.0/bin/claude"
+        ) == .npm)
+    }
+
+    @Test func theVendorsOwnBinDirectoryIsANativeInstall() {
+        let path = FileManager.default.homeDirectoryForCurrentUser.path + "/.local/bin/claude"
+        #expect(HarnessCLIUpdater.installMethod(for: .claudeCode, executablePath: path)
+            == .nativeUserBin)
+    }
+
+    /// A bare `/usr/local/bin` entry is almost always `sudo npm install -g`,
+    /// which is the install this whole path exists to repair.
+    @Test func aSystemPrefixEntryIsTreatedAsAGlobalNpmInstall() {
+        #expect(HarnessCLIUpdater.installMethod(
+            for: .codex, executablePath: "/usr/local/bin/codex"
+        ) == .npm)
+    }
+
+    @Test func noPathMeansNoClassification() {
+        #expect(HarnessCLIUpdater.installMethod(for: .codex, executablePath: nil) == .unknown)
     }
 
     @Test func cursorWithoutAKnownPathUsesTheVendorInstaller() {

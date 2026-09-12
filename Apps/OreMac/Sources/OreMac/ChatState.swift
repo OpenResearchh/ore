@@ -30,7 +30,23 @@ final class ChatState {
     private(set) var status: AgentStatus = .idle
     private(set) var usage: UsageReport?
     private(set) var pendingPermission: PermissionRequest?
-    private(set) var pendingQuestion: AgentQuestion?
+
+    /// Every question still waiting on the user, oldest first.
+    ///
+    /// A list rather than one slot because a single `AskUserQuestion` tool
+    /// call can carry several questions, and they arrive as separate events.
+    /// Overwriting meant the second one erased the first, and the agent then
+    /// received an answer to one of the things it asked and silence about
+    /// the rest.
+    private(set) var pendingQuestions: [AgentQuestion] = []
+    /// Answers collected so far, keyed by question. Held until the whole
+    /// tool call is answered, because all of them travel back through one
+    /// permission gate.
+    private(set) var questionAnswers: [QuestionID: String] = [:]
+
+    /// The one to put in front of the user: the oldest unanswered, so a
+    /// multi-question tool call is worked through in the order it was asked.
+    var pendingQuestion: AgentQuestion? { pendingQuestions.first }
     private(set) var plan: PlanUpdate.Content?
     /// Turn that currently owns the approval card, so the transcript can hide
     /// its duplicate PLAN row while the card is up.
@@ -124,6 +140,10 @@ final class ChatState {
     /// and optimistically by our own send so the very next keystroke is judged
     /// against the turn we just started rather than the one that just ended.
     private(set) var isTurnActive = false
+
+    /// The row of a queued prompt the engine has dispatched but whose turn
+    /// has not started yet. It is the message that turn belongs to.
+    private var dispatchedRowID: String?
 
     /// Reconciles against the engine's published gate. Events are the fast path;
     /// this is the correction when the two have drifted — a turn that ended in a
@@ -278,7 +298,11 @@ final class ChatState {
             resumeTurnAfterInput()
 
         case .question(let question):
-            pendingQuestion = question
+            if let existing = pendingQuestions.firstIndex(where: { $0.id == question.id }) {
+                pendingQuestions[existing] = question
+            } else if questionAnswers[question.id] == nil {
+                pendingQuestions.append(question)
+            }
             status = .awaitingInput
 
         case .usage(let report):
@@ -500,7 +524,15 @@ final class ChatState {
     /// the set that used to leave a tab working on something invisible.
     func applyPromptSubmission(_ submission: PromptSubmission) {
         let id = Self.promptRowID(submission.submissionID)
-        guard !rows.contains(where: { $0.id == id }) else { return }
+        if rows.contains(where: { $0.id == id }) {
+            // The engine re-announces a queued prompt when the queue lets it
+            // through, carrying the id it was queued under. That echo is the
+            // only thing that says *which* message was dispatched — position
+            // is not it, because the user can edit and delete queued
+            // messages in any order.
+            if !submission.isQueued { claimQueuedRow(id: id) }
+            return
+        }
         appendUserMessage(
             submission.text,
             attachments: submission.attachments,
@@ -512,13 +544,81 @@ final class ChatState {
     }
 
     /// A queued row becomes a real one when the turn it was waiting for starts.
+    ///
+    /// The row moves to the end rather than being flipped in place. It was
+    /// appended when the user pressed send, but the turn that was already
+    /// running kept streaming after that — so by the time the queued message
+    /// is actually dispatched, its original position is somewhere in the
+    /// middle of the previous response. Leaving it there made a just-sent
+    /// message appear *above* the tail of the reply it was waiting on, which
+    /// reads as the agent answering before it was asked.
+    ///
+    /// While queued the row is grouped into "Queued messages" and its
+    /// position does not show, which is why this only became visible at the
+    /// moment it went inline.
     private func claimOldestPendingRow(turnID: TurnID) {
-        guard let index = rows.firstIndex(where: { $0.isQueued }) else { return }
-        mutateRow(at: index) { row in
-            row.isQueued = false
-            row.turnID = turnID
+        // The dispatched message named itself. Anything else still queued is
+        // waiting for a later turn, and taking the oldest one instead is how
+        // a deleted or reordered queue left the wrong row marked as sent.
+        if let claimed = dispatchedRowID {
+            dispatchedRowID = nil
+            if let index = rows.firstIndex(where: { $0.id == claimed }) {
+                mutateRow(at: index) { $0.turnID = turnID }
+                refreshRevertableTurns()
+                return
+            }
         }
+        // Rows queued before submission ids existed have nothing to match on.
+        guard let index = rows.firstIndex(where: { $0.isQueued }) else { return }
+        unqueue(at: index, turnID: turnID)
+    }
+
+    /// The prompt the engine says it just dispatched, taken out of the queue
+    /// group and moved to the end of the transcript.
+    private func claimQueuedRow(id: String) {
+        guard let index = rows.firstIndex(where: { $0.id == id }), rows[index].isQueued else {
+            return
+        }
+        unqueue(at: index, turnID: nil)
+        dispatchedRowID = id
+    }
+
+    private func unqueue(at index: Int, turnID: TurnID?) {
+        var row = rows.remove(at: index)
+        row.isQueued = false
+        if let turnID { row.turnID = turnID }
+        // Same bookkeeping `mutateRow` does; the row is re-inserted rather
+        // than mutated so SwiftUI still sees the content change.
+        row.contentRevision &+= 1
+        rows.append(row)
         refreshRevertableTurns()
+    }
+
+    /// A queued message the user rewrote. The transcript row is the same
+    /// message, so it has to say the same thing the agent will be given.
+    func updateQueuedRow(submissionID: String, text: String) {
+        let id = Self.promptRowID(submissionID)
+        guard let index = rows.firstIndex(where: { $0.id == id }), rows[index].isQueued else {
+            return
+        }
+        mutateRow(at: index) { $0.text = text }
+    }
+
+    /// A queued message the user deleted. Leaving the row behind is worse
+    /// than removing it: it stays marked "queued" forever, and the next turn
+    /// to start would claim it as the message that was sent.
+    func removeQueuedRow(submissionID: String) {
+        let id = Self.promptRowID(submissionID)
+        guard let index = rows.firstIndex(where: { $0.id == id }), rows[index].isQueued else {
+            return
+        }
+        rows.remove(at: index)
+        if dispatchedRowID == id { dispatchedRowID = nil }
+        refreshRevertableTurns()
+    }
+
+    func replaceDraftComments(_ comments: [DiffCommentReference]) {
+        draftComments = comments
     }
 
     func addDraftComment(_ reference: DiffCommentReference) {
@@ -622,8 +722,41 @@ final class ChatState {
         return true
     }
 
+    /// Takes a question off the list and remembers what was said, without
+    /// yet telling the agent — a sibling on the same tool call may still be
+    /// waiting, and they share one reply.
+    func recordAnswer(_ answer: String, for id: QuestionID) {
+        questionAnswers[id] = answer
+        pendingQuestions.removeAll { $0.id == id }
+        resumeTurnAfterInput()
+    }
+
+    /// Everything still unanswered from the same tool call as `question`.
+    ///
+    /// A question with no tool call id stands alone: grouping those together
+    /// would pair questions from unrelated calls purely because neither side
+    /// reported an id.
+    func unansweredSiblings(of question: AgentQuestion) -> [AgentQuestion] {
+        guard let toolCallID = question.toolCallID else { return [] }
+        return pendingQuestions.filter { $0.toolCallID == toolCallID && $0.id != question.id }
+    }
+
+    func questions(inToolCall toolCallID: ToolCallID?) -> [AgentQuestion] {
+        guard let toolCallID else { return [] }
+        return pendingQuestions.filter { $0.toolCallID == toolCallID }
+    }
+
+    /// Called once the group's reply has gone back through the gate.
+    func clearQuestions(_ ids: [QuestionID]) {
+        let set = Set(ids)
+        pendingQuestions.removeAll { set.contains($0.id) }
+        for id in set { questionAnswers.removeValue(forKey: id) }
+        resumeTurnAfterInput()
+    }
+
     func resolveQuestion(_ id: QuestionID) {
-        if pendingQuestion?.id == id { pendingQuestion = nil }
+        pendingQuestions.removeAll { $0.id == id }
+        questionAnswers.removeValue(forKey: id)
         resumeTurnAfterInput()
     }
 

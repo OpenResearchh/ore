@@ -1,7 +1,9 @@
 import AppKit
 import OreCore
+import OreGit
 import OrePersistence
 import OreProtocol
+import OreTelemetry
 import SwiftUI
 import UserNotifications
 
@@ -21,24 +23,56 @@ struct OreMacApp: App {
     @AppStorage("ore.showsReview") private var showsReview = true
 
     init() {
+        // Before anything reads a preference, so "never set" and "set to the
+        // default" are the same value everywhere rather than each caller
+        // guessing. Notably the routine-approval switch, which defaults off.
+        AppModel.registerDefaults()
+        TelemetryConsent.registerDefaults()
+
+        // Anonymous usage analytics, built first so a launch is still counted
+        // when the store below fails to open — that failure is exactly the
+        // thing worth knowing about.
+        //
+        // `make` returns a no-op for debug builds, for any build with no key
+        // stamped into Info.plist (every contributor's, and every fork's),
+        // when ORE_TELEMETRY=0, and when the user has opted out — which it
+        // checks itself, synchronously, before returning a recording client,
+        // so the two calls below cannot beat consent to the queue. Silence is
+        // the default, and nothing downstream needs to know it might be off.
+        // See PRIVACY.md.
+        let telemetry = TelemetryClient.make(home: OreHome.directory)
+        let recorder = telemetry.recorder
+        if let facts = telemetry.launch {
+            if facts.isNewInstall {
+                recorder.record(.appInstalled(channel: facts.channel))
+            }
+            recorder.record(.appLaunched(reason: .cold, daysSinceInstall: facts.daysSinceInstall))
+        }
+
         // The store and the core are created before the first window exists, so
         // a broken database surfaces as a message rather than a blank window.
         let created: AppModel
         do {
             let store = try OreStore(path: OreStore.defaultURL)
-            created = AppModel(client: InProcessCoreClient(
-                store: store,
-                harnessRegistry: .standard(
-                    cursorAllowUnprompted: UserDefaults.standard.bool(
-                        forKey: "ore.cursorAllowUnprompted"
-                    )
+            created = AppModel(
+                client: InProcessCoreClient(
+                    store: store,
+                    harnessRegistry: .standard(
+                        cursorAllowUnprompted: UserDefaults.standard.bool(
+                            forKey: "ore.cursorAllowUnprompted"
+                        )
+                    ),
+                    allowAPIKeyFallback: UserDefaults.standard.bool(forKey: "ore.apiKeyFallback")
                 ),
-                allowAPIKeyFallback: UserDefaults.standard.bool(forKey: "ore.apiKeyFallback")
-            ))
+                telemetry: recorder
+            )
         } catch {
-            created = AppModel(client: InProcessCoreClient(
-                store: try! OreStore(), harnessRegistry: .standard()
-            ))
+            created = AppModel(
+                client: InProcessCoreClient(
+                    store: try! OreStore(), harnessRegistry: .standard()
+                ),
+                telemetry: recorder
+            )
             _launchFailure = State(initialValue: String(describing: error))
         }
         _model = State(initialValue: created)
@@ -313,6 +347,27 @@ struct RootView: View {
     /// The presence strip's usage card (limits, tokens, spend).
     @State private var showsUsagePopover = false
 
+    // Onboarding signals that are not already on the model. Both start nil
+    // meaning "not checked", which `Readiness` treats as "say nothing yet"
+    // rather than "missing".
+    @State private var githubStatus: GitHubClient.Status?
+    @State private var hasGitIdentity: Bool?
+
+    /// What the user still needs before ORE is useful to them. Recomputed
+    /// from live state rather than cached, so the card also reflects things
+    /// breaking later — an agent signing itself out months from now shows up
+    /// here without any extra plumbing.
+    private var readiness: Readiness {
+        Readiness.evaluate(
+            harnesses: model.harnesses,
+            hasProbedHarnesses: model.hasProbedHarnesses,
+            repositoryCount: model.repositories.count,
+            workspaceCount: model.workspaces.count,
+            github: githubStatus,
+            hasGitIdentity: hasGitIdentity
+        )
+    }
+
     private var bottomPane: BottomPane {
         get { BottomPane(rawValue: bottomPaneRaw) ?? .none }
         nonmutating set { bottomPaneRaw = newValue.rawValue }
@@ -340,6 +395,10 @@ struct RootView: View {
                 // read as glass instead of a grid of white rectangles.
                 .background {
                     ZStack {
+                        // Full screen deliberately falls back to this calm,
+                        // opaque reading surface; the visual-effect view hides
+                        // while the window owns the display.
+                        OreTheme.Surface.content
                         OreWindowGlassBase()
                         // Smoke in the glass: a bright wallpaper region (a
                         // nebula core, a sunlit photo) otherwise backlights
@@ -684,9 +743,8 @@ struct RootView: View {
             }
             .help("Agent usage and limits")
 
-            Text("⌥⌘T")
-                .font(.system(size: OreTheme.Font.caption, design: .rounded))
-                .foregroundStyle(.tertiary)
+            Rectangle().fill(OreTheme.hairline).frame(width: 1, height: 16)
+            openInTools(workspace)
         }
         .padding(.horizontal, OreTheme.Space.md)
         .frame(height: OreTheme.RowHeight.bar)
@@ -696,6 +754,60 @@ struct RootView: View {
         .oreGlassSurface(.capsule, elevation: .inset)
         .padding(.horizontal, OreTheme.Space.md)
         .padding(.vertical, OreTheme.Space.xs + 2)
+    }
+
+    /// Hand-off to the tools outside ORE, at the foot of the window where the
+    /// other workspace-scoped controls already live.
+    ///
+    /// A worktree is a real directory, and the honest answer to "what
+    /// actually changed" is sometimes Finder or a full editor. Before this,
+    /// getting there meant reconstructing the path by hand — the worktree
+    /// lives under `~/ore/workspaces/<repo>/<slug>`, which nobody is going to
+    /// type.
+    @ViewBuilder
+    private func openInTools(_ workspace: WorkspaceSummary) -> some View {
+        Button {
+            ExternalTools.revealInFinder(workspace.worktreePath)
+        } label: {
+            // Finder's own icon, asked of the system. `folder` is the symbol
+            // every *other* folder in ORE uses, so it said "a directory"
+            // rather than "Finder" — and sat beside a Cursor button showing
+            // its real logo, which made the row look half-finished.
+            AppMark(target: .finder, size: 16)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("f", modifiers: [.command, .option])
+        .help("Open this worktree in Finder (⌥⌘F)")
+
+        // A real Terminal window, not ORE's pane: the pane dies with the tab,
+        // and a long build or an interactive rebase wants to outlive it.
+        Button {
+            ExternalTools.openInTerminal(workspace.worktreePath)
+        } label: {
+            AppMark(target: .terminal, size: 16)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("t", modifiers: [.command, .option, .shift])
+        .help("Open this worktree in Terminal (⇧⌥⌘T)")
+
+        CopyPathButton(path: workspace.worktreePath)
+
+        // Only when Cursor is actually installed. A button that opens
+        // nothing, or worse offers to install something, is worse than no
+        // button — and most users will never have it.
+        if ExternalTools.isCursorInstalled {
+            Button {
+                ExternalTools.openInCursor(workspace.worktreePath)
+            } label: {
+                // The real Cursor mark, which already ships in the bundle for
+                // the cursor-agent harness. A generic SF Symbol here would
+                // read as "some editor" rather than naming the one it opens.
+                HarnessMark(harness: .cursorAgent, size: 15)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("e", modifiers: [.command, .option])
+            .help("Open this worktree in Cursor (⌥⌘E)")
+        }
     }
 
     private func dockTerminalTab(_ tab: TerminalTab, in workspace: WorkspaceSummary) -> some View {
@@ -722,10 +834,8 @@ struct RootView: View {
 
     private var welcome: some View {
         VStack(spacing: OreTheme.Space.md) {
-            Image(systemName: "square.stack.3d.up.fill")
-                .font(.system(size: 44, weight: .medium))
-                .foregroundStyle(Color.accentColor.gradient)
-                .symbolEffect(.pulse, options: .nonRepeating)
+            OreAppIcon(size: 72)
+                .shadow(color: .black.opacity(0.25), radius: 16, y: 8)
             Text("Build in parallel.")
                 .font(.system(size: 32, weight: .semibold))
             Text("Run several coding agents in parallel, each in its own git worktree.")
@@ -733,18 +843,35 @@ struct RootView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            Button("New Workspace…") { isShowingNewWorkspace = true }
-                .buttonStyle(OrePrimaryButtonStyle())
-                .keyboardShortcut("n", modifiers: .command)
-                .padding(.top, OreTheme.Space.sm)
-
-            if !model.harnesses.isEmpty {
-                HarnessStatusList(harnesses: model.harnesses)
-                    .padding(.top, OreTheme.Space.md)
+            // The primary action is only the primary action once the user
+            // can actually use it. With no agent installed, "New Workspace…"
+            // leads to a sheet that cannot produce working work, so the
+            // next-step card takes the lead instead.
+            if readiness.isReady {
+                Button("New Workspace…") { isShowingNewWorkspace = true }
+                    .buttonStyle(OrePrimaryButtonStyle())
+                    .keyboardShortcut("n", modifiers: .command)
+                    .padding(.top, OreTheme.Space.sm)
             }
+
+            NextStepCard(
+                readiness: readiness,
+                onAddProject: { isShowingNewWorkspace = true },
+                onNewWorkspace: { isShowingNewWorkspace = true }
+            )
+            .padding(.top, OreTheme.Space.md)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(OreTheme.Space.xl)
+        // Probed here rather than at launch: both shell out, and the only
+        // place the answers are used is this screen. A user who already has
+        // workspaces never pays for them.
+        .task {
+            async let github = model.githubStatus()
+            async let git = Readiness.probeGitIdentity()
+            githubStatus = await github
+            hasGitIdentity = await git
+        }
         // No fill: the welcome floats directly on the window's glass base.
     }
 

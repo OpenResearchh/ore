@@ -3,35 +3,14 @@
 #
 #   ./Scripts/make-dmg.sh [debug|release]   → .build/ORE-<version>.dmg
 #
-# The bundle is ad-hoc signed (see bundle.sh), so on another Mac Gatekeeper will
-# ask the user to right-click → Open the first time. Notarization belongs in a
-# real release pipeline with credentials.
+# Kept for muscle memory. make-artifacts.sh does the real work and also emits
+# the zip and SHA256SUMS that install.sh and the Homebrew cask need; there is
+# no reason to build the app twice to get one of its outputs.
+#
+# The bundle is ad-hoc signed (see bundle.sh), so on another Mac Gatekeeper
+# blocks the DMG path until the user goes to System Settings → Privacy &
+# Security → "Open Anyway". Installing via install.sh skips that entirely.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIGURATION="${1:-release}"
-
-"$ROOT/Scripts/bundle.sh" "$CONFIGURATION"
-
-APP="$ROOT/.build/ORE.app"
-VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo "0.1.0")"
-DMG="$ROOT/.build/ORE-$VERSION.dmg"
-
-STAGE_ROOT="$(mktemp -d)"
-STAGE="$STAGE_ROOT/ORE"
-mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/ORE.app"
-ln -s /Applications "$STAGE/Applications"
-
-rm -f "$DMG"
-hdiutil create \
-  -volname "ORE" \
-  -srcfolder "$STAGE" \
-  -fs HFS+ \
-  -format UDZO \
-  -ov \
-  "$DMG" >/dev/null
-
-rm -rf "$STAGE_ROOT"
-echo "Wrote $DMG"
-echo "Open it, then drag ORE onto Applications."
+exec "$ROOT/Scripts/make-artifacts.sh" "${1:-release}"

@@ -21,6 +21,12 @@ final class AssistantVoiceHUD {
     final class DisplayState {
         var showsVoiceRow = false
         var showsActions = false
+        /// The ask the panel was sized for — and the only one the card may
+        /// draw. The view used to re-derive this from the model, which is how
+        /// ✕ came to do nothing: dismissing hides an ask from `evaluate()`'s
+        /// choice, but the card kept rendering the newest ask regardless, so
+        /// with a second one pending behind it the same card stayed put.
+        var item: TabNeedsYou?
     }
 
     private var panel: NSPanel?
@@ -85,7 +91,7 @@ final class AssistantVoiceHUD {
     /// the user is somewhere else or mid voice session.
     private var actionableNeedsYou: TabNeedsYou? {
         guard let model,
-              let item = model.tabNeedsYou.last(where: { !dismissedNeedsYouIDs.contains($0.id) })
+              let item = HUDCardChoice.next(from: model.tabNeedsYou, dismissed: dismissedNeedsYouIDs)
         else { return nil }
         let voiceActive = (controller?.phase ?? .idle) != .idle
         guard voiceActive || !NSApp.isActive else { return nil }
@@ -93,11 +99,20 @@ final class AssistantVoiceHUD {
     }
 
     private func evaluate() {
+        // A dismissal only outlives the ask it was aimed at. Keeping ids for
+        // asks that have since been answered would silently pre-dismiss a
+        // later card that happened to reuse one — and grow forever.
+        if let model {
+            dismissedNeedsYouIDs = HUDCardChoice.pruned(
+                dismissedNeedsYouIDs, against: model.tabNeedsYou
+            )
+        }
         let voiceActive = (controller?.phase ?? .idle) != .idle
         let actionable = actionableNeedsYou
         let actions = actionable != nil
         display.showsVoiceRow = voiceActive
         display.showsActions = actions
+        display.item = actionable
         guard voiceActive || actions else {
             hide()
             return
@@ -245,6 +260,27 @@ private struct HUDGlassBackdrop: NSViewRepresentable {
     }
 }
 
+/// Which pending ask the floating card shows, and how long a ✕ lasts.
+///
+/// ✕ is "not now, on this surface" rather than an answer: the ask stays
+/// pending in the app and the menu bar, and the HUD moves on to whatever else
+/// is waiting. Both halves live here so the panel and the card it draws can
+/// only ever agree about which ask is on screen.
+enum HUDCardChoice {
+    /// The newest ask the user hasn't waved away, or `nil` when they have
+    /// dealt with — or dismissed — all of them.
+    static func next(from items: [TabNeedsYou], dismissed: Set<String>) -> TabNeedsYou? {
+        items.last { !dismissed.contains($0.id) }
+    }
+
+    /// A dismissal only outlives the ask it was aimed at. Keeping ids for asks
+    /// that have since been answered would grow without bound, and would
+    /// silently pre-dismiss any later card that reused one.
+    static func pruned(_ dismissed: Set<String>, against items: [TabNeedsYou]) -> Set<String> {
+        dismissed.intersection(Set(items.map(\.id)))
+    }
+}
+
 private struct AssistantHUDView: View {
     var controller: VoiceAssistantController
     var model: AppModel?
@@ -275,10 +311,13 @@ private struct AssistantHUDView: View {
             if display.showsVoiceRow {
                 voicePill
             }
-            if display.showsActions, let model, let item = model.tabNeedsYou.last {
+            // `display.item`, not `model.tabNeedsYou.last`: the panel already
+            // chose which ask to show and sized itself for it.
+            if display.showsActions, let model, let item = display.item {
                 NeedsYouActionCard(item: item, model: model) {
                     AssistantVoiceHUD.shared.dismissNeedsYouCard(item.id)
                 }
+                .id(item.id)
             }
         }
     }
@@ -366,7 +405,13 @@ private struct AssistantHUDView: View {
         case .listening: "Listening…"
         case .answering: controller.answerPlaceholder
         case .thinking: "Thinking…"
-        case .speaking: "Speaking…"
+        // Shown only while nothing has been voiced yet — the transcript
+        // replaces it the moment a word is audible, because progress is
+        // counted from samples actually played. That gap is the voice
+        // rendering the line: a lead-in pause, the model's first inference and
+        // a pre-roll cushion that grows on a loaded machine. Calling it
+        // "Speaking…" made a working synthesiser look like a wedged one.
+        case .speaking: "Preparing to speak…"
         case .idle: ""
         }
     }
@@ -387,23 +432,34 @@ private struct NeedsYouActionCard: View {
         Group {
             switch item {
             case .permission(let payload):
+                let content = PermissionPresentation(request: payload.request)
                 HStack(spacing: 10) {
                     Image(systemName: "hand.raised.fill")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(payload.request.displayName ?? payload.request.toolName)
+                        Text(content.action)
                             .font(.system(size: 13, weight: .semibold))
                             .lineLimit(1)
-                        if let summary = payload.request.summary, !summary.isEmpty {
-                            Text(summary)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                        // The command or path, not the agent's account of it —
+                        // the same act the in-app card shows.
+                        if let target = content.target {
+                            HStack(spacing: 6) {
+                                Text(target)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if let more = content.hiddenLineSummary {
+                                    Text(more)
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundStyle(.orange)
+                                }
+                            }
                         }
                     }
                     Spacer(minLength: 8)
-                    permissionButtons(payload)
+                    permissionButtons(payload, content: content)
                     dismissButton
                 }
                 .frame(width: 460 - 16, height: 56)
@@ -484,14 +540,29 @@ private struct NeedsYouActionCard: View {
     }
 
     @ViewBuilder
-    private func permissionButtons(_ payload: TabNeedsYou.Permission) -> some View {
-        Button("Allow") {
-            model.resolvePermission(
-                payload.request.id, decision: .allow,
-                for: payload.workspaceID, chatID: payload.chatID
-            )
+    private func permissionButtons(
+        _ payload: TabNeedsYou.Permission,
+        content: PermissionPresentation
+    ) -> some View {
+        // This card is one 460pt row. When the command does not fit in it,
+        // the only honest affordance is one that shows the rest — approving
+        // from here would be approving a prefix. Deny stays: refusing
+        // something you cannot read is never the unsafe direction.
+        if content.isAbbreviated {
+            Button("Review…") {
+                model.reveal(workspaceID: payload.workspaceID, chatID: payload.chatID)
+            }
+            .buttonStyle(HUDActionButtonStyle(prominent: true))
+            .help("The full command doesn't fit here — open ORE to read it before allowing")
+        } else {
+            Button("Allow") {
+                model.resolvePermission(
+                    payload.request.id, decision: .allow,
+                    for: payload.workspaceID, chatID: payload.chatID
+                )
+            }
+            .buttonStyle(HUDActionButtonStyle(prominent: true))
         }
-        .buttonStyle(HUDActionButtonStyle(prominent: true))
 
         Button("Deny") {
             model.resolvePermission(
@@ -502,7 +573,9 @@ private struct NeedsYouActionCard: View {
         }
         .buttonStyle(HUDActionButtonStyle())
 
-        if !payload.request.suggestions.isEmpty {
+        // A standing grant is a broader Allow. If the one-off cannot be
+        // approved from here, neither can the rule.
+        if !payload.request.suggestions.isEmpty, !content.isAbbreviated {
             Menu {
                 ForEach(
                     Array(payload.request.suggestions.enumerated()), id: \.offset
@@ -687,7 +760,9 @@ private struct InterruptHint: View {
 /// Five bars that breathe with the microphone while listening, ride a steady
 /// wave while the assistant speaks, and settle into a slow pulse while it
 /// works.
-private struct WaveformBars: View {
+/// Shared with the new-workspace composer, which listens the same way the
+/// assistant pill does and should look like it.
+struct WaveformBars: View {
     enum Mode: Equatable {
         /// 0…1 microphone loudness.
         case listening(Double)

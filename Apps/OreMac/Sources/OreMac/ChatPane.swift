@@ -517,8 +517,15 @@ struct ChatPane: View {
                     markdown: markdown,
                     comments: chat.draftComments,
                     paneHeight: paneHeight,
-                    onRemoveComment: { index in chat.removeDraftComment(at: index) },
-                    onClearComments: { chat.clearDraftComments() },
+                    commentOrigin: model.isReviewCommentInbox(planChatID, in: workspace.id)
+                        ? "Review"
+                        : nil,
+                    onRemoveComment: { index in
+                        model.removeDraftComment(at: index, from: planChatID, in: workspace.id)
+                    },
+                    onClearComments: {
+                        model.clearDraftComments(from: planChatID, in: workspace.id)
+                    },
                     onHandoff: {
                         model.handoffPlan(markdown, in: workspace.id)
                     },
@@ -547,11 +554,11 @@ struct ChatPane: View {
             }
 
             if !queuedMessages.isEmpty {
-                MessageQueueCard(messages: $queuedMessages) { id, text in
-                    await model.updateQueuedMessage(id, text: text)
-                } onDelete: { id in
-                    await model.deleteQueuedMessage(id)
-                    queuedMessages.removeAll { $0.id == id }
+                MessageQueueCard(messages: $queuedMessages) { record, text in
+                    await model.updateQueuedMessage(record, text: text)
+                } onDelete: { record in
+                    await model.deleteQueuedMessage(record)
+                    queuedMessages.removeAll { $0.id == record.id }
                 }
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .padding(.horizontal, OreTheme.Space.md)
@@ -560,8 +567,17 @@ struct ChatPane: View {
             if !chat.draftComments.isEmpty && !isReviewingPlan {
                 DraftCommentsBar(
                     comments: chat.draftComments,
-                    onRemove: { index in chat.removeDraftComment(at: index) },
-                    onClearAll: { chat.clearDraftComments() }
+                    origin: chatSummary.flatMap {
+                        model.isReviewCommentInbox($0.id, in: workspace.id) ? "Review" : nil
+                    },
+                    onRemove: { index in
+                        guard let chatID = chatSummary?.id else { return }
+                        model.removeDraftComment(at: index, from: chatID, in: workspace.id)
+                    },
+                    onClearAll: {
+                        guard let chatID = chatSummary?.id else { return }
+                        model.clearDraftComments(from: chatID, in: workspace.id)
+                    }
                 )
             }
 
@@ -606,23 +622,13 @@ struct ChatPane: View {
                     question: question,
                     harness: chatSummary?.harness ?? workspace.harness
                 ) { answer in
-                    // AskUserQuestion is a permission-gated tool: its result is
-                    // whatever we return through the can_use_tool reply. Allowing
-                    // it echoed the untouched input, so the agent saw an empty
-                    // "answered:" and the real answer (sent separately as a user
-                    // message) raced the still-open control request and was lost.
-                    // Deliver the answer *as* the tool result instead.
-                    if let permission = chat.pendingPermission,
-                       permission.toolCallID == question.toolCallID {
-                        model.answerQuestion(
-                            question.id,
-                            viaPermission: permission.id,
-                            answer: answer,
-                            for: workspace.id
-                        )
-                    } else {
-                        model.answerQuestion(question.id, answer: answer, for: workspace.id)
-                    }
+                    // `answerQuestion` decides whether this one has to travel
+                    // back through a permission reply — the same routing every
+                    // other answer surface gets.
+                    model.answerQuestion(
+                        question.id, answer: answer,
+                        for: workspace.id, chatID: chatSummary?.id
+                    )
                 }
                 .frame(maxWidth: OreTheme.contentMaxWidth)
                 .frame(maxWidth: .infinity)
@@ -3618,9 +3624,11 @@ private struct ShortcutCaption: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(title)
-            Text(keys)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .opacity(onPrimary ? 0.72 : 0.55)
+            if !keys.isEmpty {
+                Text(keys)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .opacity(onPrimary ? 0.72 : 0.55)
+            }
         }
     }
 }
@@ -4368,35 +4376,95 @@ private struct PermissionCard: View {
     let request: PermissionRequest
     let onDecision: (PermissionDecision) -> Void
     @FocusState private var allowFocused: Bool
+    /// Whether the user has asked to see a command too long for the card's
+    /// six lines. Until they have, Allow is not an informed answer.
+    @State private var isTargetExpanded = false
+
+    private static let collapsedLineLimit = 6
 
     var body: some View {
+        let content = PermissionPresentation(request: request)
+        let overflowing = Self.lineCount(content.target) > Self.collapsedLineLimit
+        let isHidingPart = overflowing && !isTargetExpanded
         VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
             HStack(spacing: 6) {
                 Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
-                Text(request.displayName ?? request.toolName).fontWeight(.semibold)
-                Spacer()
+                Text(content.action).fontWeight(.semibold)
+                Spacer(minLength: OreTheme.Space.sm)
+                if let tool = content.toolLabel {
+                    Text(tool)
+                        .font(.system(size: OreTheme.Font.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help("The tool the agent is asking to use")
+                }
             }
 
-            if let summary = request.summary, !summary.isEmpty {
-                Text(summary)
+            // The act itself — the command, the path, the URL. This is what is
+            // being approved, so it leads and it is never paraphrased.
+            if let target = content.target {
+                Text(target)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
-                    .lineLimit(6)
+                    .lineLimit(isTargetExpanded ? nil : Self.collapsedLineLimit)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(6)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+                if overflowing {
+                    // A tooltip would not do: the hidden tail of a command is
+                    // where `&& rm -rf` lives, and a benign first line is
+                    // exactly how a card gets approved without being read.
+                    Button {
+                        isTargetExpanded = true
+                        allowFocused = true
+                    } label: {
+                        Label(
+                            isTargetExpanded
+                                ? "Showing all \(Self.lineCount(target)) lines"
+                                : "+\(Self.lineCount(target) - Self.collapsedLineLimit) more lines — show the whole command",
+                            systemImage: isTargetExpanded ? "checkmark" : "chevron.down"
+                        )
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(isTargetExpanded ? .secondary : Color.orange)
+                    .disabled(isTargetExpanded)
+                }
             }
 
-            HStack(spacing: 8) {
+            // The agent's reason, under the act rather than instead of it.
+            if let detail = content.detail {
+                Text(detail)
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Allow and Deny get a row to themselves. A single "Always allow
+            // Bash(curl -s "http://…&max_results=…")" offer used to sit beside
+            // them at its full intrinsic width, which squeezed both buttons
+            // down to a few points of blue: the primary action, present but
+            // unreadable and effectively unclickable.
+            HStack(spacing: OreTheme.Space.sm) {
                 Button {
                     onDecision(.allow)
                 } label: {
-                    ShortcutCaption(title: "Allow", keys: "↩", onPrimary: true)
+                    ShortcutCaption(title: "Allow", keys: isHidingPart ? "" : "↩", onPrimary: true)
                 }
                     .buttonStyle(OrePrimaryButtonStyle())
-                    .keyboardShortcut(.defaultAction)
+                    // ↩ is muscle memory. Leaving it armed while part of the
+                    // command is off-screen turns a reflex into consent to
+                    // something unread.
+                    .modifier(DefaultActionShortcut(enabled: !isHidingPart))
                     .focused($allowFocused)
-                    .help("Allow this tool (↩). From the composer, ⇧⌘A.")
+                    .disabled(isHidingPart)
+                    .help(isHidingPart
+                        ? "Show the whole command before allowing it"
+                        : "Allow this tool once (↩). From the composer, ⇧⌘A.")
 
                 Button {
                     onDecision(.deny(reason: "The user denied this in ORE."))
@@ -4407,48 +4475,94 @@ private struct PermissionCard: View {
                 .keyboardShortcut(.cancelAction)
                 .help("Deny this tool (Esc). From the composer, ⇧⌘D.")
 
-                // Harness-suggested shortcuts, kept as raw payloads so what we
-                // send back is exactly what was offered. One suggestion reads
-                // inline at full width; several collapse into a menu — three
-                // side-by-side "Always allow B…" stubs told the user nothing.
-                if request.suggestions.count == 1, let only = request.suggestions.first {
-                    Button(only.title) { onDecision(.allowWithSuggestion(only.raw)) }
-                        .buttonStyle(.link)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .help(only.title)
-                } else if !request.suggestions.isEmpty {
-                    Menu {
-                        ForEach(Array(request.suggestions.enumerated()), id: \.offset) { _, suggestion in
-                            Button(suggestion.title) {
-                                onDecision(.allowWithSuggestion(suggestion.raw))
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text("Always allow")
-                                .font(.system(size: OreTheme.Font.body, weight: .medium))
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 8, weight: .semibold))
-                        }
-                        .padding(.horizontal, 12)
-                        .frame(minHeight: OreTheme.RowHeight.button)
-                        .background(OreTheme.subduedFill, in: Capsule())
-                        .overlay { Capsule().stroke(OreTheme.hairline) }
-                        .contentShape(Capsule())
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .help("Standing approvals offered by the agent — read each before granting")
-                }
-
-                Spacer()
+                Spacer(minLength: 0)
             }
+            .fixedSize(horizontal: false, vertical: true)
+
+            // Harness-suggested standing grants, kept as raw payloads so what
+            // we send back is exactly what was offered. They answer a different
+            // question from Allow — "and every time after this" — so they sit
+            // on their own line and can never crowd the once-only choice.
+            // Hidden while part of the command is, for the same reason Allow
+            // is: a standing rule is a broader yes than the one-off.
+            if !isHidingPart { grants(content.grants) }
         }
         .oreCard(padding: 12)
         .id(request.id)
         .onAppear { allowFocused = true }
+    }
+
+    private static func lineCount(_ text: String?) -> Int {
+        guard let text else { return 0 }
+        return text.components(separatedBy: .newlines).count
+    }
+
+    @ViewBuilder
+    private func grants(_ grants: [PermissionPresentation.Grant]) -> some View {
+        if grants.count == 1, let only = grants.first {
+            Button {
+                onDecision(.allowWithSuggestion(only.raw))
+            } label: {
+                // A scoped rule is the way out of answering the same question
+                // all afternoon, so it earns a chord. Mode switches change how
+                // every later tool is treated and stay click-only.
+                ShortcutCaption(title: only.label, keys: only.kind == .addRule ? "⇧↩" : "")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .buttonStyle(OreSecondaryButtonStyle())
+            .modifier(GrantShortcut(enabled: only.kind == .addRule))
+            .help(only.full)
+            .accessibilityLabel(only.full)
+        } else if !grants.isEmpty {
+            Menu {
+                ForEach(Array(grants.enumerated()), id: \.offset) { _, grant in
+                    Button(grant.full) { onDecision(.allowWithSuggestion(grant.raw)) }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text("Always allow…")
+                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .padding(.horizontal, 12)
+                .frame(minHeight: OreTheme.RowHeight.button)
+                .background(OreTheme.subduedFill, in: Capsule())
+                .overlay { Capsule().stroke(OreTheme.hairline) }
+                .contentShape(Capsule())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Standing approvals offered by the agent — read each before granting")
+        }
+    }
+}
+
+/// ⇧↩ on the standing-grant button, only where granting one is a scoped rule.
+/// Arms ↩ only when pressing it would be an informed answer.
+private struct DefaultActionShortcut: ViewModifier {
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.keyboardShortcut(.defaultAction)
+        } else {
+            content
+        }
+    }
+}
+
+private struct GrantShortcut: ViewModifier {
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.keyboardShortcut(.return, modifiers: .shift)
+        } else {
+            content
+        }
     }
 }
 
@@ -4456,6 +4570,7 @@ private struct PlanApprovalCard: View {
     let markdown: String
     let comments: [DiffCommentReference]
     let paneHeight: CGFloat
+    var commentOrigin: String? = nil
     let onRemoveComment: (Int) -> Void
     let onClearComments: () -> Void
     let onHandoff: () -> Void
@@ -4495,6 +4610,7 @@ private struct PlanApprovalCard: View {
 
                     DraftCommentsBar(
                         comments: comments,
+                        origin: commentOrigin,
                         horizontalPadding: 0,
                         onRemove: onRemoveComment,
                         onClearAll: onClearComments
@@ -4558,8 +4674,8 @@ private struct PlanApprovalCard: View {
 
 private struct MessageQueueCard: View {
     @Binding var messages: [QueuedMessageRecord]
-    let onSave: (Int64, String) async -> Void
-    let onDelete: (Int64) async -> Void
+    let onSave: (QueuedMessageRecord, String) async -> Void
+    let onDelete: (QueuedMessageRecord) async -> Void
 
     var body: some View {
         DisclosureGroup("Queued messages (\(messages.count))") {
@@ -4568,12 +4684,12 @@ private struct MessageQueueCard: View {
                     HStack {
                         TextField("Queued message", text: $messages[index].text)
                             .onSubmit {
-                                guard let id = messages[index].id else { return }
-                                Task { await onSave(id, messages[index].text) }
+                                let record = messages[index]
+                                Task { await onSave(record, record.text) }
                             }
                         Button(role: .destructive) {
-                            guard let id = messages[index].id else { return }
-                            Task { await onDelete(id) }
+                            let record = messages[index]
+                            Task { await onDelete(record) }
                         } label: { Image(systemName: "trash") }
                         .buttonStyle(.plain)
                     }
@@ -4890,6 +5006,7 @@ private struct BusyTabDot: View {
 /// Comments left on the diff, waiting to go out with the next message.
 private struct DraftCommentsBar: View {
     let comments: [DiffCommentReference]
+    var origin: String? = nil
     var horizontalPadding: CGFloat = OreTheme.Space.md
     let onRemove: (Int) -> Void
     let onClearAll: () -> Void
@@ -4897,6 +5014,12 @@ private struct DraftCommentsBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
+                if let origin {
+                    Text(origin)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .help("These comments were posted by the \(origin) button on this tab")
+                }
                 ForEach(Array(comments.enumerated()), id: \.offset) { index, comment in
                     HStack(spacing: 4) {
                         Text("\((comment.filePath as NSString).lastPathComponent):\(comment.startLine)")
@@ -4920,7 +5043,7 @@ private struct DraftCommentsBar: View {
                     Button("Clear all", action: onClearAll)
                         .buttonStyle(.link)
                         .font(.caption2)
-                        .help("Remove every pending comment")
+                        .help("Remove every pending comment from this tab")
                 }
             }
             .padding(.horizontal, horizontalPadding)

@@ -46,9 +46,9 @@ public struct SessionConfiguration: Sendable {
     public var allowedTools: [String]
     /// Tool patterns the harness must refuse outright when it supports a
     /// static deny list (Claude Code's `--disallowedTools`). Used for the
-    /// assistant, whose job is to route work to project agents — a prompt
-    /// asking it not to run `git` is a suggestion, a missing `Bash` tool is a
-    /// fact.
+    /// assistant, whose job is to route project changes to project agents.
+    /// It retains a terminal for lightweight inspection and GitHub context,
+    /// while direct file and editor tools stay unavailable.
     public var disallowedTools: [String]
 
     public init(

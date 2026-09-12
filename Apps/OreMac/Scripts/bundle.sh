@@ -7,9 +7,19 @@
 #
 #   ./Scripts/bundle.sh [debug|release]   → .build/ORE.app
 #
-# Signing and notarization are not done here — that belongs in a release
-# pipeline with real credentials. This produces an ad-hoc signed bundle, which
-# is enough to run locally.
+# This is the *only* place a bundle is assembled. The signed release route and
+# the ad-hoc one used to build their own, differently, and the two drifted:
+# one stamped the version, the other didn't; one copied the icon, the other
+# didn't. Everything downstream — notarization, the zip, the dmg — now starts
+# from what this produces, so the two routes can only differ in the signature.
+#
+# Environment:
+#   ORE_VERSION            stamped into CFBundleShortVersionString
+#   ORE_SIGNING_IDENTITY   a Developer ID; enables hardened runtime + timestamp
+#   ORE_POSTHOG_KEY        analytics key, stamped into release builds only
+#
+# Notarization is not done here — that needs credentials and a network round
+# trip, and belongs in release.sh.
 set -euo pipefail
 
 CONFIGURATION="${1:-debug}"
@@ -46,6 +56,33 @@ if [[ "$CONFIGURATION" == "debug" ]]; then
     -c "Set :CFBundleIdentifier dev.ore.OreMac.debug" \
     -c "Set :CFBundleName ORE Dev" \
     "$APP/Contents/Info.plist"
+fi
+
+# The version is stamped rather than read back out of the checked-in plist, so
+# a release cannot disagree with the tag it was cut for.
+if [[ -n "${ORE_VERSION:-}" ]]; then
+  /usr/bin/plutil -replace CFBundleShortVersionString -string "$ORE_VERSION" "$APP/Contents/Info.plist"
+  /usr/bin/plutil -replace CFBundleVersion -string "$(date +%Y%m%d%H%M)" "$APP/Contents/Info.plist"
+fi
+if [[ -n "${ORE_APPCAST_URL:-}" ]]; then
+  /usr/bin/plutil -replace SUFeedURL -string "$ORE_APPCAST_URL" "$APP/Contents/Info.plist"
+fi
+
+# Build-time configuration.
+#
+# The PostHog project key is public-by-design — it can only write events — but
+# it is still kept out of the repository and stamped only into release builds.
+# Both halves of that matter now the source is public: a contributor building
+# from a clean clone must not report into our project, and neither must a
+# fork. With the key absent the telemetry client returns a no-op, so silence
+# is the default for everyone who is not us. See PRIVACY.md.
+if [[ "$CONFIGURATION" == "release" && -n "${ORE_POSTHOG_KEY:-}" ]]; then
+  /usr/libexec/PlistBuddy \
+    -c "Add :OREPostHogKey string ${ORE_POSTHOG_KEY}" "$APP/Contents/Info.plist"
+  if [[ -n "${ORE_POSTHOG_ENDPOINT:-}" ]]; then
+    /usr/libexec/PlistBuddy \
+      -c "Add :OREPostHogEndpoint string ${ORE_POSTHOG_ENDPOINT}" "$APP/Contents/Info.plist"
+  fi
 fi
 
 # App icon (referenced by CFBundleIconFile). Regenerate from the SVG on demand
@@ -93,22 +130,69 @@ fi
 # better than ad-hoc on anyone else's Mac — it only makes the Gatekeeper
 # refusal less recognizable — and real signing belongs in a pipeline with
 # Developer ID credentials.
+#
+# `ORE_SIGNING_IDENTITY` is the same variable release.sh uses, so flipping the
+# whole pipeline onto a Developer ID really is one export. `ORE_SIGN_IDENTITY`
+# (no -ING) was the old name here and stays as a deprecated alias; having two
+# names one letter apart for the same thing was a trap.
 DEV_IDENTITY="ORE Development"
 IDENTITY="-"
-if [[ -n "${ORE_SIGN_IDENTITY:-}" ]]; then
-  IDENTITY="$ORE_SIGN_IDENTITY"
+if [[ -n "${ORE_SIGNING_IDENTITY:-${ORE_SIGN_IDENTITY:-}}" ]]; then
+  IDENTITY="${ORE_SIGNING_IDENTITY:-$ORE_SIGN_IDENTITY}"
 elif [[ "$CONFIGURATION" == "debug" ]] &&
      security find-identity -v -p codesigning 2>/dev/null | grep -qF "$DEV_IDENTITY"; then
   IDENTITY="$DEV_IDENTITY"
 fi
 
-if codesign --force --sign "$IDENTITY" \
-     --entitlements "$ROOT/Resources/ORE.entitlements" "$APP" >/dev/null 2>&1; then
-  [[ "$IDENTITY" == "-" ]] \
-    && echo "Signed ad-hoc — granted permissions will not survive the next build." \
-    || echo "Signed with '$IDENTITY'."
-else
+# Nothing may be added to or changed inside the bundle below this line. Every
+# write after the signature — a resource, an rpath, an Info.plist key — breaks
+# the seal, and the failure surfaces on the user's Mac as "damaged and can't
+# be opened", not here.
+sign() {
+  local target="$1"
+  shift
+  codesign --force --sign "$IDENTITY" "$@" "$target"
+}
+
+SIGN_OPTIONS=()
+# The hardened runtime is required for notarization, and a timestamp is what
+# keeps the signature valid after the certificate expires. Neither is possible
+# ad-hoc.
+if [[ "$IDENTITY" != "-" ]]; then
+  SIGN_OPTIONS=(--options runtime --timestamp)
+fi
+
+signing_failed=0
+{
+  # Inside out: nested code signs first, the outermost bundle last.
+  if [[ -d "$APP/Contents/Frameworks" ]]; then
+    while IFS= read -r -d '' nested; do
+      sign "$nested" "${SIGN_OPTIONS[@]}"
+    done < <(find "$APP/Contents/Frameworks" \
+      \( -name '*.xpc' -o -name 'Autoupdate' -o -name 'Updater.app' \) -print0)
+    for framework in "$APP/Contents/Frameworks"/*.framework; do
+      [[ -d "$framework" ]] || continue
+      sign "$framework" "${SIGN_OPTIONS[@]}"
+    done
+  fi
+  sign "$APP/Contents/MacOS/ore-cli" "${SIGN_OPTIONS[@]}"
+  sign "$APP" "${SIGN_OPTIONS[@]}" --entitlements "$ROOT/Resources/ORE.entitlements"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+} || signing_failed=1
+
+if [[ "$signing_failed" -eq 1 ]]; then
+  # A debug build that will not sign still runs, and saying so beats stopping
+  # someone's afternoon. A release that will not sign is not a release: it is
+  # an artifact that fails on every Mac but the one that built it.
+  if [[ "$CONFIGURATION" == "release" ]]; then
+    echo "error: signing or verification failed — refusing to produce a release bundle." >&2
+    exit 1
+  fi
   echo "note: could not sign the bundle; it will still run."
+elif [[ "$IDENTITY" == "-" ]]; then
+  echo "Signed ad-hoc — granted permissions will not survive the next build."
+else
+  echo "Signed with '$IDENTITY' and verified."
 fi
 
 echo "Built $APP"

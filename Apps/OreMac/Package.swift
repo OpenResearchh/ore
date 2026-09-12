@@ -38,6 +38,10 @@ let package = Package(
                 .product(name: "OreCore", package: "OreKit"),
                 .product(name: "OreGit", package: "OreKit"),
                 .product(name: "OreProtocol", package: "OreKit"),
+                // Anonymous usage analytics. The app is the only thing that
+                // links this: nothing inside OreKit depends on it, which is
+                // what makes it impossible for the headless core to report.
+                .product(name: "OreTelemetry", package: "OreKit"),
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
                 .product(name: "TreeSitterJSON", package: "tree-sitter-json"),
@@ -58,6 +62,7 @@ let package = Package(
             dependencies: [
                 "OreMac",
                 .product(name: "OreProtocol", package: "OreKit"),
+                .product(name: "OreTelemetry", package: "OreKit"),
             ]
         ),
     ],

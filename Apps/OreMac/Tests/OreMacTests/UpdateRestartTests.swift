@@ -84,7 +84,116 @@ struct UpdateRestartTests {
         #expect(script.contains("/bin/kill -KILL"))
         // The unbounded `while kill -0` is what held the swap hostage.
         #expect(!script.contains("while /bin/kill -0 4242"))
-        #expect(script.contains("/usr/bin/open '/Applications/ORE.app'"))
+        #expect(script.contains("/usr/bin/open \"$DST\""))
+    }
+
+    /// The installed app is never removed to make room for the new one.
+    ///
+    /// This is an ordering test on purpose: the old script's first act after
+    /// the app quit was `rm -rf` on the bundle it was replacing, so anything
+    /// that went wrong afterwards left the Mac with no ORE.
+    @Test func theSwapScriptNeverDeletesTheAppItIsReplacing() {
+        let script = swapScript()
+
+        #expect(!script.contains("/bin/rm -rf \"$DST\""))
+        #expect(!script.contains("/bin/rm -rf '/Applications/ORE.app'"))
+        // Copy, then check, then swap — in that order.
+        let copy = try? #require(script.range(of: "ditto \"$SRC\" \"$INCOMING\""))
+        let verify = try? #require(script.range(of: "codesign --verify"))
+        let swap = try? #require(script.range(of: "mv \"$INCOMING\" \"$DST\""))
+        if let copy, let verify, let swap {
+            #expect(copy.upperBound < verify.lowerBound)
+            #expect(verify.upperBound < swap.lowerBound)
+        }
+        #expect(script.contains("mv \"$DST\" \"$PREVIOUS\""), "the old app is kept, not deleted")
+    }
+
+    // MARK: - Running the real swap
+
+    /// Runs the generated script for real, with `open` stubbed out so a
+    /// throwaway bundle is never handed to Launch Services. Everything else —
+    /// ditto, codesign, the move, the rollback — is the real thing.
+    private func runSwap(
+        newApp: URL,
+        destination: URL,
+        logPath: String
+    ) throws -> Int32 {
+        var script = GitHubUpdater.relaunchScript(
+            // A pid we cannot signal reads as "already gone", which is the
+            // state the script is written to wait for.
+            newApp: newApp, destination: destination, pid: 1,
+            scriptPath: "/dev/null", label: "dev.ore.relaunch.test",
+            logPath: logPath
+        )
+        script = script.replacingOccurrences(of: "/usr/bin/open", with: "/usr/bin/true")
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-swap-\(UUID().uuidString).sh")
+        try script.write(to: path, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: path) }
+
+        let bash = Process()
+        bash.executableURL = URL(fileURLWithPath: "/bin/bash")
+        bash.arguments = [path.path]
+        bash.standardOutput = FileHandle.nullDevice
+        bash.standardError = FileHandle.nullDevice
+        try bash.run()
+        bash.waitUntilExit()
+        return bash.terminationStatus
+    }
+
+    @Test func aGoodUpdateReplacesTheInstalledApp() throws {
+        let scratch = try Scratch()
+        let staged = try scratch.app(named: "ORE.app", in: "staging", version: "2.0", signed: true)
+        let installed = try scratch.app(named: "ORE.app", in: "Applications", version: "1.0", signed: true)
+
+        _ = try runSwap(newApp: staged, destination: installed, logPath: scratch.log.path)
+
+        #expect(scratch.version(of: installed) == "2.0")
+        #expect(scratch.leftovers(in: "Applications").isEmpty, "no staging directories survive")
+    }
+
+    /// The case the old script could not survive: something is wrong with the
+    /// new app. The user must still have the one they were running.
+    @Test func anUnverifiableUpdateLeavesTheInstalledAppAlone() throws {
+        let scratch = try Scratch()
+        let staged = try scratch.app(named: "ORE.app", in: "staging", version: "2.0", signed: false)
+        let installed = try scratch.app(named: "ORE.app", in: "Applications", version: "1.0", signed: true)
+
+        let status = try runSwap(newApp: staged, destination: installed, logPath: scratch.log.path)
+
+        #expect(status != 0)
+        #expect(scratch.version(of: installed) == "1.0", "the working install is untouched")
+        #expect(scratch.leftovers(in: "Applications").isEmpty)
+        #expect(scratch.logContents().contains("signature verification"), "and it says why")
+    }
+
+    @Test func anIncompleteUpdateLeavesTheInstalledAppAlone() throws {
+        let scratch = try Scratch()
+        let staged = try scratch.app(named: "ORE.app", in: "staging", version: "2.0", signed: true)
+        // A bundle whose executable never arrived, which is what a truncated
+        // download unpacks to.
+        try FileManager.default.removeItem(at: staged.appendingPathComponent("Contents/MacOS/OreMac"))
+        let installed = try scratch.app(named: "ORE.app", in: "Applications", version: "1.0", signed: true)
+
+        let status = try runSwap(newApp: staged, destination: installed, logPath: scratch.log.path)
+
+        #expect(status != 0)
+        #expect(scratch.version(of: installed) == "1.0")
+    }
+
+    @Test func aFirstInstallWithNothingToReplaceStillLands() throws {
+        let scratch = try Scratch()
+        let staged = try scratch.app(named: "ORE.app", in: "staging", version: "2.0", signed: true)
+        let destination = scratch.root
+            .appendingPathComponent("Applications", isDirectory: true)
+            .appendingPathComponent("ORE.app")
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+
+        _ = try runSwap(newApp: staged, destination: destination, logPath: scratch.log.path)
+
+        #expect(scratch.version(of: destination) == "2.0")
     }
 
     @Test func theSwapScriptIsValidBash() throws {
@@ -276,6 +385,16 @@ struct UpdateRestartTests {
 
     // MARK: - Helpers
 
+    private func swapScript() -> String {
+        GitHubUpdater.relaunchScript(
+            newApp: URL(fileURLWithPath: "/tmp/stage/ORE.app"),
+            destination: URL(fileURLWithPath: "/Applications/ORE.app"),
+            pid: 4_242,
+            scriptPath: "/tmp/relaunch.sh",
+            label: "dev.ore.relaunch.test"
+        )
+    }
+
     private func makeDefaults() -> UserDefaults {
         UserDefaults(suiteName: "ore.tests.update.\(UUID().uuidString)")!
     }
@@ -311,6 +430,81 @@ struct UpdateRestartTests {
             releaseURL: URL(string: "https://example.invalid/\(version)")!
         )
         defaults.set(try! JSONEncoder().encode(pending), forKey: GitHubUpdater.pendingRestartKey)
+    }
+}
+
+/// A throwaway Applications folder and a throwaway app to put in it.
+///
+/// Real bundles, really signed: the swap script verifies what it copied, and
+/// a fake that cannot be verified would make every one of these tests pass
+/// for the wrong reason.
+private struct Scratch {
+    let root: URL
+    let log: URL
+
+    init() throws {
+        root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ore-update-\(UUID().uuidString)", isDirectory: true)
+        log = root.appendingPathComponent("update.log")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    func app(named name: String, in directory: String, version: String, signed: Bool) throws -> URL {
+        let parent = root.appendingPathComponent(directory, isDirectory: true)
+        let app = parent.appendingPathComponent(name)
+        try FileManager.default.createDirectory(
+            at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true
+        )
+        let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict>
+              <key>CFBundleExecutable</key><string>OreMac</string>
+              <key>CFBundleIdentifier</key><string>dev.ore.OreMac.updatetest</string>
+              <key>CFBundleShortVersionString</key><string>\(version)</string>
+            </dict></plist>
+            """
+        try plist.write(
+            to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8
+        )
+        let executable = app.appendingPathComponent("Contents/MacOS/OreMac")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: executable.path
+        )
+        if signed { run("/usr/bin/codesign", ["--force", "--sign", "-", app.path]) }
+        return app
+    }
+
+    func version(of app: URL) -> String? {
+        guard let data = try? Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil
+              ) as? [String: Any]
+        else { return nil }
+        return plist["CFBundleShortVersionString"] as? String
+    }
+
+    /// Staging and rollback directories the script is supposed to clean up.
+    func leftovers(in directory: String) -> [String] {
+        let parent = root.appendingPathComponent(directory, isDirectory: true)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+        return names.filter { $0.hasPrefix(".ORE.app.") }
+    }
+
+    func logContents() -> String {
+        (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    }
+
+    private func run(_ path: String, _ arguments: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
     }
 }
 

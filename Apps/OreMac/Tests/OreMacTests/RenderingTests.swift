@@ -964,12 +964,18 @@ struct GitHubUpdaterVersionTests {
         // forever on a quit that wedged; see `UpdateRestartTests`.
         #expect(script.contains("PID=123"))
         #expect(script.contains("wait_for_exit"))
-        let ditto = lines.firstIndex { $0.hasPrefix("/usr/bin/ditto") }
-        let clear = lines.firstIndex { $0.hasPrefix("/bin/rm -rf '/Applications") }
+        // Copy the new bundle in beside the old one, check it, swap, relaunch.
+        // This used to assert the opposite — that the installed app was
+        // deleted *before* the copy — which is the ordering that left people
+        // with no ORE when a copy failed. See `UpdateRestartTests`.
+        let copy = lines.firstIndex { $0.contains("ditto \"$SRC\" \"$INCOMING\"") }
+        let swap = lines.firstIndex { $0.contains("mv \"$INCOMING\" \"$DST\"") }
         let open = lines.firstIndex { $0.hasPrefix("/usr/bin/open") }
-        #expect(clear != nil && ditto != nil && open != nil)
-        // Clear the old bundle, copy the new one in, then relaunch — in order.
-        #expect(clear! < ditto! && ditto! < open!)
+        #expect(copy != nil && swap != nil && open != nil)
+        if let copy, let swap, let open {
+            #expect(copy < swap && swap < open)
+        }
+        #expect(!script.contains("/bin/rm -rf '/Applications/ORE.app'"))
     }
 
     @Test func prefersDmgOverZip() {

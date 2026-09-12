@@ -1,11 +1,23 @@
 name: Release
 
-# Emergency CI cut. The normal path is local:
-#   cd Apps/OreMac && ./Scripts/certify-release.sh [patch|minor|major]
-# That runs tests and builds the DMG on a Mac that already has the SDK,
-# then publishes whatever is on master. This workflow exists so a release
-# can still be cut when that machine is not around. Merges to master do
-# not ship a DMG on their own.
+# The attested release path, and now the preferred one.
+#
+# Releases used to be cut locally with Scripts/certify-release.sh because
+# Actions was not paid for on a private repository and every run failed in two
+# seconds. Actions is free for public repositories, so the build can move back
+# here — and that matters for more than convenience: build provenance
+# attestations can only be produced where the artifact is actually built.
+# A locally-cut release cannot be attested, so certify-release.sh is now the
+# fallback rather than the norm.
+#
+# Users verify a download with:
+#   gh attestation verify ORE-<version>.zip -R OpenResearchh/ore
+#
+# Order matters and is the point of the file. It used to bump the version and
+# push to master *first*, then build — so a compile error or a failing test
+# left master carrying a release commit for a version that was never
+# published, and the recovery was manual. Now nothing is pushed until the
+# tests pass and the artifacts exist.
 #
 # The version-bump commit is pushed with GITHUB_TOKEN, whose pushes do not
 # retrigger workflows; the `[skip ci]` marker is belt-and-braces.
@@ -23,6 +35,10 @@ on:
 
 permissions:
   contents: write
+  # Both are required by attest-build-provenance: id-token to prove to
+  # Sigstore which workflow is asking, attestations to record the result.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release
@@ -30,23 +46,80 @@ concurrency:
 
 jobs:
   release:
-    name: Bump, build DMG, publish
-    # Must match the OreMac CI job: the DMG builds the same target, which needs
-    # the macOS 26 SDK for the Liquid Glass symbols behind its availability
-    # checks.
+    name: Certify, build, attest, publish
+    # Must match the OreMac CI job: the app needs the macOS 26 SDK for the
+    # Liquid Glass symbols behind its availability checks.
     runs-on: macos-26
-    defaults:
-      run:
-        working-directory: Apps/OreMac
     steps:
+      # master is what ships. Dispatch can select any ref, and building one
+      # while pushing the bump to master would publish a version whose tag
+      # points at code that was never on master.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: master
+
+      - name: Refuse a dispatch from anywhere but master
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            echo "::error::Dispatched from ${{ github.ref }}. Releases are cut from master."
+            exit 1
+          fi
+
+      - name: Record the toolchain
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+
+      # Before the bump, before the push, before anything is published. A
+      # release candidate that cannot pass its own suite is not a candidate.
+      - name: OreKit tests
+        working-directory: Packages/OreKit
+        run: swift test
+
+      - name: OreMac tests
+        working-directory: Apps/OreMac
+        run: xcrun --sdk macosx swift test
 
       - name: Bump version
         id: bump
+        working-directory: Apps/OreMac
         run: echo "version=$(./Scripts/bump-version.sh ${{ inputs.bump }})" >> "$GITHUB_OUTPUT"
 
+      # Build-time configuration. Absent, the app is simply silent — see
+      # TelemetryClient.make. Stamped into Info.plist by bundle.sh.
+      - name: Build zip, dmg and checksums
+        working-directory: Apps/OreMac
+        env:
+          ORE_POSTHOG_KEY: ${{ secrets.ORE_POSTHOG_KEY }}
+          ORE_VERSION: ${{ steps.bump.outputs.version }}
+        run: ./Scripts/make-artifacts.sh release
+
+      - name: Check the artifacts are what the release contract promises
+        working-directory: Apps/OreMac
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          cd .build
+          for file in "ORE-$VERSION.zip" "ORE-$VERSION.dmg" SHA256SUMS RELEASE; do
+            [ -f "$file" ] || { echo "::error::missing $file"; exit 1; }
+          done
+          shasum -a 256 -c SHA256SUMS
+          grep -qx "version=$VERSION" RELEASE
+          # The app inside the archive, not just the archive's name.
+          rm -rf verify && /usr/bin/ditto -x -k "ORE-$VERSION.zip" verify
+          built="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            verify/ORE.app/Contents/Info.plist)"
+          [ "$built" = "$VERSION" ] || { echo "::error::bundle says $built, expected $VERSION"; exit 1; }
+          codesign --verify --deep --strict verify/ORE.app
+          rm -rf verify
+
+      # Only now is anything published. The bump commit is pushed at the same
+      # point as the release, so master and the tag agree even if a later step
+      # fails.
       - name: Commit the bump
         run: |
           git config user.name "github-actions[bot]"
@@ -54,15 +127,86 @@ jobs:
           git commit -am "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
           git push origin HEAD:master
 
-      - name: Build the DMG
-        run: ./Scripts/make-dmg.sh release
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          # The checksum file too: the README tells people to verify what they
+          # downloaded against it, so it has to be covered by the same claim.
+          subject-path: |
+            Apps/OreMac/.build/ORE-${{ steps.bump.outputs.version }}.zip
+            Apps/OreMac/.build/ORE-${{ steps.bump.outputs.version }}.dmg
+            Apps/OreMac/.build/SHA256SUMS
 
-      - name: Publish the release
+      # Published as a draft first, so a failed download check never leaves a
+      # half-usable release visible to users.
+      - name: Publish the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
         run: |
-          gh release create "v${{ steps.bump.outputs.version }}" \
-            ".build/ORE-${{ steps.bump.outputs.version }}.dmg" \
-            --title "ORE v${{ steps.bump.outputs.version }}" \
+          gh release create "v$VERSION" \
+            "Apps/OreMac/.build/ORE-$VERSION.zip" \
+            "Apps/OreMac/.build/ORE-$VERSION.dmg" \
+            "Apps/OreMac/.build/SHA256SUMS" \
+            "Apps/OreMac/.build/RELEASE" \
+            --title "ORE v$VERSION" \
             --generate-notes \
+            --notes-start-tag "$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo '')" \
+            --draft \
             --target "$(git rev-parse HEAD)"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: gh release edit "v$VERSION" --draft=false --latest
+
+      # Everything downstream — install.sh, the Homebrew cask, the in-app
+      # updater's public path — fetches these assets anonymously. If that ever
+      # stops working, it breaks for every user while still working for us,
+      # which is exactly the kind of failure that goes unnoticed for weeks.
+      - name: Verify every asset downloads anonymously
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          base="https://github.com/${{ github.repository }}/releases"
+          for url in \
+            "$base/latest/download/RELEASE" \
+            "$base/download/v$VERSION/RELEASE" \
+            "$base/download/v$VERSION/SHA256SUMS" \
+            "$base/download/v$VERSION/ORE-$VERSION.zip" \
+            "$base/download/v$VERSION/ORE-$VERSION.dmg"
+          do
+            status=$(curl -sSL -o /dev/null -w '%{http_code}' -H "Authorization:" "$url")
+            if [ "$status" != "200" ]; then
+              echo "::error::$url returned HTTP $status anonymously — installs are broken."
+              exit 1
+            fi
+            echo "$url → 200 OK"
+          done
+
+      # The exact command the README gives users, run against the exact bytes
+      # a user would download.
+      - name: Verify the published attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          curl -fsSL -o "$work/ORE-$VERSION.zip" \
+            "https://github.com/${{ github.repository }}/releases/download/v$VERSION/ORE-$VERSION.zip"
+          gh attestation verify "$work/ORE-$VERSION.zip" -R "${{ github.repository }}"
+
+      # The installer is what most people will actually run. Exercising it
+      # against the release that was just published is the only check that
+      # covers the manifest, the checksums and the asset names together.
+      - name: Install from the published release
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          ORE_INSTALL_DIR="$(mktemp -d)/Applications" \
+          ORE_HOME="$(mktemp -d)" \
+            sh ./install.sh

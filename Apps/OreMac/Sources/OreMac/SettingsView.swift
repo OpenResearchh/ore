@@ -1,6 +1,8 @@
 import AppKit
 import OreCore
+import OrePersistence
 import OreProtocol
+import OreTelemetry
 import ServiceManagement
 import SwiftUI
 
@@ -29,6 +31,8 @@ struct SettingsView: View {
     @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
+    @AppStorage(AppModel.automaticRoutinePermissionsKey)
+    private var automaticRoutinePermissions = AppModel.automaticRoutinePermissionsDefault
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
     @AppStorage(DreamSettingsStore.enabled) private var dreamsEnabled = false
     @AppStorage(DreamSettingsStore.quietStart) private var quietStart = 60
@@ -59,6 +63,7 @@ struct SettingsView: View {
         case agents = "Agents"
         case environment = "Environment"
         case dreams = "Dreams"
+        case privacy = "Privacy"
         var id: String { rawValue }
         var icon: String {
             switch self {
@@ -69,6 +74,7 @@ struct SettingsView: View {
             case .agents: "cpu"
             case .environment: "terminal"
             case .dreams: "moon.stars"
+            case .privacy: "hand.raised"
             }
         }
         var detail: String {
@@ -80,6 +86,7 @@ struct SettingsView: View {
             case .agents: "See the coding harnesses ORE can reach, their authentication, and models."
             case .environment: "Understand where work lives and what every terminal and agent inherits."
             case .dreams: "Overnight research while this Mac is idle. Off by default, read-only, budgeted."
+            case .privacy: "What ORE sends, what it never sends, and how to see or stop it."
             }
         }
     }
@@ -93,14 +100,7 @@ struct SettingsView: View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .fill(Color.accentColor.gradient)
-                        Image(systemName: "square.stack.3d.up.fill")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                    }
-                    .frame(width: 30, height: 30)
+                    OreAppIcon(size: 34)
                     VStack(alignment: .leading, spacing: 0) {
                         Text("ORE").font(.system(size: 14, weight: .semibold))
                         Text("Settings").font(.caption).foregroundStyle(.secondary)
@@ -152,7 +152,7 @@ struct SettingsView: View {
                 .padding(16)
             }
             .frame(width: 205)
-            .background(.thinMaterial)
+            .background(Color.black.opacity(0.12))
 
             Divider()
 
@@ -172,9 +172,18 @@ struct SettingsView: View {
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(Color.clear)
         }
         .frame(width: 950, height: 650)
+        .background {
+            ZStack {
+                OreTheme.Surface.content
+                OreWindowGlassBase()
+                Color.black.opacity(0.28)
+            }
+            .ignoresSafeArea()
+        }
+        .preferredColorScheme(.dark)
         // Two user-paced reads instead of one per display cycle: when Settings
         // opens, and when they navigate to the pane the toggle is on — which is
         // also when they'd be coming back from System Settings › Login Items.
@@ -194,6 +203,7 @@ struct SettingsView: View {
         case .agents: agents
         case .environment: environment
         case .dreams: dreams
+        case .privacy: PrivacySettings()
         }
     }
 
@@ -255,6 +265,15 @@ struct SettingsView: View {
                 SettingsRow("Branch prefix", detail: "Used for new worktree branches") {
                     TextField("ore", text: $branchPrefix).frame(width: 180)
                 }
+            }
+            SettingsCard(title: "Agent permissions", icon: "checkmark.shield") {
+                Toggle(
+                    "Automatically allow routine terminal commands",
+                    isOn: $automaticRoutinePermissions
+                )
+                Text("Off until you turn it on: every command asks first. Turn it on and agents may inspect files, check git state, and run familiar builds and tests inside the workspace without interrupting you — ORE records each one in the transcript. Publishing, deleting, installing software, rewriting history, privileged commands, anything reaching outside the workspace, and anything ORE cannot confidently classify still ask, whatever this is set to.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             SettingsCard(title: "Always on", icon: "menubar.arrow.up.rectangle") {
                 Toggle("Start ORE at login", isOn: launchAtLogin)
@@ -935,6 +954,129 @@ struct SettingsView: View {
                 authenticationNotice = error.localizedDescription
             }
         }
+    }
+}
+
+/// The pane PRIVACY.md points at.
+///
+/// Everything the document promises the user can do has to exist here, or the
+/// document is a lie: turn it off, see exactly what is queued before it is
+/// sent, and copy the one identifier needed to ask for deletion.
+private struct PrivacySettings: View {
+    @Environment(AppModel.self) private var appModel
+    @AppStorage(TelemetryConsent.analyticsKey)
+    private var analytics = TelemetryConsent.analyticsDefault
+
+    @State private var pending: [TelemetryInspection.PendingEvent] = []
+    @State private var showsPending = false
+    @State private var copiedInstallID = false
+
+    private var installID: String? { TelemetryInspection.installID(home: OreHome.directory) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: "Anonymous usage data", icon: "chart.bar") {
+                Toggle("Share anonymous usage data", isOn: $analytics)
+                Text("Six counters — installed, launched, workspace created, turn finished, pull request opened, and this switch being turned off. Durations and dates are reported as ranges, never exact values, and your IP address is not kept.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Turning this off deletes anything still queued on this Mac and stops recording immediately. It takes effect now, not at the next launch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsCard(title: "Never collected", icon: "lock.shield") {
+                ForEach(Self.neverCollected, id: \.self) { item in
+                    Label(item, systemImage: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Enforced by the type system: every event is a case of a closed enum whose properties can only be a number, a flag, or a token from a fixed list. There is no way to put a file path in one without changing the types.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            SettingsCard(title: "Pending events", icon: "tray.full") {
+                Text("Everything queued on this Mac and not yet sent, exactly as it would be uploaded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button(showsPending ? "Hide pending events" : "Show pending events") {
+                        showsPending.toggle()
+                        if showsPending { reload() }
+                    }
+                    if showsPending {
+                        Button("Refresh") { reload() }
+                    }
+                    Spacer()
+                }
+                if showsPending {
+                    if pending.isEmpty {
+                        Text("Nothing is queued.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(pending) { event in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(event.name) · \(event.occurredAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption.weight(.medium))
+                                Text(event.properties)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+
+            SettingsCard(title: "Your install ID", icon: "number") {
+                Text("A random UUID made on this Mac. It is the whole identity — there is no account, and nothing here is tied to your name, email, or GitHub.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Text(installID ?? "Not created yet — nothing has been recorded.")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    Spacer()
+                    if let installID {
+                        Button(copiedInstallID ? "Copied" : "Copy install ID") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(installID, forType: .string)
+                            copiedInstallID = true
+                        }
+                    }
+                }
+                Text("To have everything associated with this ID deleted, email it to privacy@openresearchh.com.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        // Recording has to stop the moment the switch moves, not at the next
+        // launch: the queue is purged here, and `make` refuses to build a
+        // recording client next time.
+        .onChange(of: analytics) { _, isOn in
+            guard !isOn else { return }
+            let recorder = appModel.telemetry
+            Task { await recorder.optOut() }
+            if showsPending { reload() }
+        }
+    }
+
+    private static let neverCollected = [
+        "Prompt text, or anything you type into ORE",
+        "Anything an agent says, thinks, or writes",
+        "Diffs, patches, or file contents",
+        "File paths and file names",
+        "Repository, branch, commit, and pull request names",
+        "API keys and agent CLI credentials",
+    ]
+
+    private func reload() {
+        pending = TelemetryInspection.pending(home: OreHome.directory)
     }
 }
 

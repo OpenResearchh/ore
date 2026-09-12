@@ -55,11 +55,35 @@ enum OreTheme {
     /// quieter wash would dissolve into the glass behind it.
     static let glassControlFill = Color.primary.opacity(0.08)
     static let glassControlStroke = Color.primary.opacity(0.10)
-    static let selectedFill = Color.accentColor.opacity(0.11)
-    /// The loud sibling of `selectedFill`: a solid accent pill with white
-    /// content, for the one selection that should anchor the eye (the current
-    /// sidebar row). Everything else keeps the quiet wash.
-    static let selectedProminentFill = Color.accentColor
+
+    /// ORE's own colour: molten copper, the colour of ore being smelted.
+    ///
+    /// Until this existed the app had no brand colour at all — every tinted
+    /// surface used `Color.accentColor`, which means it silently inherited
+    /// whatever accent the user happened to pick in System Settings. ORE
+    /// looked like a different product on every Mac.
+    ///
+    /// Copper rather than the usual blue or purple partly to stand out in a
+    /// Dock full of cool-toned developer tools, and partly because it is the
+    /// one warm hue that does not already mean something here: green is
+    /// additions and passing CI, red is deletions and failure. Brand colour
+    /// must never be mistaken for state, which is why nothing in `Status`
+    /// below uses it.
+    ///
+    /// Lighter in dark mode: #B45309 is legible on white but goes muddy
+    /// against a dark glass panel.
+    static let brand = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1)  // #F59E0B
+            : NSColor(srgbRed: 0.706, green: 0.325, blue: 0.035, alpha: 1)  // #B45309
+    })
+
+    static let selectedFill = brand.opacity(0.13)
+    /// A selected workspace should remain part of the sidebar, not turn into a
+    /// primary-action button. A restrained brand edge carries identity while
+    /// the neutral wash does the selection work.
+    static let sidebarSelectedFill = Color.primary.opacity(0.09)
+    static let selectedStroke = brand.opacity(0.32)
 
     /// Panel backgrounds. The transcript is the reading surface; everything
     /// around it recedes so the eye lands on the agent's reply, not on chrome.
@@ -159,7 +183,11 @@ final class OreAdaptiveGlassView: NSVisualEffectView {
     }
 
     private func apply(fullScreen: Bool) {
-        material = fullScreen ? .underWindowBackground : .hudWindow
+        // Full screen has no useful scene behind the window to refract. Hiding
+        // the effect reveals the opaque content floor supplied by the caller,
+        // avoiding a wallpaper-coloured haze across an entire display.
+        isHidden = fullScreen
+        material = .hudWindow
     }
 }
 
@@ -598,7 +626,7 @@ struct OreNavigationSelection: ViewModifier {
             // that the one loud accent in the pane stays the primary action.
             content.glassEffect(
                 isSelected
-                    ? .regular.tint(Color.accentColor.opacity(0.25)).interactive()
+                    ? .regular.tint(OreTheme.brand.opacity(0.25)).interactive()
                     : .regular.interactive(),
                 in: .rect(cornerRadius: OreTheme.tabRadius)
             )
@@ -625,7 +653,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
                 .frame(minHeight: OreTheme.RowHeight.button)
                 .opacity(isEnabled ? 1 : 0.55)
                 .glassEffect(
-                    .regular.tint(Color.accentColor).interactive(),
+                    .regular.tint(OreTheme.brand).interactive(),
                     in: .capsule
                 )
         } else {
@@ -635,7 +663,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
                 .padding(.horizontal, OreTheme.Space.md)
                 .frame(minHeight: OreTheme.RowHeight.button)
                 .background(
-                    Color.accentColor.opacity(isEnabled ? 1 : 0.45),
+                    OreTheme.brand.opacity(isEnabled ? 1 : 0.45),
                     in: Capsule()
                 )
                 .scaleEffect(configuration.isPressed ? 0.98 : 1)

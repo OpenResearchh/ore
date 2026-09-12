@@ -350,14 +350,22 @@ struct CodexTranslatorTests {
         #expect(!capabilities.supportsRuntimePermissionModeChange)
     }
 
-    @Test func assistantMCPAllowListPreapprovesOnlyTheOREServer() {
-        #expect(CodexSession.approvalPolicy(
-            permissionMode: .acceptEdits
-        ) == "never")
-        #expect(CodexSession.approvalPolicy(
-            permissionMode: .default
-        ) == "on-request")
+    /// Only Bypass may turn Codex's approval channel off. Accept Edits keeps
+    /// it on: the sandbox is what stops ORE asking about ordinary file edits,
+    /// and silencing approvals instead would skip the shell classifier, the
+    /// routine-approval setting and the `ore` MCP boundary altogether.
+    @Test func onlyBypassSilencesCodexApprovals() {
+        #expect(CodexSession.approvalPolicy(permissionMode: .acceptEdits) == "on-request")
+        #expect(CodexSession.approvalPolicy(permissionMode: .default) == "on-request")
+        #expect(CodexSession.approvalPolicy(permissionMode: .plan) == "on-request")
+        #expect(CodexSession.approvalPolicy(permissionMode: .bypassPermissions) == "never")
+        // Accept Edits still writes without being asked, through the sandbox.
+        #expect(CodexSession.sandboxPolicy(
+            permissionMode: .acceptEdits, writableRoots: []
+        )["type"]?.stringValue == "workspaceWrite")
+    }
 
+    @Test func assistantMCPAllowListPreapprovesOnlyTheOREServer() {
         let mcp = SessionConfiguration.MCPServer(
             command: "/Applications/ORE.app/Contents/MacOS/OREMCP",
             arguments: ["--socket", "/tmp/ore.sock"]

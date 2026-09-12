@@ -720,6 +720,25 @@ public actor OreStore {
         _ = try writer.write { db in try DiffCommentRecord.deleteOne(db, key: id) }
     }
 
+    public func deletePendingDiffComments(
+        workspaceID: WorkspaceID,
+        matching references: [DiffCommentReference]
+    ) throws {
+        let keys = Set(references.map(\.identityKey))
+        guard !keys.isEmpty else { return }
+        try writer.write { db in
+            let pending = try DiffCommentRecord
+                .filter(Column("workspaceID") == workspaceID.rawValue)
+                .filter(Column("isSent") == false)
+                .fetchAll(db)
+            for record in pending where keys.contains(record.reference.identityKey) {
+                if let id = record.id {
+                    try DiffCommentRecord.deleteOne(db, key: id)
+                }
+            }
+        }
+    }
+
     public func markViewed(_ record: ViewedFileRecord) throws {
         try writer.write { db in try record.save(db) }
     }

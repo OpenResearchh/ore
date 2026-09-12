@@ -53,7 +53,48 @@ struct NewWorkspaceSheet: View {
         }
     }
 
+    /// One sentence by default; the nine controls only when asked for. The
+    /// form is unchanged behind this — it is an override surface now, not the
+    /// way in.
+    @State private var showsAdvanced = false
+    @State private var instruction = ""
+    @State private var repositoryOverride: String?
+    @State private var harnessOverride: HarnessKind?
+    @State private var modelOverride: String?
+    @State private var wantsNewProject = false
+
     var body: some View {
+        if showsAdvanced {
+            advancedForm
+        } else {
+            NewWorkspaceComposer(
+                instruction: $instruction,
+                repositoryOverride: $repositoryOverride,
+                harnessOverride: $harnessOverride,
+                modelOverride: $modelOverride,
+                wantsNewProject: $wantsNewProject,
+                isCreating: isCreating,
+                onStart: { Task { await startFromInstruction() } },
+                onAdvanced: { carryInstructionIntoForm() },
+                onBrowseGitHub: {
+                    repositorySource = .github
+                    carryInstructionIntoForm()
+                }
+            )
+            .task { await prepareDefaults() }
+            .overlay(alignment: .bottom) {
+                if let operationError {
+                    Label(operationError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(.bottom, OreTheme.Space.sm)
+                }
+            }
+        }
+    }
+
+    /// Everything the sheet used to be, reachable in one click.
+    private var advancedForm: some View {
         VStack(alignment: .leading, spacing: OreTheme.Space.md) {
             VStack(alignment: .leading, spacing: OreTheme.Space.xs) {
                 Text("New Workspace")
@@ -176,19 +217,7 @@ struct NewWorkspaceSheet: View {
         .padding(OreTheme.Space.lg)
         .frame(width: 620)
         .frame(minHeight: 620)
-        .task {
-            await model.refreshRepositories()
-            if name.isEmpty { name = model.suggestedResearchIdentity().name }
-            if repositoryPath.isEmpty { repositoryPath = model.repositories.first ?? "" }
-            if let ready = model.readyHarnesses.first { harness = ready }
-            if let raw = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatHarness),
-               let preferred = HarnessKind(rawValue: raw), model.readyHarnesses.contains(preferred) {
-                harness = preferred
-                // The pinned model belongs to the pinned agent's catalogue, so it
-                // only carries over when that agent is the one we ended up with.
-                modelName = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatModel) ?? ""
-            }
-        }
+        .task { await prepareDefaults() }
         .task(id: repositorySource) {
             if repositorySource == .github { await loadGitHub() }
         }
@@ -297,9 +326,19 @@ struct NewWorkspaceSheet: View {
     private var githubRepositoryPicker: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: githubStatus?.isAuthenticated == true
-                    ? "checkmark.circle.fill" : "person.crop.circle.badge.exclamationmark")
-                    .foregroundStyle(githubStatus?.isAuthenticated == true ? .green : .orange)
+                // GitHub's own mark, with the connection state as a small
+                // badge on it. The state used to be the *whole* icon — a green
+                // tick or an orange person — which named the status but never
+                // the service it belonged to.
+                ServiceMark(service: .gitHub, size: 18)
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: githubStatus?.isAuthenticated == true
+                            ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(githubStatus?.isAuthenticated == true ? .green : .orange)
+                            .background(Circle().fill(.background).padding(1))
+                            .offset(x: 3, y: 3)
+                    }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(githubStatus?.isAuthenticated == true ? "GitHub connected" : "Connect GitHub")
                         .fontWeight(.medium)
@@ -429,6 +468,124 @@ struct NewWorkspaceSheet: View {
         } catch {
             operationError = error.localizedDescription
         }
+    }
+
+    /// Shared by both surfaces, so the composer and the form can never drift
+    /// apart on what a sensible default is.
+    private func prepareDefaults() async {
+        await model.refreshRepositories()
+        if name.isEmpty { name = model.suggestedResearchIdentity().name }
+        if repositoryPath.isEmpty { repositoryPath = model.repositories.first ?? "" }
+        if let ready = model.readyHarnesses.first { harness = ready }
+        if let raw = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatHarness),
+           let preferred = HarnessKind(rawValue: raw), model.readyHarnesses.contains(preferred) {
+            harness = preferred
+            modelName = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatModel) ?? ""
+        }
+    }
+
+    /// Start: the whole creation path, from one sentence.
+    ///
+    /// Anything the user said out loud wins over the inferred default, and
+    /// anything they didn't stays inferred. The instruction itself goes
+    /// through untouched as the agent's first message.
+    private func startFromInstruction() async {
+        operationError = nil
+        // The same resolution the composer is showing. Re-deriving it here
+        // with a different order of operations is what let the chip say
+        // Codex while the request carried a Claude model.
+        var plan = WorkspaceLaunchPlan.resolve(model.launchInputs(
+            instruction: instruction,
+            harnessOverride: harnessOverride,
+            modelOverride: modelOverride ?? (modelName.isEmpty ? nil : modelName),
+            repositoryOverride: repositoryOverride,
+            wantsNewProject: wantsNewProject
+        ))
+
+        // The branch has to be checked against the project that was actually
+        // chosen, which is only known now. Loading its branches is a git
+        // call, so it happens here rather than on every keystroke.
+        if let repository = plan.repository, plan.intent.baseBranch != nil {
+            let branches = await model.localBranches(repositoryPath: repository.path)
+            plan = WorkspaceLaunchPlan.resolve(model.launchInputs(
+                instruction: instruction,
+                harnessOverride: harnessOverride,
+                modelOverride: modelOverride ?? (modelName.isEmpty ? nil : modelName),
+                repositoryOverride: repository.path,
+                wantsNewProject: wantsNewProject,
+                localBranches: branches
+            ))
+        }
+
+        // Never dismiss on an unsettled plan: the sheet is the only place
+        // left to resolve it, and closing it would start work somewhere the
+        // user did not choose.
+        guard plan.canStart else {
+            operationError = plan.blockerMessage
+            return
+        }
+        if let unavailable = plan.unavailableModel {
+            operationError = "\(plan.harness.displayName) can't run “\(unavailable)” — using its default."
+        }
+
+        isCreating = true
+        defer { isCreating = false }
+
+        // No project to work in: make one rather than sending the user off to
+        // set it up first. The core creates the repository and its first
+        // workspace in a single command, so there is no intermediate state to
+        // leave them stranded in.
+        guard let repository = plan.repository else {
+            model.createProject(CreateProjectRequest(
+                name: NewProjectName.from(plan.intent.goal, avoiding: model.repositories),
+                harness: plan.harness,
+                model: plan.model,
+                initialPrompt: plan.intent.goal,
+                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+            ))
+            dismiss()
+            return
+        }
+
+        model.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: repository.path,
+            name: model.suggestedResearchIdentity().name,
+            seed: plan.baseBranch.map { .branch($0) } ?? .defaultBranch,
+            harness: plan.harness,
+            model: plan.model,
+            initialPrompt: plan.intent.goal,
+            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+        ))
+        dismiss()
+    }
+
+    /// Opening Advanced keeps whatever has been said so far, rather than
+    /// making the user type it a second time.
+    private func carryInstructionIntoForm() {
+        // Advanced is the same plan with the controls exposed, so it is
+        // filled from the same resolution rather than a second reading that
+        // could disagree with the chips the user was just looking at.
+        let plan = WorkspaceLaunchPlan.resolve(model.launchInputs(
+            instruction: instruction,
+            harnessOverride: harnessOverride,
+            modelOverride: modelOverride,
+            repositoryOverride: repositoryOverride,
+            wantsNewProject: wantsNewProject
+        ))
+        if prompt.isEmpty { prompt = instruction }
+        harness = plan.harness
+        if let chosen = plan.model { modelName = chosen }
+        if let branch = plan.baseBranch {
+            seedKind = .branch
+            seedValue = branch
+        }
+        // An unsettled project must not prefill the picker with a fallback:
+        // Advanced is where the user answers that question, and a filled-in
+        // answer is one they never gave.
+        if let resolved = plan.repository, resolved.isSettled {
+            repositoryPath = resolved.path
+        }
+        showsAdvanced = true
     }
 
     private func create() async {

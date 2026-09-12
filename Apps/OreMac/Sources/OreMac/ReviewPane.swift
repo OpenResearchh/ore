@@ -423,7 +423,10 @@ struct ReviewPane: View {
     }
 
     private var draftComments: [DiffCommentReference] {
-        model.chat(for: workspace.id).draftComments
+        if let inbox = model.reviewInboxChatID(for: workspace.id) {
+            return model.chat(for: inbox).draftComments
+        }
+        return []
     }
 
     private func startAIReview(reviewerModel: String? = nil, instructions: String? = nil) {
@@ -440,7 +443,8 @@ struct ReviewPane: View {
             in: workspace.id,
             initialMessage: prompt,
             defaults: reviewDefaults,
-            model: reviewerModel
+            model: reviewerModel,
+            isReview: true
         )
     }
 
@@ -1325,7 +1329,16 @@ struct DiffDocumentView: View {
                     }
                 }
                 if file.isBinary {
-                    Text("Binary file").foregroundStyle(.secondary).padding()
+                    // An icon or a screenshot is precisely the change a
+                    // reviewer most needs to *see*, and it was the one case
+                    // showing the least: git reduces it to "Binary files
+                    // differ" and this pane printed that as "Binary file".
+                    BinaryFilePreview(
+                        file: file,
+                        worktreePath: workspace.worktreePath,
+                        generation: model.gitGeneration(for: workspace.id),
+                        onComment: { commentOnWholeFile() }
+                    )
                 }
                 if file.isTruncated {
                     Text("This diff is too large to display.")
@@ -1377,6 +1390,19 @@ struct DiffDocumentView: View {
     private func clearSelection() {
         selectionAnchor = nil
         selectionFocus = nil
+    }
+
+    /// A comment on a file that has no lines to anchor to.
+    ///
+    /// Binary files still need review — "this icon is the wrong shade" is a
+    /// perfectly good review comment — but every other comment path here
+    /// starts from a line number. Line 1 stands in for the file as a whole,
+    /// which is the same convention GitHub uses for file-level comments.
+    private func commentOnWholeFile() {
+        commentTarget = CommentTarget(
+            filePath: path, startLine: 1, endLine: 1,
+            context: (path as NSString).lastPathComponent
+        )
     }
 
     private func commentSingle(_ line: DiffLine, in hunk: DiffHunk) {
@@ -1693,6 +1719,8 @@ private struct ShipStatusPanel: View {
     @State private var hoveredTab: ShipTab?
     @State private var hoveredCommit: String?
     @State private var hoveredCheck: String?
+    /// The SHA whose chip is currently showing "Copied".
+    @State private var copiedSHA: String?
     @State private var commits: [CommitInfo] = []
     @State private var workingTree: GitStatusSnapshot?
     @State private var pullRequest: GitHubClient.PullRequest?
@@ -1971,16 +1999,22 @@ private struct ShipStatusPanel: View {
                 }
                 .font(.system(size: OreTheme.Font.caption, design: .monospaced).weight(.medium))
             }
-            Button(action: { copySHA(commit.sha) }) {
-                Text(commit.shortSHA)
+            // The chip says "Copied" for a beat instead of the SHA. The
+            // clipboard gives no sign of its own, and a button that looks
+            // identical before and after is indistinguishable from one that
+            // did nothing.
+            Button(action: { copySHA(commit.sha); flashCopiedSHA(commit.sha) }) {
+                Text(copiedSHA == commit.sha ? "Copied" : commit.shortSHA)
                     .font(.system(size: OreTheme.Font.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(copiedSHA == commit.sha
+                        ? AnyShapeStyle(Color.green) : AnyShapeStyle(.secondary))
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
                     .background(OreTheme.subduedFill, in: Capsule())
             }
             .buttonStyle(.plain)
-            .help("Copy commit SHA")
+            .animation(.easeOut(duration: 0.15), value: copiedSHA)
+            .help(copiedSHA == commit.sha ? "Copied" : "Copy commit SHA")
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .padding(.vertical, 7)
@@ -2017,6 +2051,16 @@ private struct ShipStatusPanel: View {
                 }
         }
         .frame(width: 14)
+    }
+
+    /// Which SHA the row is currently acknowledging, keyed by value so only
+    /// the commit that was clicked reports back.
+    private func flashCopiedSHA(_ sha: String) {
+        copiedSHA = sha
+        Task {
+            try? await Task.sleep(for: .seconds(1.4))
+            if copiedSHA == sha { copiedSHA = nil }
+        }
     }
 
     private func copySHA(_ sha: String) {

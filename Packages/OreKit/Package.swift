@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "OreGit", targets: ["OreGit"]),
         .library(name: "OrePersistence", targets: ["OrePersistence"]),
         .library(name: "OreCore", targets: ["OreCore"]),
+        .library(name: "OreTelemetry", targets: ["OreTelemetry"]),
         .executable(name: "ore-cli", targets: ["ore-cli"]),
     ],
     dependencies: [
@@ -47,11 +48,25 @@ let package = Package(
             dependencies: ["OreProtocol", "OreSupport", "OreHarness", "OreGit", "OrePersistence"]
         ),
 
+        // Anonymous product analytics: a durable queue and a closed set of
+        // events.
+        //
+        // Note what is *not* here: nothing else in OreKit depends on this
+        // target. That is the whole privacy guarantee, and it is enforced by
+        // the build graph rather than by discipline — OreCore, OrePersistence
+        // and every test target physically cannot `import OreTelemetry`, so
+        // the headless core cannot report even by accident. Only the Mac app
+        // links it.
+        .target(
+            name: "OreTelemetry",
+            dependencies: [.product(name: "GRDB", package: "GRDB.swift")]
+        ),
+
         .executableTarget(name: "ore-cli", dependencies: ["OreCore", "OreSupport"]),
 
         .testTarget(
             name: "OreKitTests",
-            dependencies: ["OreCore", "OreSupport"],
+            dependencies: ["OreCore", "OreSupport", "OreTelemetry"],
             resources: [.copy("Fixtures")]
         ),
     ],

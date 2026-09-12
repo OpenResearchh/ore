@@ -728,6 +728,31 @@ final class NarrationEngine {
             }
         }
         pump()
+        // The ticker is the engine's second chance at anything a missed event
+        // stranded, and a lost ending strands more than a pump. `onEnd` is the
+        // only thing that ever finishes a line: without it the book-keeping
+        // stays mid-utterance, `notifyWhenQuiet` is never released, and the
+        // voice pill sits on "Speaking…" with the agent long since silent.
+        if Self.endingWasLost(
+            isAudibleOrQueued: hasAudibleOrQueuedSpeech,
+            isMidUtterance: currentUtterance != nil
+        ) {
+            utteranceEnded()
+        } else {
+            flushQuietWaitersIfIdle()
+        }
+    }
+
+    /// Whether the engine is still holding a line that cannot be playing.
+    ///
+    /// Both voices report ending through a callback that can go missing — the
+    /// system synthesizer occasionally declines an utterance without
+    /// delivering either delegate ending, and the neural voice drops its
+    /// ending when a preempted stream loses the generation check. Nothing is
+    /// audible and nothing is queued, yet a line is still marked in flight:
+    /// that combination only happens when an ending was lost.
+    static func endingWasLost(isAudibleOrQueued: Bool, isMidUtterance: Bool) -> Bool {
+        isMidUtterance && !isAudibleOrQueued
     }
 
     private func pump() {

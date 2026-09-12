@@ -23,6 +23,58 @@ Packages/OreKit/          the headless core (no AppKit, no SwiftUI)
 Apps/OreMac/              the Mac app — talks only to OreCore's boundary
 ```
 
+## Install
+
+```sh
+brew install --cask openresearchh/tap/ore
+```
+
+or
+
+```sh
+curl -fsSL https://openresearchh.com/ore/install.sh | sh
+```
+
+macOS 14 Sonoma or later, Apple Silicon. Apache 2.0 licensed.
+
+Both commands install an app that opens straight away. There is also a
+[DMG](https://github.com/OpenResearchh/ore/releases/latest), but ORE is not
+notarized by Apple yet, so macOS blocks the DMG on first open and you have to
+go to **System Settings → Privacy & Security → Open Anyway**. Neither command
+above has that problem, for different reasons: `curl` does not mark what it
+downloads as quarantined, and Homebrew does but the cask clears the flag
+after copying the app.
+
+A release built by
+[the workflow](.github/workflows/release.yml) carries a GitHub build
+attestation, which you can check against the exact file you downloaded:
+
+```sh
+gh attestation verify ORE-<version>.zip -R OpenResearchh/ore
+```
+
+Releases cut locally with `Scripts/certify-release.sh` say **not attested** in
+their own release notes, and that command will fail on them — there is nothing
+to verify, because an attestation can only be produced where the artifact was
+built. [SECURITY.md](SECURITY.md) explains what each one proves and what it
+does not. Note that `spctl --assess` reporting *rejected* is the expected
+result until there is a Developer ID; that is not a bug to fix.
+
+## Privacy
+
+ORE never sends your code, your prompts, or what the agents say anywhere. It
+reports six anonymous usage events so we can tell whether it is any good — no
+account, no email address, just a random ID, and no way to put a file path in
+one without changing the types. Turn it off in **Settings → Privacy**, where
+you can also read the exact rows queued on your Mac before they are sent.
+Debug and locally built copies never report anything at all.
+
+Two things ORE does not control. The agent CLI you choose is a separate
+program on your own account, and it sends your prompts and code to its
+provider — that is how it works. And macOS may transcribe dictation on
+Apple's servers when this Mac has no on-device model. The complete account,
+including every field in every event, is in [PRIVACY.md](PRIVACY.md).
+
 ## Try it
 
 ```sh
@@ -93,25 +145,36 @@ by the view hierarchy, so navigating away doesn't kill the process — a dev
 server keeps running while you read the diff.
 
 **Updates.** The in-app GitHub updater installs whatever is published as a
-Release. Master is the source of truth; a release is an explicit local cut,
-not a side effect of merging:
+Release. It copies the new bundle in beside the old one, verifies its
+signature, and only then swaps — the app you were running is kept until the
+replacement is known to work, so a failed update leaves you where you started.
+
+Master is the source of truth, and a release is explicit rather than a side
+effect of merging. The
+[release workflow](.github/workflows/release.yml) is the preferred route: it
+runs both suites, builds, attests, publishes as a draft, and only promotes
+after checking every asset downloads anonymously and the attestation verifies.
+`Scripts/certify-release.sh` does the same from a Mac, without attestations:
 
 ```sh
 cd Apps/OreMac && ./Scripts/certify-release.sh        # patch
 cd Apps/OreMac && ./Scripts/certify-release.sh minor
 ```
 
-That runs OreKit and OreMac tests, builds the DMG on this Mac, commits the
-version bump, and publishes. Sparkle (`Scripts/release.sh`) is the signed /
-notarized path once a Developer ID is available.
+Both routes produce the same four files — `ORE-<version>.zip`,
+`ORE-<version>.dmg`, `SHA256SUMS`, and a fixed-name `RELEASE` manifest the
+installer reads to pin a version in one request. `Scripts/release.sh` adds
+Developer ID signing, notarization and stapling on top of the same bundle and
+the same packaging code, once a certificate is available.
 
 ## Testing
 
-175 tests, all offline — no CLI, no network, no subscription:
+1191 tests, all offline — no CLI, no network, no subscription:
 
 ```sh
-cd Packages/OreKit && swift test   # 155: core, drivers, git, persistence
-cd Apps/OreMac    && swift test    #  20: markdown and syntax highlighting
+cd Packages/OreKit && swift test                   # 536: core, drivers, git, persistence
+cd Apps/OreMac    && xcrun --sdk macosx swift test # 655: app logic, rendering, policy
+./packaging/test-install.sh                        #  22: the installer, end to end
 ```
 
 Harness drivers are tested against **golden transcripts** recorded from live
@@ -171,12 +234,14 @@ Learned by driving them, and each one cost a real bug:
   *consuming* the package, so consumed from elsewhere the scanner is skipped and
   the link fails. Vendoring generated parsers to work around that costs more than
   it returns.
-- **Releases are unsigned here.** `Scripts/certify-release.sh` is the shipping
-  path: local tests + an ad-hoc signed DMG uploaded to GitHub Releases.
-  `Scripts/release.sh` does signing, notarization and stapling, but this
-  machine has no Developer ID, so that path is written and syntax-checked
-  rather than executed. `Scripts/bundle.sh` produces an ad-hoc signed bundle
-  that runs locally.
+- **Releases are unsigned here.** Artifacts are ad-hoc signed, which is why
+  the two install commands above exist and why `spctl --assess` says
+  *rejected*. `Scripts/release.sh` does Developer ID signing, notarization and
+  stapling on top of the same bundle every other route uses, but this machine
+  has no Developer ID, so that path is written and syntax-checked rather than
+  executed. Everything below the signature — the bundle, the zip, the dmg, the
+  checksums, the manifest — is shared, so switching routes cannot change what
+  ships.
 - **Local builds sign with a self-signed certificate, if you make one.** An
   ad-hoc signature has no certificate, so the app's only identity is the hash of
   its binary — and every rebuild changes it, silently dropping permissions you

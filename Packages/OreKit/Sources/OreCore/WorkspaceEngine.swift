@@ -53,6 +53,9 @@ public actor WorkspaceEngine {
         var latestUsage: UsageReport?
         var pendingPermissions: [PermissionRequestID: PermissionRequest] = [:]
         var pendingQuestions: [QuestionID: AgentQuestion] = [:]
+        /// Approvals ORE gave on the user's behalf, held until the harness
+        /// confirms each resolution so the audit record can be attached to it.
+        var automaticApprovals: [PermissionRequestID: AutomaticApproval] = [:]
         var pendingPlan: PendingPlan?
         /// True once this turn has edited/written/shelled. A late CreatePlan
         /// after that must not re-advertise a plan the agent already moved past.
@@ -550,11 +553,14 @@ public actor WorkspaceEngine {
             // project workspaces only get review/comment tools, while assistant
             // actions still pass through ORE's own app-side policy.
             allowedTools: ["mcp__ore"],
-            // …and the assistant runs without a shell or an editor: its job is
-            // to route work to the agent that owns the repository, not to open
-            // one itself. See `AssistantActionPolicy.disallowedHarnessTools`.
+            // …and the assistant runs without an editor or filesystem browser:
+            // its terminal is for lightweight inspection and GitHub context,
+            // while project changes stay with the repository-owning agent.
+            // See `AssistantActionPolicy.disallowedHarnessTools`.
             disallowedTools: record.workspaceKind == .assistant
-                ? AssistantActionPolicy.disallowedHarnessTools
+                ? AssistantActionPolicy.disallowedHarnessTools(
+                    permissionModel: harness.capabilities.permissionModel
+                )
                 : record.workspaceKind == .dream
                     ? Self.dreamDisallowedTools
                     : []
@@ -938,6 +944,9 @@ public actor WorkspaceEngine {
 
         if !request.diffComments.isEmpty {
             try? await store.markDiffCommentsSent(workspaceID: workspaceID)
+            // Rewrite the JSON file so ingest cannot revive sent comments
+            // as a fresh pending batch on the next Review-pane poll.
+            try? await persistPendingComments()
         }
         return true
     }
@@ -1385,13 +1394,20 @@ public actor WorkspaceEngine {
         publishChatChange(runtime)
     }
 
+    /// `automatic` is set only when ORE answered on the user's behalf under
+    /// their routine-approval setting. It is remembered until the harness
+    /// confirms the resolution, then attached to the `permissionResolved`
+    /// event so the transcript records that a command ran unasked, and why —
+    /// there was no card, so nothing else would.
     public func resolvePermission(
         _ id: PermissionRequestID,
         with decision: PermissionDecision,
-        chatID: ChatID? = nil
+        chatID: ChatID? = nil,
+        automatic: AutomaticApproval? = nil
     ) async throws {
         let runtime = try await runtime(for: chatID)
         guard let session = runtime.session else { throw HarnessError.sessionEnded }
+        if let automatic { runtime.automaticApprovals[id] = automatic }
 
         // The CLI applies a `setMode` suggestion in the permission reply
         // itself. Mirror it into the stored mode so the composer chip — which
@@ -1569,6 +1585,14 @@ public actor WorkspaceEngine {
         return try await store.pendingDiffComments(workspaceID: workspaceID).map(\.reference)
     }
 
+    public func clearDiffComments(_ references: [DiffCommentReference]) async throws {
+        try await ingestPostedComments()
+        try await store.deletePendingDiffComments(
+            workspaceID: workspaceID, matching: references
+        )
+        try await persistPendingComments()
+    }
+
     /// Agent `PostDiffComment` writes the JSON file; the Review pane and the
     /// next send read the database. Pull new file entries in so the two stay
     /// one list — and so a UI comment cannot wipe the agent's.
@@ -1576,12 +1600,10 @@ public actor WorkspaceEngine {
         let incoming = DiffCommentFile.load(in: worktreeURL)
         guard !incoming.isEmpty else { return }
         let existing = try await store.pendingDiffComments(workspaceID: workspaceID)
-        var seen: Set<String> = Set(existing.map {
-            "\($0.filePath):\($0.startLine):\($0.endLine):\($0.body)"
-        })
+        var seen: Set<String> = Set(existing.map(\.reference.identityKey))
         var added = false
         for comment in incoming {
-            let key = "\(comment.filePath):\(comment.startLine):\(comment.endLine):\(comment.body)"
+            let key = comment.identityKey
             guard seen.insert(key).inserted else { continue }
             _ = try await store.addDiffComment(DiffCommentRecord(
                 workspaceID: workspaceID,
@@ -2032,8 +2054,21 @@ public actor WorkspaceEngine {
 
     // MARK: - Event handling
 
-    private func handle(_ event: AgentEvent, chatID: ChatID) async {
+    /// Harnesses report a resolution without knowing who decided it. If ORE
+    /// answered this one automatically, say so before anything else — the
+    /// transcript and every UI surface read the same enriched event.
+    private func enriched(_ event: AgentEvent, runtime: ChatRuntime) -> AgentEvent {
+        guard case .permissionResolved(var resolution) = event,
+              let automatic = runtime.automaticApprovals.removeValue(forKey: resolution.id),
+              resolution.automatic == nil
+        else { return event }
+        resolution.automatic = automatic
+        return .permissionResolved(resolution)
+    }
+
+    private func handle(_ rawEvent: AgentEvent, chatID: ChatID) async {
         guard let runtime = chats[chatID] else { return }
+        let event = enriched(rawEvent, runtime: runtime)
         await runtime.transcript?.handle(event)
 
         switch event {

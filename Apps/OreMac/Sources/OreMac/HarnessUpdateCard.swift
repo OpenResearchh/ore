@@ -60,6 +60,50 @@ private struct HarnessUpdateRow: View {
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    // "Fix ownership of the install directory" is advice, not
+                    // a way out: it leaves the user to work out which
+                    // directory and which command. Hand over the exact lines
+                    // for the install that actually failed instead.
+                    //
+                    // Copy-and-open rather than run-it-for-me on purpose:
+                    // these can need root, and it is better for the user to
+                    // read what runs as root and type their own password than
+                    // for ORE to become something that executes privileged
+                    // commands on request. See `HarnessRepair`.
+                    if let repair = update?.repair {
+                        Text(repair.reason)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text(repair.script)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 6))
+
+                        if repair.needsRoot {
+                            Text("Runs as root — read it before you paste it.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: OreTheme.Space.sm) {
+                            CopyButton(
+                                value: repair.script, label: "Copy fix", help: "Copy the commands"
+                            )
+                            .buttonStyle(OreSecondaryButtonStyle())
+                            Button("Open Terminal") {
+                                ExternalTools.openInTerminal(NSHomeDirectory())
+                            }
+                            .buttonStyle(OreSecondaryButtonStyle())
+                            .help("Paste the commands here and press return")
+                        }
+                        .font(.system(size: OreTheme.Font.caption))
+                    }
                 }
             }
 

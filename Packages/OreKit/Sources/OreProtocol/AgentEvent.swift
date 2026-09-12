@@ -404,10 +404,34 @@ public enum PermissionDecision: Sendable, Codable, Hashable {
 public struct PermissionResolution: Sendable, Codable, Hashable {
     public var id: PermissionRequestID
     public var decision: PermissionDecision
+    /// Set when ORE answered on the user's behalf under their shell approval
+    /// setting. Such a request never became a card, so this is the only
+    /// record that a command ran unasked — and why ORE judged it safe to.
+    public var automatic: AutomaticApproval?
 
-    public init(id: PermissionRequestID, decision: PermissionDecision) {
+    public init(
+        id: PermissionRequestID,
+        decision: PermissionDecision,
+        automatic: AutomaticApproval? = nil
+    ) {
         self.id = id
         self.decision = decision
+        self.automatic = automatic
+    }
+}
+
+/// A shell command ORE approved without asking.
+public struct AutomaticApproval: Sendable, Codable, Hashable {
+    public var toolCallID: ToolCallID?
+    public var command: String
+    /// Completes "approved because it …" — "only reads", "runs the project's
+    /// tests".
+    public var reason: String
+
+    public init(toolCallID: ToolCallID?, command: String, reason: String) {
+        self.toolCallID = toolCallID
+        self.command = command
+        self.reason = reason
     }
 }
 

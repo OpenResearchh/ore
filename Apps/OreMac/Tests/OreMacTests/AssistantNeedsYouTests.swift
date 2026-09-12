@@ -12,7 +12,8 @@ struct AssistantNeedsYouRowTests {
     private func permission(
         tool: String = "Bash",
         displayName: String? = "Run command",
-        summary: String? = "swift test"
+        summary: String? = "swift test",
+        input: JSONValue = .null
     ) -> TabNeedsYou {
         .permission(TabNeedsYou.Permission(
             workspaceID: WorkspaceID(rawValue: "ws"),
@@ -23,23 +24,43 @@ struct AssistantNeedsYouRowTests {
                 toolName: tool,
                 displayName: displayName,
                 summary: summary,
-                input: .null
+                input: input
             )
         ))
     }
 
-    @Test func aPermissionHeadlineNamesTheToolAndWhatItWillDo() {
-        #expect(permission().headline == "Run command — swift test")
+    @Test func aPermissionHeadlineNamesTheActionAndWhatItWillDo() {
+        #expect(permission().headline == "Run a command — swift test")
+    }
+
+    /// The row says what will run, not what the agent said it was up to. It
+    /// used to read "Bash — Search arXiv API for PerCo SD paper", which names
+    /// neither the command nor the host it talks to.
+    @Test func aPermissionHeadlinePrefersTheCommandOverTheDescription() {
+        let row = permission(
+            summary: "Search arXiv API for PerCo SD paper",
+            input: .object(["command": .string("curl -s https://export.arxiv.org/api/query")])
+        )
+        #expect(row.headline == "Run a command — curl -s https://export.arxiv.org/api/query")
+    }
+
+    /// One line beside a button, so a long command stops rather than wrapping.
+    @Test func aLongCommandIsClippedToTheRow() {
+        let row = permission(input: .object(["command": .string(String(repeating: "x", count: 400))]))
+        #expect(row.headline.count < 120)
+        #expect(row.headline.hasSuffix("…"))
     }
 
     @Test func aPermissionWithoutASummaryStillNamesItself() {
         // No trailing separator dangling off the end of the row.
-        #expect(permission(summary: nil).headline == "Run command")
-        #expect(permission(summary: "").headline == "Run command")
+        #expect(permission(summary: nil).headline == "Run a command")
+        #expect(permission(summary: "").headline == "Run a command")
     }
 
-    @Test func aPermissionWithoutADisplayNameFallsBackToTheToolName() {
-        #expect(permission(displayName: nil, summary: nil).headline == "Bash")
+    @Test func anUnknownToolFallsBackToTheNameTheHarnessGaveIt() {
+        #expect(permission(tool: "Frobnicate", displayName: nil, summary: nil).headline == "Frobnicate")
+        #expect(permission(tool: "Frobnicate", displayName: "Frobnicate a thing", summary: nil)
+            .headline == "Frobnicate a thing")
     }
 
     // MARK: - How the ask sounds

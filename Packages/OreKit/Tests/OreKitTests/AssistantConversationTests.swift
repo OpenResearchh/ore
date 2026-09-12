@@ -320,12 +320,13 @@ struct AssistantConversationTests {
             "still say the substance and the verdict out loud before mentioning"
         ))
 
-        // Role boundaries are unchanged: the assistant still delegates and
-        // still has no shell or editor.
-        #expect(prompt.contains("never do the work"))
+        // The assistant can inspect and query GitHub from a terminal, but the
+        // editor and project implementation still belong to project agents.
+        #expect(prompt.contains("terminal for lightweight inspection and GitHub context"))
         let configuration = try #require(await assistantHarness.latestSession?.configuration)
         #expect(configuration.allowedTools == ["mcp__ore"])
-        for tool in ["Bash", "Edit", "Write", "Read", "Task", "WebFetch"] {
+        #expect(!configuration.disallowedTools.contains("Bash"))
+        for tool in ["Edit", "Write", "Read", "Task", "WebFetch"] {
             #expect(configuration.disallowedTools.contains(tool))
         }
     }

@@ -53,6 +53,11 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     case rewriteWorkspace
     /// Create or update state on a remote hosting provider.
     case remoteRepository
+    /// Bring a remote repository — and the agent instructions and settings it
+    /// carries — onto this Mac. Its own class so that granting "always" for
+    /// publishing the user's own work does not also grant cloning anything the
+    /// assistant happens to read a name for.
+    case cloneRepository
     /// Install a new version of one of the user's agent CLIs. Consequential
     /// because it replaces software outside ORE's own tree, on the user's
     /// machine, with whatever the vendor is publishing right now.
@@ -70,6 +75,7 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
         case .changeGitHistory: "Change git history"
         case .rewriteWorkspace: "Rewrite workspace files"
         case .remoteRepository: "Change remote repository state"
+        case .cloneRepository: "Clone a repository onto this Mac"
         case .updateHarnessCLI: "Update an agent CLI"
         }
     }

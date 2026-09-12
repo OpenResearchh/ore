@@ -480,9 +480,19 @@ struct CodexTranslator {
 
         switch method {
         case "item/commandExecution/requestApproval", "execCommandApproval":
+            let argv = params["command"]?.arrayValue?.compactMap(\.stringValue)
             let command = params["command"]?.stringValue
-                ?? params["command"]?.arrayValue?.compactMap(\.stringValue).joined(separator: " ")
+                ?? argv?.joined(separator: " ")
                 ?? ""
+            var input: [String: JSONValue] = [
+                "command": .string(command),
+                "cwd": params["cwd"] ?? .null,
+            ]
+            // The joined string is for reading, and it loses the quoting that
+            // marks `bash -lc 'a && b'` as one script argument. Keeping argv
+            // lets the shell approval policy judge what will actually run
+            // rather than a flattened guess at it.
+            if let argv { input["argv"] = .array(argv.map { .string($0) }) }
             return PermissionRequest(
                 turnID: turnID,
                 id: PermissionRequestID(rawValue: requestID),
@@ -490,10 +500,7 @@ struct CodexTranslator {
                 toolName: "Bash",
                 displayName: "Run command",
                 summary: command,
-                input: .object([
-                    "command": .string(command),
-                    "cwd": params["cwd"] ?? .null,
-                ]),
+                input: .object(input),
                 suggestions: [PermissionSuggestion(
                     kind: .setMode,
                     title: "Allow for this session",

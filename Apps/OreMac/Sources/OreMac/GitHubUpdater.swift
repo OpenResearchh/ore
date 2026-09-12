@@ -592,19 +592,57 @@ final class GitHubUpdater {
     /// upgraded, but only after I restarted it myself" looked like. The app
     /// has its own watchdog now; this is the backstop for the case where even
     /// that can't get the process out.
+    ///
+    /// The replacement never deletes the installed app before it has a
+    /// working copy of the new one. It used to: `rm -rf` on the bundle and
+    /// then `ditto`, which means a full disk, a sandbox refusal or a Mac
+    /// going to sleep in between left the user with no ORE at all and a
+    /// staged copy in a temporary directory they would never find. Now the
+    /// new bundle is copied next to the destination, checked, and only then
+    /// swapped in — with the old one kept aside until that has worked, and
+    /// put back if it hasn't.
     nonisolated static func relaunchScript(
         newApp: URL,
         destination: URL,
         pid: Int32,
         scriptPath: String,
-        label: String
+        label: String,
+        logPath: String = defaultLogPath
     ) -> String {
         let src = shellQuote(newApp.path)
         let dst = shellQuote(destination.path)
+        let destinationDirectory = shellQuote(destination.deletingLastPathComponent().path)
         let staging = shellQuote(newApp.deletingLastPathComponent().path)
         return """
         #!/bin/bash
         PID=\(pid)
+        SRC=\(src)
+        DST=\(dst)
+        DEST_DIR=\(destinationDirectory)
+        STAGING=\(staging)
+        LOG=\(shellQuote(logPath))
+        INCOMING="$DEST_DIR/.ORE.app.incoming.$$"
+        PREVIOUS="$DEST_DIR/.ORE.app.previous.$$"
+
+        /bin/mkdir -p "$(/usr/bin/dirname "$LOG")" 2>/dev/null
+        log() { printf '%s %s\\n' "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOG" 2>/dev/null; }
+
+        # Whatever went wrong, the user ends up with a working ORE: either the
+        # one they had, or the new one. The log is the only evidence left of a
+        # swap that happened after the app was gone.
+        give_up() {
+          log "update failed: $*"
+          /bin/rm -rf "$INCOMING"
+          if [ -d "$PREVIOUS" ] && [ ! -e "$DST" ]; then
+            /bin/mv "$PREVIOUS" "$DST" && log "restored the previous ORE.app"
+          fi
+          /bin/rm -rf "$PREVIOUS"
+          [ -e "$DST" ] && /usr/bin/open "$DST"
+          /bin/rm -rf "$STAGING"
+          /bin/rm -f \(shellQuote(scriptPath))
+          /bin/launchctl remove \(shellQuote(label))
+        }
+
         wait_for_exit() {
           deadline=$((SECONDS + $1))
           while /bin/kill -0 "$PID" 2>/dev/null; do
@@ -617,14 +655,59 @@ final class GitHubUpdater {
         wait_for_exit \(terminateSeconds) || /bin/kill -KILL "$PID" 2>/dev/null
         wait_for_exit \(killSeconds)
         /bin/sleep 0.3
-        /bin/rm -rf \(dst)
-        /usr/bin/ditto \(src) \(dst)
-        /usr/bin/xattr -dr com.apple.quarantine \(dst) || true
-        /usr/bin/open \(dst)
-        /bin/rm -rf \(staging)
+
+        log "installing $SRC into $DST"
+
+        # On the destination volume, so the slow part is the copy and the
+        # irreversible part is a rename.
+        /bin/rm -rf "$INCOMING"
+        if ! /usr/bin/ditto "$SRC" "$INCOMING"; then
+          give_up "could not copy the new app into $DEST_DIR"
+          exit 1
+        fi
+        /usr/bin/xattr -dr com.apple.quarantine "$INCOMING" 2>/dev/null
+
+        # An update that cannot be verified is not installed. A truncated
+        # download, a half-unpacked archive or a broken seal all land here,
+        # and all of them would otherwise replace a working app with one
+        # macOS refuses to launch.
+        if [ ! -x "$INCOMING/Contents/MacOS/OreMac" ]; then
+          give_up "the copied app has no executable"
+          exit 1
+        fi
+        if ! /usr/bin/codesign --verify --deep --strict "$INCOMING" 2>>"$LOG"; then
+          give_up "the copied app failed signature verification"
+          exit 1
+        fi
+
+        if [ -e "$DST" ]; then
+          /bin/rm -rf "$PREVIOUS"
+          if ! /bin/mv "$DST" "$PREVIOUS"; then
+            give_up "could not move the installed app aside"
+            exit 1
+          fi
+        fi
+        if ! /bin/mv "$INCOMING" "$DST"; then
+          give_up "could not move the new app into place"
+          exit 1
+        fi
+
+        log "installed; reopening"
+        /usr/bin/open "$DST" || log "could not reopen $DST"
+        /bin/rm -rf "$PREVIOUS"
+        /bin/rm -rf "$STAGING"
         /bin/rm -f \(shellQuote(scriptPath))
         /bin/launchctl remove \(shellQuote(label))
         """
+    }
+
+    /// Where the swap script writes what it did. Inside the app's own state
+    /// directory, because by the time it runs there is no app to report to.
+    nonisolated static var defaultLogPath: String {
+        let home = ProcessInfo.processInfo.environment["ORE_HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("ore", isDirectory: true).path
+        return (home as NSString).appendingPathComponent("update.log")
     }
 
     /// How long the script gives each stage of getting the old app out: its

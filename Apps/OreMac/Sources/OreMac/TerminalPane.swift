@@ -167,8 +167,21 @@ final class OreTerminalView: LocalProcessTerminalView {
         // Match the app's own text rendering rather than SwiftTerm's default,
         // so the terminal doesn't look pasted in.
         font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        nativeBackgroundColor = .textBackgroundColor
-        nativeForegroundColor = .labelColor
+
+        // ORE is dark-only — `OreMacApp` sets `.preferredColorScheme(.dark)`.
+        // That is a SwiftUI environment value, though, and it does not reach an
+        // NSView's effective appearance. `.textBackgroundColor` and
+        // `.labelColor` are *dynamic*: SwiftTerm resolves them once, here, at
+        // assignment — before this view is in a window — so they resolved
+        // against the system appearance instead of the app's. On a Mac set to
+        // Light that painted a white terminal with black text inside ORE's
+        // dark chrome, which is what it looked like: a blank white panel.
+        appearance = NSAppearance(named: .darkAqua)
+        let dark = NSAppearance(named: .darkAqua) ?? effectiveAppearance
+        dark.performAsCurrentDrawingAppearance {
+            nativeBackgroundColor = .textBackgroundColor
+            nativeForegroundColor = .labelColor
+        }
     }
 
     override func dataReceived(slice: ArraySlice<UInt8>) {

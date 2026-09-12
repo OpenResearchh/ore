@@ -98,7 +98,7 @@ struct MenuBarDashboard: View {
 
     private var header: some View {
         HStack(spacing: OreTheme.Space.sm) {
-            Image(systemName: "sparkles").foregroundStyle(Color.accentColor)
+            OreAppIcon(size: 18)
             Text("ORE").font(.system(size: OreTheme.Font.body, weight: .semibold))
             Spacer()
             Text(voiceHint)
@@ -178,7 +178,15 @@ struct MenuBarDashboard: View {
     }
 
     private func permissionCard(_ item: TabNeedsYou) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        // `headline` clips to 80 characters and takes two lines here, so a
+        // long or multi-line command is only partly on screen. Allow and
+        // Always are withdrawn in that case — the menu bar has nowhere to
+        // put the rest, and the rest is the part worth reading.
+        let isAbbreviated: Bool = {
+            guard case .permission(let payload) = item else { return false }
+            return PermissionPresentation(request: payload.request).isAbbreviated
+        }()
+        return VStack(alignment: .leading, spacing: 6) {
             // `headline`, not `spokenSummary`: this card is read, and it sits
             // above an Allow button where the tool and its argument are the
             // whole point — see the note on both properties.
@@ -189,11 +197,18 @@ struct MenuBarDashboard: View {
                 Button("Deny") { denyPermission(item) }
                     .controlSize(.small)
                 Spacer()
-                Button("Allow") { allowPermission(item) }
-                    .controlSize(.small)
-                    .buttonStyle(.borderedProminent)
-                Button("Always") { alwaysAllow(item) }
-                    .controlSize(.small)
+                if isAbbreviated {
+                    Button("Review…") { model.reveal(workspaceID: item.workspaceID, chatID: item.chatID) }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                        .help("The full command doesn't fit here — open ORE to read it")
+                } else {
+                    Button("Allow") { allowPermission(item) }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                    Button("Always") { alwaysAllow(item) }
+                        .controlSize(.small)
+                }
             }
         }
     }

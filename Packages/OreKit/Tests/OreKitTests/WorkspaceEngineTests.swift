@@ -466,6 +466,22 @@ struct WorkspaceEngineTests {
         #expect(after.map(\.body).sorted() == ["and this", "unwrap this"])
     }
 
+    @Test func clearingACommentRewritesTheJSONSoIngestCannotResurrectIt() async throws {
+        let harness = try await makeEngine()
+        let comment = DiffCommentReference(
+            filePath: "Sources/App.swift",
+            startLine: 12,
+            endLine: 14,
+            body: "unwrap this"
+        )
+        try DiffCommentFile.append(comment, in: harness.worktree)
+        #expect(try await harness.engine.pendingDiffComments().count == 1)
+
+        try await harness.engine.clearDiffComments([comment])
+        #expect(try await harness.engine.pendingDiffComments().isEmpty)
+        #expect(DiffCommentFile.load(in: harness.worktree).isEmpty)
+    }
+
     @Test func aWorkspaceNeedingInputIsMarkedUnreadUnlessItIsOnScreen() async throws {
         // The sidebar answers "which agent needs me"; the one the user is
         // already looking at does not.
@@ -737,10 +753,9 @@ struct WorkspaceEngineTests {
         #expect(session.configuration.allowedTools == ["mcp__ore"])
     }
 
-    /// The assistant orchestrates; it does not open a shell in someone else's
-    /// worktree. Asking it not to in the prompt is a suggestion — launching it
-    /// without `Bash` is the boundary.
-    @Test func theAssistantRunsWithoutAShellOrAnEditor() async throws {
+    /// The assistant keeps a terminal for lightweight inspection, but project
+    /// edits remain with the agent whose tab owns that worktree.
+    @Test func theAssistantRunsWithATerminalButNoEditor() async throws {
         let fixture = try await GitFixture.initialized()
         let store = try OreStore()
         try await store.addRepository(RepositoryRecord(
@@ -766,14 +781,17 @@ struct WorkspaceEngineTests {
         let session = try #require(fake.latestSession)
 
         let disallowed = Set(session.configuration.disallowedTools)
-        for tool in ["Bash", "Edit", "Write", "Read", "Task", "WebFetch"] {
+        #expect(!disallowed.contains("Bash"), "the assistant needs its terminal")
+        for tool in ["Edit", "Write", "Read", "Task", "WebFetch"] {
             #expect(disallowed.contains(tool), "the assistant must not be given \(tool)")
         }
         // Its own ORE tools are the other half of the arrangement: no CLI
         // prompt on top of ORE's action policy.
         #expect(session.configuration.allowedTools == ["mcp__ore"])
         // And it's told it is the concierge, not a worktree's agent.
-        #expect(session.configuration.appendSystemPrompt?.contains("never do the work") == true)
+        #expect(session.configuration.appendSystemPrompt?.contains(
+            "terminal for lightweight inspection and GitHub context"
+        ) == true)
     }
 
     @Test func aMissingHarnessFailsWithSomethingActionable() async throws {

@@ -99,8 +99,7 @@ struct AssistantActivityView: View {
         state: ChatState
     ) -> some View {
         HStack(spacing: OreTheme.Space.md) {
-            Image(systemName: "sparkles")
-                .foregroundStyle(Color.accentColor)
+            OreAppIcon(size: 22)
             conversationMenu(assistant: assistant, chatID: chatID, current: summary)
             if state.status != .idle {
                 // Humanized, like the chat pane's composer status. This used to
@@ -484,17 +483,21 @@ struct AssistantActivityView: View {
         _ permission: PermissionRequest,
         workspaceID: WorkspaceID
     ) -> some View {
-        HStack(spacing: OreTheme.Space.md) {
+        let content = PermissionPresentation(request: permission)
+        return HStack(spacing: OreTheme.Space.md) {
             Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
-                Text(permission.displayName ?? permission.toolName)
+                Text(content.action)
                     .fontWeight(.medium)
-                if let summary = permission.summary, !summary.isEmpty {
-                    Text(summary)
+                // The command, path or URL — the same act the chat pane shows,
+                // so answering here means answering the same question.
+                if let target = content.target {
+                    Text(target)
                         .font(.system(size: OreTheme.Font.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: OreTheme.Space.sm)

@@ -77,9 +77,13 @@ enum TabNeedsYou: Identifiable, Equatable {
     var headline: String {
         switch self {
         case .permission(let item):
-            let tool = item.request.displayName ?? item.request.toolName
-            guard let summary = item.request.summary, !summary.isEmpty else { return tool }
-            return "\(tool) — \(summary)"
+            // The same reading the card gives, so the row the user clicks and
+            // the card it takes them to describe one act in one vocabulary.
+            // Clipped: this is a single line beside a button, and a `curl` is
+            // longer than the row will ever be.
+            let content = PermissionPresentation(request: item.request)
+            guard let target = content.target else { return content.action }
+            return "\(content.action) — \(PermissionPresentation.clip(target, to: 80))"
         case .question(let item):
             return item.question.prompt
         case .plan(let item):

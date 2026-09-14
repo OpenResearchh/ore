@@ -668,9 +668,9 @@ struct UserMessageAttachmentTests {
 /// white on white, which reads as the chips having disappeared.
 @MainActor
 struct TranscriptAppearanceTests {
-    private func editRow() -> TranscriptRow {
+    private func editRow(id: String = "tool-appearance") -> TranscriptRow {
         TranscriptRow(
-            id: "tool-appearance",
+            id: id,
             turnID: TurnID(rawValue: "t1"),
             kind: .toolCall,
             text: "Edit",
@@ -704,6 +704,33 @@ struct TranscriptAppearanceTests {
         #expect(darkPixels != nil)
         #expect(lightPixels != nil)
         #expect(darkPixels != lightPixels)
+    }
+
+    @Test func pillsFollowTheWindowAppearanceEvenWhenTheAppIsDark() {
+        // The assistant window follows the Mac; the main window is smoked
+        // glass. NSApp.effectiveAppearance is the system, so a light window
+        // used to be served dark-mode chips keyed as "Aqua".
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+        application.appearance = NSAppearance(named: .darkAqua)
+
+        let row = editRow(id: "tool-appearance-window")
+        let lightChip = TranscriptCell.usingAppearance(NSAppearance(named: .aqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let darkChip = TranscriptCell.usingAppearance(NSAppearance(named: .darkAqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let lightFill = chipFill(lightChip)
+        let darkFill = chipFill(darkChip)
+        #expect(lightFill != nil)
+        #expect(darkFill != nil)
+        if let lightFill, let darkFill {
+            let lightLuma = lightFill.redComponent + lightFill.greenComponent + lightFill.blueComponent
+            let darkLuma = darkFill.redComponent + darkFill.greenComponent + darkFill.blueComponent
+            #expect(lightLuma < darkLuma, "light pills are a dark wash; dark pills are a light wash")
+        }
     }
 
     @Test func footerFileChipsIncludeAWrapGutter() {
@@ -829,6 +856,14 @@ struct TranscriptAppearanceTests {
             }
         }
         return found
+    }
+
+    private func chipFill(_ image: NSImage?) -> NSColor? {
+        guard let image, let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              rep.pixelsWide > 0, rep.pixelsHigh > 0
+        else { return nil }
+        return rep.colorAt(x: rep.pixelsWide / 2, y: rep.pixelsHigh / 2)
     }
 }
 

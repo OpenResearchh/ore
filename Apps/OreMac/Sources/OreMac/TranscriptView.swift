@@ -696,13 +696,15 @@ struct TranscriptView: NSViewRepresentable {
             guard available > 1 else { return TranscriptCell.estimatedHeight(for: item) }
 
             let width = min(max(available, 100), TranscriptCell.contentMaxWidth)
-            let height = TranscriptCell.height(
-                for: item,
-                width: width,
-                worktreePath: worktreePath,
-                responseCollapse: responseCollapse(for: item),
-                turnHeader: turnHeader(for: item)
-            )
+            let height = TranscriptCell.usingAppearance(tableView.effectiveAppearance) {
+                TranscriptCell.height(
+                    for: item,
+                    width: width,
+                    worktreePath: worktreePath,
+                    responseCollapse: responseCollapse(for: item),
+                    turnHeader: turnHeader(for: item)
+                )
+            }
             heightCache[item.id] = height
             return height
         }
@@ -1537,10 +1539,12 @@ final class TranscriptCell: NSTableCellView {
         userWidthConstraint.isActive = isUser
 
         if isUser {
-            let natural = Self.attributedText(for: row, worktreePath: worktreePath).boundingRect(
-                with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).width + 20
+            let natural = Self.usingAppearance(effectiveAppearance) {
+                Self.attributedText(for: row, worktreePath: worktreePath).boundingRect(
+                    with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading]
+                ).width + 20
+            }
             // The bubble is sized from its text, but the badge sits inside it
             // and is not part of that measurement. A one-word prompt from the
             // assistant is narrower than its own label, so the badge decides the
@@ -1553,9 +1557,11 @@ final class TranscriptCell: NSTableCellView {
 
         // A collapsed response swaps in its truncated render — the same string
         // `height(for:)` measured, which is what keeps row height honest.
-        let attributedText = responseCollapse == .collapsed
-            ? Self.collapsedAttributedText(for: row)
-            : Self.attributedText(for: row, worktreePath: worktreePath)
+        let attributedText = Self.usingAppearance(effectiveAppearance) {
+            responseCollapse == .collapsed
+                ? Self.collapsedAttributedText(for: row)
+                : Self.attributedText(for: row, worktreePath: worktreePath)
+        }
         label.dismissAttachmentPreview()
         label.textStorage?.setAttributedString(attributedText)
         label.onOpenFile = onOpenFile
@@ -2475,11 +2481,45 @@ final class TranscriptCell: NSTableCellView {
 
     /// The appearance transcript bitmaps are rendered against.
     ///
-    /// `NSApp.effectiveAppearance` rather than a view's: these are static
-    /// drawing helpers with no view in scope, and the transcript never differs
-    /// from the app's appearance anyway.
+    /// Prefer the appearance the caller bound with `usingAppearance` — that's
+    /// the *view's* effective appearance. `NSApp.effectiveAppearance` follows
+    /// the system, which is the wrong room: the main window is smoked glass
+    /// (always dark) while the assistant window follows the Mac. Drawing chips
+    /// against NSApp while showing them in a light assistant window is what
+    /// left dark-mode pills (light labels on a dark fill) sitting on paper.
     static var currentAppearance: NSAppearance {
-        NSApp?.effectiveAppearance ?? NSAppearance(named: .aqua) ?? NSAppearance()
+        renderingAppearance
+            ?? NSApp?.effectiveAppearance
+            ?? NSAppearance(named: .aqua)
+            ?? NSAppearance()
+    }
+
+    private static var renderingAppearance: NSAppearance?
+
+    /// Binds chip/markdown rasterisation to `appearance` for the duration of
+    /// `body`. Measure and draw both go through here so a row's cached bitmap
+    /// is the one that window actually shows.
+    static func usingAppearance<T>(_ appearance: NSAppearance, _ body: () -> T) -> T {
+        let previous = renderingAppearance
+        renderingAppearance = appearance
+        defer { renderingAppearance = previous }
+        var value: T!
+        appearance.performAsCurrentDrawingAppearance {
+            value = body()
+        }
+        return value
+    }
+
+    /// Snapshot a dynamic colour against `appearance`. `withAlphaComponent`
+    /// on a catalog colour otherwise keeps the dynamic identity and
+    /// `lockFocus` / image handlers resolve it against whatever appearance
+    /// happens to be current — often NSApp, not the window.
+    private static func color(_ color: NSColor, in appearance: NSAppearance) -> NSColor {
+        var resolved = color
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.deviceRGB) ?? color
+        }
+        return resolved
     }
 
     private static func drawSubjectPill(
@@ -2490,18 +2530,26 @@ final class TranscriptCell: NSTableCellView {
         insertions: Int,
         deletions: Int
     ) -> NSImage {
+        let appearance = currentAppearance
+        let label = color(.labelColor, in: appearance)
+        let secondary = color(.secondaryLabelColor, in: appearance)
+        let separator = color(.separatorColor, in: appearance)
+        let plusColor = color(.systemGreen, in: appearance)
+        let minusColor = color(.systemRed, in: appearance)
+        let resolvedTint = color(tint, in: appearance)
+
         let font = monospace
             ? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             : NSFont.systemFont(ofSize: 12, weight: .medium)
         let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: font, .foregroundColor: NSColor.labelColor,
+            .font: font, .foregroundColor: label,
         ]
         let statFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         let plusAttrs: [NSAttributedString.Key: Any] = [
-            .font: statFont, .foregroundColor: NSColor.systemGreen,
+            .font: statFont, .foregroundColor: plusColor,
         ]
         let minusAttrs: [NSAttributedString.Key: Any] = [
-            .font: statFont, .foregroundColor: NSColor.systemRed,
+            .font: statFont, .foregroundColor: minusColor,
         ]
         let plusText = insertions > 0 ? "+\(insertions)" : ""
         let minusText = deletions > 0 ? "−\(deletions)" : ""
@@ -2524,60 +2572,63 @@ final class TranscriptCell: NSTableCellView {
                 + hPad
         )
         let height = ceil(textSize.height + vPad * 2)
-        let image = NSImage(size: NSSize(width: max(1, width), height: max(1, height)))
-        image.lockFocus()
-        let rect = NSRect(x: 0.5, y: 0.5, width: width - 1, height: height - 1)
-        let path = NSBezierPath(roundedRect: rect, xRadius: OreTheme.chipRadius, yRadius: OreTheme.chipRadius)
         let fill = identity == nil
-            ? tint.withAlphaComponent(0.16)
-            : NSColor.secondaryLabelColor.withAlphaComponent(0.10)
-        fill.setFill()
-        path.fill()
-        path.lineWidth = 1
-        if identity == nil {
-            tint.withAlphaComponent(0.35).setStroke()
-        } else {
-            NSColor.separatorColor.withAlphaComponent(0.55).setStroke()
-        }
-        path.stroke()
-        var x = hPad
-        if let identity {
-            let iconRect = NSRect(x: x, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
-            drawFileIcon(identity, in: iconRect)
-            x += iconSize + iconGap
-        }
-        (text as NSString).draw(
-            at: NSPoint(x: x, y: (height - textSize.height) / 2),
-            withAttributes: textAttrs
-        )
-        x += textSize.width
-        if !plusText.isEmpty {
-            x += statGap
-            (plusText as NSString).draw(
-                at: NSPoint(x: x, y: (height - plusSize.height) / 2),
-                withAttributes: plusAttrs
+            ? resolvedTint.withAlphaComponent(0.16)
+            : secondary.withAlphaComponent(0.10)
+        let stroke = identity == nil
+            ? resolvedTint.withAlphaComponent(0.35)
+            : separator.withAlphaComponent(0.55)
+        let image = NSImage(size: NSSize(width: max(1, width), height: max(1, height)), flipped: false) { _ in
+            let rect = NSRect(x: 0.5, y: 0.5, width: width - 1, height: height - 1)
+            let path = NSBezierPath(roundedRect: rect, xRadius: OreTheme.chipRadius, yRadius: OreTheme.chipRadius)
+            fill.setFill()
+            path.fill()
+            path.lineWidth = 1
+            stroke.setStroke()
+            path.stroke()
+            var x = hPad
+            if let identity {
+                let iconRect = NSRect(x: x, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
+                drawFileIcon(identity, in: iconRect, appearance: appearance)
+                x += iconSize + iconGap
+            }
+            (text as NSString).draw(
+                at: NSPoint(x: x, y: (height - textSize.height) / 2),
+                withAttributes: textAttrs
             )
-            x += plusSize.width
+            x += textSize.width
+            if !plusText.isEmpty {
+                x += statGap
+                (plusText as NSString).draw(
+                    at: NSPoint(x: x, y: (height - plusSize.height) / 2),
+                    withAttributes: plusAttrs
+                )
+                x += plusSize.width
+            }
+            if !minusText.isEmpty {
+                x += plusText.isEmpty ? statGap : betweenStats
+                (minusText as NSString).draw(
+                    at: NSPoint(x: x, y: (height - minusSize.height) / 2),
+                    withAttributes: minusAttrs
+                )
+            }
+            return true
         }
-        if !minusText.isEmpty {
-            x += plusText.isEmpty ? statGap : betweenStats
-            (minusText as NSString).draw(
-                at: NSPoint(x: x, y: (height - minusSize.height) / 2),
-                withAttributes: minusAttrs
-            )
-        }
-        image.unlockFocus()
         return image
     }
 
     /// Language glyphs already carry colour; SF Symbol templates need a tint
     /// pass so a Swift file doesn't render as a grey blob inside a coloured chip.
-    private static func drawFileIcon(_ identity: FileVisualIdentity, in rect: NSRect) {
+    private static func drawFileIcon(
+        _ identity: FileVisualIdentity,
+        in rect: NSRect,
+        appearance: NSAppearance
+    ) {
         let icon = identity.appKitImage(size: rect.width)
         if icon.isTemplate {
             let tinted = NSImage(size: rect.size, flipped: false) { bounds in
                 icon.draw(in: bounds)
-                identity.tone.nsColor.set()
+                color(identity.tone.nsColor, in: appearance).set()
                 bounds.fill(using: .sourceIn)
                 return true
             }

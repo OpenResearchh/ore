@@ -997,9 +997,17 @@ struct TranscriptView: NSViewRepresentable {
             let previous = scrollView.contentInsets
             guard abs(previous.top - top) > 0.5
                     || abs(previous.bottom - bottom) > 0.5 else { return }
-            scrollView.contentInsets.top = top
-            scrollView.contentInsets.bottom = bottom
-            if policy.isFollowingBottom { scrollToBottom(tableView) }
+            // Decided before the insets move. Re-tiling posts a bounds change,
+            // and a bottom check against the new, taller inset reads a reader
+            // resting at the foot as scrolled away: a permission card switched
+            // following off and left the newest lines under the dock.
+            let wasFollowing = policy.isFollowingBottom
+            withProgrammaticScroll {
+                scrollView.contentInsets = NSEdgeInsets(
+                    top: top, left: previous.left, bottom: bottom, right: previous.right
+                )
+            }
+            if wasFollowing { scrollToBottom(tableView) }
         }
 
         /// The reader asked to catch up. This resumes following, so the agent's

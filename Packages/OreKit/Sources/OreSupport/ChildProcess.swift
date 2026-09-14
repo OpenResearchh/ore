@@ -263,7 +263,12 @@ public final class ChildProcess: @unchecked Sendable {
         AsyncStream(Data.self, bufferingPolicy: bufferingPolicy) { continuation in
             let thread = Thread {
                 while true {
-                    let chunk = handle.availableData
+                    // `availableData` hands back an autoreleased NSData, and a
+                    // Thread's own pool only drains when its body returns — at
+                    // EOF. Without a pool per read, every 16 KB chunk a
+                    // harness ever wrote stayed resident for as long as the
+                    // session ran: hundreds of MB after a few hours.
+                    let chunk = autoreleasepool { handle.availableData }
                     if chunk.isEmpty { break }  // EOF
                     continuation.yield(chunk)
                 }

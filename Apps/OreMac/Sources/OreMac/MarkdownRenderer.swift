@@ -59,6 +59,18 @@ struct MarkdownRenderer {
         _ markdown: String,
         highlighting: HighlightCachePolicy = .all
     ) -> NSAttributedString {
+        // Trailing block spacing is padding inside the bubble's own padding.
+        trimmingTrailingNewlines(renderBlocks(markdown, highlighting: highlighting))
+    }
+
+    /// Parses, draws and links one run of top-level blocks, keeping the
+    /// trailing newlines so runs rendered separately concatenate into exactly
+    /// what one render of the whole run produces. Trimming before or after the
+    /// link passes is equivalent: neither pattern matches across a newline.
+    private func renderBlocks(
+        _ markdown: String,
+        highlighting: HighlightCachePolicy
+    ) -> NSMutableAttributedString {
         let document = Document(parsing: markdown, options: [.parseBlockDirectives])
         let fenceCount = codeBlockCount(in: document)
         var visitor = Visitor(
@@ -68,16 +80,238 @@ struct MarkdownRenderer {
             fenceCount: fenceCount,
             skipCachingLastFence: highlighting == .stablePrefix
         )
-        let result = NSMutableAttributedString(
-            attributedString: trimmingTrailingNewlines(visitor.visit(document))
-        )
+        let result = NSMutableAttributedString(attributedString: visitor.visit(document))
         // Claim bare URLs first so the file-reference pass can't chew into a
         // domain (its single-letter extensions like `.c`/`.m` used to turn
         // `github.com` into a `github.c` file chip mid-URL).
         linkifyBareURLs(in: result)
         linkFileReferences(in: result)
-        // Trailing block spacing is padding inside the bubble's own padding.
         return result
+    }
+
+    // MARK: - Streaming
+
+    /// The settled head of a streaming reply, rendered once.
+    ///
+    /// A streaming row used to be re-parsed from its first byte on every flush,
+    /// so a long answer cost more per delta the longer it got. Everything above
+    /// the last blank line that starts an independent block cannot change as
+    /// text is appended, so it is rendered once and only the tail is redone.
+    struct StreamingPrefix {
+        fileprivate let source: String
+        fileprivate let rendered: NSAttributedString
+        fileprivate let baseFont: NSFont
+        fileprivate let textColor: NSColor
+
+        /// UTF-8 length of the source the head covers.
+        var sourceLength: Int { source.utf8.count }
+        /// UTF-16 length of the rendered head, for callers bounding a cache.
+        var renderedLength: Int { rendered.length }
+
+        fileprivate func isExtended(by markdown: String, baseFont: NSFont, textColor: NSColor) -> Bool {
+            guard self.baseFont == baseFont, self.textColor == textColor else { return false }
+            let contiguous = source.utf8.withContiguousStorageIfAvailable { head in
+                markdown.utf8.withContiguousStorageIfAvailable { whole -> Bool in
+                    guard whole.count >= head.count else { return false }
+                    guard let headBase = head.baseAddress, let wholeBase = whole.baseAddress else {
+                        return head.isEmpty
+                    }
+                    return memcmp(wholeBase, headBase, head.count) == 0
+                }
+            }
+            if let answer = contiguous.flatMap({ $0 }) { return answer }
+            return markdown.utf8.starts(with: source.utf8)
+        }
+    }
+
+    struct StreamingRender {
+        var rendered: NSAttributedString
+        /// Nil when the document has no settled head, or holds a construct that
+        /// reaches across blank lines, so the next flush renders it whole.
+        var prefix: StreamingPrefix?
+    }
+
+    /// Renders a document that is still growing, reusing `previous` when the
+    /// text only grew past it. The result is identical to
+    /// `render(markdown, highlighting: .stablePrefix)`.
+    func renderStreaming(_ markdown: String, reusing previous: StreamingPrefix?) -> StreamingRender {
+        let reusable = previous.flatMap {
+            $0.isExtended(by: markdown, baseFont: baseFont, textColor: textColor) ? $0 : nil
+        }
+        let scanStart = reusable?.sourceLength ?? 0
+        guard case .split(let found) = Self.streamingBoundary(in: markdown, from: scanStart) else {
+            return StreamingRender(rendered: render(markdown, highlighting: .stablePrefix), prefix: nil)
+        }
+        let boundary = found ?? scanStart
+
+        var head = reusable
+        if boundary > scanStart {
+            let chunk = renderBlocks(
+                Self.slice(markdown, utf8From: scanStart, to: boundary), highlighting: .all
+            )
+            // Every block the visitor draws ends in a newline, which is what
+            // keeps the link passes from matching across the seam. A chunk that
+            // does not is something this split does not model; render whole.
+            if chunk.length > 0, chunk.mutableString.character(at: chunk.length - 1) != 10 {
+                return StreamingRender(rendered: render(markdown, highlighting: .stablePrefix), prefix: nil)
+            }
+            let combined = NSMutableAttributedString(attributedString: reusable?.rendered ?? NSAttributedString())
+            combined.append(chunk)
+            head = StreamingPrefix(
+                source: Self.slice(markdown, utf8From: 0, to: boundary),
+                rendered: combined,
+                baseFont: baseFont,
+                textColor: textColor
+            )
+        }
+
+        let tail = renderBlocks(
+            Self.slice(markdown, utf8From: boundary, to: markdown.utf8.count),
+            highlighting: .stablePrefix
+        )
+        guard let head else {
+            return StreamingRender(rendered: trimmingTrailingNewlines(tail), prefix: nil)
+        }
+        let result = NSMutableAttributedString(attributedString: head.rendered)
+        result.append(tail)
+        return StreamingRender(rendered: trimmingTrailingNewlines(result), prefix: head)
+    }
+
+    enum StreamingBoundary: Equatable {
+        /// Something in the document can reach across a blank line (a link
+        /// reference definition, an HTML block, a directive, a fence nested in
+        /// a container), so it has to be parsed whole.
+        case unsplittable
+        /// UTF-8 offset of the latest line after `from` where a parse of the
+        /// rest starts in the same state a parse of the whole would be in.
+        case split(at: Int?)
+    }
+
+    /// Finds where a streaming document can be cut without changing how either
+    /// side parses. Deliberately conservative: a cut is only taken after a blank
+    /// line, outside any fence, before an unindented line that cannot continue
+    /// a list or quote. Anything unsure renders whole, which is only slower.
+    static func streamingBoundary(in markdown: String, from start: Int = 0) -> StreamingBoundary {
+        markdown.utf8.withContiguousStorageIfAvailable { scanBoundary($0, from: start) } ?? .unsplittable
+    }
+
+    private static func scanBoundary(_ bytes: UnsafeBufferPointer<UInt8>, from start: Int) -> StreamingBoundary {
+        let count = bytes.count
+        guard start >= 0, start <= count else { return .unsplittable }
+        var fence: (marker: UInt8, length: Int)?
+        var afterBlank = false
+        var latest: Int?
+        var lineStart = start
+        while lineStart < count {
+            var lineEnd = lineStart
+            while lineEnd < count, bytes[lineEnd] != 10 { lineEnd += 1 }
+            var content = lineStart
+            var leadingTab = false
+            while content < lineEnd, bytes[content] == 32 || bytes[content] == 9 {
+                if bytes[content] == 9 { leadingTab = true }
+                content += 1
+            }
+            let indent = content - lineStart
+
+            if let open = fence {
+                if !leadingTab, indent <= 3,
+                   closesFence(bytes, from: content, to: lineEnd, marker: open.marker, length: open.length) {
+                    fence = nil
+                }
+            } else if content == lineEnd {
+                afterBlank = true
+            } else {
+                if afterBlank, indent == 0, startsIndependentBlock(bytes, at: content, lineEnd: lineEnd) {
+                    latest = lineStart
+                }
+                afterBlank = false
+                if let opened = fenceOpening(bytes, from: content, to: lineEnd) {
+                    // An indented fence may belong to a list item, and ends
+                    // when the item does — a rule this scan does not track.
+                    guard indent == 0 else { return .unsplittable }
+                    fence = opened
+                } else if indent <= 3, !leadingTab, reachesAcrossBlocks(bytes, from: content, to: lineEnd) {
+                    return .unsplittable
+                }
+            }
+            lineStart = lineEnd + 1
+        }
+        return .split(at: latest)
+    }
+
+    private static func fenceOpening(
+        _ bytes: UnsafeBufferPointer<UInt8>, from start: Int, to end: Int
+    ) -> (marker: UInt8, length: Int)? {
+        let marker = bytes[start]
+        guard marker == 96 || marker == 126 else { return nil }
+        var index = start
+        while index < end, bytes[index] == marker { index += 1 }
+        let length = index - start
+        guard length >= 3 else { return nil }
+        // A backtick fence's info string cannot itself contain a backtick.
+        if marker == 96, bytes[index..<end].contains(96) { return nil }
+        return (marker, length)
+    }
+
+    private static func closesFence(
+        _ bytes: UnsafeBufferPointer<UInt8>, from start: Int, to end: Int, marker: UInt8, length: Int
+    ) -> Bool {
+        var index = start
+        while index < end, bytes[index] == marker { index += 1 }
+        guard index - start >= length else { return false }
+        return bytes[index..<end].allSatisfy { $0 == 32 || $0 == 9 || $0 == 13 }
+    }
+
+    /// Link reference definitions resolve across the whole document; HTML
+    /// blocks and directives can span blank lines.
+    private static func reachesAcrossBlocks(
+        _ bytes: UnsafeBufferPointer<UInt8>, from start: Int, to end: Int
+    ) -> Bool {
+        switch bytes[start] {
+        case 60, 64: // `<`, `@`
+            return true
+        case 91: // `[`
+            var index = start + 1
+            while index + 1 < end {
+                if bytes[index] == 93, bytes[index + 1] == 58 { return true } // `]:`
+                index += 1
+            }
+            return false
+        default:
+            return false
+        }
+    }
+
+    /// Whether an unindented line after a blank line begins a block that
+    /// neither continues nor extends what came before it. A line still
+    /// arriving that could yet become a list marker is not.
+    private static func startsIndependentBlock(
+        _ bytes: UnsafeBufferPointer<UInt8>, at start: Int, lineEnd: Int
+    ) -> Bool {
+        switch bytes[start] {
+        case 62: // `>`
+            return false
+        case 45, 43, 42: // `-`, `+`, `*`
+            let next = start + 1
+            guard next < lineEnd else { return false }
+            return bytes[next] != 32 && bytes[next] != 9
+        case 48...57:
+            var index = start
+            while index < lineEnd, (48...57).contains(bytes[index]) { index += 1 }
+            guard index < lineEnd else { return false }
+            return bytes[index] != 46 && bytes[index] != 41 // `.`, `)`
+        default:
+            return true
+        }
+    }
+
+    /// Cuts at UTF-8 offsets that always sit just after a newline, so both
+    /// ends are scalar boundaries.
+    private static func slice(_ string: String, utf8From start: Int, to end: Int) -> String {
+        let utf8 = string.utf8
+        let lower = utf8.index(utf8.startIndex, offsetBy: start)
+        let upper = utf8.index(lower, offsetBy: end - start)
+        return String(string[lower..<upper])
     }
 
     /// How aggressively fenced-block highlighting is cached.
@@ -120,7 +354,9 @@ struct MarkdownRenderer {
         return components.url
     }
 
-    private func linkFileReferences(in result: NSMutableAttributedString) {
+    /// Compiled once: every render of every row used to rebuild this pattern
+    /// and its long extension alternation.
+    private static let fileReferenceExpression: NSRegularExpression? = {
         let extensions = [
             "swift", "m", "mm", "h", "c", "cc", "cpp", "cs", "go", "rs", "java", "kt",
             "js", "jsx", "ts", "tsx", "py", "rb", "php", "sh", "zsh", "fish", "sql",
@@ -133,7 +369,15 @@ struct MarkdownRenderer {
         // e.g. the `.c` in `github.com` — which used to fracture URLs.
         let pattern = #"(?<![A-Za-z0-9_])(?:/?(?:[A-Za-z0-9_.@+\-]+/)+)?[A-Za-z0-9_.@+\-]+\.(?:"#
             + extensions + #")(?::\d+(?:[:,]\d+)?)?(?![A-Za-z0-9])"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
+        return try? NSRegularExpression(pattern: pattern)
+    }()
+
+    private static let bareURLExpression = try? NSRegularExpression(
+        pattern: #"(?:https?://|mailto:)[^\s<>]+"#
+    )
+
+    private func linkFileReferences(in result: NSMutableAttributedString) {
+        guard let expression = Self.fileReferenceExpression else { return }
         let whole = NSRange(location: 0, length: result.length)
         for match in expression.matches(in: result.string, range: whole).reversed() {
             guard result.attribute(.link, at: match.range.location, effectiveRange: nil) == nil else { continue }
@@ -155,8 +399,7 @@ struct MarkdownRenderer {
     /// icon plus a shortened label, so a long link reads as one tappable token
     /// instead of a wall of path segments the reader has to scan.
     private func linkifyBareURLs(in result: NSMutableAttributedString) {
-        let pattern = #"(?:https?://|mailto:)[^\s<>]+"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
+        guard let expression = Self.bareURLExpression else { return }
         let whole = NSRange(location: 0, length: result.length)
         let trailing: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "\"", "'", "]", ">"]
         for match in expression.matches(in: result.string, range: whole).reversed() {

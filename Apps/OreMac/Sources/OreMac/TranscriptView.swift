@@ -90,6 +90,10 @@ struct TranscriptView: NSViewRepresentable {
     /// scrolled rows slide underneath. Hosts without floating top chrome (the
     /// assistant window, the split column) keep the plain default.
     var topInset: CGFloat = 10
+    /// `TranscriptDisplay.Memo.structureToken` read right after deriving
+    /// `rows`. While it holds still only the last row can have changed, so the
+    /// table diffs that one row. Nil always takes the full diff.
+    var structureToken: Int? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -197,7 +201,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.bind(scrollAnchor: scrollAnchor)
         context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.setSearchQuery(searchQuery)
-        context.coordinator.update(rows: rows)
+        context.coordinator.update(rows: rows, structureToken: structureToken)
     }
 
     static func dismantleNSView(_ container: TranscriptContainerView, coordinator: Coordinator) {
@@ -241,6 +245,8 @@ struct TranscriptView: NSViewRepresentable {
         /// neither) doesn't force the rail to redraw and rebuild tracking areas.
         private var railTurnRows: [Int] = []
         private var railTotalRows = 0
+        /// The structure token `rows` was last fully diffed under.
+        private var lastStructureToken: Int?
         /// A saved scroll offset waiting to be applied. Restoring before the
         /// table has a real width (and therefore measured, correct row heights)
         /// lands the offset in the empty band above still-unmeasured rows — the
@@ -298,10 +304,15 @@ struct TranscriptView: NSViewRepresentable {
             self.onOpenFile = onOpenFile
         }
 
-        func update(rows newRows: [TranscriptRow]) {
+        func update(rows newRows: [TranscriptRow], structureToken: Int? = nil) {
             guard let tableView else { return }
 
             let previous = rows
+            if let structureToken, structureToken == lastStructureToken,
+               updateStreamingRow(previous: previous, newRows: newRows) {
+                return
+            }
+            lastStructureToken = structureToken
             rows = newRows
             seedCollapsedResponsesIfNeeded()
             // A live search keeps up with streaming rows; free when no find
@@ -401,6 +412,29 @@ struct TranscriptView: NSViewRepresentable {
                 measureAroundViewport(in: tableView)
                 scheduleIdleMeasurePass()
             }
+        }
+
+        /// The streaming fast path. The rows came from the same derivation as
+        /// the last ones, so only the last row can differ: the header scan, the
+        /// row-by-row diff and the rail check — each a whole-transcript pass at
+        /// the stream's flush rate — have nothing to find.
+        private func updateStreamingRow(previous: [TranscriptRow], newRows: [TranscriptRow]) -> Bool {
+            guard previous.count == newRows.count,
+                  let last = newRows.indices.last,
+                  previous[last].id == newRows[last].id
+            else { return false }
+            rows = newRows
+            if hasActiveSearch { recomputeSearchMatches(preserveCursor: true) }
+            let difference = Self.difference(previous[last], newRows[last])
+            guard difference.changed else { return true }
+            heightCache.removeValue(forKey: newRows[last].id)
+            pendingTextReload.insert(last)
+            if difference.structural {
+                flushPendingReload()
+            } else {
+                scheduleTextFlush()
+            }
+            return true
         }
 
         /// Whether the row at one index must be re-measured, and whether the
@@ -1623,23 +1657,30 @@ final class TranscriptCell: NSTableCellView {
     /// The folded render: the response's first lines as real markdown with a
     /// trailing ellipsis. swift-markdown accepts incomplete CommonMark (it
     /// renders streaming text the same way), so cutting mid-document is safe.
-    /// Cached per (row id, text length) — collapsed rows are complete, so the
-    /// text cannot change under the cache.
+    /// Cached per (row id, text length, appearance) — collapsed rows are
+    /// complete, so the text cannot change under the cache.
     static func collapsedAttributedText(for row: TranscriptRow) -> NSAttributedString {
-        if let cached = collapsedRenderCache[row.id], cached.length == row.text.count {
-            return cached.value
+        var hasher = Hasher()
+        hasher.combine(currentAppearance.name.rawValue)
+        hasher.combine(row.text.utf8.count)
+        let signature = hasher.finalize()
+        if let cached = collapsedRenderCache.value(forID: row.id, signature: signature) {
+            return cached
         }
         let rendered = MarkdownRenderer(
             baseFont: .systemFont(ofSize: OreTheme.Font.prose),
             textColor: .labelColor,
             highlighter: SyntaxHighlighter.shared
         ).render(truncatedMarkdown(row.text), highlighting: .all)
-        collapsedRenderCache[row.id] = (row.text.count, rendered)
+        collapsedRenderCache.store(rendered, id: row.id, turnID: row.turnID, signature: signature)
         return rendered
     }
 
-    private nonisolated(unsafe) static var collapsedRenderCache:
-        [String: (length: Int, value: NSAttributedString)] = [:]
+    /// Kept apart from `renderCache` so full renders never push the folded
+    /// previews out. It used to be an unbounded dictionary.
+    private nonisolated(unsafe) static var collapsedRenderCache = RenderCache(
+        byteBudget: 8 << 20, entryLimit: 1_000
+    )
 
     /// First ~14 lines / ~1000 characters, cut at a line boundary.
     private static func truncatedMarkdown(_ text: String) -> String {
@@ -1870,20 +1911,34 @@ final class TranscriptCell: NSTableCellView {
     /// through here so a row's cached height always matches what it draws.
     static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let appearance = currentAppearance.name.rawValue
-        if let cached = renderCache.value(for: row, appearance: appearance) { return cached }
+        let signature = renderSignature(for: row, appearance: appearance)
+        if let cached = renderCache.value(forID: row.id, signature: signature) { return cached }
 
         let rendered: NSAttributedString
+        var streamingPrefix: MarkdownRenderer.StreamingPrefix?
         switch row.kind {
         case .assistantText:
             // swift-markdown accepts incomplete CommonMark, so the answer can
             // grow as a structured document: headings, lists, and fenced code
             // settle progressively instead of flashing from raw source to rich
             // text only when the entire block completes.
-            rendered = MarkdownRenderer(
+            let renderer = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
                 highlighter: SyntaxHighlighter.shared
-            ).render(row.text, highlighting: row.isComplete ? .all : .stablePrefix)
+            )
+            if row.isComplete {
+                rendered = renderer.render(row.text, highlighting: .all)
+            } else {
+                // Only the tail past the last settled block is parsed again;
+                // the head carries over from this row's previous render.
+                let streamed = renderer.renderStreaming(
+                    row.text,
+                    reusing: renderCache.streamingPrefix(forID: row.id, appearance: appearance)
+                )
+                rendered = streamed.rendered
+                streamingPrefix = streamed.prefix
+            }
 
         case .plan:
             let source = PlanProposalPolicy.normalizedMarkdown(row.text) ?? ""
@@ -1912,75 +1967,221 @@ final class TranscriptCell: NSTableCellView {
             )
         }
 
-        renderCache.store(rendered, for: row, appearance: appearance)
+        renderCache.store(
+            rendered,
+            id: row.id,
+            turnID: row.turnID,
+            signature: signature,
+            appearance: appearance,
+            streamingPrefix: streamingPrefix
+        )
         return rendered
     }
 
     /// Markdown parsing is not free, and a streaming row is re-measured and
-    /// redrawn on every delta. Caching by (id, text length, completeness) keeps
-    /// that to one parse per change rather than several.
+    /// redrawn on every delta. Caching by row identity keeps that to one parse
+    /// per change rather than several.
     private nonisolated(unsafe) static var renderCache = RenderCache()
 
-    struct RenderCache {
-        private var entries: [String: (signature: Int, value: NSAttributedString)] = [:]
+    /// Forgets every cached render of these turns' rows. For AppModel to call
+    /// when it releases a chat: those rows won't be drawn again, and the byte
+    /// bound alone would hold them until newer renders pushed them out.
+    static func dropRenderCache(turnIDs: some Sequence<TurnID>) {
+        let turns = Set(turnIDs)
+        guard !turns.isEmpty else { return }
+        renderCache.removeEntries(forTurns: turns)
+        collapsedRenderCache.removeEntries(forTurns: turns)
+    }
 
-        /// Rendered rows bake in resolved colours and rasterised chips, so the
-        /// appearance is part of a row's identity — a light/dark switch has to
-        /// invalidate every entry. It is passed in rather than read here
-        /// because the cache itself is not main-actor isolated.
-        private func signature(for row: TranscriptRow, appearance: String) -> Int {
-            var hasher = Hasher()
-            hasher.combine(appearance)
-            hasher.combine(row.contentRevision)
-            hasher.combine(row.activitySignature)
-            hasher.combine(row.text)
-            hasher.combine(row.resultText)
-            hasher.combine(row.isComplete)
-            hasher.combine(row.isQueued)
-            hasher.combine(row.isExpanded)
-            hasher.combine(row.toolInput)
-            hasher.combine(row.resultMetadata)
-            hasher.combine(row.resolvedSubject)
-            hasher.combine(row.attachments)
-            hasher.combine(row.subagentChildCount)
-            return hasher.finalize()
+    /// A row's render identity, without walking its payload.
+    ///
+    /// Every measure and every draw asks, so hashing `text` and `toolInput`
+    /// whole here was O(transcript bytes) per scroll tick. `contentRevision`
+    /// moves on every content edit `ChatState` makes; the bounded samples cover
+    /// rows built elsewhere (history, tests) that reuse an id at revision zero.
+    /// Rendered rows bake in resolved colours and rasterised chips, so the
+    /// appearance is part of the identity too.
+    static func renderSignature(for row: TranscriptRow, appearance: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(appearance)
+        hasher.combine(row.kind)
+        hasher.combine(row.contentRevision)
+        hasher.combine(row.activitySignature)
+        combineSample(of: row.text, into: &hasher)
+        combineSample(of: row.resultText, into: &hasher)
+        hasher.combine(row.isComplete)
+        hasher.combine(row.isQueued)
+        hasher.combine(row.isExpanded)
+        hasher.combine(row.isError)
+        hasher.combine(row.resolvedSubject)
+        hasher.combine(row.attachments)
+        hasher.combine(row.subagentChildCount)
+        combineFingerprint(of: row.toolInput, into: &hasher)
+        combineFingerprint(of: row.resultMetadata, into: &hasher)
+        return hasher.finalize()
+    }
+
+    /// Length plus the first and last few bytes.
+    private static func combineSample(of text: String?, into hasher: inout Hasher) {
+        guard let text else {
+            hasher.combine(-1)
+            return
+        }
+        let utf8 = text.utf8
+        hasher.combine(utf8.count)
+        for byte in utf8.prefix(48) { hasher.combine(byte) }
+        for byte in utf8.suffix(48) { hasher.combine(byte) }
+    }
+
+    /// Shape and sampled leaves, a few levels deep.
+    private static func combineFingerprint(
+        of value: JSONValue?,
+        into hasher: inout Hasher,
+        depth: Int = 0
+    ) {
+        guard let value else {
+            hasher.combine(-1)
+            return
+        }
+        switch value {
+        case .null:
+            hasher.combine(0)
+        case .bool(let flag):
+            hasher.combine(flag)
+        case .integer(let number):
+            hasher.combine(number)
+        case .number(let number):
+            hasher.combine(number)
+        case .string(let string):
+            combineSample(of: string, into: &hasher)
+        case .array(let items):
+            hasher.combine(items.count)
+            guard depth < 3 else { return }
+            for item in items.prefix(8) {
+                combineFingerprint(of: item, into: &hasher, depth: depth + 1)
+            }
+            if items.count > 8 {
+                combineFingerprint(of: items.last, into: &hasher, depth: depth + 1)
+            }
+        case .object(let fields):
+            hasher.combine(fields.count)
+            guard depth < 3 else { return }
+            // Iteration order is per dictionary instance, so fields fold
+            // order-independently.
+            var folded = 0
+            for (name, field) in fields {
+                var fieldHasher = Hasher()
+                fieldHasher.combine(name)
+                combineFingerprint(of: field, into: &fieldHasher, depth: depth + 1)
+                folded = folded &+ fieldHasher.finalize()
+            }
+            hasher.combine(folded)
+        }
+    }
+
+    /// Renders by row id, bounded by approximate bytes with least-recently-used
+    /// eviction. The old bound was 2,000 entries of any size, which whole-file
+    /// tool output and long replies turned into hundreds of megabytes.
+    struct RenderCache {
+        private struct Entry {
+            var signature: Int
+            var value: NSAttributedString
+            var turnID: TurnID
+            var appearance: String
+            var streamingPrefix: MarkdownRenderer.StreamingPrefix?
+            var cost: Int
+            var lastUsed: UInt64
         }
 
-        func value(for row: TranscriptRow, appearance: String) -> NSAttributedString? {
-            guard let entry = entries[row.id],
-                  entry.signature == signature(for: row, appearance: appearance)
-            else { return nil }
+        private var entries: [String: Entry] = [:]
+        private var tick: UInt64 = 0
+        private(set) var totalCost = 0
+        let byteBudget: Int
+        let entryLimit: Int
+
+        init(byteBudget: Int = 64 << 20, entryLimit: Int = 4_000) {
+            self.byteBudget = byteBudget
+            self.entryLimit = entryLimit
+        }
+
+        var count: Int { entries.count }
+
+        func contains(id: String) -> Bool { entries[id] != nil }
+
+        /// Approximate bytes: UTF-16 storage plus attribute runs, for the
+        /// render and any streaming head kept beside it.
+        static func cost(
+            of value: NSAttributedString,
+            streamingPrefix: MarkdownRenderer.StreamingPrefix? = nil
+        ) -> Int {
+            (value.length + (streamingPrefix?.renderedLength ?? 0)) * 4 + 128
+        }
+
+        mutating func value(forID id: String, signature: Int) -> NSAttributedString? {
+            guard let entry = entries[id], entry.signature == signature else { return nil }
+            tick &+= 1
+            entries[id]?.lastUsed = tick
             return entry.value
+        }
+
+        /// The settled head of this row's last streaming render, still valid
+        /// only under the appearance it was drawn in.
+        func streamingPrefix(forID id: String, appearance: String) -> MarkdownRenderer.StreamingPrefix? {
+            guard let entry = entries[id], entry.appearance == appearance else { return nil }
+            return entry.streamingPrefix
         }
 
         mutating func store(
             _ value: NSAttributedString,
-            for row: TranscriptRow,
-            appearance: String
+            id: String,
+            turnID: TurnID,
+            signature: Int,
+            appearance: String = "",
+            streamingPrefix: MarkdownRenderer.StreamingPrefix? = nil
         ) {
-            if entries.count >= Self.capacity { evictOldest() }
-            recency[row.id] = tick
-            tick += 1
-            entries[row.id] = (signature(for: row, appearance: appearance), value)
+            let cost = Self.cost(of: value, streamingPrefix: streamingPrefix)
+            if let replaced = entries.removeValue(forKey: id) {
+                totalCost -= replaced.cost
+            }
+            guard cost <= byteBudget else { return }
+            tick &+= 1
+            entries[id] = Entry(
+                signature: signature,
+                value: value,
+                turnID: turnID,
+                appearance: appearance,
+                streamingPrefix: streamingPrefix,
+                cost: cost,
+                lastUsed: tick
+            )
+            totalCost += cost
+            guard entries.count > entryLimit || totalCost > byteBudget else { return }
+            evictLeastRecentlyUsed(keeping: id)
         }
 
-        private static let capacity = 2_000
-        private var recency: [String: UInt64] = [:]
-        private var tick: UInt64 = 0
+        mutating func removeEntries(forTurns turns: Set<TurnID>) {
+            for (id, entry) in entries where turns.contains(entry.turnID) {
+                entries.removeValue(forKey: id)
+                totalCost -= entry.cost
+            }
+        }
 
-        /// Drops the least recently rendered half.
+        /// Coldest first, down to three quarters of both bounds so the next
+        /// few stores don't each pay for a sort.
         ///
         /// Clearing the whole cache at the cap meant a transcript longer than
         /// the cap re-parsed every visible row on the next scroll tick, over and
-        /// over. Evicting the cold half keeps the rows the reader is actually
-        /// looking at warm.
-        private mutating func evictOldest() {
-            let survivors = recency.sorted { $0.value > $1.value }
-                .prefix(Self.capacity / 2)
-                .map(\.key)
-            let keep = Set(survivors)
-            entries = entries.filter { keep.contains($0.key) }
-            recency = recency.filter { keep.contains($0.key) }
+        /// over. Evicting only the cold end keeps the rows the reader is
+        /// actually looking at warm — and never the one just rendered.
+        private mutating func evictLeastRecentlyUsed(keeping newest: String) {
+            let targetCount = entryLimit * 3 / 4
+            let targetCost = byteBudget * 3 / 4
+            for (id, entry) in entries.sorted(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+                guard entries.count > targetCount || totalCost > targetCost else { break }
+                guard id != newest else { continue }
+                entries.removeValue(forKey: id)
+                totalCost -= entry.cost
+            }
         }
     }
 

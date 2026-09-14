@@ -63,54 +63,102 @@ final class SyntaxHighlighter: @unchecked Sendable {
         baseColor: NSColor = .labelColor,
         cache: Bool = true
     ) -> NSAttributedString {
+        guard cache else {
+            return renderHighlight(code, language: rawLanguage, font: font, baseColor: baseColor)
+        }
         let cacheKey = HighlightCacheKey(
             language: Self.canonicalName(rawLanguage) ?? "",
-            code: code,
+            codeHash: code.hashValue,
+            codeLength: code.utf8.count,
             fontSize: font.pointSize,
             appearance: NSAppearance.currentDrawing().name.rawValue
         )
-        if cache {
-            lock.lock()
-            let cached = highlightCache[cacheKey]
-            lock.unlock()
-            if let cached { return cached }
-        }
+        if let cached = cachedHighlight(for: cacheKey, code: code) { return cached }
 
         let rendered = renderHighlight(
             code, language: rawLanguage, font: font, baseColor: baseColor
         )
-        if cache {
-            storeHighlight(rendered, for: cacheKey)
-        }
+        storeHighlight(rendered, code: code, for: cacheKey)
         return rendered
     }
 
+    init(highlightCacheBudget: Int = 8 << 20, highlightCacheCapacity: Int = 48) {
+        self.highlightCacheBudget = highlightCacheBudget
+        self.highlightCacheCapacity = highlightCacheCapacity
+    }
+
+    /// Keyed by a hash of the code rather than the code itself, with the
+    /// code kept on the entry for a full comparison on a hit — a collision
+    /// must never hand back another snippet's colours.
     private struct HighlightCacheKey: Hashable {
         var language: String
-        var code: String
+        var codeHash: Int
+        var codeLength: Int
         var fontSize: CGFloat
         var appearance: String
     }
 
-    private var highlightCache: [HighlightCacheKey: NSAttributedString] = [:]
-    private var highlightRecency: [HighlightCacheKey: UInt64] = [:]
-    private var highlightTick: UInt64 = 0
-    private static let highlightCacheCapacity = 48
+    private struct HighlightCacheEntry {
+        var code: String
+        var value: NSAttributedString
+        var cost: Int
+        var lastUsed: UInt64
+    }
 
-    private func storeHighlight(_ value: NSAttributedString, for key: HighlightCacheKey) {
+    private var highlightCache: [HighlightCacheKey: HighlightCacheEntry] = [:]
+    private var highlightTick: UInt64 = 0
+    private var highlightCacheCost = 0
+    /// Bounded by size as well as count. Forty-eight whole files was the old
+    /// bound, and the editor added one per keystroke.
+    private let highlightCacheBudget: Int
+    private let highlightCacheCapacity: Int
+
+    /// Approximate bytes: the attributed copy (UTF-16 plus attribute runs)
+    /// and the code string kept for the equality check.
+    static func highlightCost(of value: NSAttributedString, code: String) -> Int {
+        value.length * 4 + code.utf8.count + 64
+    }
+
+    /// Entry count and approximate bytes held, for tests.
+    var highlightCacheUsage: (count: Int, cost: Int) {
         lock.lock()
         defer { lock.unlock() }
-        if highlightCache.count >= Self.highlightCacheCapacity {
-            let survivors = highlightRecency.sorted { $0.value > $1.value }
-                .prefix(Self.highlightCacheCapacity / 2)
-                .map(\.key)
-            let keep = Set(survivors)
-            highlightCache = highlightCache.filter { keep.contains($0.key) }
-            highlightRecency = highlightRecency.filter { keep.contains($0.key) }
-        }
+        return (highlightCache.count, highlightCacheCost)
+    }
+
+    private func cachedHighlight(for key: HighlightCacheKey, code: String) -> NSAttributedString? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = highlightCache[key], entry.code == code else { return nil }
         highlightTick += 1
-        highlightRecency[key] = highlightTick
-        highlightCache[key] = value
+        highlightCache[key]?.lastUsed = highlightTick
+        return entry.value
+    }
+
+    private func storeHighlight(_ value: NSAttributedString, code: String, for key: HighlightCacheKey) {
+        let cost = Self.highlightCost(of: value, code: code)
+        lock.lock()
+        defer { lock.unlock() }
+        if let replaced = highlightCache.removeValue(forKey: key) {
+            highlightCacheCost -= replaced.cost
+        }
+        // One snippet worth a large share of the budget would evict everything
+        // else to make room, then be the next thing evicted.
+        guard cost <= highlightCacheBudget / 4 else { return }
+        highlightTick += 1
+        highlightCache[key] = HighlightCacheEntry(code: code, value: value, cost: cost, lastUsed: highlightTick)
+        highlightCacheCost += cost
+        guard highlightCache.count > highlightCacheCapacity || highlightCacheCost > highlightCacheBudget
+        else { return }
+        // Least recently used first, down to three quarters so the next few
+        // stores don't each pay for a sort.
+        let targetCount = highlightCacheCapacity * 3 / 4
+        let targetCost = highlightCacheBudget * 3 / 4
+        for (staleKey, entry) in highlightCache.sorted(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            guard highlightCache.count > targetCount || highlightCacheCost > targetCost else { break }
+            highlightCache.removeValue(forKey: staleKey)
+            highlightCacheCost -= entry.cost
+        }
     }
 
     private func renderHighlight(

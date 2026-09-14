@@ -15,6 +15,12 @@ final class ChatState {
     private(set) var rows: [TranscriptRow] = [] {
         didSet {
             rowsRevision &+= 1
+            if let index = appendingTextRow, index == rows.count - 1 {
+                lastMutation = .appendedText(rowIndex: index)
+            } else {
+                lastMutation = .structural
+                structuralRevision &+= 1
+            }
             let nowHasRows = !rows.isEmpty
             if hasRows != nowHasRows { hasRows = nowHasRows }
         }
@@ -24,6 +30,23 @@ final class ChatState {
     /// transcript on every body evaluation — at 40 flushes/second while text
     /// streams, that regrouping was a large share of the main thread.
     private(set) var rowsRevision = 0
+
+    /// What the latest `rows` mutation was.
+    enum RowMutation: Equatable {
+        /// Text appended in place to the last row; nothing else moved.
+        case appendedText(rowIndex: Int)
+        /// Anything else.
+        case structural
+    }
+
+    /// Not observed: it only ever changes together with `rowsRevision`.
+    @ObservationIgnored private(set) var lastMutation: RowMutation = .structural
+    /// Bumped by every mutation except a text append to the last row. While it
+    /// holds still, a consumer that has already derived the transcript knows
+    /// only the last row's text can have changed, and can skip the
+    /// whole-transcript passes a streaming flush otherwise costs.
+    @ObservationIgnored private(set) var structuralRevision = 0
+    @ObservationIgnored private var appendingTextRow: Int?
     /// Emptiness without observing `rows` itself. The empty-state check used to
     /// subscribe the whole chat pane to every streaming mutation.
     private(set) var hasRows = false
@@ -148,11 +171,61 @@ final class ChatState {
     /// Reconciles against the engine's published gate. Events are the fast path;
     /// this is the correction when the two have drifted — a turn that ended in a
     /// way the client never saw an event for, say a session killed underneath it.
-    func reconcileTurnActive(_ serverValue: Bool) {
-        // Our optimistic claim is newer than the summary that crossed it in
-        // flight: keep it until a turn event or a later summary agrees.
-        if isTurnActive, !serverValue, !hasTurnEventArrived { return }
-        isTurnActive = serverValue
+    func reconcileTurnActive(_ serverValue: Bool, now: Date = Date()) {
+        lastServerTurnActive = serverValue
+        if isTurnActive, !serverValue, !hasTurnEventArrived {
+            // Our optimistic claim is newer than the summary that crossed it in
+            // flight: keep it until a turn event or a later summary agrees.
+            //
+            // But not forever. A send the engine never took up produces no turn
+            // event and no session error, and the tab animated busy for good.
+            // Once the engine says no turn is open and nothing at all has come
+            // from the harness for a while, the claim is the stale side.
+            let quietSince = lastEventAt ?? turnStartedAt ?? .distantPast
+            let quiet = now.timeIntervalSince(quietSince)
+            guard quiet >= Self.unconfirmedClaimTimeout else {
+                scheduleClaimExpiry(after: Self.unconfirmedClaimTimeout - quiet)
+                return
+            }
+            releaseUnconfirmedClaim()
+            return
+        }
+        // Summaries arrive for every chat on every change; an unchanged write
+        // would still invalidate everything observing the gate.
+        if isTurnActive != serverValue { isTurnActive = serverValue }
+    }
+
+    /// How long a local turn claim survives the engine reporting no open turn
+    /// with no harness event arriving either.
+    static let unconfirmedClaimTimeout: TimeInterval = 12
+
+    @ObservationIgnored private var lastServerTurnActive: Bool?
+    @ObservationIgnored private var claimExpiry: Task<Void, Never>?
+
+    /// Summaries only arrive when something changes, so the last one saying
+    /// "no turn" may be the last one for a long time. Re-check on a timer
+    /// against it rather than waiting for another.
+    private func scheduleClaimExpiry(after delay: TimeInterval) {
+        guard claimExpiry == nil else { return }
+        claimExpiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(max(0.5, delay)))
+            // Cancelled means released; the handle may already be a newer task's.
+            guard !Task.isCancelled, let self else { return }
+            self.claimExpiry = nil
+            guard self.lastServerTurnActive == false else { return }
+            self.reconcileTurnActive(false)
+        }
+    }
+
+    private func releaseUnconfirmedClaim() {
+        claimExpiry?.cancel()
+        claimExpiry = nil
+        // A question or permission card is still the user's to answer.
+        if status != .awaitingInput { status = .idle }
+        isTurnActive = false
+        turnStartedAt = nil
+        lastEventAt = nil
+        runningToolLabel = nil
     }
 
     /// When the current turn began, for the live "time elapsed" counter. Nil
@@ -444,6 +517,12 @@ final class ChatState {
         hasLoadedHistory = true
         // Live events may already have arrived; history belongs before them.
         rows = historicalRows + rows
+        // Rows already streaming moved down by the history's length.
+        if !historicalRows.isEmpty {
+            for (blockID, index) in streamingRowIndex {
+                streamingRowIndex[blockID] = index + historicalRows.count
+            }
+        }
         refreshRevertableTurns()
     }
 
@@ -601,6 +680,7 @@ final class ChatState {
 
     private func unqueue(at index: Int, turnID: TurnID?) {
         var row = rows.remove(at: index)
+        shiftStreamingIndexes(afterRemovingAt: index)
         row.isQueued = false
         if let turnID { row.turnID = turnID }
         // Same bookkeeping `mutateRow` does; the row is re-inserted rather
@@ -629,6 +709,7 @@ final class ChatState {
             return
         }
         rows.remove(at: index)
+        shiftStreamingIndexes(afterRemovingAt: index)
         if dispatchedRowID == id { dispatchedRowID = nil }
         refreshRevertableTurns()
     }
@@ -784,12 +865,27 @@ final class ChatState {
 
     // MARK: - Row assembly
 
+    /// Edits the row where it sits. Copying it out and writing it back made the
+    /// local copy share the text buffer with the array's, so `text += delta`
+    /// copied the whole text on every delta — quadratic over a long reply.
+    /// One inout access is also one `didSet`, so one revision per edit.
     private func mutateRow(at index: Int, _ body: (inout TranscriptRow) -> Void) {
         guard rows.indices.contains(index) else { return }
-        var row = rows[index]
+        Self.revise(&rows[index], body)
+    }
+
+    private static func revise(_ row: inout TranscriptRow, _ body: (inout TranscriptRow) -> Void) {
         body(&row)
         row.contentRevision &+= 1
-        rows[index] = row
+    }
+
+    /// Keeps `streamingRowIndex` pointing at the same rows after one is
+    /// removed from the middle. A stale index pointed a delta past the end,
+    /// which appended a second row with the same id.
+    private func shiftStreamingIndexes(afterRemovingAt removed: Int) {
+        for (blockID, index) in streamingRowIndex where index > removed {
+            streamingRowIndex[blockID] = index - 1
+        }
     }
 
     private func refreshRevertableTurns() {
@@ -803,6 +899,8 @@ final class ChatState {
 
     private func append(delta: BlockDelta, kind: TranscriptRow.Kind) {
         if let index = streamingRowIndex[delta.blockID], rows.indices.contains(index) {
+            appendingTextRow = index
+            defer { appendingTextRow = nil }
             mutateRow(at: index) { $0.text += delta.text }
             return
         }

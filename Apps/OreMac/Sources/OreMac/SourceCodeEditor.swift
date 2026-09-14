@@ -159,11 +159,14 @@ struct SourceCodeEditor: NSViewRepresentable {
             let openedDifferentFile = self.path != path
             let selection = textView.selectedRange()
             let font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            // Uncached: every keystroke is a new whole-file string, so caching
+            // only filled the shared cache with copies nobody would ask for again.
             let highlighted = NSMutableAttributedString(attributedString:
                 SyntaxHighlighter.shared.highlight(
                     value,
                     language: SyntaxHighlighter.language(forPath: path, contents: value),
-                    font: font
+                    font: font,
+                    cache: false
                 )
             )
             let paragraph = NSMutableParagraphStyle()

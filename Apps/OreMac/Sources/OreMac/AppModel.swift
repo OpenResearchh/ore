@@ -2635,10 +2635,6 @@ final class AppModel {
         try await client.diff(workspaceID: id, againstBase: true)
     }
 
-    func loadGitAction(for id: WorkspaceID) async throws -> SuggestedGitAction {
-        try await client.suggestedGitAction(workspaceID: id)
-    }
-
     func loadGitStatus(for id: WorkspaceID) async throws -> SuggestedGitStatus {
         try await client.suggestedGitStatus(workspaceID: id)
     }
@@ -3129,6 +3125,12 @@ final class AppModel {
         }.value
     }
 
+    /// A file as it was at the workspace's merge base: how the review pane
+    /// shows a deleted image, or the "before" of a replaced one.
+    func baseFileData(path: String, in workspaceID: WorkspaceID) async -> Data? {
+        try? await client.baseFileData(workspaceID: workspaceID, path: path)
+    }
+
     func saveFileContents(_ contents: String, path: String, in workspace: WorkspaceSummary) async throws {
         let root = workspace.worktreePath
         try await Task.detached(priority: .userInitiated) {
@@ -3199,11 +3201,7 @@ final class AppModel {
     // MARK: - Events
 
     private func apply(_ event: CoreEvent) {
-        #if DEBUG
-        UIFanoutProbe.record(event)
-        #endif
-        // One funnel for analytics, in the same place and for the same reason
-        // as the probe above: every core event passes through here exactly
+        // One funnel for analytics: every core event passes through here exactly
         // once, so nothing has to be instrumented twice or kept in sync with
         // a second dispatch path. The translator decides what, if anything,
         // is worth reporting; most events produce nothing.
@@ -3456,17 +3454,6 @@ final class AppModel {
             // the whole point — unlike `chatAdded`, this event only ever fires
             // for a seam ORE made itself.
             selectChat(successor, in: id)
-
-        case .chatRemoved(_, let chatID):
-            forget(chatID)
-            chatSummaries.removeAll { $0.id == chatID }
-
-        case .chatsListed(let workspaceID, let chats):
-            for chat in chats {
-                chatOwners[chat.id] = workspaceID
-                upsertChat(chat)
-            }
-            adoptResearchChatTitles(in: workspaceID)
 
         case .gitStatusChanged(let id, let status):
             let live = workspaceLive.state(for: id)
@@ -4205,11 +4192,7 @@ final class AppModel {
 
     private func upsertChat(_ summary: ChatSummary) {
         if let index = chatSummaries.firstIndex(where: { $0.id == summary.id }) {
-            if chatSummaries[index] == summary {
-                #if DEBUG
-                UIFanoutProbe.equalChatSummariesSkipped += 1
-                #endif
-            } else {
+            if chatSummaries[index] != summary {
                 chatSummaries[index] = summary
             }
         } else {
@@ -4405,18 +4388,39 @@ private enum GitHubRepositoryInputError: LocalizedError, Sendable {
 enum FilePresentationMode: String, Sendable {
     case source
     case diff
-    /// Rendered markdown. Only offered for markdown files — a plan the agent
-    /// wrote should read as a document, not as raw markup.
+    /// The file rendered: markdown as a document, HTML as a page, an image as
+    /// an image. A plan the agent wrote should read as a document, and an icon
+    /// it drew should be looked at, not decoded.
     case preview
+
+    enum PreviewKind: Sendable, Equatable {
+        case markdown
+        case html
+        case image
+    }
+
+    /// What a preview of this path renders, or nil when there isn't one.
+    static func previewKind(path: String) -> PreviewKind? {
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ["md", "markdown", "mdown", "mdx"].contains(ext) { return .markdown }
+        if ["html", "htm", "xhtml"].contains(ext) { return .html }
+        if BinaryFileKind(path: path).isPreviewable { return .image }
+        return nil
+    }
 
     /// Whether this path can render as a document at all.
     static func supportsPreview(path: String) -> Bool {
-        ["md", "markdown", "mdown", "mdx"]
-            .contains((path as NSString).pathExtension.lowercased())
+        previewKind(path: path) != nil
     }
 
-    /// What a plain "open this file" means for this path: markdown reads as a
-    /// document by default, everything else as source.
+    /// Whether the file has a text form to open in the editor. A PNG does
+    /// not, and offering Source for one only led to "Can't open this file".
+    static func hasSource(path: String) -> Bool {
+        !BinaryFileKind(path: path).isKnownBinary
+    }
+
+    /// What a plain "open this file" means for this path: documents, pages
+    /// and images open as previews by default, everything else as source.
     static func preferred(forPath path: String) -> FilePresentationMode {
         supportsPreview(path: path) ? .preview : .source
     }

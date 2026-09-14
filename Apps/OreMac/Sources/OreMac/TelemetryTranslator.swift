@@ -47,10 +47,6 @@ struct TelemetryTranslator {
             remember(chat)
             return []
 
-        case .chatsListed(_, let chats):
-            chats.forEach { remember($0) }
-            return []
-
         case .snapshot(let snapshot):
             snapshot.chats.forEach { remember($0) }
             return []

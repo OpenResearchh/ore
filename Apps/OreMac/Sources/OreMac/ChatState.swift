@@ -770,12 +770,6 @@ final class ChatState {
         resumeTurnAfterInput()
     }
 
-    func resolveQuestion(_ id: QuestionID) {
-        pendingQuestions.removeAll { $0.id == id }
-        questionAnswers.removeValue(forKey: id)
-        resumeTurnAfterInput()
-    }
-
     /// The permission/question card is gone; the turn is not. Show the
     /// composer as working until the harness's next real status arrives.
     private func resumeTurnAfterInput() {

@@ -37,23 +37,4 @@ struct ConflictMarkerTests {
         let theirs = ConflictMarkers.resolving(text, hunkStartingAt: 2, side: .theirs)
         #expect(theirs?.trimmingCharacters(in: .newlines) == "a\ntheirs\nb")
     }
-
-    @Test func resolvingAllTakesEveryRegion() {
-        let text = """
-        <<<<<<< HEAD
-        1
-        =======
-        x
-        >>>>>>> a
-        mid
-        <<<<<<< HEAD
-        2
-        =======
-        y
-        >>>>>>> b
-        """
-        let resolved = ConflictMarkers.resolvingAll(text, side: .ours)
-        #expect(resolved.trimmingCharacters(in: .newlines) == "1\nmid\n2")
-        #expect(ConflictMarkers.hunks(in: resolved).isEmpty)
-    }
 }

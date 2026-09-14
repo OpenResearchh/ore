@@ -1823,14 +1823,6 @@ extension InProcessCoreClient {
         }
     }
 
-    /// The assistant's own provider hit a hard limit; move it to another
-    /// ready harness so the user's next question still gets answered. The
-    /// engine's harness switch carries a locally generated handoff summary,
-    /// so the conversation continues rather than restarting.
-    public func assistantRateLimited(chatID: ChatID) async {
-        await failOverAssistant(chatID: chatID)
-    }
-
     func considerAssistantFailover(chatID: ChatID, event: AgentEvent) async {
         if AssistantFailoverPolicy.reason(for: event) != nil {
             await failOverAssistant(chatID: chatID)

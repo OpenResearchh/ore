@@ -1,0 +1,33 @@
+ORE
+Copyright 2026 Jupiter Innovations Lab Inc.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties, distributed under
+their own licenses:
+
+- GRDB.swift (https://github.com/groue/GRDB.swift) — MIT License,
+  Copyright (C) 2015-2025 Gwendal Roué
+- swift-markdown (https://github.com/swiftlang/swift-markdown) — Apache License 2.0,
+  Copyright (c) Apple Inc. and the Swift project authors
+- swift-cmark (https://github.com/swiftlang/swift-cmark) — BSD 2-Clause License,
+  Copyright (c) 2014, John MacFarlane
+- swift-argument-parser (https://github.com/apple/swift-argument-parser) —
+  Apache License 2.0, Copyright (c) Apple Inc. and the Swift project authors
+- SwiftTreeSitter (https://github.com/ChimeHQ/SwiftTreeSitter) — BSD 3-Clause License,
+  Copyright (c) 2021, Chime
+- tree-sitter (https://github.com/tree-sitter/tree-sitter) — MIT License,
+  Copyright (c) 2018-2024 Max Brunsfeld
+- tree-sitter-json (https://github.com/tree-sitter/tree-sitter-json) — MIT License,
+  Copyright (c) 2014 Max Brunsfeld
+- tree-sitter-swift (https://github.com/alex-pinkus/tree-sitter-swift) — MIT License,
+  Copyright (c) 2021 alex-pinkus
+- SwiftTerm (https://github.com/migueldeicaza/SwiftTerm) — MIT License,
+  Copyright (c) 2019-2026 Miguel de Icaza
+- Sparkle (https://github.com/sparkle-project/Sparkle) — MIT License,
+  Copyright (c) 2006-2013 Andy Matuschak and the Sparkle Project contributors
+- FluidAudio (https://github.com/FluidInference/FluidAudio) — Apache License 2.0
+
+The full license texts are included in each project's source distribution.
+Third-party marks used to identify agent CLIs are listed in
+Apps/OreMac/Sources/OreMac/Resources/HarnessIcons/ATTRIBUTION.md.

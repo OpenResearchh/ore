@@ -276,4 +276,11 @@ extension AsyncStream where Element == Data {
         for await chunk in self { data.append(chunk) }
         return String(decoding: data, as: UTF8.self)
     }
+
+    /// Collects the whole stream as bytes, for output that isn't text.
+    public func collectData() async -> Data {
+        var data = Data()
+        for await chunk in self { data.append(chunk) }
+        return data
+    }
 }

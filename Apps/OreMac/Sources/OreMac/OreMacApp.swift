@@ -1068,43 +1068,6 @@ private struct FilePalette: View {
     }
 }
 
-/// The onboarding doctor's result, shown until the user has a workspace.
-struct HarnessStatusList: View {
-    let harnesses: [HarnessProbeResult]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(harnesses, id: \.kind) { harness in
-                HStack(spacing: 6) {
-                    Image(systemName: harness.isReady
-                        ? "checkmark.circle.fill"
-                        : (harness.isInstalled ? "exclamationmark.circle.fill" : "xmark.circle"))
-                        .foregroundStyle(harness.isReady
-                            ? Color.green
-                            : (harness.isInstalled ? .orange : .secondary))
-
-                    Text(harness.kind.displayName).fontWeight(.medium)
-
-                    if let version = harness.version {
-                        Text(version).font(.caption).foregroundStyle(.secondary)
-                    }
-
-                    if !harness.isInstalled {
-                        Text("not installed").font(.caption).foregroundStyle(.secondary)
-                    } else if harness.authState == .notAuthenticated {
-                        // The fix is a specific command; saying so beats
-                        // "authentication failed".
-                        Text(harness.kind == .claudeCode ? "run `claude /login`" : "run `codex login`")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.orange)
-                    }
-                }
-            }
-        }
-        .oreCard(padding: 12, radius: 14)
-    }
-}
-
 /// The `ore.toml` approval prompt. Kept out of `RootView`'s modifier chain,
 /// which is already longer than the type checker will solve in one piece.
 private struct ScriptApprovalDialog: ViewModifier {

@@ -20,13 +20,6 @@ public enum OreHome {
     public static var worktreeRoot: URL {
         directory.appendingPathComponent("workspaces", isDirectory: true)
     }
-
-    /// The product-owned assistant workspace's home. Deliberately outside
-    /// `worktreeRoot`: it is not a worktree of any user repository, it's the
-    /// assistant's own memory and scratch space.
-    public static var assistantDirectory: URL {
-        directory.appendingPathComponent("assistant", isDirectory: true)
-    }
 }
 
 /// The database.
@@ -260,22 +253,6 @@ public actor OreStore {
             )
             return (maximum ?? -1) + 1
         }
-    }
-
-    public func updateChat(
-        _ id: ChatID,
-        _ mutate: @Sendable @escaping (inout ChatRecord) -> Void
-    ) throws -> ChatRecord? {
-        try writer.write { db in
-            guard var record = try ChatRecord.fetchOne(db, key: id.rawValue) else { return nil }
-            mutate(&record)
-            try record.update(db)
-            return record
-        }
-    }
-
-    public func deleteChat(_ id: ChatID) throws {
-        _ = try writer.write { db in try ChatRecord.deleteOne(db, key: id.rawValue) }
     }
 
     public func saveChatTransition(_ transition: ChatTransition) throws {
@@ -714,10 +691,6 @@ public actor OreStore {
                 .filter(Column("isSent") == false)
                 .updateAll(db, Column("isSent").set(to: true))
         }
-    }
-
-    public func deleteDiffComment(id: Int64) throws {
-        _ = try writer.write { db in try DiffCommentRecord.deleteOne(db, key: id) }
     }
 
     public func deletePendingDiffComments(

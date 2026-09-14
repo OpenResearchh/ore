@@ -1,5 +1,6 @@
 import AppKit
 import OreGit
+import OreProtocol
 import SwiftUI
 
 /// What a changed file looks like when it is not text.
@@ -13,12 +14,20 @@ import SwiftUI
 /// This renders the file instead. Images and PDFs get a real preview;
 /// anything else at least gets its type and size rather than a dead end.
 ///
-/// Deliberately reads from the worktree rather than from git. That means the
-/// preview is the *current* state of the file, so an added or modified image
-/// shows correctly, and a deleted one has nothing to show — which is the
-/// honest answer without adding a git-blob read to get the old version.
+/// The current version is read from the worktree and the previous one — the
+/// merge base the review diff compares against — from git. A replaced image
+/// shows both side by side, and a deleted one still shows what was removed:
+/// "there is nothing left to preview" was true of the worktree and useless to
+/// someone deciding whether the deletion was right.
 struct BinaryFilePreview: View {
-    let file: FileDiff
+    @Environment(AppModel.self) private var model
+
+    let path: String
+    /// The change under review, or nil for a file opened as it is now.
+    var status: GitFileChange.Status?
+    /// Where a renamed file lived at the base.
+    var originalPath: String?
+    let workspaceID: WorkspaceID
     let worktreePath: String
     /// Bumped by the git watcher whenever the worktree changes. Part of this
     /// view's task identity, because the interesting case — an agent
@@ -30,19 +39,23 @@ struct BinaryFilePreview: View {
     /// so the hover chip lives on the preview itself.
     var onComment: () -> Void
 
-    @State private var image: NSImage?
-    @State private var pixelSize: CGSize?
-    @State private var byteCount: Int64?
+    @State private var before: Loaded?
+    @State private var after: Loaded?
     @State private var isHovering = false
     /// Which load the state on screen came from. An earlier read finishing
     /// after a later one would otherwise put the previous image back.
     @State private var loadedToken: String?
 
-    private var kind: BinaryFileKind { BinaryFileKind(path: file.path) }
+    private var kind: BinaryFileKind { BinaryFileKind(path: path) }
 
-    /// One load per (file, worktree state). Also the token a finished read is
-    /// checked against before it is allowed to draw.
-    private var taskID: String { "\(worktreePath)|\(file.path)|\(generation)" }
+    /// One load per (file, change, worktree state). Also the token a finished
+    /// read is checked against before it is allowed to draw.
+    private var taskID: String {
+        "\(worktreePath)|\(path)|\(status?.rawValue ?? "")|\(generation)"
+    }
+
+    /// The version the header describes: the current file, or the removed one.
+    private var primary: Loaded? { after ?? before }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -66,7 +79,7 @@ struct BinaryFilePreview: View {
             if let dimensions {
                 metadataChip(dimensions)
             }
-            if let byteCount {
+            if let byteCount = primary?.byteCount {
                 metadataChip(
                     ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file)
                 )
@@ -89,7 +102,7 @@ struct BinaryFilePreview: View {
     /// reports, which halve every Retina asset and made a 64×64 `@2x` icon
     /// read as 32×32.
     private var dimensions: String? {
-        guard let pixelSize, pixelSize.width > 0 else { return nil }
+        guard let pixelSize = primary?.pixelSize, pixelSize.width > 0 else { return nil }
         return "\(Int(pixelSize.width)) × \(Int(pixelSize.height))"
     }
 
@@ -106,23 +119,21 @@ struct BinaryFilePreview: View {
 
     @ViewBuilder
     private var content: some View {
-        if file.status == .deleted {
-            note("This file was deleted. There is nothing left in the worktree to preview.")
-        } else if let image {
-            // A checkerboard, because transparency is the whole point of most
-            // of the icons that land here and a white PNG on a white pane
-            // looks identical to an empty one.
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(maxWidth: 480, maxHeight: 420)
-                .background(CheckerboardBackground())
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(OreTheme.hairline)
-                )
+        if loadedToken != taskID {
+            ProgressView().controlSize(.small)
+        } else if let old = before?.image, let new = after?.image {
+            HStack(alignment: .top, spacing: 16) {
+                labeled("Before", old, maxWidth: 360)
+                labeled("After", new, maxWidth: 360)
+            }
+        } else if status == .deleted {
+            if let old = before?.image {
+                labeled("Deleted on this branch — last version", old, maxWidth: 480)
+            } else {
+                note("This file was deleted, and its previous version couldn't be read.")
+            }
+        } else if let image = after?.image {
+            framed(image, maxWidth: 480)
         } else if kind.isPreviewable {
             note("Could not read this file for preview.")
         } else {
@@ -131,6 +142,32 @@ struct BinaryFilePreview: View {
                 .buttonStyle(.link)
                 .font(.system(size: 12))
         }
+    }
+
+    private func labeled(_ title: String, _ image: NSImage, maxWidth: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            framed(image, maxWidth: maxWidth)
+        }
+    }
+
+    /// A checkerboard, because transparency is the whole point of most of the
+    /// icons that land here and a white PNG on a white pane looks identical to
+    /// an empty one.
+    private func framed(_ image: NSImage, maxWidth: CGFloat) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(maxWidth: maxWidth, maxHeight: 420)
+            .background(CheckerboardBackground())
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(OreTheme.hairline)
+            )
     }
 
     /// Selects the file in Finder rather than opening it.
@@ -142,7 +179,7 @@ struct BinaryFilePreview: View {
     /// The path also goes through `safeFileURL`, so a diff naming
     /// `../../../etc/passwd` reveals nothing.
     private func showInFinder() {
-        guard let url = try? AppModel.safeFileURL(root: worktreePath, relativePath: file.path)
+        guard let url = try? AppModel.safeFileURL(root: worktreePath, relativePath: path)
         else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
@@ -157,25 +194,39 @@ struct BinaryFilePreview: View {
 
     private func load() async {
         let token = taskID
-        image = nil
-        pixelSize = nil
-        byteCount = nil
+        before = nil
+        after = nil
         loadedToken = nil
 
         let root = worktreePath
-        let relative = file.path
+        let relative = path
         let kind = self.kind
-        let loaded = await Task.detached(priority: .userInitiated) {
-            Self.read(root: root, relativePath: relative, kind: kind)
-        }.value
+        // An added file has no past, a deleted one no present, and a file
+        // opened outside review only needs how it looks now.
+        let wantsCurrent = status != .deleted
+        let wantsBase = kind.isPreviewable && status != nil
+            && status != .added && status != .untracked
+
+        var current: Loaded?
+        if wantsCurrent {
+            current = await Task.detached(priority: .userInitiated) {
+                Self.read(root: root, relativePath: relative, kind: kind)
+            }.value
+        }
+        var base: Loaded?
+        if wantsBase,
+           let data = await model.baseFileData(path: originalPath ?? path, in: workspaceID) {
+            base = await Task.detached(priority: .userInitiated) {
+                Self.decode(data: data, kind: kind)
+            }.value
+        }
 
         // A `.task` is cancelled when its id changes, but a detached read is
         // not, so a slow file can still land here after the reviewer has
         // moved on.
         guard !Task.isCancelled, token == taskID else { return }
-        image = loaded.image
-        pixelSize = loaded.pixelSize
-        byteCount = loaded.byteCount
+        after = current
+        before = base
         loadedToken = token
     }
 
@@ -221,6 +272,26 @@ struct BinaryFilePreview: View {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return Loaded(byteCount: byteCount)
         }
+        return thumbnail(from: source, byteCount: byteCount)
+    }
+
+    /// `read`, for bytes that came out of git rather than off the disk.
+    nonisolated static func decode(data: Data, kind: BinaryFileKind) -> Loaded {
+        let byteCount = Int64(data.count)
+        guard kind.isPreviewable else { return Loaded(byteCount: byteCount) }
+        if kind.isVector {
+            let image = NSImage(data: data)
+            return Loaded(image: image, pixelSize: image?.size, byteCount: byteCount)
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return Loaded(byteCount: byteCount)
+        }
+        return thumbnail(from: source, byteCount: byteCount)
+    }
+
+    private nonisolated static func thumbnail(
+        from source: CGImageSource, byteCount: Int64?
+    ) -> Loaded {
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
         let pixelSize = properties.flatMap { properties -> CGSize? in
             guard let width = properties[kCGImagePropertyPixelWidth] as? Int,
@@ -259,10 +330,14 @@ struct BinaryFileKind: Sendable {
     /// Resolution-independent: there is nothing to downsample, and no pixel
     /// dimensions to report. Kept on the direct AppKit path.
     var isVector = false
+    /// Recognised as a format that is never text, so there is no source to
+    /// open. False for SVG, which is XML, and for anything unrecognised — a
+    /// `Makefile` has no extension and is still text.
+    var isKnownBinary = true
 
     init(path: String) {
         switch (path as NSString).pathExtension.lowercased() {
-        case "svg": (label, isPreviewable, isVector) = ("SVG image", true, true)
+        case "svg": (label, isPreviewable, isVector, isKnownBinary) = ("SVG image", true, true, false)
         case "pdf": (label, isPreviewable, isVector) = ("PDF", true, true)
         // NSImage handles all of these natively, SVG included since macOS 13.
         case "png": (label, isPreviewable) = ("PNG image", true)
@@ -279,7 +354,7 @@ struct BinaryFileKind: Sendable {
         case "zip", "gz", "tar", "bz2", "7z": (label, isPreviewable) = ("Archive", false)
         case "woff", "woff2", "ttf", "otf": (label, isPreviewable) = ("Font", false)
         case "sqlite", "db": (label, isPreviewable) = ("Database", false)
-        default: (label, isPreviewable) = ("Binary file", false)
+        default: (label, isPreviewable, isKnownBinary) = ("Binary file", false, false)
         }
     }
 }

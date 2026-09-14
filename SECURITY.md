@@ -34,7 +34,7 @@ is no key for us to lose or leak, and no key for you to fetch.
 
 **Not every release is attested.** An attestation can only be produced where
 the artifact is built, so a release cut from a maintainer's Mac with
-`Scripts/certify-release.sh` has none — `gh attestation verify` will fail on
+`Apps/OreMac/Scripts/certify-release.sh` has none — `gh attestation verify` will fail on
 it, and that is the correct answer rather than a problem with your setup.
 Those releases say **not attested** in their own release notes. A Developer ID
 signature, when there is one, is not a substitute: it says who signed the
@@ -92,8 +92,11 @@ knowing:
   inheriting yours.
 - ORE never stores a GitHub token. All GitHub access goes through the `gh`
   CLI you authenticated yourself.
-- Everything ORE persists is local: `~/ore/ore.sqlite` and the worktrees under
-  `~/ore/workspaces`.
+- Everything ORE persists is local: under `~/ore/` (or `$ORE_HOME`) the
+  database `ore.sqlite`, the worktrees in `workspaces/`, the assistant's own
+  workspace in `assistant/`, the anonymous analytics queue `telemetry.sqlite`
+  and the `install-channel` marker; downloaded voice models under
+  `~/Library/Caches`; and preferences in the `dev.ore.OreMac` defaults domain.
 
 For what ORE reports about usage, see [PRIVACY.md](PRIVACY.md).
 

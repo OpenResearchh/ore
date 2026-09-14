@@ -219,10 +219,6 @@ public actor GitHubClient {
         }
 
         public var hasRunningChecks: Bool { checks.contains { !$0.isComplete } }
-
-        public var allChecksPassed: Bool {
-            !checks.isEmpty && checks.allSatisfy { $0.isComplete && $0.isSuccess }
-        }
     }
 
     public struct CheckRun: Sendable, Hashable, Codable {

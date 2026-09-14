@@ -85,9 +85,6 @@ public struct GitStatusSnapshot: Sendable, Hashable, Codable {
 
     public var hasUncommittedChanges: Bool { !files.isEmpty }
 
-    public var stagedFiles: [GitFileChange] { files.filter(\.isStaged) }
-    public var unstagedFiles: [GitFileChange] { files.filter(\.isUnstaged) }
-
     mutating func refreshWorkingTreeTotals() {
         stagedFileCount = files.filter(\.isStaged).count
         unstagedFileCount = files.filter(\.isUnstaged).count

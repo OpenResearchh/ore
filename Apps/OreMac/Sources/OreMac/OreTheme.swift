@@ -11,7 +11,6 @@ enum OreTheme {
         static let md: CGFloat = 16
         static let lg: CGFloat = 24
         static let xl: CGFloat = 48
-        static let xxl: CGFloat = 96
     }
 
     /// Decorative motion (busy borders, tab dots, HUD waveform, sidebar ring).
@@ -596,19 +595,6 @@ struct OreComposerBusyBorder: View {
     }
 }
 
-/// Navigation is the other functional layer Apple calls out for Liquid Glass.
-/// Keeping it to the outer rail avoids stacking glass on every row and badge.
-struct OreNavigationSurface: ViewModifier {
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: .rect(cornerRadius: OreTheme.cardRadius))
-        } else {
-            content.background(.ultraThinMaterial)
-        }
-    }
-}
-
 /// Tabs are navigation chrome floating over the transcript, so every pill is
 /// cut from Liquid Glass — not only the selected one. Transparent unselected
 /// tabs read fine on a fixed bar, but this strip floats: rows scroll directly
@@ -824,10 +810,6 @@ extension View {
             elevation: elevation,
             interactive: interactive
         ))
-    }
-
-    func oreNavigationSurface() -> some View {
-        modifier(OreNavigationSurface())
     }
 
     func oreNavigationSelection(isSelected: Bool, isHovered: Bool) -> some View {

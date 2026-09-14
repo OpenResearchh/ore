@@ -124,6 +124,7 @@ def record(name, prompt, approve=True, interrupt_after=None):
     time.sleep(1)
     process.kill()
 
+    lines = [scrub(line) for line in lines]
     path = os.path.abspath(os.path.join(FIXTURES, name + ".jsonl"))
     with open(path, "w") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -140,6 +141,15 @@ SCENARIOS = {
         "codex-file-change",
         "Create a file named ore.txt containing the word ore."),
 }
+
+
+# Recordings are committed to a public repository, so the recording machine's
+# home directory is replaced before the file is written.
+HOME = os.path.expanduser("~")
+
+
+def scrub(line):
+    return line.replace(HOME, "/Users/user")
 
 
 def main():

@@ -1226,18 +1226,6 @@ struct ChatPane: View {
     }
     }
 
-    @ViewBuilder
-    private func modelChoices(for tab: ChatSummary) -> some View {
-        Text("Default model").tag("")
-        ForEach(model.knownModels(for: tab.harness)) { choice in
-            Text(choice.displayName).tag(choice.id)
-        }
-        if let selected = tab.model,
-           !model.knownModels(for: tab.harness).contains(where: { $0.id == selected }) {
-            Text(selected).tag(selected)
-        }
-    }
-
     // MARK: - Composer
 
     private func composer(paneHeight: CGFloat) -> some View {
@@ -1891,14 +1879,6 @@ struct ChatPane: View {
             effortStepPulse += 1
         }
         return true
-    }
-
-    private func harnessIcon(_ harness: HarnessKind) -> String {
-        switch harness {
-        case .claudeCode: "sparkles"
-        case .codex: "bolt.fill"
-        case .cursorAgent: "cursorarrow.rays"
-        }
     }
 
     /// Speaker, mic and send are one trailing cluster: same 30pt circle, 8pt

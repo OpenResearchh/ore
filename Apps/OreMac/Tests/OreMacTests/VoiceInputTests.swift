@@ -343,7 +343,7 @@ struct VoiceIntentExtractorTests {
     /// open), so it must not stall.
     ///
     /// The bounds are deliberately far above the measured cost — roughly 3ms for
-    /// a typical utterance and 23ms for a very long one on this machine — because
+    /// a typical utterance and 23ms for a very long one on an M-series Mac — because
     /// a timing test that sits near the real number only ever reports CI load.
     /// What they genuinely catch is a return to something with a startup cost:
     /// the previous sentence-embedding matcher paid a multi-hundred-millisecond

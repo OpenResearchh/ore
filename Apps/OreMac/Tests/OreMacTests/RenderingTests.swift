@@ -341,15 +341,17 @@ struct SyntaxHighlighterTests {
         #expect(keyword != type)
     }
 
-    @Test func swiftUsesTheParserRatherThanTheRegexFallback() {
-        // A user-defined type name is the cheap way to tell the two apart: the
-        // regex pass only knows a fixed keyword list, so `Square` would come
-        // back unstyled. Colouring it means a grammar actually parsed this.
-        let code = "struct Square { let side: Double }"
-        let typeName = color(of: "Square", in: code, language: "swift")
+    @Test func swiftUsesTheParserRatherThanTheLexerFallback() {
+        // A lowercase type annotation is the cheap way to tell the two apart:
+        // the lexer only calls a word a type by convention (capitalised, or
+        // after `struct`), so `meters` would come back unstyled. Colouring it
+        // means a grammar actually parsed this.
+        let code = "let side: meters = 1"
+        let typeName = color(of: "meters", in: code, language: "swift")
 
         #expect(typeName != nil)
         #expect(typeName != NSColor.labelColor, "the tree-sitter grammar did not load")
+        #expect(SyntaxLexer.tokens(for: code, language: "swift").allSatisfy { $0.kind != .type })
     }
 
     @Test func stringsAndCommentsAreColouredInJSON() {
@@ -360,7 +362,7 @@ struct SyntaxHighlighterTests {
         #expect(result.string == code)
     }
 
-    @Test func anUnknownLanguageStillGetsTheRegexPass() {
+    @Test func aLanguageWithoutAGrammarStillGetsTheLexer() {
         // Unhighlighted code in an app for reading code is worse than
         // approximate highlighting.
         let code = "def greet(name):\n    return \"hi\"  # a comment"

@@ -39,12 +39,6 @@ public enum ShellEnvironment {
             value = computed
             return computed
         }
-
-        func invalidate() {
-            lock.lock()
-            defer { lock.unlock() }
-            value = nil
-        }
     }
 
     /// The user's login-shell environment, probed once per app run.
@@ -62,10 +56,6 @@ public enum ShellEnvironment {
         Thread.detachNewThread {
             _ = loginShellEnvironment()
         }
-    }
-
-    public static func invalidateCache() {
-        cache.invalidate()
     }
 
     /// The environment to hand a harness child process: login-shell values,

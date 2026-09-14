@@ -53,8 +53,13 @@ cask "ore" do
 
   uninstall quit: "dev.ore.OreMac"
 
+  # Never "~/ore" as a whole: ~/ore/workspaces holds the user's worktrees,
+  # which can carry uncommitted work that exists nowhere else.
   zap trash: [
-    "~/ore",
+    "~/ore/ore.sqlite*",
+    "~/ore/telemetry.sqlite*",
+    "~/ore/install-channel",
+    "~/ore/assistant",
     "~/Library/Preferences/dev.ore.OreMac.plist",
     "~/Library/Caches/dev.ore.OreMac",
   ]

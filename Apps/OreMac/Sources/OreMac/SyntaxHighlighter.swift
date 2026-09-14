@@ -3,17 +3,24 @@ import SwiftTreeSitter
 import TreeSitterJSON
 import TreeSitterSwift
 
-/// Syntax highlighting for code blocks and diffs.
+/// Syntax highlighting for code blocks, the source editor and diffs.
 ///
-/// tree-sitter parses rather than pattern-matches, which is what makes it
-/// correct on the things a regex highlighter gets wrong — a keyword inside a
-/// string, a comment containing code, a generic parameter list. It is also
-/// incremental, though ORE re-parses whole snippets: they are small, and the
-/// diff viewer's unit of work is a hunk, not a file.
+/// Two engines, one theme. tree-sitter parses rather than pattern-matches,
+/// which makes it the most accurate option, but only Swift and JSON have
+/// grammars ORE can bundle (see below). Everything else — and every diff
+/// line, and any snippet tree-sitter fails on — goes through `SyntaxLexer`, a
+/// single-pass scanner driven by declarative `LanguageDefinition`s.
 ///
-/// Any language without a bundled grammar falls back to a regex pass rather
-/// than to nothing. Unhighlighted code in an app whose whole job is reading
-/// code is a worse outcome than approximate highlighting.
+/// The lexer is deliberately a lexer, not a parser: it knows where comments,
+/// strings, numbers and words start and end in each language, and colours by
+/// what a token is rather than where it sits. That is enough to never colour a
+/// `//` inside a string as a comment or a keyword inside a comment, and it runs
+/// in one linear pass with no regular expressions, so a 2 MB file in the
+/// editor costs about as much as copying it.
+///
+/// Unhighlighted code in an app whose whole job is reading code is a worse
+/// outcome than approximate highlighting, so unknown languages get a generic
+/// C-like definition rather than nothing. Plain text (`text`, `log`) opts out.
 final class SyntaxHighlighter: @unchecked Sendable {
     static let shared = SyntaxHighlighter()
 
@@ -25,8 +32,7 @@ final class SyntaxHighlighter: @unchecked Sendable {
         var query: Query?
     }
 
-    /// Grammars bundled with the app, and the names people actually write in a
-    /// fenced code block.
+    /// Grammars bundled with the app.
     ///
     /// Each grammar's C entry point returns an opaque `TSLanguage *`.
     private static func grammar(named name: String) -> OpaquePointer? {
@@ -37,18 +43,6 @@ final class SyntaxHighlighter: @unchecked Sendable {
         }
     }
 
-    private static let aliases: [String: String] = [
-        "py": "python",
-        "jsonc": "json",
-        "js": "javascript",
-        "jsx": "javascript",
-        "mjs": "javascript",
-        "cjs": "javascript",
-        "ts": "javascript",
-        "tsx": "javascript",
-        "node": "javascript",
-    ]
-
     // Only grammars whose SwiftPM manifest actually builds are bundled.
     //
     // Several official tree-sitter grammars (JavaScript, Python among them)
@@ -58,11 +52,10 @@ final class SyntaxHighlighter: @unchecked Sendable {
     // itself. Consumed from another directory the test fails, the scanner is
     // skipped, and the link dies on undefined symbols. Vendoring a copy of a
     // generated parser to work around that is a maintenance burden that
-    // outweighs the benefit, so those languages take the regex path — the same
-    // degradation any unbundled language gets.
+    // outweighs the benefit, so those languages take the lexer path.
 
-    /// Highlights a snippet. Returns plain attributed text when the language is
-    /// unknown, so a caller never has to check.
+    /// Highlights a snippet or a whole file. Returns plain attributed text when
+    /// the language opts out of colour, so a caller never has to check.
     func highlight(
         _ code: String,
         language rawLanguage: String?,
@@ -132,43 +125,35 @@ final class SyntaxHighlighter: @unchecked Sendable {
         )
         guard !code.isEmpty else { return result }
 
-        guard let name = Self.canonicalName(rawLanguage) else {
-            RegexHighlighter.apply(to: result, language: nil)
+        let name = Self.canonicalName(rawLanguage)
+        if let name, applyTreeSitter(to: result, code: code, language: name) {
             return result
         }
-        guard let loaded = loadLanguage(name), let query = loaded.query else {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
+        SyntaxPainter.paint(SyntaxLexer.tokens(for: code, language: name), into: result, font: font)
+        return result
+    }
 
+    /// Colours `result` with a bundled grammar. False when there is no grammar
+    /// for the language or it couldn't parse, so the caller can fall back.
+    private func applyTreeSitter(to result: NSMutableAttributedString, code: String, language name: String) -> Bool {
+        guard let loaded = loadLanguage(name), let query = loaded.query else { return false }
         let parser = Parser()
-        do {
-            try parser.setLanguage(loaded.language)
-        } catch {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
-
-        guard let tree = parser.parse(code) else {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
+        guard (try? parser.setLanguage(loaded.language)) != nil, let tree = parser.parse(code) else { return false }
 
         let cursor = query.execute(in: tree)
         let utf16Length = code.utf16.count
-
+        result.beginEditing()
+        defer { result.endEditing() }
         while let match = cursor.next() {
             for capture in match.captures {
                 guard let captureName = capture.name,
-                      let color = SyntaxTheme.color(forCapture: captureName)
+                      let color = SyntaxTheme.color(forCapture: captureName),
+                      let range = Self.attributedRange(for: capture.node.byteRange, utf16Length: utf16Length)
                 else { continue }
-                guard let range = Self.attributedRange(
-                    for: capture.node.byteRange, utf16Length: utf16Length
-                ) else { continue }
                 result.addAttribute(.foregroundColor, value: color, range: range)
             }
         }
-        return result
+        return true
     }
 
     /// Highlights one line, for the diff viewer.
@@ -179,27 +164,32 @@ final class SyntaxHighlighter: @unchecked Sendable {
         baseColor: NSColor = .labelColor
     ) -> NSAttributedString {
         // A single diff line is rarely a complete parse unit, so tree-sitter
-        // would produce errors more often than colour. The regex pass is the
-        // honest tool at this granularity.
+        // would produce errors more often than colour. The lexer needs no
+        // context beyond the line, which is the honest tool at this granularity.
         let result = NSMutableAttributedString(
             string: line,
             attributes: [.font: font, .foregroundColor: baseColor]
         )
-        RegexHighlighter.apply(to: result, language: Self.canonicalName(language))
+        guard !line.isEmpty else { return result }
+        SyntaxPainter.paint(
+            SyntaxLexer.tokens(for: line, language: Self.canonicalName(language)), into: result, font: font
+        )
         return result
     }
 
-    /// The grammar name for a fenced block's info string or a file extension.
+    /// The language name for a fenced block's info string or a file extension.
     static func canonicalName(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        // A fence can carry more than a language: ```swift title=foo.swift
-        let first = raw.split(separator: " ").first.map(String.init) ?? raw
-        let lowered = first.lowercased()
-        return aliases[lowered] ?? lowered
+        LanguageRegistry.canonicalName(raw)
     }
 
+    /// The language for a file, by well-known name (`Dockerfile`, `.zshrc`)
+    /// and then by extension.
     static func language(forPath path: String) -> String? {
-        canonicalName((path as NSString).pathExtension)
+        LanguageRegistry.language(forPath: path)
+    }
+
+    static func language(forPath path: String, contents: String) -> String? {
+        LanguageRegistry.language(forPath: path, contents: contents)
     }
 
     // MARK: - Loading
@@ -242,11 +232,46 @@ final class SyntaxHighlighter: @unchecked Sendable {
     }
 }
 
+/// Applies lexer tokens to attributed text.
+enum SyntaxPainter {
+    static func paint(_ tokens: [SyntaxToken], into result: NSMutableAttributedString, font: NSFont) {
+        guard !tokens.isEmpty else { return }
+        let colors = SyntaxTheme.tokenColors
+        let length = result.length
+        var bold: NSFont?
+        var italic: NSFont?
+
+        // One editing session: without it every attribute change notifies
+        // layout, which on a large file costs more than the lexing.
+        result.beginEditing()
+        defer { result.endEditing() }
+        for token in tokens {
+            let end = min(token.end, length)
+            guard token.start < end else { continue }
+            let range = NSRange(location: token.start, length: end - token.start)
+            if let color = colors[Int(token.kind.rawValue)] {
+                result.addAttribute(.foregroundColor, value: color, range: range)
+            }
+            switch token.kind {
+            case .heading, .bold:
+                if bold == nil { bold = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+                result.addAttribute(.font, value: bold ?? font, range: range)
+            case .italic:
+                if italic == nil { italic = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+                result.addAttribute(.font, value: italic ?? font, range: range)
+            default:
+                break
+            }
+        }
+    }
+}
+
 /// Colours by capture name.
 ///
 /// Capture names are tree-sitter's shared vocabulary (`@keyword`, `@string`,
-/// `@function`), so one theme covers every grammar. System colours are used so
-/// the theme follows light and dark mode without a second palette.
+/// `@function`), so one theme covers every grammar and the lexer. System
+/// colours are used so the theme follows light and dark mode without a second
+/// palette.
 enum SyntaxTheme {
     static func color(forCapture capture: String) -> NSColor? {
         // Captures are dotted and specific-to-general: `keyword.function`
@@ -259,6 +284,9 @@ enum SyntaxTheme {
         }
     }
 
+    /// The lexer's colours, resolved once per token kind rather than per token.
+    static let tokenColors: [NSColor?] = SyntaxTokenKind.allCases.map { color(forCapture: $0.capture) }
+
     private static let table: [String: NSColor] = [
         "keyword": .systemPink,
         "conditional": .systemPink,
@@ -266,6 +294,9 @@ enum SyntaxTheme {
         "include": .systemPink,
         "operator": .labelColor,
         "string": .systemRed,
+        "string.escape": .systemOrange,
+        // Regular expressions, heredoc markers, LaTeX math.
+        "string.special": .systemBrown,
         "number": .systemPurple,
         "boolean": .systemPurple,
         "constant": .systemPurple,
@@ -275,11 +306,27 @@ enum SyntaxTheme {
         "type": .systemTeal,
         "constructor": .systemTeal,
         "variable": .labelColor,
+        // `self`/`this` read as keywords, as in Xcode.
+        "variable.builtin": .systemPink,
+        // Sigil variables: `$HOME`, `@name`, `--custom-property`.
+        "variable.special": .systemIndigo,
         "property": .systemIndigo,
         "parameter": .labelColor,
         "punctuation": .tertiaryLabelColor,
+        // Interpolation delimiters, list markers, fences.
+        "punctuation.special": .systemOrange,
         "attribute": .systemOrange,
         "label": .systemOrange,
+        "tag": .systemBlue,
+        "markup.heading": .systemBlue,
+        "markup.link": .systemIndigo,
+        "markup.link.url": .systemTeal,
+        "markup.raw": .systemRed,
+        "markup.quote": .secondaryLabelColor,
+        "diff.plus": .systemGreen,
+        "diff.minus": .systemRed,
+        "diff.hunk": .systemTeal,
+        "diff.header": .systemPurple,
     ]
 }
 
@@ -305,7 +352,7 @@ enum HighlightQueries {
         // Where the grammar bundles live depends on how the code was launched:
         // inside `Contents/Resources` for the app, beside the test binary when
         // running tests. Searching both means highlighting behaves the same in
-        // both, rather than silently degrading to the regex pass in one.
+        // both, rather than silently degrading to the lexer in one.
         let ownBundle = Bundle(for: SyntaxHighlighter.self)
         let searchRoots = [
             Bundle.main.resourceURL,
@@ -341,8 +388,6 @@ enum HighlightQueries {
     static func source(for language: String) -> String? {
         switch language {
         case "swift": return swift
-        case "python": return python
-        case "javascript": return javascript
         case "json": return json
         default: return nil
         }
@@ -369,114 +414,10 @@ enum HighlightQueries {
     (function_declaration (simple_identifier) @function)
     """
 
-    private static let python = """
-    (comment) @comment
-    (string) @string
-    (integer) @number
-    (float) @number
-    [(true) (false) (none)] @boolean
-    (identifier) @variable
-    (call function: (identifier) @function)
-    (function_definition name: (identifier) @function)
-    (class_definition name: (identifier) @type)
-    [
-      "def" "class" "if" "elif" "else" "for" "while" "return" "import" "from"
-      "as" "try" "except" "finally" "raise" "with" "lambda" "yield" "async"
-      "await" "pass" "break" "continue" "in" "is" "not" "and" "or" "global"
-    ] @keyword
-    """
-
-    private static let javascript = """
-    (comment) @comment
-    (string) @string
-    (template_string) @string
-    (number) @number
-    [(true) (false) (null) (undefined)] @boolean
-    (identifier) @variable
-    (call_expression function: (identifier) @function)
-    (function_declaration name: (identifier) @function)
-    (class_declaration name: (identifier) @type)
-    (property_identifier) @property
-    [
-      "function" "const" "let" "var" "if" "else" "for" "while" "return"
-      "class" "extends" "new" "import" "from" "export" "default" "try"
-      "catch" "finally" "throw" "async" "await" "yield" "typeof" "instanceof"
-    ] @keyword
-    """
-
     private static let json = """
     (string) @string
     (number) @number
     [(true) (false) (null)] @boolean
     (pair key: (string) @property)
     """
-}
-
-/// Fallback highlighting for languages without a bundled grammar.
-///
-/// Deliberately crude: strings, comments and a common keyword set. It exists so
-/// that an unfamiliar language still reads as code rather than as a wall of
-/// uniform text.
-enum RegexHighlighter {
-    private static let keywords: Set<String> = [
-        "func", "function", "def", "class", "struct", "enum", "interface", "trait",
-        "let", "var", "const", "val", "if", "else", "elif", "for", "while", "loop",
-        "return", "import", "from", "package", "use", "using", "include", "require",
-        "public", "private", "protected", "internal", "static", "final", "async",
-        "await", "try", "catch", "except", "finally", "throw", "throws", "raise",
-        "new", "delete", "null", "nil", "none", "true", "false", "self", "this",
-        "match", "case", "switch", "break", "continue", "yield", "type", "impl",
-    ]
-
-    static func apply(to string: NSMutableAttributedString, language: String?) {
-        let text = string.string
-        guard !text.isEmpty else { return }
-
-        applyPattern(#"(?m)(//|#).*$"#, color: .secondaryLabelColor, to: string, in: text)
-        applyPattern(#"/\*[\s\S]*?\*/"#, color: .secondaryLabelColor, to: string, in: text)
-        applyPattern(#""(?:[^"\\\n]|\\.)*""#, color: .systemRed, to: string, in: text)
-        applyPattern(#"'(?:[^'\\\n]|\\.)*'"#, color: .systemRed, to: string, in: text)
-        applyPattern(#"\b\d+(\.\d+)?\b"#, color: .systemPurple, to: string, in: text)
-
-        guard let wordExpression = try? NSRegularExpression(pattern: #"\b[A-Za-z_]\w*\b"#)
-        else { return }
-        let whole = NSRange(text.startIndex..., in: text)
-
-        for match in wordExpression.matches(in: text, range: whole) {
-            guard let range = Range(match.range, in: text),
-                  keywords.contains(String(text[range]))
-            else { continue }
-            // Comments and strings already claimed their ranges; a keyword
-            // inside one must not be recoloured.
-            guard !isClaimed(match.range, in: string) else { continue }
-            string.addAttribute(.foregroundColor, value: NSColor.systemPink, range: match.range)
-        }
-    }
-
-    private static func applyPattern(
-        _ pattern: String,
-        color: NSColor,
-        to string: NSMutableAttributedString,
-        in text: String
-    ) {
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
-        let whole = NSRange(text.startIndex..., in: text)
-        for match in expression.matches(in: text, range: whole) {
-            guard !isClaimed(match.range, in: string) else { continue }
-            string.addAttribute(.foregroundColor, value: color, range: match.range)
-        }
-    }
-
-    private static func isClaimed(_ range: NSRange, in string: NSMutableAttributedString) -> Bool {
-        guard range.location < string.length else { return true }
-        var claimed = false
-        string.enumerateAttribute(.foregroundColor, in: range) { value, _, stop in
-            guard let color = value as? NSColor else { return }
-            if color != .labelColor {
-                claimed = true
-                stop.pointee = true
-            }
-        }
-        return claimed
-    }
 }

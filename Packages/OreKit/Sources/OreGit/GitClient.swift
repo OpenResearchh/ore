@@ -56,6 +56,32 @@ public actor GitClient {
         )
     }
 
+    /// A file's bytes as of `revision`, or nil when it did not exist there or
+    /// is larger than `maximumBytes`.
+    ///
+    /// `run` decodes standard output as UTF-8, which is fine for porcelain and
+    /// ruinous for an image, so blob contents take their own binary-safe path.
+    /// It is how the review pane shows what a deleted or replaced image was.
+    public func fileData(
+        atRevision revision: String,
+        path: String,
+        in directory: URL? = nil,
+        maximumBytes: Int = 20_000_000
+    ) async -> Data? {
+        let object = "\(revision):\(path)"
+        guard let size = try? await run(["cat-file", "-s", object], in: directory) else {
+            return nil
+        }
+        guard let bytes = Int(size.trimmedStandardOutput), bytes <= maximumBytes else {
+            return nil
+        }
+        return try? await GitProcess.runData(
+            executablePath: executablePath,
+            arguments: ["cat-file", "blob", object],
+            workingDirectory: directory ?? repositoryURL
+        )
+    }
+
     /// Resolves a path inside the git directory, correctly for a worktree —
     /// where `.git` is a file pointing elsewhere and per-worktree state lives
     /// under the common directory.
@@ -109,13 +135,6 @@ public actor GitClient {
     }
 
     // MARK: - Repository facts
-
-    /// The repository's common git directory — shared by every worktree, and
-    /// where ORE's own refs live.
-    public func commonGitDirectory() async throws -> URL {
-        let output = try await run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        return URL(fileURLWithPath: output.trimmedStandardOutput)
-    }
 
     public func topLevel() async throws -> URL {
         let output = try await run(["rev-parse", "--show-toplevel"])
@@ -555,12 +574,41 @@ enum GitProcess {
         )
     }
 
+    /// `run`, for output that must stay bytes.
+    static func runData(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: URL
+    ) async throws -> Data {
+        let process = try ChildProcess(
+            executablePath: executablePath,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: gitEnvironment()
+        )
+        async let standardOutput = process.stdoutChunks.collectData()
+        async let standardError = process.stderrChunks.collectText()
+        process.closeStandardInput()
+
+        let output = await standardOutput
+        let errorOutput = await standardError
+        let status = await process.waitForExit()
+        guard status == 0 else {
+            throw GitError.commandFailed(
+                arguments: arguments,
+                exitCode: status,
+                message: errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return output
+    }
+
     /// Git's environment, with anything interactive disabled.
     ///
     /// A GUI app has no terminal to type a passphrase into: without this, a
     /// repository whose remote needs credentials hangs forever instead of
     /// failing with something we can show the user.
-    private static func gitEnvironment() -> [String: String] {
+    static func gitEnvironment() -> [String: String] {
         var environment = ShellEnvironment.childEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GIT_OPTIONAL_LOCKS"] = "0"

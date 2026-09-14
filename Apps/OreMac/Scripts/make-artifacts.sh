@@ -12,10 +12,8 @@
 # beside it resolves to that directory: the redirection fails and the release
 # goes out missing the one asset install.sh cannot proceed without.
 #
-# Three artifacts, one build. make-dmg.sh calls bundle.sh itself, so producing
-# a zip alongside it used to mean compiling the app twice and shipping two
-# bundles that were only probably identical. Everything here comes from the
-# same $APP, so the zip and the dmg contain the same bytes by construction.
+# Three artifacts, one build. Everything here comes from the same $APP, so the
+# zip and the dmg contain the same bytes by construction.
 #
 # `--no-build` packages the bundle already in .build. That is how the signed
 # route gets here: release.sh has to notarize and staple the app *before* it

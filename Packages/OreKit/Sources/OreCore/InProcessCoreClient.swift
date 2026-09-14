@@ -232,15 +232,9 @@ public actor InProcessCoreClient: CoreClient {
             let chat = try await engine(for: workspaceID).setDraft(chatID: chatID, text: text)
             continuation.yield(.chatUpdated(chat))
 
-        case .listChats(let workspaceID):
-            try await listChats(workspaceID)
-
         case .sendMessage(let request):
             let engine = try await engine(for: request.workspaceID)
             _ = try await engine.send(request)
-
-        case .interruptTurn(let id):
-            try await engine(for: id).interrupt()
 
         case .interruptChatTurn(let id, let chatID):
             try await engine(for: id).interrupt(chatID: chatID)
@@ -276,12 +270,6 @@ public actor InProcessCoreClient: CoreClient {
 
         case .revertChatToCheckpoint(let id, let chatID, let turnID):
             try await engine(for: id).revert(to: turnID, chatID: chatID)
-
-        case .startSession(let id, let request):
-            _ = try await engine(for: id).ensureSession(request)
-
-        case .startChatSession(let id, let chatID, let request):
-            _ = try await engine(for: id).ensureSession(request, chatID: chatID)
 
         case .stopSession(let id):
             try await engine(for: id).stopSession()
@@ -474,16 +462,6 @@ public actor InProcessCoreClient: CoreClient {
             return
         }
         continuation.yield(.snapshot(snapshot))
-    }
-
-    private func listChats(_ workspaceID: WorkspaceID) async throws {
-        let revision = listRevision
-        let chats = try await engine(for: workspaceID).chatSummaries()
-        guard revision == listRevision else {
-            try await listChats(workspaceID)
-            return
-        }
-        continuation.yield(.chatsListed(workspaceID, chats))
     }
 
     func markListMutation() {
@@ -1228,6 +1206,12 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).diff(againstBase: againstBase)
     }
 
+    /// A file as it was at the workspace's merge base, or nil when it did not
+    /// exist there. Binary-safe: this is how a deleted image is still shown.
+    public func baseFileData(workspaceID: WorkspaceID, path: String) async throws -> Data? {
+        try await engine(for: workspaceID).baseFileData(path: path)
+    }
+
     public func suggestedGitAction(workspaceID: WorkspaceID) async throws -> SuggestedGitAction {
         try await engine(for: workspaceID).suggestedGitAction()
     }
@@ -1608,10 +1592,9 @@ private extension CoreCommand {
     var workspaceID: WorkspaceID? {
         switch self {
         case .archiveWorkspace(let id), .unarchiveWorkspace(let id),
-             .interruptTurn(let id), .stopSession(let id), .listChats(let id):
+             .stopSession(let id):
             return id
-        case .deleteWorkspace(let id, _), .setPermissionMode(let id, _),
-             .startSession(let id, _):
+        case .deleteWorkspace(let id, _), .setPermissionMode(let id, _):
             return id
         case .renameWorkspace(let id, _, _), .setWorkspacePinned(let id, _),
              .addDiffComment(let id, _), .clearDiffComments(let id, _),
@@ -1638,7 +1621,7 @@ private extension CoreCommand {
              .setChatDraft(let id, _, _), .interruptChatTurn(let id, _),
              .setChatPermissionMode(let id, _, _),
              .setChatEffort(let id, _, _),
-             .startChatSession(let id, _, _), .stopChatSession(let id, _):
+             .stopChatSession(let id, _):
             return id
         case .resolveChatPermission(let id, _, _, _, _),
              .answerChatQuestion(let id, _, _, _),

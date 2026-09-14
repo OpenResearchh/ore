@@ -198,12 +198,6 @@ public actor WorkspaceEngine {
         )
     }
 
-    public func currentRecord() -> WorkspaceRecord { record }
-
-    public func pendingPermissionRequests() -> [PermissionRequest] {
-        chats.values.flatMap { $0.pendingPermissions.values }
-    }
-
     // MARK: - Lifecycle
 
     public func start() async {
@@ -1574,6 +1568,13 @@ public actor WorkspaceEngine {
                 worktree: worktreeURL, baseBranch: record.baseBranch
             )
             : try await diffEngine.workingTreeDiff(worktree: worktreeURL)
+    }
+
+    /// A file as it was at the merge base — the "before" of the review diff.
+    public func baseFileData(path: String) async -> Data? {
+        let mergeBase = await git.mergeBase(with: record.baseBranch, in: worktreeURL)
+            ?? record.baseBranch
+        return await git.fileData(atRevision: mergeBase, path: path, in: worktreeURL)
     }
 
     public func addDiffComment(_ reference: DiffCommentReference) async throws {

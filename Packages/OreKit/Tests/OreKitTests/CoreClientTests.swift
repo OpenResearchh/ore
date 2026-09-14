@@ -500,7 +500,7 @@ struct CoreClientTests {
         let client = try makeClient(fixture)
         let recorder = CoreEventRecorder(client)
 
-        await client.send(.interruptTurn(WorkspaceID(rawValue: "does-not-exist")))
+        await client.send(.interruptChatTurn(WorkspaceID(rawValue: "does-not-exist"), ChatID(rawValue: "missing")))
 
         guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
                 if case .commandFailed = $0 { return true }

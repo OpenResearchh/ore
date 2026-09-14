@@ -133,7 +133,7 @@ struct TelemetryPayloadTests {
         #expect(ModelTag(rawModel: "gpt-5-codex") == .gpt)
         #expect(ModelTag(rawModel: nil) == .other)
 
-        let hostile = "/Users/tushar/code/secret-startup"
+        let hostile = "/Users/ada/code/secret-startup"
         let tag = ModelTag(rawModel: hostile)
         #expect(tag == .other)
         #expect(!tag.telemetryToken.contains("secret"))

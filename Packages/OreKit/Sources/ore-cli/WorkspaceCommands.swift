@@ -353,9 +353,6 @@ actor CoreEventPrinter {
             endLine()
             print("· chat \(chat.title)  \(chat.id.rawValue.prefix(8))")
 
-        case .chatRemoved, .chatsListed:
-            break
-
         case .gitStatusChanged(let id, let status):
             latest[id]?.gitStatus = status
 

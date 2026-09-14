@@ -13,8 +13,6 @@ public enum CoreEvent: Sendable, Codable {
     case workspaceRemoved(WorkspaceID)
     case chatAdded(ChatSummary)
     case chatUpdated(ChatSummary)
-    case chatRemoved(WorkspaceID, ChatID)
-    case chatsListed(WorkspaceID, [ChatSummary])
     /// A prompt reached a chat. Emitted for every send, including the ones a
     /// client never saw: the assistant's, and the opening prompt of a freshly
     /// created workspace. Without it those prompts stay invisible until the

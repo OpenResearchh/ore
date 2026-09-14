@@ -28,10 +28,9 @@ private enum GitHubUpdateError: LocalizedError, Sendable {
 /// today. This fills that gap: it asks GitHub for the latest release, and if
 /// this build is behind, offers to install it and restart.
 ///
-/// Auth is the trick that makes it work *now*, while the repo is private: it
-/// shells out to `gh` when the CLI is signed in (which it is, since ORE
-/// drives it), and falls back to the public REST endpoint so the same code
-/// keeps working once the repo is public or for a user without `gh`.
+/// It asks through `gh` when the CLI is signed in, so the check is not subject
+/// to the anonymous API rate limit, and falls back to the public REST endpoint
+/// for a user without `gh`.
 @MainActor
 @Observable
 final class GitHubUpdater {
@@ -402,7 +401,7 @@ final class GitHubUpdater {
         return (name, url, intValue(chosen["id"]))
     }
 
-    /// Uses the signed-in `gh` CLI so the check works against a private repo.
+    /// Uses the signed-in `gh` CLI, which is not subject to the anonymous rate limit.
     private nonisolated static func ghAPI(path: String) async -> Data? {
         guard let gh = executable(named: "gh") else { return nil }
         return await run(gh, ["api", path, "-H", "Accept: application/vnd.github+json"])

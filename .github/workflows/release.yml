@@ -2,12 +2,9 @@ name: Release
 
 # The attested release path, and now the preferred one.
 #
-# Releases used to be cut locally with Scripts/certify-release.sh because
-# Actions was not paid for on a private repository and every run failed in two
-# seconds. Actions is free for public repositories, so the build can move back
-# here — and that matters for more than convenience: build provenance
-# attestations can only be produced where the artifact is actually built.
-# A locally-cut release cannot be attested, so certify-release.sh is now the
+# Scripts/certify-release.sh can cut the same release from a Mac, but build
+# provenance attestations can only be produced where the artifact is actually
+# built. A locally-cut release cannot be attested, so certify-release.sh is the
 # fallback rather than the norm.
 #
 # Users verify a download with:

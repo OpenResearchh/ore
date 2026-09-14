@@ -1109,6 +1109,9 @@ struct DiffDocumentView: View {
     @State private var sourceText = ""
     @State private var savedSourceText = ""
     @State private var sourceError: String?
+    /// A deleted document's last version, so its preview still has something
+    /// to render.
+    @State private var baseText: String?
     @State private var mode: FilePresentationMode = .diff
     @State private var isSaving = false
     @State private var conflictHunks: [ConflictHunk] = []
@@ -1132,8 +1135,8 @@ struct DiffDocumentView: View {
             }
 
             if mode == .preview, supportsPreview {
-                markdownPreview
-            } else if mode == .source {
+                documentPreview
+            } else if mode == .source, hasSource {
                 sourceEditor
             } else if let file {
                 diffScroll(file)
@@ -1145,8 +1148,10 @@ struct DiffDocumentView: View {
                     Text("No diff for this file")
                         .font(.system(size: OreTheme.Font.title, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Button("Open Source") { setMode(.source) }
-                        .buttonStyle(.bordered)
+                    if hasSource {
+                        Button("Open Source") { setMode(.source) }
+                            .buttonStyle(.bordered)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1161,7 +1166,7 @@ struct DiffDocumentView: View {
         .onChange(of: model.fileFocus[workspace.id]?[path]) { _, focus in
             // A `file:line` click on an already-open file must show source, not
             // the diff, so the line reveal lands somewhere visible.
-            if focus != nil { mode = .source }
+            if focus != nil, hasSource { mode = .source }
         }
         .sheet(item: $commentTarget) { target in
             CommentSheet(
@@ -1204,7 +1209,7 @@ struct DiffDocumentView: View {
 
             Picker("View", selection: modeBinding) {
                 if supportsPreview { Text("Preview").tag(FilePresentationMode.preview) }
-                Text("Source").tag(FilePresentationMode.source)
+                if hasSource { Text("Source").tag(FilePresentationMode.source) }
                 if file != nil { Text("Diff").tag(FilePresentationMode.diff) }
             }
             .pickerStyle(.segmented)
@@ -1270,22 +1275,72 @@ struct DiffDocumentView: View {
         FilePresentationMode.supportsPreview(path: path)
     }
 
-    /// The rendered document — how a markdown file (a plan, a README) opens
-    /// by default. Source and diff stay one segment away.
+    private var hasSource: Bool {
+        FilePresentationMode.hasSource(path: path)
+    }
+
+    /// The rendered file — how a markdown document, an HTML page or an image
+    /// opens by default. Source and diff stay one segment away.
+    @ViewBuilder
+    private var documentPreview: some View {
+        switch FilePresentationMode.previewKind(path: path) {
+        case .image:
+            ScrollView {
+                BinaryFilePreview(
+                    path: path,
+                    // Only a deletion changes what "the file" is here; the
+                    // side-by-side comparison belongs to the Diff segment.
+                    status: file?.status == .deleted ? .deleted : nil,
+                    originalPath: file?.originalPath,
+                    workspaceID: workspace.id,
+                    worktreePath: workspace.worktreePath,
+                    generation: model.gitGeneration(for: workspace.id),
+                    onComment: { commentOnWholeFile() }
+                )
+            }
+            .scrollIndicators(.hidden)
+        case .html:
+            if isLoading && sourceText.isEmpty && baseText == nil {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let sourceError, baseText == nil {
+                unavailable(sourceError)
+            } else {
+                HTMLFilePreview(
+                    worktreePath: workspace.worktreePath,
+                    path: path,
+                    generation: model.gitGeneration(for: workspace.id),
+                    fallbackHTML: baseText
+                )
+                .clipped()
+            }
+        case .markdown, nil:
+            markdownPreview
+        }
+    }
+
     @ViewBuilder
     private var markdownPreview: some View {
         if isLoading && sourceText.isEmpty {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let sourceError {
-            ContentUnavailableView(
-                "Can’t open this file",
-                systemImage: "doc.badge.ellipsis",
-                description: Text(sourceError)
-            )
-        } else {
-            MarkdownPreview(markdown: sourceText)
+        } else if let text = sourceError == nil ? sourceText : baseText {
+            MarkdownPreview(markdown: text)
                 .accessibilityLabel("Preview of \((path as NSString).lastPathComponent)")
                 .clipped()
+        } else {
+            unavailable(sourceError ?? "")
+        }
+    }
+
+    private func unavailable(_ message: String) -> some View {
+        ContentUnavailableView {
+            Label("Can’t open this file", systemImage: "doc.badge.ellipsis")
+        } description: {
+            Text(message)
+        } actions: {
+            if file != nil, mode != .diff {
+                Button("Show Diff") { setMode(.diff) }
+                    .buttonStyle(.bordered)
+            }
         }
     }
 
@@ -1294,11 +1349,7 @@ struct DiffDocumentView: View {
         if isLoading && sourceText.isEmpty {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let sourceError {
-            ContentUnavailableView(
-                "Can’t open this file",
-                systemImage: "doc.badge.ellipsis",
-                description: Text(sourceError)
-            )
+            unavailable(sourceError)
         } else {
             SourceCodeEditor(
                 text: $sourceText,
@@ -1334,7 +1385,10 @@ struct DiffDocumentView: View {
                     // showing the least: git reduces it to "Binary files
                     // differ" and this pane printed that as "Binary file".
                     BinaryFilePreview(
-                        file: file,
+                        path: file.path,
+                        status: file.status,
+                        originalPath: file.originalPath,
+                        workspaceID: workspace.id,
                         worktreePath: workspace.worktreePath,
                         generation: model.gitGeneration(for: workspace.id),
                         onComment: { commentOnWholeFile() }
@@ -1434,24 +1488,70 @@ struct DiffDocumentView: View {
         let showLoader = file == nil && sourceText.isEmpty
         if showLoader { isLoading = true }
         defer { isLoading = false }
-        async let loadedSource = try? model.fileContents(path: path, in: workspace)
+        // A PNG has no text to read, and trying is what used to put "can only
+        // edit UTF-8 text files" where the image should have been.
+        let readsSource = hasSource
+        let workspace = self.workspace
+        let path = self.path
+        let sourceRead: Task<Result<String, any Error>, Never>? = readsSource
+            ? Task { [model] in
+                do { return .success(try await model.fileContents(path: path, in: workspace)) }
+                catch { return .failure(error) }
+            }
+            : nil
         let diffs = (try? await model.loadDiff(for: workspace.id)) ?? []
         file = diffs.first { $0.path == path }
-        if let text = await loadedSource {
+        let isDeleted = file?.status == .deleted
+
+        switch await sourceRead?.value {
+        case .success(let text):
             sourceText = text
             savedSourceText = text
             sourceError = nil
-        } else {
-            sourceError = "ORE can only edit UTF-8 text files smaller than 2 MB."
+        case .failure(let error):
+            sourceError = Self.sourceErrorMessage(error, isDeleted: isDeleted)
+        case nil:
+            sourceError = nil
         }
+
+        // A deleted document still has a preview: the version it had at the base.
+        let previewKind = FilePresentationMode.previewKind(path: path)
+        if isDeleted, sourceError != nil, previewKind == .markdown || previewKind == .html {
+            let data = await model.baseFileData(path: file?.originalPath ?? path, in: workspace.id)
+            baseText = data.flatMap { String(data: $0, encoding: .utf8) }
+        } else {
+            baseText = nil
+        }
+
         let requested = model.filePresentationModes[workspace.id]?[path]
             ?? (supportsPreview ? .preview : .diff)
-        mode = file == nil && requested == .diff
+        var resolved = file == nil && requested == .diff
             ? FilePresentationMode.preferred(forPath: path)
             : requested
+        if resolved == .source, !readsSource {
+            resolved = supportsPreview ? .preview : .diff
+        }
+        mode = resolved
         let stored = await model.loadViewedFiles(for: workspace.id)
         if let file { isViewed = stored[path] == contentHash(file) }
         conflictHunks = await model.loadConflictHunks(path: path, for: workspace.id)
+    }
+
+    /// Why the editor can't show this file, in terms of this file.
+    private static func sourceErrorMessage(_ error: any Error, isDeleted: Bool) -> String {
+        if isDeleted {
+            return "This file was deleted on this branch. The diff shows what it contained."
+        }
+        switch (error as? CocoaError)?.code {
+        case .fileReadTooLarge?:
+            return "This file is larger than 2 MB, more than ORE opens in its editor."
+        case .fileReadInapplicableStringEncoding?:
+            return "This isn’t a UTF-8 text file, so it can’t be edited here."
+        case .fileReadNoSuchFile?, .fileNoSuchFile?:
+            return "This file isn’t in the worktree."
+        default:
+            return "ORE can only edit UTF-8 text files smaller than 2 MB."
+        }
     }
 
     private var conflictBanner: some View {

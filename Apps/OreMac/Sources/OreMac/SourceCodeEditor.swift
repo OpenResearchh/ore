@@ -162,7 +162,7 @@ struct SourceCodeEditor: NSViewRepresentable {
             let highlighted = NSMutableAttributedString(attributedString:
                 SyntaxHighlighter.shared.highlight(
                     value,
-                    language: SyntaxHighlighter.language(forPath: path),
+                    language: SyntaxHighlighter.language(forPath: path, contents: value),
                     font: font
                 )
             )

@@ -4,7 +4,7 @@ import OreProtocol
 import OreSupport
 
 /// Creates and maintains the product-owned assistant workspace: one hidden
-/// workspace per user, living at `OreHome.assistantDirectory`, whose agent
+/// workspace per user, living at `$ORE_HOME/assistant`, whose agent
 /// answers for the whole product rather than any one project.
 ///
 /// Everything here is idempotent. `ensureAssistant` runs on every app start;

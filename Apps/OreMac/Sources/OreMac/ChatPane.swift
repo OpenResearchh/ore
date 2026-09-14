@@ -186,7 +186,7 @@ struct ChatPane: View {
         enum Action {
             /// Send this prompt to the current chat.
             case send(String)
-            /// Spin up the temporary commit tab (`AppModel.startCommitAgent`).
+            /// Ask this tab's agent to commit (`AppModel.commitWithAgent`).
             case commitAgent
             /// Close this tab — offered on a finished commit tab.
             case closeTab
@@ -313,7 +313,7 @@ struct ChatPane: View {
         case .send(let prompt):
             model.send(prompt, to: workspace.id)
         case .commitAgent:
-            model.startCommitAgent(in: workspace.id)
+            model.commitWithAgent(in: workspace.id)
         case .closeTab:
             guard let id = chatSummary?.id else { return }
             model.closeChat(id, in: workspace.id)

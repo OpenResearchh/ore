@@ -2029,11 +2029,11 @@ private struct ShipStatusPanel: View {
         let isSelected = tab == target
         return Button {
             // Commits is a verb here, not just a filter: with uncommitted work
-            // in the tree, clicking it spins up the temporary commit tab — an
-            // agent forked from the current conversation that stages and
-            // commits with real messages. With a clean tree it stays a tab.
+            // in the tree, clicking it asks the current tab's agent — which
+            // already knows the work — to stage and commit with real
+            // messages. With a clean tree it stays a tab.
             if target == .commits, model.gitChrome(for: workspace.id).hasUncommittedChanges {
-                model.startCommitAgent(in: workspace.id)
+                model.commitWithAgent(in: workspace.id)
             }
             tab = target
         } label: {
@@ -2616,13 +2616,13 @@ struct GitActionToolbar: View {
     private var actionHelp: String {
         switch action {
         case .commit:
-            return "Commit these changes. The agent writes the message from the diff. (\(shortcutHint))"
+            return "Ask this tab's agent to commit these changes, with messages written from the diff. (\(shortcutHint))"
         case .push(let count, let isFirst):
             return isFirst
                 ? "Publish this branch to origin. (\(shortcutHint))"
                 : "Push \(count) unpushed commit\(count == 1 ? "" : "s") to origin. (\(shortcutHint))"
         case .createPullRequest:
-            return "Draft a pull-request prompt in chat so the agent can write the title and body. (\(shortcutHint))"
+            return "Ask this tab's agent to commit what's left, push, and open the pull request. (\(shortcutHint))"
         case .createGitHubRepo:
             return "Create a GitHub repository for this project and publish the branch. (\(shortcutHint))"
         case .fixFailingChecks:
@@ -2667,14 +2667,14 @@ struct GitActionToolbar: View {
         guard !model.isGitOpInFlight(workspace.id) else { return }
         switch action {
         case .commit:
-            // No sheet, no questions: a temporary tab's agent stages and
+            // No sheet, no questions: the current tab's agent stages and
             // commits everything with real messages. The message editor
             // remains reachable through the button's context menu.
-            model.startCommitAgent(in: workspace.id)
+            model.commitWithAgent(in: workspace.id)
         case .createPullRequest:
             // Same default flow for shipping: commit what's left, push, open
             // the PR against the chosen base — one click, zero prompts.
-            model.startShipAgent(in: workspace.id, base: chosenBase)
+            model.shipWithAgent(in: workspace.id, base: chosenBase)
         case .merge:
             editor = .merge
         default:

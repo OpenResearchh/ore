@@ -1363,21 +1363,26 @@ final class AppModel {
         serviceTier: String? = nil,
         origin: MessageOrigin = .user,
         to id: WorkspaceID,
-        chatID: ChatID
+        chatID: ChatID,
+        fromComposer: Bool = true
     ) {
         let state = chat(for: chatID)
-        let comments = state.takeDraftComments()
-        persistDraftComments([], for: chatID)
         cancelScheduledContinuation(for: chatID)
-        persistDraftAttachments([], for: chatID)
-        // The text just left the composer, so any buffered copy of it is stale.
-        // Clearing the summary here rather than waiting out the debounce is what
-        // keeps the tab bar's unsent-draft pencil from lingering after a send.
-        discardPendingDraft(for: chatID)
-        if composerInjection?.chatID == chatID { composerInjection = nil }
-        if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
-            summary.draftText = ""
-            upsertChat(summary)
+        // A button's prompt isn't the composer's text: whatever the user has
+        // half-typed, attached or commented stays put for their own send.
+        let comments = fromComposer ? state.takeDraftComments() : []
+        if fromComposer {
+            persistDraftComments([], for: chatID)
+            persistDraftAttachments([], for: chatID)
+            // The text just left the composer, so any buffered copy of it is stale.
+            // Clearing the summary here rather than waiting out the debounce is what
+            // keeps the tab bar's unsent-draft pencil from lingering after a send.
+            discardPendingDraft(for: chatID)
+            if composerInjection?.chatID == chatID { composerInjection = nil }
+            if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
+                summary.draftText = ""
+                upsertChat(summary)
+            }
         }
         // One id for the row drawn now and the engine's echo of the same send,
         // so this message is not drawn a second time when the echo arrives.
@@ -1668,25 +1673,12 @@ final class AppModel {
         ))) }
     }
 
-    /// The temporary "commit clerk" tab: forked from the active chat — so it
-    /// already knows what the work was about and can write honest messages —
-    /// named Commit, and immediately prompted to stage and commit everything.
-    /// The composer's suggestion chip offers closing the tab once the tree is
-    /// clean (see `composerSuggestion` in ChatPane).
-    func startCommitAgent(in workspaceID: WorkspaceID) {
-        guard let source = activeChat(for: workspaceID),
-              chatCreationsInFlight.insert(workspaceID).inserted else { return }
-        pendingNewChatMessages[workspaceID, default: []].append(Self.commitAgentPrompt)
-        showChatInCenter(workspaceID)
-        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
-        Task { await client.send(.createChat(CreateChatRequest(
-            workspaceID: workspaceID,
-            title: ResearchIdentity.unique("Commit", excluding: used),
-            harness: source.harness,
-            model: source.model,
-            permissionMode: source.permissionMode,
-            forkFrom: source.id
-        ))) }
+    /// Asks the tab the user is in to stage and commit everything. That tab's
+    /// agent already knows what the work was about, so it writes honest
+    /// messages, and the result lands where the user is looking rather than
+    /// in a tab spun up beside it. A busy turn queues it like any message.
+    func commitWithAgent(in workspaceID: WorkspaceID) {
+        sendToCurrentTab(Self.commitAgentPrompt, in: workspaceID)
     }
 
     static let commitAgentPrompt = """
@@ -1698,33 +1690,36 @@ final class AppModel {
         without asking for confirmation.
         """
 
-    /// The "ship it" sibling of `startCommitAgent`: a temporary tab that
-    /// commits whatever is outstanding, pushes, and opens the pull request —
-    /// the whole default flow, no sheets, no questions.
-    func startShipAgent(in workspaceID: WorkspaceID, base: String? = nil) {
-        guard let source = activeChat(for: workspaceID),
-              chatCreationsInFlight.insert(workspaceID).inserted else { return }
+    /// The "ship it" sibling of `commitWithAgent`: the current tab commits
+    /// whatever is outstanding, pushes, and opens the pull request — the
+    /// whole default flow, no sheets, no questions.
+    func shipWithAgent(in workspaceID: WorkspaceID, base: String? = nil) {
         let baseBranch = base
             ?? workspaces.first { $0.id == workspaceID }?.baseBranch
             ?? "main"
-        pendingNewChatMessages[workspaceID, default: []].append("""
-            Ship this branch. Commit any outstanding staged and unstaged work \
-            with clear, conventional commit messages, push the branch, and \
-            open a pull request against \(baseBranch) with a concise title \
-            and a description that covers what changed and why. Never force \
-            push. Proceed without asking for confirmation, and finish by \
-            reporting the pull request URL.
-            """)
+        sendToCurrentTab(Self.shipAgentPrompt(base: baseBranch), in: workspaceID)
+    }
+
+    static func shipAgentPrompt(base: String) -> String {
+        """
+        Ship this branch. Commit any outstanding staged and unstaged work \
+        with clear, conventional commit messages, push the branch, and \
+        open a pull request against \(base) with a concise title \
+        and a description that covers what changed and why. Never force \
+        push. Proceed without asking for confirmation, and finish by \
+        reporting the pull request URL.
+        """
+    }
+
+    /// A button's prompt goes to the tab on screen, leaving its composer
+    /// alone. Only a workspace with no tab open gets a new one.
+    private func sendToCurrentTab(_ prompt: String, in workspaceID: WorkspaceID) {
         showChatInCenter(workspaceID)
-        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
-        Task { await client.send(.createChat(CreateChatRequest(
-            workspaceID: workspaceID,
-            title: ResearchIdentity.unique("Ship", excluding: used),
-            harness: source.harness,
-            model: source.model,
-            permissionMode: source.permissionMode,
-            forkFrom: source.id
-        ))) }
+        guard let chatID = activeChat(for: workspaceID)?.id else {
+            createChat(in: workspaceID, initialMessage: prompt)
+            return
+        }
+        send(prompt, to: workspaceID, chatID: chatID, fromComposer: false)
     }
 
     /// Marks a chat as ephemeral: hidden from the tab strip, never focused,

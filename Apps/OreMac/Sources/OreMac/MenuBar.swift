@@ -400,13 +400,13 @@ struct MenuBarDashboard: View {
 
     /// The fleet's one suggested next step, right under the header — the menu
     /// bar's version of the composer's suggestion ladder. Clicking acts:
-    /// reveal the workspace, and for commit suggestions also spin up the
-    /// commit tab.
+    /// reveal the workspace, and for commit suggestions also ask its current
+    /// tab's agent to commit.
     private func fleetSuggestionRow(_ suggestion: FleetSuggestionResolver.Suggestion) -> some View {
         Button {
             if let workspace = model.sortedWorkspaces.first(where: { $0.id == suggestion.workspaceID }) {
                 if suggestion.startsCommitAgent {
-                    model.startCommitAgent(in: workspace.id)
+                    model.commitWithAgent(in: workspace.id)
                 }
                 reveal(workspace)
             }

@@ -137,7 +137,10 @@ struct ChatPane: View {
                             }
                         }
                     }
-                    .frame(maxWidth: .infinity)
+                    // The column always owns the pane's full height. A short
+                    // document state ("Can't open this file") otherwise sized
+                    // the column to itself and floated mid-window.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                     if let splitID = resolvedSplitChatID {
                         // The reference design's seam: a live accent line, not a
@@ -147,10 +150,11 @@ struct ChatPane: View {
                             .frame(width: 2)
                         SplitChatColumn(workspace: workspace, chatID: splitID)
                             .padding(.top, OreTheme.RowHeight.bar)
-                            .frame(maxWidth: .infinity)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                             .id(splitID)
                     }
                 }
+                .frame(maxHeight: .infinity, alignment: .top)
 
                 ChatTabBar(
                     workspace: workspace,
@@ -168,7 +172,9 @@ struct ChatPane: View {
                 // `OreNavigationSelection`), which is also how the system's
                 // floating tab groups solve this.
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            // Top, not the default centre: a stack shorter than the pane was
+            // centred whole, carrying the tab strip down to the middle.
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // No opaque fill. The transcript scrolls directly over the window's

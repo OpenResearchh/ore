@@ -1252,6 +1252,9 @@ struct DiffDocumentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        // Full height whatever the state: the header stays pinned to the top
+        // and a one-line message never shrinks the document to its own size.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // Code wants paper, not weather: syntax colour on drifting wallpaper
         // light is where translucency stops being worth it. Nearly opaque, with
         // just enough of the glass base bleeding through to stay in the same
@@ -1438,6 +1441,7 @@ struct DiffDocumentView: View {
                     .buttonStyle(.bordered)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder

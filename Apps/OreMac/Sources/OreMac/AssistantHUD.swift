@@ -78,6 +78,7 @@ final class AssistantVoiceHUD {
         withObservationTracking {
             _ = model.tabNeedsYou
             _ = controller.phase
+            _ = model.narration.currentSpokenText
         } onChange: {
             Task { @MainActor in
                 AssistantVoiceHUD.shared.evaluate()
@@ -107,7 +108,10 @@ final class AssistantVoiceHUD {
                 dismissedNeedsYouIDs, against: model.tabNeedsYou
             )
         }
-        let voiceActive = (controller?.phase ?? .idle) != .idle
+        let voiceActive = HUDVoiceSource.current(
+            isAssistantActive: (controller?.phase ?? .idle) != .idle,
+            narrationText: model?.narration.currentSpokenText
+        ) != .none
         let actionable = actionableNeedsYou
         let actions = actionable != nil
         display.showsVoiceRow = voiceActive
@@ -281,6 +285,24 @@ enum HUDCardChoice {
     }
 }
 
+/// Whose voice the pill is carrying.
+///
+/// The assistant's own conversation drives the controller's phases, and the
+/// pill used to follow those alone. Everything else that speaks — a tab's
+/// narration, a fleet announcement — goes through the narration engine without
+/// touching them, which is how a tab could talk out loud with no pill and no
+/// captions anywhere on screen.
+enum HUDVoiceSource: Equatable {
+    case none
+    case assistant
+    case narration
+
+    static func current(isAssistantActive: Bool, narrationText: String?) -> HUDVoiceSource {
+        if isAssistantActive { return .assistant }
+        return narrationText == nil ? .none : .narration
+    }
+}
+
 private struct AssistantHUDView: View {
     var controller: VoiceAssistantController
     var model: AppModel?
@@ -335,6 +357,16 @@ private struct AssistantHUDView: View {
                 .foregroundStyle(micIsOpen ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+            // Narration from a tab doesn't always say where it came from —
+            // only fleet announcements name their place — so the pill does.
+            if isNarrating, let place = narratingPlace {
+                Text(place)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 92, alignment: .trailing)
+            }
+
             if controller.phase == .listening {
                 Text(listeningCaption)
                     .font(.system(size: 9, weight: .medium))
@@ -360,6 +392,20 @@ private struct AssistantHUDView: View {
         controller.phase == .listening || controller.phase == .answering
     }
 
+    /// The tab whose narration is playing, by the name its tab shows.
+    private var narratingPlace: String? {
+        guard let model, let id = model.narration.speakingChatID else { return nil }
+        return model.chatSummaries.first { $0.id == id }?.title
+    }
+
+    /// A tab or the fleet is speaking while the assistant itself is idle.
+    private var isNarrating: Bool {
+        HUDVoiceSource.current(
+            isAssistantActive: controller.phase != .idle,
+            narrationText: model?.narration.currentSpokenText
+        ) == .narration
+    }
+
     /// "Say the phrase" normally; the near-miss correction when the user is
     /// trying and the recognizer keeps almost hearing it.
     private var listeningCaption: String {
@@ -373,7 +419,8 @@ private struct AssistantHUDView: View {
         case .armed: "mic"
         case .listening, .answering: "mic.fill"
         case .speaking: "speaker.wave.2.fill"
-        case .thinking, .idle: "sparkles"
+        case .thinking: "sparkles"
+        case .idle: isNarrating ? "speaker.wave.2.fill" : "sparkles"
         }
     }
 
@@ -381,7 +428,8 @@ private struct AssistantHUDView: View {
         switch controller.phase {
         case .listening, .answering: .listening(controller.audioLevel)
         case .speaking: .speaking
-        case .armed, .thinking, .idle: .thinking
+        case .armed, .thinking: .thinking
+        case .idle: isNarrating ? .speaking : .thinking
         }
     }
 
@@ -394,8 +442,14 @@ private struct AssistantHUDView: View {
             controller.liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         case .speaking:
             controller.spokenSoFar.trimmingCharacters(in: .whitespacesAndNewlines)
-        case .armed, .thinking, .idle:
+        case .armed, .thinking:
             ""
+        case .idle:
+            // The same word-by-word prefix the assistant's own speech streams:
+            // the engine reports it for whichever utterance is playing.
+            isNarrating
+                ? (model?.narration.spokenPrefix ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
         }
     }
 
@@ -412,7 +466,7 @@ private struct AssistantHUDView: View {
         // a pre-roll cushion that grows on a loaded machine. Calling it
         // "Speaking…" made a working synthesiser look like a wedged one.
         case .speaking: "Preparing to speak…"
-        case .idle: ""
+        case .idle: isNarrating ? "Preparing to speak…" : ""
         }
     }
 }

@@ -27,6 +27,26 @@ public enum AgentEvent: Sendable, Codable, Hashable {
     /// stay under the window). ORE doesn't drive this — it surfaces it, so the
     /// transcript shows a marker instead of the conversation silently continuing.
     case contextCompacted(ContextCompaction)
+    /// Every piece of work the agent started and handed off — a backgrounded
+    /// command, an async subagent — that is still running, replacing whatever
+    /// was reported before. A level, not start/finish edges, so one missed
+    /// event cannot leave the UI claiming to wait on something long finished.
+    case backgroundTasksChanged([AgentBackgroundTask])
+}
+
+public struct AgentBackgroundTask: Sendable, Codable, Hashable, Identifiable {
+    public var id: String
+    /// The harness's own category ("local_bash", "local_agent", …), kept for
+    /// wording and for bug reports; nothing branches on its exact values.
+    public var kind: String?
+    /// What the agent said the work is, e.g. "Run the OreMac test suite".
+    public var description: String
+
+    public init(id: String, kind: String? = nil, description: String) {
+        self.id = id
+        self.kind = kind
+        self.description = description
+    }
 }
 
 public struct ContextCompaction: Sendable, Codable, Hashable {

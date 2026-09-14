@@ -42,6 +42,13 @@ public actor CodexSession: AgentSession {
     /// keeps running on exactly the policy `thread/start` established.
     private var hasPermissionOverride = false
 
+    /// Codex has no notification for the commands it keeps running after a
+    /// call returns, only a list request, so the set is asked for when it can
+    /// have changed and re-asked while it is non-empty.
+    private var backgroundPoll: Task<Void, Never>?
+    private var reportedBackgroundTaskIDs: [String] = []
+    private static let backgroundPollInterval: Duration = .seconds(3)
+
     public private(set) var providerSessionID: String?
 
     init(
@@ -106,6 +113,10 @@ public actor CodexSession: AgentSession {
                     "title": .string("ORE"),
                     "version": .string(OreVersion.current),
                 ]),
+                // `thread/backgroundTerminals/list` — the only way to learn what
+                // Codex left running after a turn — is refused without this
+                // ("requires experimentalApi capability").
+                "capabilities": .object(["experimentalApi": .bool(true)]),
             ]),
             timeout: .seconds(30)
         )
@@ -262,6 +273,7 @@ public actor CodexSession: AgentSession {
         guard !isStopping else { return }
         isStopping = true
 
+        backgroundPoll?.cancel()
         await denyAllPendingApprovals()
         incomingTask?.cancel()
         stderrTask?.cancel()
@@ -416,6 +428,9 @@ public actor CodexSession: AgentSession {
             )
             emit(output)
             if translator.threadID != nil { providerSessionID = translator.threadID }
+            if Self.backgroundTerminalsMayHaveChanged(method: notification.method) {
+                refreshBackgroundTerminals()
+            }
 
         case .request(let request):
             await handleServerRequest(request)
@@ -474,6 +489,56 @@ public actor CodexSession: AgentSession {
                 error: "ORE does not implement \(request.method)"
             )
         }
+    }
+
+    // MARK: - Background terminals
+
+    /// A turn ending is when handed-off work would otherwise vanish from view;
+    /// a terminal exiting or being written to is when the set moves on its own.
+    static func backgroundTerminalsMayHaveChanged(method: String) -> Bool {
+        switch method {
+        case "turn/completed", "process/exited", "item/commandExecution/terminalInteraction":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func refreshBackgroundTerminals() {
+        guard !isStopping else { return }
+        backgroundPoll?.cancel()
+        backgroundPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let stillRunning = await self.pollBackgroundTerminals()
+                guard stillRunning else { return }
+                try? await Task.sleep(for: Self.backgroundPollInterval)
+            }
+        }
+    }
+
+    /// Returns whether anything is still running, i.e. whether to ask again.
+    private func pollBackgroundTerminals() async -> Bool {
+        guard let connection, let threadID = translator.threadID, !isStopping else { return false }
+        let result: JSONValue
+        do {
+            result = try await connection.send(
+                method: "thread/backgroundTerminals/list",
+                params: .object(["threadId": .string(threadID)]),
+                timeout: .seconds(10)
+            )
+        } catch {
+            // An app-server that predates the call, or one busy enough to time
+            // out: stop this round rather than guess. The next turn asks again.
+            return false
+        }
+        let tasks = translator.backgroundTasks(fromTerminalList: result)
+        let ids = tasks.map(\.id)
+        if ids != reportedBackgroundTaskIDs {
+            reportedBackgroundTaskIDs = ids
+            continuation.yield(.backgroundTasksChanged(tasks))
+        }
+        return !tasks.isEmpty
     }
 
     private func emit(_ output: CodexTranslator.Output) {

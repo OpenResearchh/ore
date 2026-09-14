@@ -43,6 +43,11 @@ struct CursorAgentTranslator {
     /// Last ready-flag emitted with `lastPlanMarkdown`, so a duplicate
     /// completed record does not republish.
     private var lastPlanReady = false
+    /// Shells and subagents this process left running in the background, keyed
+    /// by the id Cursor reports their completion under. They live with the
+    /// process: headless cursor-agent announces each finish with a
+    /// `task_notification` line while it runs, and nothing survives its exit.
+    private var backgroundTasks: [AgentBackgroundTask] = []
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -92,6 +97,12 @@ struct CursorAgentTranslator {
         let failure = exitCode == 0
             ? nil
             : CursorAgentFailure.classify(exitCode: exitCode, stderr: stderr)
+        // Whatever the process had running in the background ended with it,
+        // and will never send the notification that would clear it.
+        if !backgroundTasks.isEmpty {
+            backgroundTasks.removeAll()
+            output.events.append(.backgroundTasksChanged([]))
+        }
 
         guard let turnID = currentTurnID else {
             // Config-level failures (bad model, expired login) kill the process
@@ -139,6 +150,16 @@ struct CursorAgentTranslator {
     // MARK: - Message shapes
 
     private mutating func applySystem(_ message: JSONValue, to output: inout Output) {
+        if message["subtype"]?.stringValue == "task_notification" {
+            // Headless cursor-agent's own word that background work finished:
+            // `{"type":"system","subtype":"task_notification","task_id",…}`.
+            guard let id = Self.identifier(message["task_id"]),
+                  backgroundTasks.contains(where: { $0.id == id })
+            else { return }
+            backgroundTasks.removeAll { $0.id == id }
+            output.events.append(.backgroundTasksChanged(backgroundTasks))
+            return
+        }
         guard message["subtype"]?.stringValue == "init" else { return }
         model = message["model"]?.stringValue ?? model
         output.events.append(.sessionStarted(SessionStarted(
@@ -202,6 +223,13 @@ struct CursorAgentTranslator {
                     || result?["rejected"] != nil,
                 text: Self.cursorResultText(result)
             )))
+            if let task = Self.backgroundTask(
+                tool: name, input: toolInputs[toolCallID], result: result
+            ) {
+                backgroundTasks.removeAll { $0.id == task.id }
+                backgroundTasks.append(task)
+                output.events.append(.backgroundTasksChanged(backgroundTasks))
+            }
             if Self.isPlanTool(name) {
                 emitPlanProposal(
                     from: toolInputs[toolCallID], turnID: turnID, ready: true, to: &output
@@ -261,6 +289,51 @@ struct CursorAgentTranslator {
     /// `hookAdditionalContexts`). Taking `.first` on that dictionary produced
     /// transcript rows named `Toolcallid` / `Startedatms`. Prefer the `*ToolCall`
     /// entry; skip hook-only records entirely.
+    /// A completed call that left work running: a shell spawned in (or moved
+    /// to) the background reports a `shellId`, a background subagent an
+    /// `agentId`. That id is what the eventual `task_notification` names.
+    static func backgroundTask(
+        tool: String,
+        input: JSONValue?,
+        result: JSONValue?
+    ) -> AgentBackgroundTask? {
+        guard let result else { return nil }
+        let success = result["success"]
+        let isBackground = result["isBackground"]?.boolValue == true
+            || success?["isBackground"]?.boolValue == true
+            || input?["isBackground"]?.boolValue == true
+        guard isBackground else { return nil }
+        func text(_ key: String) -> String? {
+            guard let value = input?[key]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty
+            else { return nil }
+            return value
+        }
+        switch tool {
+        case "Bash":
+            guard let shellID = identifier(success?["shellId"] ?? result["shellId"]),
+                  shellID != "0"
+            else { return nil }
+            return AgentBackgroundTask(
+                id: shellID, kind: "shell", description: text("description") ?? text("command") ?? ""
+            )
+        case "Task":
+            guard let agentID = identifier(success?["agentId"] ?? result["agentId"]) else {
+                return nil
+            }
+            return AgentBackgroundTask(
+                id: agentID, kind: "subagent", description: text("description") ?? "Subagent"
+            )
+        default:
+            return nil
+        }
+    }
+
+    /// Cursor's ids arrive as numbers in some records and strings in others.
+    private static func identifier(_ value: JSONValue?) -> String? {
+        value?.stringValue ?? value?.intValue.map(String.init)
+    }
+
     private static func cursorToolEntry(
         in call: [String: JSONValue]
     ) -> (key: String, payload: JSONValue)? {

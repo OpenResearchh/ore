@@ -418,6 +418,11 @@ actor EventPrinter {
             return "· session ended (exit \(ended.exitCode.map(String.init) ?? "?"))"
         case .contextCompacted(let compaction):
             return "· \(compaction.summary)"
+        case .backgroundTasksChanged(let tasks):
+            return tasks.isEmpty
+                ? "· background work finished"
+                : "· waiting on \(tasks.count) background task\(tasks.count == 1 ? "" : "s"): "
+                    + tasks.map(\.description).joined(separator: "; ")
         }
     }
 }

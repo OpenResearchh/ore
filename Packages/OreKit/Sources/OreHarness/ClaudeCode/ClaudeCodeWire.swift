@@ -71,6 +71,27 @@ enum ClaudeWire {
         }
     }
 
+    /// `{"type":"system","subtype":"background_tasks_changed","tasks":[…]}` —
+    /// every live background task after a start, completion or kill. The CLI
+    /// documents replace semantics: swap the whole set for each payload.
+    struct BackgroundTasksChanged: Decodable {
+        var tasks: [Entry]
+
+        struct Entry: Decodable {
+            var taskID: String
+            var taskType: String?
+            var description: String?
+            var ambient: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case taskID = "task_id"
+                case taskType = "task_type"
+                case description
+                case ambient
+            }
+        }
+    }
+
     // MARK: - Assistant / user messages
 
     struct AssistantMessage: Decodable {

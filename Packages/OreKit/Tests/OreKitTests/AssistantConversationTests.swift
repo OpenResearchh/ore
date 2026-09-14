@@ -169,6 +169,11 @@ struct AssistantConversationTests {
         #expect(chats.contains { $0.id == original })
         #expect(try await store.turns(chatID: original).count == 1)
 
+        // But closed. Left open, it stayed the fallback "current" conversation,
+        // so the next digest compacted it again and again.
+        #expect(chats.first { $0.id == original }?.isClosed == true)
+        #expect(chats.first { $0.id == successor.id }?.isClosed == false)
+
         // Both sides of the seam are marked, so neither transcript reads as
         // having simply stopped or simply begun.
         let retiredMarks = try await store.chatTransitions(chatID: original).map(\.kind)

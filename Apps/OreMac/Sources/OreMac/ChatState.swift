@@ -166,6 +166,16 @@ final class ChatState {
     /// Human-readable phrase for the in-flight tool, e.g. "Reading ChatPane.swift".
     private(set) var runningToolLabel: String?
 
+    /// Work the agent handed off and is still waiting on — a backgrounded
+    /// build or test run, an async subagent. Outlives the turn that started
+    /// it, which is the point: the turn reads as finished while this is what
+    /// the agent will pick up next.
+    private(set) var backgroundTasks: [AgentBackgroundTask] = []
+
+    /// When the current stretch of background work began, for the waiting
+    /// row's elapsed time. Nil while nothing is running in the background.
+    private(set) var backgroundWaitStartedAt: Date?
+
     /// False between the user pressing send and the harness reporting its
     /// first turn event — the window where a one-shot CLI (Cursor) is still
     /// booting and the UI would otherwise look stuck.
@@ -402,6 +412,12 @@ final class ChatState {
             turnStartedAt = nil
             lastEventAt = nil
             runningToolLabel = nil
+            // Background work belongs to the process that just exited; it will
+            // not report finishing, so waiting on it would never end.
+            setBackgroundTasks([])
+
+        case .backgroundTasksChanged(let tasks):
+            setBackgroundTasks(tasks)
 
         case .contextCompacted(let compaction):
             // The harness summarised its own history to stay under the window.
@@ -826,6 +842,18 @@ final class ChatState {
             parentToolCallID: block.parentToolCallID,
             isComplete: true
         ))
+    }
+
+    /// Replaces the live set, as the harness reports it. The start time is kept
+    /// across changes in membership: a second task joining the first is still
+    /// the same wait, as far as the person looking at the composer is concerned.
+    private func setBackgroundTasks(_ tasks: [AgentBackgroundTask]) {
+        if tasks.isEmpty {
+            backgroundWaitStartedAt = nil
+        } else if backgroundTasks.isEmpty {
+            backgroundWaitStartedAt = Date()
+        }
+        backgroundTasks = tasks
     }
 
     private func attach(_ result: ToolResult) {

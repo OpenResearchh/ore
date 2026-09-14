@@ -133,8 +133,8 @@ public struct ChatSummary: Sendable, Codable, Hashable, Identifiable {
     public var contextUsage: UsageReport?
     /// Turns the person actually had here — fleet digests excluded. Carried on
     /// the summary like `queuedMessageCount` because the client cannot count
-    /// them without holding the whole transcript, and the Assistant window has
-    /// to be able to say how long a conversation has got.
+    /// them without holding the whole transcript, and the Assistant window's
+    /// switcher has to tell a conversation apart from ORE's housekeeping.
     public var turnCount: Int
     public var createdAt: Date
     public var lastActivity: Date?

@@ -463,7 +463,7 @@ final class NarrationEngine {
                 text: text
             ))
 
-        case .sessionStarted, .statusChanged, .usage:
+        case .sessionStarted, .statusChanged, .usage, .backgroundTasksChanged:
             break
         }
     }

@@ -291,9 +291,11 @@ public actor TranscriptWriter {
             ))
 
         case .textDelta, .thinkingDelta, .statusChanged, .rateLimit,
-             .permissionResolved, .sessionError:
+             .permissionResolved, .sessionError, .backgroundTasksChanged:
             // Deltas are for the live view only; the rest is either transient
-            // state or already captured on the turn.
+            // state or already captured on the turn. Background work in
+            // particular dies with the session, so a stored set would only ever
+            // come back stale.
             break
         }
     }

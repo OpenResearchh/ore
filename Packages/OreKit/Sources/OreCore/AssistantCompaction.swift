@@ -44,9 +44,4 @@ public enum AssistantCompaction {
         guard let usage, let window = usage.contextWindow, window > 0 else { return nil }
         return Double(usage.totalContextTokens) / Double(window)
     }
-
-    /// What the Assistant window puts next to the conversation title.
-    public static func lengthLabel(userTurnCount: Int) -> String {
-        userTurnCount == 1 ? "1 turn" : "\(userTurnCount) turns"
-    }
 }

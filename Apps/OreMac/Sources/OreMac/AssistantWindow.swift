@@ -117,7 +117,6 @@ struct AssistantActivityView: View {
                 .lineLimit(1)
             }
             Spacer(minLength: OreTheme.Space.sm)
-            if let summary { lengthIndicator(summary) }
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
@@ -135,32 +134,31 @@ struct AssistantActivityView: View {
     /// The title doubles as the conversation switcher. A window this narrow has
     /// no room for a tab bar, and the assistant is one conversation at a time
     /// by nature — the others are history, not parallel work.
+    ///
+    /// ORE starts and retires these on its own, so the user is never asked to
+    /// keep count: there is no turn counter, and the list holds only what a
+    /// person would call a conversation (see `AssistantConversationList`). A
+    /// retired conversation is picked like any other — choosing it reopens it.
     private func conversationMenu(
         assistant: WorkspaceSummary,
         chatID: ChatID,
         current: ChatSummary?
     ) -> some View {
-        let open = model.chats(for: assistant.id)
-        let closed = model.chats(for: assistant.id, includeClosed: true).filter(\.isClosed)
+        let list = AssistantConversationList(
+            model.chats(for: assistant.id, includeClosed: true), current: chatID
+        )
         return Menu {
             Button("New Conversation") { model.createAssistantConversation() }
-            Divider()
-            ForEach(open) { conversation in
-                Button {
-                    model.selectChat(conversation.id, in: assistant.id)
-                } label: {
-                    Label(
-                        conversation.title,
-                        systemImage: conversation.id == chatID ? "checkmark" : "bubble.left"
-                    )
+            if !list.recent.isEmpty {
+                Divider()
+                ForEach(list.recent) {
+                    conversationButton($0, assistant: assistant, current: chatID)
                 }
             }
-            if !closed.isEmpty {
-                Section("Closed") {
-                    ForEach(closed) { conversation in
-                        Button(conversation.title) {
-                            model.reopenChat(conversation.id, in: assistant.id)
-                        }
+            if !list.earlier.isEmpty {
+                Menu("Earlier") {
+                    ForEach(list.earlier) {
+                        conversationButton($0, assistant: assistant, current: chatID)
                     }
                 }
             }
@@ -172,29 +170,20 @@ struct AssistantActivityView: View {
         .fixedSize()
     }
 
-    /// How long this conversation has got, and whether ORE is about to retire
-    /// it. Shown before the seam rather than explained after it — a compaction
-    /// the user saw coming reads as ORE tidying up, and one that arrives
-    /// unannounced reads as ORE losing their conversation.
-    private func lengthIndicator(_ summary: ChatSummary) -> some View {
-        let nearing = AssistantCompaction.isNearingCompaction(
-            userTurnCount: summary.turnCount, usage: summary.contextUsage
-        )
-        let fraction = AssistantCompaction.contextFraction(summary.contextUsage)
-        return HStack(spacing: 4) {
-            Image(systemName: nearing ? "arrow.triangle.2.circlepath" : "bubble.left.and.bubble.right")
-                .font(.system(size: OreTheme.Font.caption))
-            Text(AssistantCompaction.lengthLabel(userTurnCount: summary.turnCount))
-                .font(.system(size: OreTheme.Font.caption, design: .rounded).monospacedDigit())
+    private func conversationButton(
+        _ conversation: ChatSummary,
+        assistant: WorkspaceSummary,
+        current: ChatID
+    ) -> some View {
+        Button {
+            if conversation.isClosed { model.reopenChat(conversation.id, in: assistant.id) }
+            model.selectChat(conversation.id, in: assistant.id)
+        } label: {
+            Label(
+                conversation.title,
+                systemImage: conversation.id == current ? "checkmark" : "bubble.left"
+            )
         }
-        .foregroundStyle(nearing ? Color.orange : Color.secondary)
-        .help(
-            fraction.map {
-                "\(summary.turnCount) turns · \(Int($0 * 100))% of the model's context"
-                    + (nearing ? " — ORE will soon summarize this into a new conversation" : "")
-            }
-                ?? "\(summary.turnCount) turns in this conversation"
-        )
     }
 
     private func activity(

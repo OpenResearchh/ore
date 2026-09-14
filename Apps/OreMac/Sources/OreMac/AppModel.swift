@@ -482,11 +482,11 @@ final class AppModel {
         workspaces.first { $0.id == selectedWorkspaceID }
     }
 
-    /// The assistant's single chat tab, once the snapshot has arrived.
+    /// The assistant's current conversation, once the snapshot has arrived.
     var assistantChatID: ChatID? {
         guard let assistant = assistantWorkspace else { return nil }
         return activeChat(for: assistant.id)?.id
-            ?? chatSummaries.first { $0.workspaceID == assistant.id }?.id
+            ?? chatSummaries.last { $0.workspaceID == assistant.id }?.id
     }
 
     func resolveAssistantConfirmation(
@@ -842,7 +842,15 @@ final class AppModel {
         if let id = activeChatIDs[workspaceID], let chat = open.first(where: { $0.id == id }) {
             return chat
         }
-        return open.first
+        return defaultChat(among: open, in: workspaceID)
+    }
+
+    /// Where a workspace lands with no remembered choice. Tabs open on their
+    /// first; the assistant opens on its newest, because its conversations are
+    /// a succession rather than parallel tabs — the oldest is the one most
+    /// likely retired, and landing there routed every fleet digest into it.
+    private func defaultChat(among open: [ChatSummary], in workspaceID: WorkspaceID) -> ChatSummary? {
+        workspaceID == assistantWorkspace?.id ? open.last : open.first
     }
 
     func chat(for id: ChatID) -> ChatState {
@@ -1229,6 +1237,7 @@ final class AppModel {
         // Clearing the summary here rather than waiting out the debounce is what
         // keeps the tab bar's unsent-draft pencil from lingering after a send.
         discardPendingDraft(for: chatID)
+        if composerInjection?.chatID == chatID { composerInjection = nil }
         if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
             summary.draftText = ""
             upsertChat(summary)
@@ -2467,6 +2476,18 @@ final class AppModel {
         chat.status.occupiesComposer
             || chat.queuedMessageCount > 0
             || self.chat(for: chat.id).isBusy
+    }
+
+    /// Marks an injection as taken by the composer it was meant for.
+    ///
+    /// An injection exists to reach a composer that may not be on screen yet.
+    /// Once one has applied it, the text lives in that chat's draft like
+    /// anything typed — and leaving the injection set made every later visit to
+    /// the tab put the same text back: the Rebase button's prompt reappearing
+    /// in the composer long after the rebase was done.
+    func consumeComposerInjection(_ generation: UInt64) {
+        guard composerInjection?.generation == generation else { return }
+        composerInjection = nil
     }
 
     private func injectComposerText(_ text: String, into chat: ChatSummary) {
@@ -4185,9 +4206,10 @@ final class AppModel {
             let saved = UserDefaults.standard.string(
                 forKey: "ore.activeChat.\(summary.workspaceID.rawValue)"
             )
+            let open = chats(for: summary.workspaceID)
             activeChatIDs[summary.workspaceID] = saved.flatMap { raw in
-                chats(for: summary.workspaceID).first { $0.id.rawValue == raw }?.id
-            } ?? chats(for: summary.workspaceID).first?.id
+                open.first { $0.id.rawValue == raw }?.id
+            } ?? defaultChat(among: open, in: summary.workspaceID)?.id
         }
     }
 
@@ -4196,9 +4218,10 @@ final class AppModel {
             let saved = UserDefaults.standard.string(
                 forKey: "ore.activeChat.\(workspace.id.rawValue)"
             )
+            let open = chats(for: workspace.id)
             activeChatIDs[workspace.id] = saved.flatMap { raw in
-                chats(for: workspace.id).first { $0.id.rawValue == raw }?.id
-            } ?? chats(for: workspace.id).first?.id
+                open.first { $0.id.rawValue == raw }?.id
+            } ?? defaultChat(among: open, in: workspace.id)?.id
         }
     }
 

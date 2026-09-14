@@ -164,6 +164,25 @@ struct ClaudeCodeTranslator {
                 preTokens: meta?.compactMetadata?.preTokens
             )))
 
+        case "background_tasks_changed":
+            // The level signal, not the task_started / task_notification pair:
+            // the CLI's own guidance for "is background work running" is to
+            // replace the set with each payload, so a bookend that never
+            // arrives cannot wedge a stale waiting indicator. Entries the CLI
+            // flags `ambient` are left out: the flag is undocumented in the
+            // stream, and a long-lived watcher shown as "waiting" would read as
+            // a wait that never ends.
+            guard let payload = try? decoder.decode(
+                ClaudeWire.BackgroundTasksChanged.self, from: data
+            ) else { return output }
+            output.events.append(.backgroundTasksChanged(
+                payload.tasks.filter { $0.ambient != true }.map {
+                    AgentBackgroundTask(
+                        id: $0.taskID, kind: $0.taskType, description: $0.description ?? ""
+                    )
+                }
+            ))
+
         default:
             // hook_started / hook_response and friends: diagnostics, not chat.
             break

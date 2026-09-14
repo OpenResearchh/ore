@@ -666,6 +666,7 @@ struct ChatPane: View {
             if let injection = model.composerInjection, injection.chatID == chatSummary?.id {
                 draft = injection.text
                 composerFocused = true
+                model.consumeComposerInjection(injection.generation)
             } else {
                 draft = chatSummary?.draftText ?? ""
             }
@@ -684,6 +685,7 @@ struct ChatPane: View {
             draftOwnerID = injection.chatID
             draft = injection.text
             composerFocused = true
+            model.consumeComposerInjection(injection.generation)
         }
         .task(id: queuedMessagesTaskID) {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
@@ -1252,6 +1254,12 @@ struct ChatPane: View {
                     // is already happening.
                     isStarting: !chat.hasTurnEventArrived,
                     onStop: { model.interrupt(workspace.id) }
+                )
+                .transition(.opacity)
+            } else if !chat.backgroundTasks.isEmpty {
+                ComposerWaitingStatus(
+                    tasks: chat.backgroundTasks,
+                    startedAt: chat.backgroundWaitStartedAt
                 )
                 .transition(.opacity)
             }
@@ -2924,6 +2932,18 @@ enum ComposerBusyCopy {
         "\(elapsed(from: start, to: now)) this turn"
     }
 
+    /// The waiting row's wording. Names the work when there is one piece of it,
+    /// because "a background task" says nothing a person can act on; counts
+    /// it when there are several, because a list does not fit on one line.
+    static func waitingLabel(_ tasks: [AgentBackgroundTask]) -> String {
+        guard let first = tasks.first else { return "" }
+        if tasks.count > 1 { return "Waiting on \(tasks.count) background tasks" }
+        let description = first.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        return description.isEmpty
+            ? "Waiting on a background task"
+            : "Waiting on background work · \(description)"
+    }
+
     static func elapsed(from start: Date, to now: Date) -> String {
         let total = max(0, Int(now.timeIntervalSince(start)))
         let hours = total / 3600, minutes = (total % 3600) / 60, seconds = total % 60
@@ -3383,6 +3403,41 @@ private struct ComposerBusyStatus: View {
             }
         }
         .padding(.horizontal, 2)
+    }
+}
+
+/// The composer's quieter sibling to `ComposerBusyStatus`: the turn is over
+/// and the composer is free, but the agent handed work off — a build, a test
+/// run, a subagent — and will pick its result up on its own. Without this a
+/// chat waiting on a ten-minute build read exactly like one with nothing left
+/// to do. No live dot and no Stop: nothing here is the agent working, and the
+/// work belongs to the harness until it reports back.
+private struct ComposerWaitingStatus: View {
+    let tasks: [AgentBackgroundTask]
+    var startedAt: Date?
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            HStack(spacing: 7) {
+                Image(systemName: "hourglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .symbolEffect(.pulse, options: .repeating)
+                Text(ComposerBusyCopy.waitingLabel(tasks))
+                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if let startedAt {
+                    Text(ComposerBusyCopy.elapsed(from: startedAt, to: context.date))
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 2)
+        .help(tasks.map(\.description).filter { !$0.isEmpty }.joined(separator: "\n"))
     }
 }
 

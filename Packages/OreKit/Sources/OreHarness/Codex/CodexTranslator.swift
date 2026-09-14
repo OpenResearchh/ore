@@ -35,6 +35,11 @@ struct CodexTranslator {
     private var lastAssistantText: String?
     /// Narration stripped from a completed message, held for `turn/completed`.
     private var pendingNarration: String?
+    /// Command text by item id, kept past the turn that ran it: a background
+    /// terminal is listed by the item that started it, often turns later.
+    /// Bounded, because only recent commands can plausibly still be running.
+    private var commandsByItemID: [String: String] = [:]
+    private var commandItemOrder: [String] = []
 
     init(sessionID: SessionID) {
         self.sessionID = sessionID
@@ -205,6 +210,7 @@ struct CodexTranslator {
             )))
 
         case "commandExecution":
+            rememberCommand(item["command"]?.stringValue, itemID: itemID)
             applyToolItem(
                 item,
                 itemID: itemID,
@@ -319,6 +325,59 @@ struct CodexTranslator {
             text: resultText
         )))
         append(status: .requesting, to: &output)
+    }
+
+    // MARK: - Background terminals
+
+    private mutating func rememberCommand(_ command: String?, itemID: String) {
+        guard let command, !command.isEmpty, commandsByItemID[itemID] == nil else { return }
+        commandsByItemID[itemID] = command
+        commandItemOrder.append(itemID)
+        if commandItemOrder.count > 200 {
+            commandsByItemID.removeValue(forKey: commandItemOrder.removeFirst())
+        }
+    }
+
+    /// The live background set, from a `thread/backgroundTerminals/list` reply.
+    func backgroundTasks(fromTerminalList result: JSONValue) -> [AgentBackgroundTask] {
+        Self.backgroundTasks(fromTerminalList: result, commands: commandsByItemID)
+    }
+
+    /// Codex keeps a command that outlives its call running as a "background
+    /// terminal", and lists them only on request — there is no notification
+    /// for the set. Each entry names the item that started it, which is how
+    /// the command text is recovered when the entry doesn't carry its own.
+    static func backgroundTasks(
+        fromTerminalList result: JSONValue,
+        commands: [String: String]
+    ) -> [AgentBackgroundTask] {
+        (result["data"]?.arrayValue ?? []).compactMap { terminal in
+            let itemID = terminal["itemId"]?.stringValue
+            let processID = terminal["processId"]?.stringValue
+                ?? terminal["processId"]?.intValue.map(String.init)
+            guard let id = processID ?? itemID else { return nil }
+            let listed = terminal["command"]?.stringValue
+                ?? terminal["command"]?.arrayValue?.compactMap(\.stringValue)
+                    .joined(separator: " ")
+            let command = listed ?? itemID.flatMap { commands[$0] } ?? ""
+            return AgentBackgroundTask(
+                id: id, kind: "terminal", description: readableCommand(command)
+            )
+        }
+    }
+
+    /// Codex runs every command through a login shell, so the raw text reads
+    /// `/bin/zsh -lc 'swift test'`. The waiting row wants the part a person
+    /// typed.
+    static func readableCommand(_ command: String) -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let wrappers = ["/bin/zsh -lc ", "/bin/bash -lc ", "zsh -lc ", "bash -lc ", "/bin/sh -c ", "sh -c "]
+        guard let wrapper = wrappers.first(where: { trimmed.hasPrefix($0) }) else { return trimmed }
+        var body = String(trimmed.dropFirst(wrapper.count))
+        if body.count >= 2, let quote = body.first, quote == "'" || quote == "\"", body.last == quote {
+            body = String(body.dropFirst().dropLast())
+        }
+        return body
     }
 
     // MARK: - Plans, usage, completion

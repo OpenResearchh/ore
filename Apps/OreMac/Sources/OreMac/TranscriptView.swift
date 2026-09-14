@@ -318,21 +318,11 @@ struct TranscriptView: NSViewRepresentable {
                 var changed: IndexSet = headerChanges
                 var structural = !headerChanges.isEmpty
                 for index in newRows.indices {
-                    let old = previous[index]
-                    let new = newRows[index]
-                    // Diff identity, not payload. Comparing `text` / `toolInput`
-                    // / hashing grouped tool output was O(transcript bytes) on
-                    // every flush and is what froze a long session.
-                    let isStructural = old.isComplete != new.isComplete
-                        || old.isQueued != new.isQueued
-                        || old.isExpanded != new.isExpanded
-                        || old.subagentChildCount != new.subagentChildCount
-                    let contentChanged = old.contentRevision != new.contentRevision
-                        || old.activitySignature != new.activitySignature
-                    if contentChanged || isStructural {
-                        heightCache.removeValue(forKey: new.id)
+                    let difference = Self.difference(previous[index], newRows[index])
+                    if difference.changed {
+                        heightCache.removeValue(forKey: newRows[index].id)
                         changed.insert(index)
-                        if isStructural { structural = true }
+                        if difference.structural { structural = true }
                     }
                 }
                 guard !changed.isEmpty else { return }
@@ -350,16 +340,26 @@ struct TranscriptView: NSViewRepresentable {
                 tableView.insertRows(at: added, withAnimation: [])
                 // An append can move a turn header onto a row that was already
                 // rendered (rare — a turn's first prose row arriving after its
-                // plan); those rows re-measure and redraw in place.
-                let priorHeaderChanges = headerChanges.filteredIndexSet { $0 < previous.count }
-                if !priorHeaderChanges.isEmpty {
+                // plan). Far more often the row *before* the new one finished in
+                // the same flush: a tool call gaining its result, a thinking block
+                // its last words. Inserting below a row re-derives nothing about
+                // it, so without this its height stayed the one measured for its
+                // old content, and the cell drew the new content clipped into it.
+                // Those rows re-measure and redraw in place.
+                var stale = headerChanges.filteredIndexSet { $0 < previous.count }
+                for index in previous.indices
+                where Self.difference(previous[index], newRows[index]).changed {
+                    heightCache.removeValue(forKey: newRows[index].id)
+                    stale.insert(index)
+                }
+                if !stale.isEmpty {
                     NSAnimationContext.runAnimationGroup { context in
                         context.duration = 0
                         context.allowsImplicitAnimation = false
-                        tableView.noteHeightOfRows(withIndexesChanged: priorHeaderChanges)
+                        tableView.noteHeightOfRows(withIndexesChanged: stale)
                     }
                     tableView.reloadData(
-                        forRowIndexes: priorHeaderChanges,
+                        forRowIndexes: stale,
                         columnIndexes: IndexSet(integer: 0)
                     )
                 }
@@ -400,6 +400,25 @@ struct TranscriptView: NSViewRepresentable {
                 measureAroundViewport(in: tableView)
                 scheduleIdleMeasurePass()
             }
+        }
+
+        /// Whether the row at one index must be re-measured, and whether the
+        /// change is structural (applied now) rather than streamed text.
+        ///
+        /// Diff identity, not payload. Comparing `text` / `toolInput` / hashing
+        /// grouped tool output was O(transcript bytes) on every flush and is
+        /// what froze a long session.
+        static func difference(
+            _ old: TranscriptRow,
+            _ new: TranscriptRow
+        ) -> (changed: Bool, structural: Bool) {
+            let structural = old.isComplete != new.isComplete
+                || old.isQueued != new.isQueued
+                || old.isExpanded != new.isExpanded
+                || old.subagentChildCount != new.subagentChildCount
+            let content = old.contentRevision != new.contentRevision
+                || old.activitySignature != new.activitySignature
+            return (content || structural, structural)
         }
 
         func appearanceChanged() {
@@ -1149,7 +1168,8 @@ private extension Array where Element == TranscriptRow {
 @MainActor
 enum TranscriptHeightMeasurer {
     private static let textView: NSTextView = {
-        let view = NSTextView(frame: .zero)
+        // The same TextKit 1 stack the cell's label draws with.
+        let view = NSTextView(usingTextLayoutManager: false)
         view.isRichText = true
         view.isHorizontallyResizable = false
         view.isVerticallyResizable = true
@@ -1201,7 +1221,14 @@ final class TranscriptCell: NSTableCellView {
 
     private let bubble = NSView()
     private let indentGuide = NSView()
-    private let label = TranscriptTextView(frame: .zero)
+    /// TextKit 1, explicitly. `NSTextView(frame:)` gives TextKit 2, which lays
+    /// text out only around what it believes is the visible viewport — and a
+    /// text view inside a table cell has no scroll view of its own to tell it.
+    /// A reply taller than the window drew nothing at all while only its lower
+    /// part was on screen, filling in once its top scrolled into view. It also
+    /// kept the drawn layout on a different engine from the one
+    /// `TranscriptHeightMeasurer` measures with.
+    private let label = TranscriptTextView(usingTextLayoutManager: false)
     private let badge = NSTextField(labelWithString: "")
     private let contentGuide = NSLayoutGuide()
     private var badgeHeightZero: NSLayoutConstraint!
@@ -1755,7 +1782,11 @@ final class TranscriptCell: NSTableCellView {
         responseCollapse: ResponseCollapse = .none,
         turnHeader: String? = nil
     ) -> CGFloat {
-        if row.kind == .divider { return 36 }
+        // Dividers are measured like every other row. They used to return a
+        // flat 36pt, but the cell spends 16pt around the label plus the vertical
+        // inset on both sides — 32pt before any text — so a divider drew into
+        // 4pt and showed only the tops of its letters: the sliced line between
+        // every compacted assistant conversation.
         // The collapsed variant measures the same truncated string the cell
         // draws — never the full text clamped after the fact.
         let attributed = responseCollapse == .collapsed
@@ -1785,7 +1816,7 @@ final class TranscriptCell: NSTableCellView {
         case .assistantText, .plan: return 72
         case .userMessage: return 44
         case .turnFooter: return 28
-        case .divider: return 36
+        case .divider: return 38
         case .toolCall, .thinking, .activityGroup, .error: return 28
         }
     }
@@ -1796,7 +1827,7 @@ final class TranscriptCell: NSTableCellView {
     private static func verticalInset(for row: TranscriptRow) -> CGFloat {
         switch row.kind {
         case .toolCall, .thinking, .activityGroup, .error: return 4
-        case .turnFooter: return 4
+        case .turnFooter, .divider: return 4
         default: return verticalInset
         }
     }

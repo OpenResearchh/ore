@@ -1226,6 +1226,15 @@ public actor WorkspaceEngine {
             """
         try await store.saveChat(successorRuntime.record)
 
+        // Retired means closed. Left open, the old conversation stayed at the
+        // head of every "which conversation is current" fallback, so the next
+        // fleet digest landed back in it, found it still over the ceiling, and
+        // compacted it again — one conversation spawned dozens of successors,
+        // most of them empty. Closed is still readable, and reopening resumes it.
+        source.record.isClosed = true
+        try await store.saveChat(source.record)
+        publishChatChange(source)
+
         for (chat, kind) in [(chatID, ChatTransition.Kind.compacted),
                              (successor.id, .continuedFromCompaction)] {
             try? await store.saveChatTransition(ChatTransition(chatID: chat, kind: kind))

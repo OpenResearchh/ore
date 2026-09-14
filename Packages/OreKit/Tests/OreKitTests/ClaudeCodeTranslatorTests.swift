@@ -64,6 +64,24 @@ struct ClaudeCodeTranslatorTests {
         #expect(completed[0].usage?.outputTokens ?? 0 > 0)
     }
 
+    /// A backgrounded build outlives the turn that started it. The CLI reports
+    /// the live set as a level, and ORE forwards exactly that set — ambient
+    /// entries excluded — so the composer can say what the agent is waiting on.
+    @Test func backgroundTasksSurfaceAsTheLiveSet() {
+        let transcript = """
+        {"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b694r01jx","task_type":"local_bash","description":"Run OreKit assistant conversation tests"},{"task_id":"m1","task_type":"monitor","description":"Watch logs","ambient":true}],"uuid":"u1","session_id":"s1"}
+        {"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"u2","session_id":"s1"}
+        """
+        let sets = ClaudeCodeTranscriptReplay.events(transcript: transcript).compactMap { event in
+            if case .backgroundTasksChanged(let tasks) = event { return tasks }
+            return nil
+        }
+        #expect(sets.count == 2)
+        #expect(sets.first?.map(\.id) == ["b694r01jx"])
+        #expect(sets.first?.first?.description == "Run OreKit assistant conversation tests")
+        #expect(sets.last?.isEmpty == true)
+    }
+
     @Test func autoCompactionSurfacesAsAContextCompactedEvent() {
         // Claude Code compacts its own context and announces it with a
         // `compact_boundary` system line; ORE surfaces that so the transcript —

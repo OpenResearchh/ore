@@ -120,6 +120,11 @@ final class TerminalRegistry {
     }
 
     func closeTerminal(for workspaceID: WorkspaceID) {
+        // Archiving calls this for workspaces that never opened a terminal;
+        // removing absent keys would still notify every dock observing these.
+        guard views[workspaceID] != nil || tabs[workspaceID] != nil
+            || activeTabIDs[workspaceID] != nil || detectedURLs[workspaceID] != nil
+        else { return }
         views[workspaceID]?.values.forEach { $0.terminate() }
         views.removeValue(forKey: workspaceID)
         tabs.removeValue(forKey: workspaceID)

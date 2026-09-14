@@ -23,8 +23,16 @@ struct TelemetryTranslator {
         var model: ModelTag
     }
 
+    private struct TurnStart {
+        var chatID: ChatID
+        var at: Date
+    }
+
     private var facts: [ChatID: ChatFacts] = [:]
-    private var turnStarts: [TurnID: Date] = [:]
+    /// Keyed by turn, remembering the chat so a turn whose completion never
+    /// arrives (a killed session) can be dropped instead of kept for the
+    /// life of the process.
+    private var turnStarts: [TurnID: TurnStart] = [:]
 
     /// Injected so duration bucketing is deterministic under test.
     private let now: () -> Date
@@ -52,7 +60,10 @@ struct TelemetryTranslator {
             return []
 
         case .agent(_, let chatID, .turnStarted(let started)):
-            turnStarts[started.turnID] = now()
+            // A chat runs one turn at a time, so an older start still held for
+            // it belongs to a turn that ended without a completion event.
+            dropTurnStarts(for: chatID)
+            turnStarts[started.turnID] = TurnStart(chatID: chatID, at: now())
             // The turn's model is more accurate than the chat's, which can be
             // "whatever the default was when the chat was made".
             if started.model != nil, var known = facts[chatID] {
@@ -88,7 +99,21 @@ struct TelemetryTranslator {
         return .pullRequestCreated(isFirst: isFirst)
     }
 
+    /// The chat was deleted; nothing about it will be reported again.
+    mutating func forget(_ chatID: ChatID) {
+        facts.removeValue(forKey: chatID)
+        dropTurnStarts(for: chatID)
+    }
+
+    /// For tests: how many turns are being timed.
+    var pendingTurnCount: Int { turnStarts.count }
+
     // MARK: - Private
+
+    private mutating func dropTurnStarts(for chatID: ChatID) {
+        guard turnStarts.values.contains(where: { $0.chatID == chatID }) else { return }
+        turnStarts = turnStarts.filter { $0.value.chatID != chatID }
+    }
 
     private mutating func remember(_ chat: ChatSummary) {
         facts[chat.id] = ChatFacts(
@@ -104,7 +129,7 @@ struct TelemetryTranslator {
         // event reached the UI. Fall back to our own timing, and to zero for
         // a turn that was already running when the app launched (there is no
         // start to subtract, and inventing one would skew the bucket).
-        let seconds = result.duration ?? started.map { now().timeIntervalSince($0) } ?? 0
+        let seconds = result.duration ?? started.map { now().timeIntervalSince($0.at) } ?? 0
         let known = facts[chatID]
 
         let isFirst = !sawFirstTurn

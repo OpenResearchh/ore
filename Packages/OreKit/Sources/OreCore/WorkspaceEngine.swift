@@ -730,6 +730,9 @@ public actor WorkspaceEngine {
         await runtime.session?.stop()
         runtime.session = nil
         runtime.sessionEffort = nil
+        // The cancelled loop won't deliver `sessionEnded`, so coalesced tool
+        // and plan revisions are written here or not at all.
+        await runtime.transcript?.flush()
         runtime.transcript = nil
         runtime.isTurnActive = false
         setStatus(.idle, runtime: runtime)

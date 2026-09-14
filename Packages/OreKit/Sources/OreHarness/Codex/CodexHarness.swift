@@ -60,10 +60,16 @@ public struct CodexHarness: AgentHarness {
                 executablePath: path,
                 arguments: ["app-server"],
                 workingDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
-                environment: ShellEnvironment.childEnvironment()
+                environment: ShellEnvironment.childEnvironment(),
+                discardStandardError: true
             )
             let connection = JSONRPCConnection(process: process)
             await connection.start()
+            // Notifications aren't wanted here, but left unread they buffer
+            // until the connection goes away. Ends when `stop()` finishes it.
+            Task {
+                for await _ in connection.incoming {}
+            }
             defer {
                 Task {
                     await connection.stop()

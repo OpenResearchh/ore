@@ -24,6 +24,25 @@ enum ClaudeWire {
         }
     }
 
+    private static let typePrefix = Array(#"{"type":""#.utf8)
+
+    /// The top-level `type` of a line, read without parsing it.
+    ///
+    /// The CLI writes `type` as the first key of every message, so a line that
+    /// starts `{"type":"…"` names its type in the first few bytes — and a token
+    /// delta is otherwise parsed twice, once for the envelope and once for the
+    /// payload. Nil means "not in that shape, decode the envelope to find out",
+    /// never "not a message".
+    static func peekType(in line: String) -> Substring? {
+        let bytes = line.utf8
+        guard bytes.starts(with: typePrefix) else { return nil }
+        let start = bytes.index(bytes.startIndex, offsetBy: typePrefix.count)
+        guard let end = bytes[start...].firstIndex(where: { $0 == UInt8(ascii: "\"") || $0 == UInt8(ascii: "\\") }),
+              bytes[end] == UInt8(ascii: "\"")
+        else { return nil }
+        return Substring(bytes[start..<end])
+    }
+
     // MARK: - system/init
 
     struct SystemInit: Decodable {
@@ -421,8 +440,14 @@ enum ClaudeWire {
     }
 
     static func inboundControl(in line: String) -> InboundControl {
-        guard line.contains("\"control_request\""),
-              let data = line.data(using: .utf8),
+        // Every stdout line comes through here; the peek settles almost all of
+        // them without scanning a multi-megabyte tool result for the marker.
+        if let type = peekType(in: line) {
+            guard type == "control_request" else { return .none }
+        } else {
+            guard line.contains("\"control_request\"") else { return .none }
+        }
+        guard let data = line.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               json["type"] as? String == "control_request"
         else { return .none }

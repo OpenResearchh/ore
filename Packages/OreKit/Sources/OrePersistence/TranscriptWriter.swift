@@ -14,6 +14,7 @@ public actor TranscriptWriter {
     private let sessionID: SessionID
     private let harness: HarnessKind
     private let chatID: ChatID?
+    private let coalescingInterval: Duration
     private var currentTurn: TurnState?
 
     private struct TurnState {
@@ -27,16 +28,34 @@ public actor TranscriptWriter {
         var usage: UsageReport?
     }
 
+    /// A tool call or plan row that is rewritten in place as it grows.
+    ///
+    /// Cursor re-emits a tool call every time its content grows and Codex
+    /// streams plan deltas, and each write is a transaction plus a search-index
+    /// update. So the row is written when first seen and when it completes; in
+    /// between, a revision lands at most once per `coalescingInterval` and the
+    /// newest one waits in `pending` for the next boundary.
+    private struct UpsertedBlock {
+        var ordinal: Int
+        var createdAt: Date
+        var lastWrite: ContinuousClock.Instant
+        var pending: BlockRecord?
+    }
+
+    private var upserted: [String: UpsertedBlock] = [:]
+
     public init(
         store: OreStore,
         sessionID: SessionID,
         harness: HarnessKind = .claudeCode,
-        chatID: ChatID? = nil
+        chatID: ChatID? = nil,
+        coalescingInterval: Duration = .milliseconds(500)
     ) {
         self.store = store
         self.sessionID = sessionID
         self.harness = harness
         self.chatID = chatID
+        self.coalescingInterval = coalescingInterval
     }
 
     /// Records the prompt that opens the next turn. Called on send, before the
@@ -68,6 +87,18 @@ public actor TranscriptWriter {
         }
     }
 
+    /// Writes every coalesced revision still held in memory. The engine calls
+    /// this when it stops a session, since a cancelled event loop never
+    /// delivers the `sessionEnded` that would otherwise flush.
+    public func flush() async {
+        do {
+            try await flushPending()
+        } catch {
+            persistenceFailures += 1
+            lastPersistenceError = String(describing: error)
+        }
+    }
+
     public private(set) var persistenceFailures = 0
     public private(set) var lastPersistenceError: String?
 
@@ -86,6 +117,9 @@ public actor TranscriptWriter {
             hasPersistedSession = true
 
         case .turnStarted(let started):
+            // A turn that never completed must not strand its last revisions.
+            try await flushPending()
+            upserted.removeAll()
             // Every turn and block hangs off the session row by foreign key.
             // Waiting for `.sessionStarted` to create it would mean losing the
             // whole transcript from any harness that doesn't announce itself —
@@ -130,12 +164,12 @@ public actor TranscriptWriter {
             ))
 
         case .toolCall(let call):
-            let id = "tool-\(call.id.rawValue)"
-            if let existing = try await store.block(id) {
-                try await append(BlockRecord(
-                    id: existing.id,
+            // A call is complete when its result arrives, which flushes it.
+            try await upsert(id: "tool-\(call.id.rawValue)", isFinal: false) { ordinal, createdAt in
+                BlockRecord(
+                    id: "tool-\(call.id.rawValue)",
                     turnID: call.turnID,
-                    ordinal: existing.ordinal,
+                    ordinal: ordinal,
                     kind: .toolCall,
                     text: call.displayName ?? call.name,
                     toolName: call.name,
@@ -143,24 +177,12 @@ public actor TranscriptWriter {
                     displayName: call.displayName,
                     payload: call.input,
                     parentToolCallID: call.parentToolCallID,
-                    createdAt: existing.createdAt
-                ))
-                return
+                    createdAt: createdAt
+                )
             }
-            try await append(BlockRecord(
-                id: id,
-                turnID: call.turnID,
-                ordinal: nextOrdinal(),
-                kind: .toolCall,
-                text: call.displayName ?? call.name,
-                toolName: call.name,
-                toolCallID: call.id,
-                displayName: call.displayName,
-                payload: call.input,
-                parentToolCallID: call.parentToolCallID
-            ))
 
         case .toolResult(let result):
+            try await flushPending(id: "tool-\(result.toolCallID.rawValue)")
             try await append(BlockRecord(
                 id: "result-\(result.toolCallID.rawValue)",
                 turnID: result.turnID,
@@ -178,6 +200,7 @@ public actor TranscriptWriter {
             let payload: JSONValue
             let text: String
             let stableID: String
+            let isFinal: Bool
             switch update.content {
             case .todos(let items):
                 text = items.map { "\($0.status == .completed ? "x" : " ") \($0.text)" }
@@ -186,6 +209,8 @@ public actor TranscriptWriter {
                     .object(["text": .string(item.text), "status": .string(item.status.rawValue)])
                 })
                 stableID = "plan-\(update.turnID.rawValue)-todos"
+                // A checklist has no completion of its own; turn end flushes it.
+                isFinal = false
             case .proposal(let markdown, let requestID):
                 text = markdown
                 payload = .object([
@@ -197,27 +222,21 @@ public actor TranscriptWriter {
                 // `completed` ready must not append a second block the tail
                 // would miss or double.
                 stableID = "plan-\(update.turnID.rawValue)-proposal"
+                // A ready plan, or one an approval hangs off, is what a
+                // relaunch must find — never left waiting in memory.
+                isFinal = update.isReady || requestID != nil
             }
-            if let existing = try await store.block(stableID) {
-                try await append(BlockRecord(
-                    id: existing.id,
+            try await upsert(id: stableID, isFinal: isFinal) { ordinal, createdAt in
+                BlockRecord(
+                    id: stableID,
                     turnID: update.turnID,
-                    ordinal: existing.ordinal,
+                    ordinal: ordinal,
                     kind: .plan,
                     text: text,
                     payload: payload,
-                    createdAt: existing.createdAt
-                ))
-                return
+                    createdAt: createdAt
+                )
             }
-            try await append(BlockRecord(
-                id: stableID,
-                turnID: update.turnID,
-                ordinal: nextOrdinal(),
-                kind: .plan,
-                text: text,
-                payload: payload
-            ))
 
         case .permissionRequest(let request):
             try await append(BlockRecord(
@@ -247,8 +266,11 @@ public actor TranscriptWriter {
             currentTurn?.usage = usage
 
         case .turnCompleted(let result):
+            try await flushPending()
+            upserted.removeAll()
             guard var turn = currentTurn else { return }
             let usage = result.usage ?? turn.usage
+            let stored = try await store.turn(result.turnID)
             try await store.saveTurn(TurnRecord(
                 id: result.turnID,
                 sessionID: sessionID,
@@ -261,9 +283,8 @@ public actor TranscriptWriter {
                 cacheReadTokens: usage?.cacheReadTokens ?? 0,
                 cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
                 contextWindow: usage?.contextWindow,
-                checkpointCommit: try await store.turn(result.turnID)?.checkpointCommit,
-                checkpointProviderSessionID:
-                    try await store.turn(result.turnID)?.checkpointProviderSessionID,
+                checkpointCommit: stored?.checkpointCommit,
+                checkpointProviderSessionID: stored?.checkpointProviderSessionID,
                 attachments: turn.promptAttachments,
                 // The completed turn is written as a whole record, so the origin
                 // has to be carried across or finishing a turn would relabel an
@@ -276,6 +297,8 @@ public actor TranscriptWriter {
             currentTurn = nil
 
         case .sessionEnded:
+            try await flushPending()
+            upserted.removeAll()
             currentTurn = nil
 
         case .contextCompacted(let compaction):
@@ -334,6 +357,49 @@ public actor TranscriptWriter {
 
     private func append(_ record: BlockRecord) async throws {
         try await store.appendBlock(record)
+    }
+
+    /// Writes a row that is rewritten in place, keeping its first ordinal and
+    /// creation time. See `UpsertedBlock` for when a revision is held back.
+    private func upsert(
+        id: String,
+        isFinal: Bool,
+        _ record: (_ ordinal: Int, _ createdAt: Date) -> BlockRecord
+    ) async throws {
+        let now = ContinuousClock.now
+        if var known = upserted[id] {
+            let revision = record(known.ordinal, known.createdAt)
+            guard isFinal || known.lastWrite.duration(to: now) >= coalescingInterval else {
+                known.pending = revision
+                upserted[id] = known
+                return
+            }
+            known.pending = nil
+            known.lastWrite = now
+            upserted[id] = known
+            try await append(revision)
+            return
+        }
+        // First sight in this writer. The row can still exist from an earlier
+        // writer on the same session, so it is looked up once, not per revision.
+        let existing = try await store.block(id)
+        let ordinal = existing?.ordinal ?? nextOrdinal()
+        let createdAt = existing?.createdAt ?? Date()
+        try await append(record(ordinal, createdAt))
+        upserted[id] = UpsertedBlock(ordinal: ordinal, createdAt: createdAt, lastWrite: now)
+    }
+
+    /// Writes held-back revisions — one row's, or all of them. Each is taken
+    /// out before its write so a reentrant event can't write it twice.
+    private func flushPending(id: String? = nil) async throws {
+        let ids = id.map { [$0] } ?? upserted.compactMap { $0.value.pending == nil ? nil : $0.key }
+        for id in ids {
+            guard var known = upserted[id], let revision = known.pending else { continue }
+            known.pending = nil
+            known.lastWrite = ContinuousClock.now
+            upserted[id] = known
+            try await append(revision)
+        }
     }
 
     private func nextOrdinal() -> Int {

@@ -1155,7 +1155,9 @@ public actor InProcessCoreClient: CoreClient {
                 executablePath: shell,
                 arguments: ShellEnvironment.commandArguments(for: shell, script: script),
                 workingDirectory: directory,
-                environment: ShellEnvironment.childEnvironment()
+                environment: ShellEnvironment.childEnvironment(),
+                // The failure report is built from stdout; stderr was never read.
+                discardStandardError: true
             )
         } catch {
             // Silently returning here is how a setup script that never ran
@@ -1508,6 +1510,14 @@ public actor InProcessCoreClient: CoreClient {
 
     public func blocks(turnID: TurnID) async throws -> [BlockRecord] {
         try await store.blocks(turnID: turnID)
+    }
+
+    /// A chat's whole history in one query rather than one `blocks(turnID:)`
+    /// per turn. One entry per turn that has blocks, in transcript order, each
+    /// with its blocks by ordinal; turns without blocks are omitted, so match
+    /// entries to `transcript(chatID:)` by `turnID`.
+    public func blocks(chatID: ChatID) async throws -> [(turnID: TurnID, blocks: [BlockRecord])] {
+        try await store.blocks(chatID: chatID)
     }
 
     public func search(

@@ -136,4 +136,19 @@ struct ClaudeControlPayloadTests {
         #expect(ClaudeWire.inboundControl(in: #"{"type":"assistant","message":{}}"#) == .none)
         #expect(ClaudeWire.inboundControl(in: "not json") == .none)
     }
+
+    @Test func theMessageTypeIsPeekedOnlyFromTheCompactLeadingKey() {
+        #expect(ClaudeWire.peekType(in: #"{"type":"stream_event","event":{"type":"x"}}"#) == "stream_event")
+        // Anything else is left to a real decode rather than guessed at.
+        #expect(ClaudeWire.peekType(in: #"{ "type": "assistant"}"#) == nil)
+        #expect(ClaudeWire.peekType(in: #"{"session_id":"s","type":"assistant"}"#) == nil)
+        #expect(ClaudeWire.peekType(in: #"{"type":"a\"b"}"#) == nil)
+        #expect(ClaudeWire.peekType(in: #"{"type":"unterminated"#) == nil)
+        #expect(ClaudeWire.peekType(in: "not json") == nil)
+    }
+
+    @Test func aControlRequestWithoutTheCompactLeadingKeyIsStillAnswered() {
+        let line = #"{"request_id":"req_2","type":"control_request","request":{"subtype":"hook_callback"}}"#
+        #expect(ClaudeWire.inboundControl(in: line) == .unsupported(requestID: "req_2", subtype: "hook_callback"))
+    }
 }

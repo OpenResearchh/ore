@@ -32,6 +32,9 @@ public actor ClaudeCodeSession: AgentSession {
     /// one of these must be answered — including on interrupt and on shutdown.
     private var pendingPermissions: [PermissionRequestID: JSONValue] = [:]
     private var pendingControlRequests: [String: CheckedContinuation<Void, any Error>] = [:]
+    /// Cancelled with the request they guard, so answered requests don't
+    /// leave a sleeping task behind.
+    private var controlRequestTimeouts: [String: Task<Void, Never>] = [:]
     private var controlRequestCounter = 0
     /// Last few stderr lines, attached to errors so a bug report explains
     /// itself without a debug build.
@@ -327,8 +330,8 @@ public actor ClaudeCodeSession: AgentSession {
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             pendingControlRequests[requestID] = continuation
-            Task { [weak self] in
-                try? await Task.sleep(for: timeout)
+            controlRequestTimeouts[requestID] = Task { [weak self] in
+                do { try await Task.sleep(for: timeout) } catch { return }
                 await self?.resumeControlRequest(
                     id: requestID,
                     error: HarnessError.transportFailure(
@@ -340,6 +343,7 @@ public actor ClaudeCodeSession: AgentSession {
     }
 
     private func resumeControlRequest(id: String, error: (any Error)?) {
+        controlRequestTimeouts.removeValue(forKey: id)?.cancel()
         guard let continuation = pendingControlRequests.removeValue(forKey: id) else { return }
         if let error {
             continuation.resume(throwing: error)
@@ -351,6 +355,8 @@ public actor ClaudeCodeSession: AgentSession {
     private func failAllPendingControlRequests(reason: String) {
         let pending = pendingControlRequests
         pendingControlRequests.removeAll()
+        for (_, timeout) in controlRequestTimeouts { timeout.cancel() }
+        controlRequestTimeouts.removeAll()
         for (_, continuation) in pending {
             continuation.resume(throwing: HarnessError.transportFailure(reason))
         }

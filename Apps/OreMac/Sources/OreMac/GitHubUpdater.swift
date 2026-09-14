@@ -749,7 +749,14 @@ final class GitHubUpdater {
         of process: Process,
         timeout: Duration
     ) async -> Int32? {
-        await withTaskCancellationHandler {
+        // Cancelled on the way out so a child that exits promptly doesn't
+        // leave a task (and the Process) sleeping out the full deadline.
+        let deadline = Task {
+            do { try await Task.sleep(for: timeout) } catch { return }
+            if process.isRunning { process.terminate() }
+        }
+        defer { deadline.cancel() }
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
                 do {
@@ -758,10 +765,6 @@ final class GitHubUpdater {
                     process.terminationHandler = nil
                     continuation.resume(returning: nil)
                     return
-                }
-                Task {
-                    try? await Task.sleep(for: timeout)
-                    if process.isRunning { process.terminate() }
                 }
             }
         } onCancel: {

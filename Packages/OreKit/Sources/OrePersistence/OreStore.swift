@@ -45,6 +45,9 @@ public actor OreStore {
         configuration.busyMode = .timeout(5)
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
+            // Under WAL, NORMAL only risks the last commits on power loss, never
+            // corruption, and drops an fsync from every transcript write.
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
         }
 
         try FileManager.default.createDirectory(
@@ -546,6 +549,39 @@ public actor OreStore {
                 .order(Column("ordinal"))
                 .fetchAll(db)
         }
+    }
+
+    /// Every block of a conversation in one read, for loading its history
+    /// without a query per turn.
+    ///
+    /// Shape: one entry per turn that has blocks, in `turns(chatID:)` order,
+    /// each holding that turn's blocks by ordinal. Turns without blocks are
+    /// absent, so pair the result with `turns(chatID:)` by `turnID`.
+    public func blocks(chatID: ChatID) throws -> [(turnID: TurnID, blocks: [BlockRecord])] {
+        let records = try writer.read { db in
+            try BlockRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT block.*
+                    FROM block
+                    JOIN turn ON turn.id = block.turnID
+                    JOIN session ON session.id = turn.sessionID
+                    WHERE session.chatID = ?
+                    ORDER BY session.startedAt, turn.ordinal, turn.startedAt, block.turnID,
+                             block.ordinal
+                    """,
+                arguments: [chatID.rawValue]
+            )
+        }
+        var grouped: [(turnID: TurnID, blocks: [BlockRecord])] = []
+        for record in records {
+            if grouped.last?.turnID.rawValue == record.turnID {
+                grouped[grouped.count - 1].blocks.append(record)
+            } else {
+                grouped.append((TurnID(rawValue: record.turnID), [record]))
+            }
+        }
+        return grouped
     }
 
     public func nextBlockOrdinal(turnID: TurnID) throws -> Int {

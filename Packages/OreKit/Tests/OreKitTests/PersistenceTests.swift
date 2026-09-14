@@ -529,10 +529,65 @@ struct PersistenceTests {
         // the harness verbatim.
         #expect(block.decodedPayload?["timeout"] == .integer(5))
     }
+
+    @Test func aChatsBlocksLoadInOneQueryGroupedByTurnInTranscriptOrder() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store)
+        let chatID = ChatID(rawValue: "chat1")
+        let otherChatID = ChatID(rawValue: "chat2")
+        for id in [chatID, otherChatID] {
+            try await store.saveChat(ChatRecord(
+                id: id, workspaceID: workspace.workspaceID, title: id.rawValue, harness: .claudeCode
+            ))
+        }
+        // Ordinals restart in the second session, as after a harness handoff;
+        // session order has to win over turn ordinal.
+        let now = Date()
+        let first = SessionID(rawValue: "s-first")
+        let second = SessionID(rawValue: "s-second")
+        try await store.saveSession(SessionRecord(
+            id: second, workspaceID: workspace.workspaceID, chatID: chatID,
+            harness: .codex, startedAt: now
+        ))
+        try await store.saveSession(SessionRecord(
+            id: first, workspaceID: workspace.workspaceID, chatID: chatID,
+            harness: .claudeCode, startedAt: now.addingTimeInterval(-60)
+        ))
+        try await store.saveSession(SessionRecord(
+            id: SessionID(rawValue: "s-other"), workspaceID: workspace.workspaceID,
+            chatID: otherChatID, harness: .claudeCode, startedAt: now.addingTimeInterval(-120)
+        ))
+        try await store.saveTurn(TurnRecord(id: "t-late", sessionID: second, ordinal: 0))
+        try await store.saveTurn(TurnRecord(id: "t-empty", sessionID: first, ordinal: 1))
+        try await store.saveTurn(TurnRecord(id: "t-early", sessionID: first, ordinal: 0))
+        try await store.saveTurn(TurnRecord(
+            id: "t-other", sessionID: SessionID(rawValue: "s-other"), ordinal: 0
+        ))
+        // Written out of order, so the ordering comes from the query.
+        try await store.appendBlocks([
+            BlockRecord(id: "late-1", turnID: "t-late", ordinal: 1, kind: .text, text: "b"),
+            BlockRecord(id: "early-1", turnID: "t-early", ordinal: 1, kind: .text, text: "y"),
+            BlockRecord(id: "other-0", turnID: "t-other", ordinal: 0, kind: .text, text: "no"),
+            BlockRecord(id: "late-0", turnID: "t-late", ordinal: 0, kind: .text, text: "a"),
+            BlockRecord(id: "early-0", turnID: "t-early", ordinal: 0, kind: .text, text: "x"),
+        ])
+
+        let history = try await store.blocks(chatID: chatID)
+        #expect(history.map(\.turnID.rawValue) == ["t-early", "t-late"])
+        #expect(history.map { $0.blocks.map(\.id) } == [["early-0", "early-1"], ["late-0", "late-1"]])
+
+        // Same content as the per-turn query it replaces.
+        for entry in history {
+            #expect(entry.blocks == (try await store.blocks(turnID: entry.turnID)))
+        }
+        #expect(try await store.blocks(chatID: ChatID(rawValue: "missing")).isEmpty)
+    }
 }
 
 struct TranscriptWriterTests {
-    private func makeWriter() async throws -> (OreStore, TranscriptWriter, SessionID) {
+    private func makeWriter(
+        coalescingInterval: Duration = .milliseconds(500)
+    ) async throws -> (OreStore, TranscriptWriter, SessionID) {
         let store = try OreStore()
         try await store.addRepository(RepositoryRecord(
             path: "/repo", name: "repo", defaultBranch: "main"
@@ -687,6 +742,9 @@ struct TranscriptWriterTests {
             displayName: "x.txt",
             input: ["file_path": "x.txt", "patch": "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n"]
         )))
+        // Revisions of a growing call are coalescing-held; the result or turn
+        // end flushes them. Flush explicitly so this checks the upsert itself.
+        await writer.flush()
 
         let blocks = try await store.blocks(turnID: turnID)
         #expect(blocks.count == 1)

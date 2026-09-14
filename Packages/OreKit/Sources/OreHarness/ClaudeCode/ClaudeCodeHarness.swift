@@ -160,7 +160,9 @@ enum CommandProbe {
                 executablePath: executablePath,
                 arguments: arguments,
                 workingDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
-                environment: ShellEnvironment.childEnvironment()
+                environment: ShellEnvironment.childEnvironment(),
+                // Only stdout is the answer; nobody reads stderr here.
+                discardStandardError: true
             )
         } catch {
             return nil

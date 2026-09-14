@@ -458,6 +458,108 @@ struct StatusWatcherTests {
         await watcher.stop()
     }
 
+    @Test func buildOutputAndGitBookkeepingDoNotWakeTheWatcher() {
+        // A build writes thousands of files a second; each used to cost a
+        // `git status` plus two numstat runs.
+        let filter = StatusEventFilter(
+            worktreePaths: ["/Users/me/target/repo"],
+            gitDirectoryPaths: ["/Users/me/target/repo/.git"]
+        )
+        let root = "/Users/me/target/repo"
+        #expect(filter.relevance(of: "\(root)/.build/debug/App.o") == .ignored)
+        #expect(filter.relevance(of: "\(root)/web/node_modules/react/index.js") == .ignored)
+        #expect(filter.relevance(of: "\(root)/DerivedData/Build/x") == .ignored)
+        #expect(filter.relevance(of: "\(root)/.next/cache/a") == .ignored)
+        #expect(filter.relevance(of: "\(root)/dist/bundle.js") == .ignored)
+        #expect(filter.relevance(of: "\(root)/crate/target/debug/app") == .ignored)
+        #expect(filter.relevance(of: "\(root)/pkg/__pycache__/m.pyc") == .ignored)
+        #expect(filter.relevance(of: "\(root)/.git/objects/ab/cdef") == .ignored)
+        #expect(filter.relevance(of: "\(root)/.git/logs/HEAD") == .ignored)
+        #expect(filter.relevance(of: "\(root)/.git/FETCH_HEAD") == .ignored)
+        #expect(filter.relevance(of: "\(root)/.git/worktrees/other/index") == .ignored)
+    }
+
+    @Test func headIndexRefsAndOrdinaryFilesStillWakeTheWatcher() {
+        // The worktree itself sits under a directory named `target`: only
+        // components below the root may be filtered.
+        let root = "/Users/me/target/repo"
+        let filter = StatusEventFilter(
+            worktreePaths: [root],
+            gitDirectoryPaths: ["\(root)/.git"]
+        )
+        #expect(filter.relevance(of: "\(root)/Sources/App.swift") == .workingFiles)
+        #expect(filter.relevance(of: "\(root)/README.md") == .workingFiles)
+        #expect(filter.relevance(of: root) == .workingFiles)
+        #expect(filter.relevance(of: "\(root)/.git/HEAD") == .gitMetadata)
+        #expect(filter.relevance(of: "\(root)/.git/index") == .gitMetadata)
+        #expect(filter.relevance(of: "\(root)/.git/refs/heads/main") == .gitMetadata)
+        #expect(filter.relevance(of: "\(root)/.git/packed-refs") == .gitMetadata)
+        // Unknown roots are not ignored: a missed update is worse than a spare read.
+        #expect(filter.relevance(of: "/elsewhere/file") == .workingFiles)
+    }
+
+    @Test func aLinkedWorktreesGitDirectoryIsClassifiedAsMetadata() {
+        let filter = StatusEventFilter(
+            worktreePaths: ["/w/feature"],
+            gitDirectoryPaths: ["/repo/.git/worktrees/feature/"]
+        )
+        #expect(filter.relevance(of: "/repo/.git/worktrees/feature/HEAD") == .gitMetadata)
+        #expect(filter.relevance(of: "/repo/.git/worktrees/feature/index") == .gitMetadata)
+        #expect(filter.relevance(of: "/repo/.git/worktrees/feature/logs/HEAD") == .ignored)
+        #expect(filter.relevance(of: "/w/feature/.git") == .gitMetadata)
+    }
+
+    @Test func aBatchTakesItsMostDemandingPath() {
+        let filter = StatusEventFilter(worktreePaths: ["/w"], gitDirectoryPaths: ["/w/.git"])
+        #expect(filter.relevance(of: ["/w/.build/a", "/w/.git/objects/x"]) == .ignored)
+        #expect(filter.relevance(of: ["/w/.build/a", "/w/.git/index"]) == .gitMetadata)
+        #expect(filter.relevance(of: ["/w/.git/index", "/w/main.swift", "/w/.build/a"]) == .workingFiles)
+        #expect(filter.relevance(of: [String]()) == .ignored)
+    }
+
+    @Test func aSymlinkedWorktreeMatchesItsResolvedSpelling() throws {
+        let link = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-filter-\(UUID().uuidString)")
+        let target = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-filter-target-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        defer {
+            try? FileManager.default.removeItem(at: link)
+            try? FileManager.default.removeItem(at: target)
+        }
+
+        let filter = StatusEventFilter(worktree: link, gitDirectories: [])
+        let resolved = link.resolvingSymlinksInPath().path
+        #expect(filter.relevance(of: "\(resolved)/node_modules/x") == .ignored)
+        #expect(filter.relevance(of: "\(link.path)/node_modules/x") == .ignored)
+    }
+
+    @Test func anExplicitRefreshRecountsLinesWhileThePollIsRunning() async throws {
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "poll", baseRevision: "main", baseBranch: "main"
+        )).path
+
+        let watcher = StatusWatcher(
+            git: fixture.git, worktreeURL: worktree, pollInterval: .milliseconds(50)
+        )
+        var iterator = watcher.updates.makeAsyncIterator()
+        try fixture.write("README.md", "# repo\nmore\n", in: worktree)
+        await watcher.start()
+        let first = try #require(await iterator.next())
+        #expect(first.files.first { $0.path == "README.md" }?.insertions == 1)
+
+        // An explicit refresh still recounts lines the porcelain can't see.
+        try fixture.write("README.md", "# repo\nmore\nand more\n", in: worktree)
+        await watcher.refreshNow()
+        let second = try #require(await iterator.next())
+        #expect(second.files.first { $0.path == "README.md" }?.insertions == 2)
+
+        await watcher.stop()
+    }
+
     @Test func fastForwardMovesALocalBranchThatIsNotCheckedOut() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

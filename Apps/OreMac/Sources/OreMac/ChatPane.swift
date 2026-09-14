@@ -85,6 +85,9 @@ struct ChatPane: View {
     @State private var dockHeight: CGFloat = 0
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
+    /// Fresh lookups, for event handlers. Each access filters and sorts every
+    /// chat summary, so render paths resolve both once in `chatBody` and take
+    /// them as parameters (named the same, shadowing these) instead.
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
 
@@ -201,7 +204,7 @@ struct ChatPane: View {
     /// tab offers to close itself, a failure offers a diagnosis, a stale base
     /// offers a sync, uncommitted work offers the commit clerk, a diff offers
     /// a summary, and only then the generic recap.
-    private var composerSuggestion: ComposerSuggestion? {
+    private func composerSuggestion(chat: ChatState, chatSummary: ChatSummary?) -> ComposerSuggestion? {
         guard chat.hasRows, !chat.isBusy else { return nil }
         guard chat.pendingPermission == nil, chat.pendingQuestion == nil,
               chat.prominentError == nil, chat.draftComments.isEmpty,
@@ -290,7 +293,7 @@ struct ChatPane: View {
     /// A ready plan is its own response surface. Keeping the ordinary composer
     /// beneath it produces two competing places to type and, under vertical
     /// compression, lets the transcript squeeze the plan body to zero height.
-    private var isReviewingPlan: Bool {
+    private func isReviewingPlan(_ chat: ChatState) -> Bool {
         if case .proposal = chat.plan { return true }
         return false
     }
@@ -318,7 +321,7 @@ struct ChatPane: View {
     }
 
     /// Reloads the queued-message strip when the tab changes or its queue does.
-    private var queuedMessagesTaskID: String {
+    private func queuedMessagesTaskID(_ chatSummary: ChatSummary?) -> String {
         let id = chatSummary?.id.rawValue ?? ""
         let count = chatSummary?.queuedMessageCount ?? 0
         return "\(id)-\(count)"
@@ -362,7 +365,7 @@ struct ChatPane: View {
     /// Split out of `chatBody` because that one expression had grown past what
     /// the type checker will solve in reasonable time.
     @ViewBuilder
-    private var transcriptViewport: some View {
+    private func transcriptViewport(chat: ChatState, chatSummary: ChatSummary?) -> some View {
         ZStack(alignment: .bottomLeading) {
             if !chat.hasRows && !chat.isBusy {
                 ResearchEmptyState(
@@ -384,7 +387,7 @@ struct ChatPane: View {
                     worktreePath: workspace.worktreePath,
                     agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "",
                     searchQuery: isSearching ? effectiveSearchQuery : "",
-                    persistenceKey: transcriptScrollKey,
+                    persistenceKey: transcriptScrollKey(chatSummary),
                     expandedActivityGroups: expandedActivityGroups,
                     canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
                     onRevert: { revertTarget = $0 },
@@ -442,12 +445,19 @@ struct ChatPane: View {
         }
     }
 
-    private var transcriptScrollKey: String {
+    private func transcriptScrollKey(_ chatSummary: ChatSummary?) -> String {
         "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
     }
 
     @ViewBuilder
     private func chatBody(paneHeight: CGFloat) -> some View {
+        // Resolved once per pass and handed down. As computed properties these
+        // were re-resolved at every one of the body's ~100 reads, each one a
+        // filter and sort over every chat in the app.
+        let chatSummary = model.activeChat(for: workspace.id)
+        let chat = chatSummary.map { model.chat(for: $0.id) } ?? ChatState()
+        let reviewingPlan = isReviewingPlan(chat)
+        let nudge = composerSuggestion(chat: chat, chatSummary: chatSummary)
         // The transcript fills the column and the dock *floats over its foot*
         // on glass — rows scroll underneath the composer, which is what gives
         // Liquid Glass something to refract. Stacking the composer below the
@@ -480,7 +490,7 @@ struct ChatPane: View {
                     )
                 }
             }
-            transcriptViewport
+            transcriptViewport(chat: chat, chatSummary: chatSummary)
                 // Transition snapshots of an infinitely-sized empty view could
                 // paint over sibling split-view columns while changing tabs. The
                 // transcript viewport owns and clips all of its content now.
@@ -501,7 +511,7 @@ struct ChatPane: View {
             // prompts for the same decision. The dedicated card owns it, and
             // answering there also allows (or denies) this permission.
             if let permission = chat.pendingPermission,
-               !hidesGenericPermission(permission) {
+               !hidesGenericPermission(permission, in: chat) {
                 PermissionCard(request: permission) { decision in
                     model.resolvePermission(permission.id, decision: decision, for: workspace.id)
                 }
@@ -564,7 +574,7 @@ struct ChatPane: View {
                 .padding(.horizontal, OreTheme.Space.md)
             }
 
-            if !chat.draftComments.isEmpty && !isReviewingPlan {
+            if !chat.draftComments.isEmpty && !reviewingPlan {
                 DraftCommentsBar(
                     comments: chat.draftComments,
                     origin: chatSummary.flatMap {
@@ -584,7 +594,7 @@ struct ChatPane: View {
             // The reference design's floating nudge: one contextual next step
             // hovering above the composer when the agent is idle and nothing
             // else is asking for the user's attention.
-            if let suggestion = composerSuggestion {
+            if let suggestion = nudge {
                 ComposerSuggestionChip(
                     text: suggestion.title,
                     icon: suggestion.icon,
@@ -602,7 +612,7 @@ struct ChatPane: View {
             // Hard failures — usage limits especially — belong where the user
             // is about to act, not buried as a red row up in the transcript.
             if let error = chat.prominentError {
-                composerErrorBanner(error)
+                composerErrorBanner(error, chat: chat, chatSummary: chatSummary)
             } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
                 ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
                     .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -635,8 +645,8 @@ struct ChatPane: View {
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.vertical, 10)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if !isReviewingPlan {
-                composer(paneHeight: paneHeight)
+            } else if !reviewingPlan {
+                composer(paneHeight: paneHeight, chat: chat, chatSummary: chatSummary)
             }
             }
             .background(
@@ -653,7 +663,7 @@ struct ChatPane: View {
             // snapped, and the transcript's inset — pinned to it — jumped with
             // a visible jerk. Animating the dock lets the height glide, and
             // the scroll inset follows it frame by frame.
-            .animation(.easeOut(duration: 0.18), value: composerSuggestion?.id)
+            .animation(.easeOut(duration: 0.18), value: nudge?.id)
             .animation(.easeOut(duration: 0.18), value: chat.pendingQuestion?.id)
             .animation(.easeOut(duration: 0.18), value: chat.draftComments.isEmpty)
         }
@@ -687,7 +697,7 @@ struct ChatPane: View {
             composerFocused = true
             model.consumeComposerInjection(injection.generation)
         }
-        .task(id: queuedMessagesTaskID) {
+        .task(id: queuedMessagesTaskID(chatSummary)) {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
             queuedMessages = await model.queuedMessages(for: id)
         }
@@ -765,7 +775,9 @@ struct ChatPane: View {
             // what normally records the text, and it cannot fire on a view that
             // is going away — so a prompt `finishVoice` just committed would be
             // lost without this.
-            if let chatSummary, draftOwnerID == chatSummary.id {
+            // A fresh lookup, not this pass's snapshot: the pane can be torn
+            // down in the same update that changed the active chat.
+            if let chatSummary = self.chatSummary, draftOwnerID == chatSummary.id {
                 model.setDraft(draft, for: chatSummary)
             }
             model.flushPendingDrafts()
@@ -802,7 +814,7 @@ struct ChatPane: View {
         // can arrive from the assistant/MCP rather than this view's picker.
         // Reconcile either case automatically so an effort from the previous
         // model never remains selected for a different capability set.
-        .task(id: effortCapabilityKey) {
+        .task(id: effortCapabilityKey(chatSummary)) {
             if let tab = chatSummary { clampEffort(to: tab) }
         }
         .onChange(of: fastModeEnabled) { _, enabled in
@@ -903,27 +915,39 @@ struct ChatPane: View {
         @Binding var searchFocusRequest: Int
         @State private var hoveredTabKey: String?
 
-        private var chat: ChatState { model.chat(for: workspace.id) }
-        private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
-
-        /// Ephemeral chats (the find bar's Answers chat) never render as tabs.
-        private var visibleTabs: [ChatSummary] {
-            model.chats(for: workspace.id).filter {
-                !model.isEphemeralChat($0.id)
-                    && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
-            }
-        }
-
         var body: some View {
+        // Resolved once per pass. Each label used to re-filter and re-sort the
+        // tab list for its own crowding and close-button checks — quadratic in
+        // tabs, on every summary change anywhere.
+        let allTabs = model.chats(for: workspace.id)
+        // Ephemeral chats (the find bar's Answers chat) never render as tabs.
+        let tabs = allTabs.filter {
+            !model.isEphemeralChat($0.id)
+                && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
+        }
+        let activeID = model.activeChat(for: workspace.id)?.id
+        let activeFilePath = model.activeFilePath[workspace.id]
+        let openFilePaths = model.openFilePaths[workspace.id] ?? []
+        // Past four tabs the strip drowns in truncated titles; background tabs
+        // collapse to mark + short name and the selected tab keeps its full one.
+        let isCrowded = tabs.count + openFilePaths.count > 4
+        let activeTabKey = activeFilePath.map { "file:\($0)" }
+            ?? activeID.map { "chat:\($0.rawValue)" }
+            ?? ""
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: OreTheme.Space.xs) {
-                    ForEach(visibleTabs) { tab in
+                    ForEach(tabs) { tab in
                         Button {
                             model.selectChat(tab.id, in: workspace.id)
                             model.showChatInCenter(workspace.id)
                         } label: {
-                            tabLabel(tab)
+                            tabLabel(
+                                tab,
+                                isSelected: tab.id == activeID && activeFilePath == nil,
+                                isCrowded: isCrowded,
+                                isClosable: tabs.count > 1
+                            )
                         }
                         .buttonStyle(.plain)
                         .id("chat:\(tab.id.rawValue)")
@@ -946,7 +970,7 @@ struct ChatPane: View {
                                     model.openSplitChat(tab.id, in: workspace.id)
                                 }
                             }
-                            if model.chats(for: workspace.id).count > 1 {
+                            if allTabs.count > 1 {
                                 Button("Close") { requestCloseChat(tab) }
                             }
                         }
@@ -954,9 +978,9 @@ struct ChatPane: View {
 
                     // File diffs opened from the review list show up here as
                     // tabs, so a diff reads as an open document, not a side pane.
-                    ForEach(model.openFilePaths[workspace.id] ?? [], id: \.self) { path in
+                    ForEach(openFilePaths, id: \.self) { path in
                         Button { model.selectDiffFile(path, in: workspace.id) } label: {
-                            fileTabLabel(path)
+                            fileTabLabel(path, isSelected: activeFilePath == path, isCrowded: isCrowded)
                         }
                         .buttonStyle(.plain)
                         .id("file:\(path)")
@@ -986,7 +1010,9 @@ struct ChatPane: View {
             // underneath stay readable through the blur, and the cluster reads
             // as one floating control group the way Apple gathers toolbar
             // buttons on shared glass.
-            trailingControls
+            // Only the active tab's state, and created if missing as before:
+            // the checkpoint menu needs it even while a file tab is showing.
+            trailingControls(chat: activeID.map { model.chat(for: $0) })
                 .padding(.horizontal, OreTheme.Space.xs)
                 .oreGlassSurface(.capsule, elevation: .inset)
                 .padding(.trailing, OreTheme.Space.xs)
@@ -1007,19 +1033,6 @@ struct ChatPane: View {
     /// it back.
     private var tabControlAllowance: CGFloat {
         136
-    }
-
-    private var activeTabKey: String {
-        if let path = model.activeFilePath[workspace.id] { return "file:\(path)" }
-        if let id = chatSummary?.id { return "chat:\(id.rawValue)" }
-        return ""
-    }
-
-    /// Past four tabs the strip drowns in truncated titles; background tabs
-    /// collapse to mark + short name and the selected tab keeps its full one.
-    private var isCrowded: Bool {
-        visibleTabs.count
-            + (model.openFilePaths[workspace.id]?.count ?? 0) > 4
     }
 
     /// "Femtosecond Chemistry" → "Femtosecond": the first word carries the
@@ -1043,8 +1056,7 @@ struct ChatPane: View {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    private func fileTabLabel(_ path: String) -> some View {
-        let isSelected = model.activeFilePath[workspace.id] == path
+    private func fileTabLabel(_ path: String, isSelected: Bool, isCrowded: Bool) -> some View {
         let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             SourceFileIcon(path: path, size: 16)
@@ -1075,10 +1087,15 @@ struct ChatPane: View {
         }
     }
 
-    private func tabLabel(_ tab: ChatSummary) -> some View {
-        let isSelected = tab.id == chatSummary?.id && model.activeFilePath[workspace.id] == nil
-        let tabState = model.chat(for: tab.id)
-        let isWorking = tabState.isBusy
+    private func tabLabel(
+        _ tab: ChatSummary, isSelected: Bool, isCrowded: Bool, isClosable: Bool
+    ) -> some View {
+        // Read without creating. `chat(for:)` here built state and loaded the
+        // history of every tab in the strip; a tab with no state yet is not
+        // running and has no draft attachments this session. Hovering warms
+        // it (below), so a click or a transcript copy still finds it loaded.
+        let tabState = model.chatStates[tab.id]
+        let isWorking = tabState?.isBusy ?? false
         let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected && !isWorking)
@@ -1094,7 +1111,7 @@ struct ChatPane: View {
                 Text(compact ? shortTitle(tab.title) : tab.title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if !compact, !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
+                if !compact, !tab.draftText.isEmpty || !(tabState?.draftAttachments.isEmpty ?? true) {
                     Image(systemName: "pencil").font(.system(size: 8))
                 }
                 if tab.queuedMessageCount > 0 {
@@ -1103,7 +1120,7 @@ struct ChatPane: View {
                 }
                 // Compact tabs keep the close affordance on hover — hiding it
                 // entirely forced a select-then-close dance.
-                if visibleTabs.count > 1,
+                if isClosable,
                    !compact || hoveredTabKey == "chat:\(tab.id.rawValue)" {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .semibold))
@@ -1145,8 +1162,12 @@ struct ChatPane: View {
         .contentShape(RoundedRectangle(cornerRadius: OreTheme.tabRadius))
         .onHover { hovering in
             let key = "chat:\(tab.id.rawValue)"
-            if hovering { hoveredTabKey = key }
-            else if hoveredTabKey == key { hoveredTabKey = nil }
+            if hovering {
+                hoveredTabKey = key
+                if model.chatStates[tab.id] == nil { _ = model.chat(for: tab.id) }
+            } else if hoveredTabKey == key {
+                hoveredTabKey = nil
+            }
         }
     }
 
@@ -1162,7 +1183,8 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private var trailingControls: some View {
+    private func trailingControls(chat: ChatState?) -> some View {
+        let revertableTurns = chat?.revertableTurns ?? []
         HStack(spacing: OreTheme.Space.xs) {
             Button {
                 // ⌘F never closes: pressed with the bar already open it
@@ -1197,9 +1219,9 @@ struct ChatPane: View {
             .help("New tab (⌘T)")
 
             Menu {
-                if !chat.revertableTurns.isEmpty {
+                if !revertableTurns.isEmpty {
                     Section("Checkpoints") {
-                        ForEach(Array(chat.revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
+                        ForEach(Array(revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
                             Button("Before turn \(index + 1)") { revertTarget = turn }
                         }
                     }
@@ -1212,7 +1234,7 @@ struct ChatPane: View {
                         }
                     }
                 }
-                if chat.revertableTurns.isEmpty && closed.isEmpty {
+                if revertableTurns.isEmpty && closed.isEmpty {
                     Text("No history yet")
                 }
             } label: {
@@ -1228,19 +1250,17 @@ struct ChatPane: View {
 
     // MARK: - Composer
 
-    private func composer(paneHeight: CGFloat) -> some View {
-        VStack(spacing: OreTheme.Space.sm) {
+    private func composer(paneHeight: CGFloat, chat: ChatState, chatSummary: ChatSummary?) -> some View {
+        let external = externalAttachments(chat)
+        let mentions = mentionSuggestions(chat)
+        return VStack(spacing: OreTheme.Space.sm) {
             if chat.isBusy {
+                // Handed the state, not its values: the status row reads
+                // `lastEventAt` and friends itself, so a streaming event
+                // redraws that row instead of this whole conversation column.
                 ComposerBusyStatus(
                     harness: chatSummary?.harness ?? workspace.harness,
-                    status: chat.status,
-                    startedAt: chat.turnStartedAt,
-                    lastEventAt: chat.lastEventAt,
-                    runningToolLabel: chat.runningToolLabel,
-                    // Booting a one-shot CLI takes seconds before its first
-                    // event; the status row says so rather than claiming work
-                    // is already happening.
-                    isStarting: !chat.hasTurnEventArrived,
+                    chat: chat,
                     onStop: { model.interrupt(workspace.id) }
                 )
                 .transition(.opacity)
@@ -1264,9 +1284,9 @@ struct ChatPane: View {
                     )
             }
 
-            if !externalAttachments.isEmpty {
+            if !external.isEmpty {
                 AttachmentChipStrip(
-                    attachments: externalAttachments.map {
+                    attachments: external.map {
                         AttachmentChipStrip.IndexedAttachment(index: $0.offset, attachment: $0.element)
                     },
                     worktreePath: workspace.worktreePath,
@@ -1293,7 +1313,7 @@ struct ChatPane: View {
                 .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
-            if !mentionSuggestions.isEmpty {
+            if !mentions.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
                         Text("REFERENCE A FILE")
@@ -1307,7 +1327,7 @@ struct ChatPane: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
 
-                    ForEach(mentionSuggestions.prefix(6)) { node in
+                    ForEach(mentions.prefix(6)) { node in
                         Button { tagFile(node) } label: {
                             HStack(spacing: 8) {
                                 SourceFileIcon(path: node.path, size: 17)
@@ -1353,7 +1373,7 @@ struct ChatPane: View {
             } else {
                 InlineMentionTextEditor(
                     text: $draft,
-                    mentionNames: attachments
+                    mentionNames: chat.draftAttachments
                         .filter {
                             !$0.relativePath.hasPrefix(".context/attachments/")
                                 || inlinePastedPaths.contains($0.relativePath)
@@ -1369,7 +1389,7 @@ struct ChatPane: View {
                     .focused($composerFocused)
                     .overlay(alignment: .topLeading) {
                         if draft.isEmpty {
-                            Text(placeholder)
+                            Text(placeholder(chat))
                                 .font(.system(size: OreTheme.Font.prose))
                                 .foregroundStyle(.tertiary)
                                 // Match the editor's textContainerInset (5×6) so the
@@ -1383,7 +1403,7 @@ struct ChatPane: View {
             }
 
             if let tab = chatSummary {
-                composerToolbar(for: tab)
+                composerToolbar(for: tab, chat: chat)
             }
         }
         // While the agent runs, the composer's own border animates — the input
@@ -1413,7 +1433,8 @@ struct ChatPane: View {
         }
     }
 
-    private func composerToolbar(for tab: ChatSummary) -> some View {
+    /// `tab` is the active chat's summary: the toolbar only exists when there is one.
+    private func composerToolbar(for tab: ChatSummary, chat: ChatState) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
@@ -1421,36 +1442,26 @@ struct ChatPane: View {
                 if supportsEffort(for: tab) {
                     effortButton(for: tab)
                 }
-                permissionChip
+                permissionChip(chat: chat, chatSummary: tab)
                 modeControls(for: tab)
-
-                if let usage = chat.usage ?? tab.contextUsage,
-                   let window = usage.contextWindow, window > 0 {
-                    ContextMeter(
-                        used: usage.totalContextTokens,
-                        window: window,
-                        usage: usage,
-                        modelName: tab.model
-                    )
-                }
-
+                ComposerContextMeter(chat: chat, tab: tab)
                 Spacer(minLength: OreTheme.Space.md)
-                composerSendCluster
+                composerSendCluster(chat: chat, chatSummary: tab)
             }
 
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
                 modelChooserButton(for: tab)
-                permissionChip
+                permissionChip(chat: chat, chatSummary: tab)
                 modeControls(for: tab)
                 Spacer(minLength: OreTheme.Space.md)
-                composerSendCluster
+                composerSendCluster(chat: chat, chatSummary: tab)
             }
         }
         .frame(minHeight: 34)
     }
 
-    private var permissionChip: some View {
+    private func permissionChip(chat: ChatState, chatSummary: ChatSummary?) -> some View {
         let current = chatSummary?.permissionMode ?? workspace.permissionMode
         // Switching is always allowed in an open chat. On a harness that binds
         // its policy per turn the change lands on the next one, and saying so
@@ -1485,7 +1496,7 @@ struct ChatPane: View {
 
     /// Generic Allow/Deny is the wrong surface when a dedicated card already
     /// answers the same permission request.
-    private func hidesGenericPermission(_ permission: PermissionRequest) -> Bool {
+    private func hidesGenericPermission(_ permission: PermissionRequest, in chat: ChatState) -> Bool {
         if permission.toolName == "AskUserQuestion" { return true }
         if permission.toolName == "ExitPlanMode", case .proposal = chat.plan {
             return true
@@ -1781,7 +1792,7 @@ struct ChatPane: View {
     /// Changes whenever the selected model's effective effort capabilities do.
     /// It deliberately includes the discovered values, not only the model id:
     /// a late CLI catalog refresh can correct a stale built-in catalog in place.
-    private var effortCapabilityKey: String {
+    private func effortCapabilityKey(_ chatSummary: ChatSummary?) -> String {
         guard let tab = chatSummary else { return "none" }
         return ([tab.harness.rawValue, tab.model ?? "default"]
             + availableEfforts(for: tab).map(\.rawValue))
@@ -1884,18 +1895,18 @@ struct ChatPane: View {
     /// Speaker, mic and send are one trailing cluster: same 30pt circle, 8pt
     /// between them, and a wider gap from the chips so the accent action
     /// isn't crowded.
-    private var composerSendCluster: some View {
+    private func composerSendCluster(chat: ChatState, chatSummary: ChatSummary?) -> some View {
         HStack(spacing: OreTheme.Space.sm) {
-            speakerButton
+            speakerButton(chatSummary)
             micButton
-            sendButton
+            sendButton(chat)
         }
     }
 
     /// Per-tab narration toggle: on means this chat's agent activity is
     /// spoken aloud, even when the tab is in the background (where it only
     /// interjects for things that need the user).
-    private var speakerButton: some View {
+    private func speakerButton(_ chatSummary: ChatSummary?) -> some View {
         let narrationOn = chatSummary.map { model.narration.isEnabled($0.id) } ?? false
         let isSpeaking = narrationOn && chatSummary != nil
             && model.narration.speakingChatID == chatSummary?.id
@@ -2351,7 +2362,7 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private var sendButton: some View {
+    private func sendButton(_ chat: ChatState) -> some View {
         if #available(macOS 26.0, *) {
             Button(action: send) {
                 Image(systemName: chat.willQueueNextMessage ? "text.append" : "arrow.up")
@@ -2380,7 +2391,7 @@ struct ChatPane: View {
         }
     }
 
-    private var placeholder: String {
+    private func placeholder(_ chat: ChatState) -> String {
         if case .preparing = voice.status { return "Starting dictation…" }
         if case .downloadingModel = voice.status { return "Downloading speech model…" }
         if case .error(let message) = voice.status { return message }
@@ -2444,7 +2455,7 @@ struct ChatPane: View {
         }
     }
 
-    private var externalAttachments: [(offset: Int, element: Attachment)] {
+    private func externalAttachments(_ chat: ChatState) -> [(offset: Int, element: Attachment)] {
         Array(chat.draftAttachments.enumerated()).filter {
             $0.element.relativePath.hasPrefix(".context/attachments/")
                 && !inlinePastedPaths.contains($0.element.relativePath)
@@ -2652,7 +2663,7 @@ struct ChatPane: View {
         return ComposerCommand.all.filter { query.isEmpty || $0.name.dropFirst().hasPrefix(query) }
     }
 
-    private var mentionSuggestions: [WorkspaceFileNode] {
+    private func mentionSuggestions(_ chat: ChatState) -> [WorkspaceFileNode] {
         guard let mention = activeMention else { return [] }
         let query = mention.query.lowercased()
         // One set, not an array `contains` per file: with hundreds of files
@@ -2719,7 +2730,7 @@ struct ChatPane: View {
     }
 
     private func acceptFirstMentionSuggestion() -> Bool {
-        guard let first = mentionSuggestions.first else { return false }
+        guard let first = mentionSuggestions(chat).first else { return false }
         tagFile(first)
         return true
     }
@@ -2761,7 +2772,9 @@ struct ChatPane: View {
         model.openSourceFile(path, in: workspace.id, line: focusLine)
     }
 
-    private func composerErrorBanner(_ error: ChatState.ProminentError) -> some View {
+    private func composerErrorBanner(
+        _ error: ChatState.ProminentError, chat: ChatState, chatSummary: ChatSummary?
+    ) -> some View {
         let harness = chatSummary?.harness ?? workspace.harness
         let update = model.harnessCLIUpdate
         let matchingUpdate: AppModel.HarnessCLIUpdate? = update?.kind == harness ? update : nil
@@ -3335,15 +3348,24 @@ struct AgentPresenceStrip: View {
 /// quiet row above the text, paired with the composer's animated busy border.
 private struct ComposerBusyStatus: View {
     let harness: HarnessKind
-    let status: AgentStatus
-    var startedAt: Date?
-    var lastEventAt: Date?
-    var runningToolLabel: String?
-    var isStarting: Bool = false
+    /// Read here rather than unpacked by the caller: `lastEventAt` moves on
+    /// every streamed event, and only this row should redraw for it.
+    let chat: ChatState
     let onStop: () -> Void
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        let status = chat.status
+        let startedAt = chat.turnStartedAt
+        let lastEventAt = chat.lastEventAt
+        let runningToolLabel = chat.runningToolLabel
+        // Booting a one-shot CLI takes seconds before its first event; the
+        // status row says so rather than claiming work is already happening.
+        let isStarting = !chat.hasTurnEventArrived
+        TimelineView(StatusClockSchedule(
+            anchor: startedAt ?? .distantPast,
+            paused: controlActiveState != .key
+        )) { context in
             HStack(spacing: 7) {
                 // Who is working, in the same visual language as the header's
                 // presence line: the agent's mark and a live green dot. The
@@ -3395,9 +3417,13 @@ private struct ComposerBusyStatus: View {
 private struct ComposerWaitingStatus: View {
     let tasks: [AgentBackgroundTask]
     var startedAt: Date?
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        TimelineView(StatusClockSchedule(
+            anchor: startedAt ?? .distantPast,
+            paused: controlActiveState != .key
+        )) { context in
             HStack(spacing: 7) {
                 Image(systemName: "hourglass")
                     .font(.system(size: 11, weight: .medium))
@@ -3418,6 +3444,58 @@ private struct ComposerWaitingStatus: View {
         }
         .padding(.horizontal, 2)
         .help(tasks.map(\.description).filter { !$0.isEmpty }.joined(separator: "\n"))
+    }
+}
+
+/// The composer status rows' one-second clock.
+///
+/// `.periodic(from: .now, by: 1)` restarted its phase on every parent render,
+/// and kept ticking behind a window nobody was looking at. This one ticks on
+/// whole seconds from a fixed anchor, so a redraw lands on the same grid, and
+/// stops while the window isn't key — the pause every decorative timeline in
+/// the app already takes. The labels catch up when the window is focused.
+struct StatusClockSchedule: TimelineSchedule {
+    var anchor: Date
+    var paused: Bool
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        if paused {
+            var pending: Date? = startDate
+            return AnyIterator {
+                defer { pending = nil }
+                return pending
+            }
+        }
+        // The last whole second from the anchor at or before `startDate`.
+        // Whole seconds are exact in `Double` for any date this far from the
+        // anchor, and an anchor at `.distantPast` just means "no alignment".
+        let offset = startDate.timeIntervalSince(anchor)
+        var next = offset.isFinite && abs(offset) < 1e12
+            ? anchor.addingTimeInterval(offset.rounded(.down))
+            : startDate
+        return AnyIterator {
+            defer { next = next.addingTimeInterval(1) }
+            return next
+        }
+    }
+}
+
+/// The toolbar's context meter, split out so `usage` — rewritten as a turn
+/// streams — redraws the meter instead of the whole composer column.
+private struct ComposerContextMeter: View {
+    let chat: ChatState
+    let tab: ChatSummary
+
+    var body: some View {
+        if let usage = chat.usage ?? tab.contextUsage,
+           let window = usage.contextWindow, window > 0 {
+            ContextMeter(
+                used: usage.totalContextTokens,
+                window: window,
+                usage: usage,
+                modelName: tab.model
+            )
+        }
     }
 }
 

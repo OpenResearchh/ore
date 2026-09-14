@@ -28,28 +28,12 @@ struct Sidebar: View {
     /// "Active" is the reference design's question — who is doing something or
     /// waiting on me — not merely "exists": an agent working, blocked, failed,
     /// or finished with unread output all count.
-    private func isActive(_ workspace: WorkspaceSummary) -> Bool {
+    private static func isActive(_ workspace: WorkspaceSummary, chats: [ChatSummary]) -> Bool {
         if workspace.hasUnread { return true }
-        switch sidebarEffectiveStatus(for: workspace, chats: model.chats(for: workspace.id)) {
+        switch sidebarEffectiveStatus(for: workspace, chats: chats) {
         case .thinking, .requesting, .runningTool, .awaitingInput, .failed: return true
         case .idle, .interrupted: return false
         }
-    }
-
-    private var activeCount: Int {
-        model.sortedWorkspaces.filter(isActive).count
-    }
-
-    private var pinnedWorkspaces: [WorkspaceSummary] {
-        model.sortedWorkspaces.filter(\.isPinned)
-    }
-
-    /// What the main list shows: pinned rows live in their own strip, and the
-    /// Active tab narrows to workspaces that are doing something or need you.
-    private var listedWorkspaces: [WorkspaceSummary] {
-        var workspaces = model.sortedWorkspaces.filter { !$0.isPinned }
-        if filter == .active { workspaces = workspaces.filter(isActive) }
-        return workspaces
     }
 
     private struct RepositoryGroup: Identifiable {
@@ -65,7 +49,7 @@ struct Sidebar: View {
         }
     }
 
-    private var repositoryGroups: [RepositoryGroup] {
+    private static func repositoryGroups(_ listedWorkspaces: [WorkspaceSummary]) -> [RepositoryGroup] {
         Dictionary(grouping: listedWorkspaces, by: \.repositoryPath)
             .map { path, workspaces in
                 RepositoryGroup(
@@ -94,17 +78,42 @@ struct Sidebar: View {
     /// ⌘1–9 jumps to a workspace by its position in `sortedWorkspaces`. Mapping
     /// each of the first nine to its number lets the sidebar show the shortcut
     /// inline, so switching between parallel agents is discoverable, not hidden.
-    private var workspaceShortcuts: [WorkspaceID: Int] {
+    private static func workspaceShortcuts(_ sortedWorkspaces: [WorkspaceSummary]) -> [WorkspaceID: Int] {
         var result: [WorkspaceID: Int] = [:]
-        for (index, workspace) in model.sortedWorkspaces.prefix(9).enumerated() {
+        for (index, workspace) in sortedWorkspaces.prefix(9).enumerated() {
             result[workspace.id] = index + 1
         }
         return result
     }
 
     var body: some View {
+        // Everything derived from the fleet is resolved once per pass and
+        // handed down. `sortedWorkspaces` sorts on every read and `chats(for:)`
+        // filters every summary; as computed properties they ran several times
+        // per workspace, plus once per row for the shortcut map.
+        let workspaces = model.sortedWorkspaces
+        let chatsByWorkspace = Dictionary(
+            workspaces.map { ($0.id, model.chats(for: $0.id)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let activeIDs = Set(workspaces.lazy
+            .filter { Self.isActive($0, chats: chatsByWorkspace[$0.id] ?? []) }
+            .map(\.id))
+        let pinnedWorkspaces = workspaces.filter(\.isPinned)
+        // What the main list shows: pinned rows live in their own strip, and the
+        // Active tab narrows to workspaces that are doing something or need you.
+        let listedWorkspaces = workspaces.filter {
+            !$0.isPinned && (filter != .active || activeIDs.contains($0.id))
+        }
+        let workingCount = workspaces.lazy.filter { workspace in
+            switch sidebarEffectiveStatus(for: workspace, chats: chatsByWorkspace[workspace.id] ?? []) {
+            case .thinking, .requesting, .runningTool: return true
+            default: return false
+            }
+        }.count
+        let shortcuts = Self.workspaceShortcuts(workspaces)
         List {
-            if model.sortedWorkspaces.isEmpty {
+            if workspaces.isEmpty {
                 emptyState
             } else if filter == .active, listedWorkspaces.isEmpty, pinnedWorkspaces.isEmpty {
                 Text("All agents are idle")
@@ -115,7 +124,7 @@ struct Sidebar: View {
 
             if !pinnedWorkspaces.isEmpty {
                 Section {
-                    PinnedStrip(workspaces: pinnedWorkspaces, chatsFor: { model.chats(for: $0) })
+                    PinnedStrip(workspaces: pinnedWorkspaces, chatsFor: { chatsByWorkspace[$0] ?? [] })
                         .listRowSeparator(.hidden)
                         .listRowInsets(EdgeInsets(
                             top: 2, leading: OreTheme.Space.sm,
@@ -126,15 +135,15 @@ struct Sidebar: View {
                 }
             }
 
-            ForEach(repositoryGroups) { repository in
+            ForEach(Self.repositoryGroups(listedWorkspaces)) { repository in
                 DisclosureGroup(isExpanded: repositoryBinding(repository.path)) {
                     ForEach(repository.workspaces) { workspace in
                         WorkspaceRow(
                             workspace: workspace,
-                            chats: model.chats(for: workspace.id),
+                            chats: chatsByWorkspace[workspace.id] ?? [],
                             identity: model.researchIdentity(for: workspace),
                             isSelected: model.selectedWorkspaceID == workspace.id,
-                            shortcutIndex: workspaceShortcuts[workspace.id],
+                            shortcutIndex: shortcuts[workspace.id],
                             onRename: {
                                 renameText = workspace.name
                                 renameWorkspace = workspace
@@ -213,7 +222,7 @@ struct Sidebar: View {
         }
         // Warm every row's portrait up front instead of on first render, so
         // faces appear with the list rather than popping in as you scroll.
-        .task(id: model.sortedWorkspaces.count) {
+        .task(id: workspaces.count) {
             for workspace in model.sortedWorkspaces {
                 guard !Task.isCancelled else { return }
                 guard let identity = model.researchIdentity(for: workspace) else { continue }
@@ -232,8 +241,8 @@ struct Sidebar: View {
         .scrollIndicators(.hidden)
         .background(OreListScrollerOverlay())
         .safeAreaInset(edge: .top, spacing: 0) {
-            if !model.sortedWorkspaces.isEmpty {
-                filterTabs
+            if !workspaces.isEmpty {
+                filterTabs(allCount: workspaces.count, activeCount: activeIDs.count)
                     .padding(.horizontal, OreTheme.Space.sm)
                     .padding(.top, OreTheme.Space.xs)
                     .padding(.bottom, OreTheme.Space.sm)
@@ -241,7 +250,7 @@ struct Sidebar: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack(spacing: OreTheme.Space.sm) {
-                connectedPill
+                connectedPill(working: workingCount, total: workspaces.count)
                 Spacer()
                 SettingsLink {
                     Image(systemName: "gearshape")
@@ -277,7 +286,7 @@ struct Sidebar: View {
     /// The reference design's segmented capsule: All | Active, each with its
     /// count. Selection stays quiet (a primary wash, not accent) so the blue
     /// pill remains reserved for the selected workspace row.
-    private var filterTabs: some View {
+    private func filterTabs(allCount: Int, activeCount: Int) -> some View {
         HStack(spacing: 2) {
             ForEach(SidebarFilter.allCases) { tab in
                 let isOn = filter == tab
@@ -287,7 +296,7 @@ struct Sidebar: View {
                     HStack(spacing: 4) {
                         Text(tab.title)
                             .font(.system(size: OreTheme.Font.body, weight: isOn ? .semibold : .regular))
-                        Text("\(tab == .all ? model.sortedWorkspaces.count : activeCount)")
+                        Text("\(tab == .all ? allCount : activeCount)")
                             .font(.system(size: OreTheme.Font.caption).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
@@ -309,13 +318,7 @@ struct Sidebar: View {
 
     /// The footer's presence pill: green while any agent is live, quiet gray
     /// otherwise — the sidebar's own "Connected" light.
-    private var connectedPill: some View {
-        let working = model.sortedWorkspaces.filter { workspace in
-            switch sidebarEffectiveStatus(for: workspace, chats: model.chats(for: workspace.id)) {
-            case .thinking, .requesting, .runningTool: return true
-            default: return false
-            }
-        }.count
+    private func connectedPill(working: Int, total: Int) -> some View {
         let isLive = working > 0
         return HStack(spacing: 6) {
             Circle()
@@ -326,7 +329,7 @@ struct Sidebar: View {
             // meanings on one surface reads as a bug.
             Text(isLive
                 ? "\(working) working"
-                : "\(model.sortedWorkspaces.count) workspace\(model.sortedWorkspaces.count == 1 ? "" : "s")")
+                : "\(total) workspace\(total == 1 ? "" : "s")")
                 .font(.system(size: OreTheme.Font.caption, weight: .medium))
         }
         .foregroundStyle(isLive ? OreTheme.Presence.active : Color.secondary)

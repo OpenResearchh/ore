@@ -101,11 +101,29 @@ struct AssistantActivityView: View {
         HStack(spacing: OreTheme.Space.md) {
             OreAppIcon(size: 22)
             conversationMenu(assistant: assistant, chatID: chatID, current: summary)
+            HeaderStatus(harness: summary?.harness ?? .claudeCode, state: state)
+            Spacer(minLength: OreTheme.Space.sm)
+            TabPicker(tab: $tab)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .frame(height: OreTheme.RowHeight.bar)
+        // Every other bar in the app floats on the toolbar material; without it
+        // this header fused into the content below it.
+        .background(.bar)
+    }
+
+    /// The agent's live status beside the title. Its own view so a status or
+    /// tool change redraws this label, not the whole window body above it.
+    private struct HeaderStatus: View {
+        let harness: HarnessKind
+        let state: ChatState
+
+        var body: some View {
             if state.status != .idle {
                 // Humanized, like the chat pane's composer status. This used to
                 // print the raw enum — the user was shown "runningTool".
                 Text(ComposerBusyCopy.label(
-                    harness: summary?.harness ?? .claudeCode,
+                    harness: harness,
                     status: state.status,
                     runningToolLabel: state.runningToolLabel,
                     isStarting: false,
@@ -116,7 +134,15 @@ struct AssistantActivityView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
-            Spacer(minLength: OreTheme.Space.sm)
+        }
+    }
+
+    /// The segmented tab switcher, isolated behind its binding. Rebuilt inline,
+    /// every status or chat change re-created its tagged segments.
+    private struct TabPicker: View {
+        @Binding var tab: Tab
+
+        var body: some View {
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
@@ -124,11 +150,6 @@ struct AssistantActivityView: View {
             .labelsHidden()
             .frame(width: 190)
         }
-        .padding(.horizontal, OreTheme.Space.md)
-        .frame(height: OreTheme.RowHeight.bar)
-        // Every other bar in the app floats on the toolbar material; without it
-        // this header fused into the content below it.
-        .background(.bar)
     }
 
     /// The title doubles as the conversation switcher. A window this narrow has

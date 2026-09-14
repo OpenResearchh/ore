@@ -197,28 +197,59 @@ final class OreAdaptiveGlassView: NSVisualEffectView {
 /// a List's `.background`, finds the backing scroll view, and forces the same
 /// overlay/light-knob answer every AppKit scroll surface in the app uses.
 struct OreListScrollerOverlay: NSViewRepresentable {
+    /// The scroll view found by the last search. Weak: when the List rebuilds
+    /// its scroll view the old one goes away and the next update searches again.
+    @MainActor
+    final class Coordinator {
+        weak var scrollView: NSScrollView?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSView {
         let probe = NSView()
-        DispatchQueue.main.async { Self.apply(near: probe) }
+        let coordinator = context.coordinator
+        DispatchQueue.main.async { Self.apply(near: probe, coordinator: coordinator) }
         return probe
     }
 
     func updateNSView(_ probe: NSView, context: Context) {
         // Re-applied on SwiftUI updates: AppKit resets scroller style when the
         // system preference changes, and the List can rebuild its scroll view.
-        DispatchQueue.main.async { Self.apply(near: probe) }
+        // The sidebar updates constantly, so the subview search only runs until
+        // the scroll view is found; after that an update is three property reads.
+        let coordinator = context.coordinator
+        if let scroll = coordinator.scrollView, scroll.window != nil {
+            guard !Self.isStyled(scroll) else { return }
+        }
+        DispatchQueue.main.async { Self.apply(near: probe, coordinator: coordinator) }
     }
 
-    private static func apply(near probe: NSView) {
+    private static func isStyled(_ scroll: NSScrollView) -> Bool {
+        scroll.scrollerStyle == .overlay
+            && scroll.scrollerKnobStyle == .light
+            && scroll.autohidesScrollers
+    }
+
+    private static func style(_ scroll: NSScrollView) {
+        scroll.scrollerStyle = .overlay
+        scroll.scrollerKnobStyle = .light
+        scroll.autohidesScrollers = true
+    }
+
+    private static func apply(near probe: NSView, coordinator: Coordinator) {
+        if let scroll = coordinator.scrollView, scroll.window != nil {
+            style(scroll)
+            return
+        }
         // The background probe is a sibling of the list's scroll view, not an
         // ancestor — climb a few levels, searching down at each.
         var root: NSView? = probe.superview
         for _ in 0..<4 {
             guard let candidate = root else { return }
             if let scroll = firstTableScrollView(in: candidate) {
-                scroll.scrollerStyle = .overlay
-                scroll.scrollerKnobStyle = .light
-                scroll.autohidesScrollers = true
+                coordinator.scrollView = scroll
+                style(scroll)
                 return
             }
             root = candidate.superview

@@ -54,6 +54,9 @@ struct SettingsView: View {
     /// Cached: `FinishPhraseStore.currentSpoken` decodes JSON, and this body
     /// re-runs every display cycle. Refreshed when the tuning sheet closes.
     @State private var finishPhraseSpoken = FinishPhraseStore.currentSpoken
+    /// Cached for the same reason: it asks `SystemLanguageModel` for its
+    /// availability. Refreshed each time the narration card appears.
+    @State private var summarizerAvailability = ""
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "General"
@@ -140,11 +143,12 @@ struct SettingsView: View {
 
                 Spacer(minLength: 12)
 
+                let readyHarnesses = appModel.readyHarnesses
                 HStack(spacing: 7) {
                     Circle()
-                        .fill(appModel.readyHarnesses.isEmpty ? Color.orange : Color.green)
+                        .fill(readyHarnesses.isEmpty ? Color.orange : Color.green)
                         .frame(width: 7, height: 7)
-                    Text("\(appModel.readyHarnesses.count) agents ready")
+                    Text("\(readyHarnesses.count) agents ready")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -317,9 +321,12 @@ struct SettingsView: View {
                 // Whether the smarter narration path exists on this machine.
                 // "Ready" versus "turn on Apple Intelligence" is the answer to
                 // why narration is or isn't summarizing the agent's own words.
-                Text("On-device summaries — \(appModel.narration.summarizerAvailability)")
+                Text("On-device summaries — \(summarizerAvailability)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .onAppear {
+                        summarizerAvailability = appModel.narration.summarizerAvailability
+                    }
             }
             SettingsCard(title: "Voice input", icon: "mic") {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")

@@ -1940,7 +1940,12 @@ private struct ShipStatusPanel: View {
         // up the moment it sees no PR (`guard let pr` below), and a PR opened
         // from the terminal moves no local file to restart it. When the action
         // notices the PR, the panel reloads with it.
-        .task(id: "\(workspace.id.rawValue)-\(model.gitGeneration(for: workspace.id))-\(model.gitAction(for: workspace.id).title)") {
+        //
+        // Hidden host: the poll is three child processes per iteration, and CI
+        // can run for half an hour. Ending the task while hidden, and keying
+        // on the flag, means showing the window restarts it with a fresh load.
+        .task(id: "\(workspace.id.rawValue)-\(model.gitGeneration(for: workspace.id))-\(model.gitAction(for: workspace.id).title)-\(model.isBackgroundPollingEnabled)") {
+            guard model.isBackgroundPollingEnabled else { return }
             await load()
             // CI has no local filesystem event to ride on. GitHub often posts
             // the first check runs several seconds after a push, so poll fast
@@ -1960,7 +1965,7 @@ private struct ShipStatusPanel: View {
                 }
                 let fast = pr.hasRunningChecks || (pr.checks.isEmpty && withinFirstRunWindow)
                 try? await Task.sleep(for: .seconds(fast ? 4 : 12))
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, model.isBackgroundPollingEnabled else { return }
                 await load()
             }
         }

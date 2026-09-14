@@ -87,8 +87,14 @@ public struct HarnessRegistry: Sendable {
     /// Catalogs are fetched in parallel because each harness owns a separate
     /// local CLI process. One broken provider must not hide the others.
     public func discoverAllModels() async -> [(HarnessKind, [AgentModel])] {
+        await discoverModels(for: Set(available.map(\.kind)))
+    }
+
+    /// Only the named harnesses, so launch can skip catalogs it already holds
+    /// a fresh copy of — Codex's means starting a whole app-server.
+    public func discoverModels(for kinds: Set<HarnessKind>) async -> [(HarnessKind, [AgentModel])] {
         await withTaskGroup(of: (HarnessKind, [AgentModel]).self) { group in
-            for harness in available {
+            for harness in available where kinds.contains(harness.kind) {
                 group.addTask { (harness.kind, await harness.discoverModels()) }
             }
             var results: [(HarnessKind, [AgentModel])] = []

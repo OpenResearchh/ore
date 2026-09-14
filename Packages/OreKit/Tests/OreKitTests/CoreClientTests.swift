@@ -175,13 +175,76 @@ struct CoreClientTests {
         #expect(fixture.read(".env", in: worktree) == "SECRET=1\n")
         #expect(summary.model == "sonnet")
 
-        // The setup script runs in the worktree, through a login shell.
+        // The script is repository content — after a clone, someone else's —
+        // so the approval request takes the place of running it.
+        guard case .repositoryScriptsNeedApproval(let approval)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("an unapproved setup script must ask before it runs")
+            return
+        }
+        #expect(approval.setup == "echo setup-ran > setup-marker.txt")
+        #expect(!fixture.exists("setup-marker.txt", in: worktree))
+
+        // Once allowed, it runs in the worktree, through a login shell.
+        await client.send(.approveRepositoryScripts(approval))
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while ContinuousClock.now < deadline,
               !fixture.exists("setup-marker.txt", in: worktree) {
             try? await Task.sleep(for: .milliseconds(100))
         }
         #expect(fixture.exists("setup-marker.txt", in: worktree))
+
+        await client.shutdown()
+    }
+
+    @Test func anApprovalOnlyCoversTheScriptTheUserWasShown() async throws {
+        // An ore.toml edited while the prompt was open must not inherit the
+        // approval: nothing runs, and the new text is asked about instead.
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo first > marker.txt"
+        """)
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "edited"
+        )))
+
+        guard case .workspaceAdded(let summary)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }), case .repositoryScriptsNeedApproval(let shown)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("expected the workspace and an approval request")
+            return
+        }
+        let worktree = URL(fileURLWithPath: summary.worktreePath)
+
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo second > marker.txt"
+        """)
+        let checkpoint = await recorder.checkpoint()
+        await client.send(.approveRepositoryScripts(shown))
+
+        guard case .repositoryScriptsNeedApproval(let again)? = await recorder.waitFor(
+            after: checkpoint,
+            matching: {
+                if case .repositoryScriptsNeedApproval = $0 { return true }
+                return false
+            }
+        ) else {
+            Issue.record("an edited script must be asked about again")
+            return
+        }
+        #expect(again.setup == "echo second > marker.txt")
+        #expect(!fixture.exists("marker.txt", in: worktree))
 
         await client.shutdown()
     }

@@ -1633,8 +1633,9 @@ public actor WorkspaceEngine {
     }
 
     public func conflictHunks(path: String) throws -> [ConflictHunk] {
-        let url = worktreeURL.appendingPathComponent(path)
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        guard let url = try? conflictFile(path),
+              let text = try? String(contentsOf: url, encoding: .utf8)
+        else { return [] }
         return ConflictMarkers.hunks(in: text)
     }
 
@@ -1648,7 +1649,7 @@ public actor WorkspaceEngine {
         startLine: Int,
         side: ConflictSide
     ) async throws {
-        let url = worktreeURL.appendingPathComponent(path)
+        let url = try conflictFile(path)
         let text = try String(contentsOf: url, encoding: .utf8)
         guard let next = ConflictMarkers.resolving(
             text, hunkStartingAt: startLine, side: side
@@ -1660,6 +1661,20 @@ public actor WorkspaceEngine {
             try await git.runSerialized(["add", "--", path], in: worktreeURL)
         }
         await statusWatcher?.refreshNow()
+    }
+
+    /// A conflicted file named by the caller — the assistant or a conflict
+    /// card — kept inside this worktree. Symlinks are resolved first, so a
+    /// committed link can't aim the rewrite at a file elsewhere on disk.
+    private func conflictFile(_ path: String) throws -> URL {
+        let root = worktreeURL.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = root.appendingPathComponent(path)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard candidate.path.hasPrefix(prefix) else {
+            throw OreCoreError.pathOutsideWorkspace(path)
+        }
+        return candidate
     }
 
     public func turnCheckpoints(chatID: ChatID) async throws -> [TurnCheckpoint] {
@@ -2507,6 +2522,7 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case noPullRequest(String)
     case pullRequestNotMerged(String)
     case conflictHunkMissing(String, Int)
+    case pathOutsideWorkspace(String)
     case assistantWorkspaceProtected
     case questionNotPending(QuestionID, ChatID)
 
@@ -2527,6 +2543,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "The pull request for \(branch) has not been merged."
         case .conflictHunkMissing(let path, let line):
             return "No conflict hunk at \(path):\(line)."
+        case .pathOutsideWorkspace(let path):
+            return "\(path) is outside this workspace."
         case .assistantWorkspaceProtected:
             return "The assistant workspace belongs to ORE and can't be archived or deleted."
         case .questionNotPending(let id, let chatID):

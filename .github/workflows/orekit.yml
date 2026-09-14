@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# Once the repository is public, anyone can open a pull request that runs this
+# workflow. The token it gets should only ever read, whatever the repository
+# default is set to later; nothing here needs to write.
+permissions:
+  contents: read
+
 jobs:
   core:
     name: OreKit (macOS)

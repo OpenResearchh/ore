@@ -96,6 +96,12 @@ public enum CoreCommand: Sendable, Codable {
     /// confirmation id from `CoreEvent.assistantConfirmationRequested`.
     case resolveAssistantConfirmation(String, AssistantConfirmationDecision)
 
+    // Repository configuration
+    /// Allow the `ore.toml` scripts from `repositoryScriptsNeedApproval` and run
+    /// the setup the workspace skipped. If the file changed since, nothing runs
+    /// and the new text is asked about instead.
+    case approveRepositoryScripts(RepositoryScriptsApproval)
+
     // Dream Mode
     case updateDreamSettings(DreamSettings)
     case updateDreamEnvironment(DreamEnvironmentSnapshot)

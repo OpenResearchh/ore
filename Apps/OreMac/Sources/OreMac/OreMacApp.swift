@@ -447,6 +447,7 @@ struct RootView: View {
             }
         }
         .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
+        .modifier(ScriptApprovalDialog())
         .confirmationDialog(
             "Archive \u{201C}\(model.pendingArchive?.workspace.name ?? "workspace")\u{201D}?",
             isPresented: Binding(
@@ -1101,5 +1102,40 @@ struct HarnessStatusList: View {
             }
         }
         .oreCard(padding: 12, radius: 14)
+    }
+}
+
+/// The `ore.toml` approval prompt. Kept out of `RootView`'s modifier chain,
+/// which is already longer than the type checker will solve in one piece.
+private struct ScriptApprovalDialog: ViewModifier {
+    @Environment(AppModel.self) private var model
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "Run this project\u{2019}s scripts?",
+            // Not dismissed through the binding: a button's own action already
+            // removed its item, and clearing again here would drop the next one.
+            isPresented: Binding(
+                get: { !model.pendingScriptApprovals.isEmpty },
+                set: { _ in }
+            ),
+            titleVisibility: .visible,
+            presenting: model.pendingScriptApprovals.first
+        ) { approval in
+            Button("Run Scripts") { model.approveRepositoryScripts(approval) }
+            Button("Don\u{2019}t Run", role: .cancel) { model.declineRepositoryScripts(approval) }
+        } message: { approval in
+            Text(Self.message(for: approval))
+        }
+    }
+
+    static func message(for approval: RepositoryScriptsApproval) -> String {
+        let repository = URL(fileURLWithPath: approval.repositoryPath).lastPathComponent
+        let commands = [
+            approval.setup.map { "Setup, on every new workspace:\n\($0)" },
+            approval.archive.map { "Archive, when a workspace is archived:\n\($0)" },
+        ].compactMap { $0 }.joined(separator: "\n\n")
+        return "The ore.toml in \(repository) wants to run these commands as you. "
+            + "Only allow them if you trust this repository.\n\n\(commands)"
     }
 }

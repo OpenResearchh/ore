@@ -102,7 +102,9 @@ Each gets a worktree at `~/ore/workspaces/<repo>/<slug>`, outside the repository
 so it never shows up in the parent's watchers, searches or `.gitignore`.
 Gitignored files named in `ore.toml` are copied in, and a `.context/` scratch
 directory is created and excluded from git. Archiving preserves uncommitted work
-on a ref; unarchiving puts it back.
+on a ref; unarchiving puts it back. A repository's `setup` and `archive` scripts
+run only after you've read and allowed them, and an edited script asks again:
+`ore.toml` is repository content, and after a clone it's someone else's.
 
 **Agents.** Claude Code and Codex, both verified end to end against live CLIs:
 streaming text and thinking, tool calls, permission prompts answered both ways,

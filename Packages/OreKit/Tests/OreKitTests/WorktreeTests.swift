@@ -64,6 +64,35 @@ struct WorktreeTests {
         #expect(worktree.missingCopies == ["config/missing.json"])
     }
 
+    @Test func copiedFilesNeverLeaveTheRepositoryOrTheWorktree() async throws {
+        // The copy list is repository content, and each destination is deleted
+        // before the copy — an entry that climbs out by `..`, starts at `/`, or
+        // passes through a symlinked directory would delete a real file
+        // somewhere else on disk.
+        let fixture = try await GitFixture.initialized()
+        let outside = fixture.root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let victim = outside.appendingPathComponent("keep.txt")
+        try "keep\n".write(to: victim, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.repository.appendingPathComponent("linked"),
+            withDestinationURL: outside
+        )
+        let climb = String(repeating: "../", count: 24) + victim.path.dropFirst()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+
+        let worktree = try await manager.create(WorktreeManager.CreateRequest(
+            name: "hostile config",
+            baseRevision: "main",
+            baseBranch: "main",
+            filesToCopy: [climb, "linked/keep.txt", victim.path]
+        ))
+
+        #expect(worktree.missingCopies == [climb, "linked/keep.txt", victim.path])
+        #expect((try? String(contentsOf: victim, encoding: .utf8)) == "keep\n")
+        #expect(!fixture.exists("linked/keep.txt", in: worktree.path))
+    }
+
     @Test func contextDirectoryExistsAndIsHiddenFromTheUsersDiff() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

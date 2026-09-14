@@ -472,6 +472,18 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v12.repositoryScriptApproval") { db in
+            // `ore.toml` scripts come from the repository, and a cloned
+            // repository is someone else's code. One row per repository: the
+            // exact setup and archive text the user read and allowed.
+            try db.create(table: "repositoryScriptApproval") { table in
+                table.primaryKey("repositoryPath", .text)
+                table.column("setup", .text)
+                table.column("archive", .text)
+                table.column("approvedAt", .datetime).notNull()
+            }
+        }
+
         return migrator
     }
 }

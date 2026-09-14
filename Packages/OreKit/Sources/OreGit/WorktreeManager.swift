@@ -81,9 +81,13 @@ public actor WorktreeManager {
 
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        // `baseRevision` can come from a pull request's head branch or from the
+        // assistant; ending option parsing keeps a name that starts with a
+        // dash from being read as a flag.
         try await git.runSerialized([
             "worktree", "add",
             "-b", branch,
+            "--end-of-options",
             path.path,
             request.baseRevision,
         ])
@@ -100,14 +104,21 @@ public actor WorktreeManager {
     }
 
     /// Copies gitignored files the project needs but git won't carry.
+    ///
+    /// The list comes from the repository's own `ore.toml`, so each entry is
+    /// untrusted: it has to name something inside the checkout and land inside
+    /// the worktree. Anything that could leave either is reported as missing
+    /// instead of followed — the destination is deleted before the copy, and
+    /// outside the worktree that would be a real folder like `~/.ssh`.
     private func copyFiles(_ relativePaths: [String], into worktree: URL) async -> [String] {
         var missing: [String] = []
         let source = await git.repositoryURL
 
         for relativePath in relativePaths {
-            let from = source.appendingPathComponent(relativePath)
-            let to = worktree.appendingPathComponent(relativePath)
-            guard fileManager.fileExists(atPath: from.path) else {
+            guard let from = Self.containedPath(relativePath, in: source, fileManager: fileManager),
+                  let to = Self.containedPath(relativePath, in: worktree, fileManager: fileManager),
+                  fileManager.fileExists(atPath: from.path)
+            else {
                 missing.append(relativePath)
                 continue
             }
@@ -125,6 +136,25 @@ public actor WorktreeManager {
             }
         }
         return missing
+    }
+
+    /// `relativePath` under `root`, or nil when it could lead out of it: an
+    /// absolute path, a `..` component, or a directory along the way that is a
+    /// symlink — a repository can commit one pointing anywhere. The last
+    /// component may itself be a link; copying and removing handle a link as
+    /// the link, never as what it points at.
+    static func containedPath(_ relativePath: String, in root: URL, fileManager: FileManager) -> URL? {
+        let components = relativePath.split(separator: "/").map(String.init).filter { $0 != "." }
+        guard !relativePath.hasPrefix("/"), let last = components.last, !components.contains("..")
+        else { return nil }
+        var directory = root
+        for component in components.dropLast() {
+            directory.appendPathComponent(component)
+            if (try? fileManager.destinationOfSymbolicLink(atPath: directory.path)) != nil {
+                return nil
+            }
+        }
+        return directory.appendingPathComponent(last)
     }
 
     /// Each workspace gets a `.context` directory: attachments, plans and notes

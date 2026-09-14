@@ -130,6 +130,9 @@ public actor InProcessCoreClient: CoreClient {
         case .deleteWorkspace(let id, let deleteBranch):
             try await deleteWorkspace(id, deleteBranch: deleteBranch)
 
+        case .approveRepositoryScripts(let approval):
+            try await approveRepositoryScripts(approval)
+
         case .renameWorkspace(let id, let name, let userInitiated):
             try await engine(for: id).rename(name, userInitiated: userInitiated)
             markListMutation()
@@ -695,8 +698,25 @@ public actor InProcessCoreClient: CoreClient {
         markListMutation()
         continuation.yield(.workspaceAdded(await engine.summary()))
 
-        if let setup = configuration.scripts.setup {
-            await runScript(setup, in: worktree.path, workspaceID: record.workspaceID)
+        // `ore.toml` is repository content — after a clone, someone else's —
+        // so its scripts wait for the user to read and allow them once.
+        let scripts = configuration.scripts
+        if scripts.setup != nil || scripts.archive != nil {
+            let approved = (try? await store.repositoryScriptsApproved(
+                repositoryPath: record.repositoryPath,
+                setup: scripts.setup,
+                archive: scripts.archive
+            )) == true
+            if !approved {
+                continuation.yield(.repositoryScriptsNeedApproval(RepositoryScriptsApproval(
+                    workspaceID: record.workspaceID,
+                    repositoryPath: record.repositoryPath,
+                    setup: scripts.setup,
+                    archive: scripts.archive
+                )))
+            } else if let setup = scripts.setup {
+                await runScript(setup, in: worktree.path, workspaceID: record.workspaceID)
+            }
         }
         if let initialPrompt, !initialPrompt.isEmpty {
             _ = try? await engine.send(SendMessageRequest(
@@ -707,6 +727,39 @@ public actor InProcessCoreClient: CoreClient {
             ))
         }
         return record
+    }
+
+    /// The user read a repository's `ore.toml` scripts and allowed them. Only
+    /// the text they were shown is approved: if the file changed while the
+    /// prompt was open, the new text is asked about and nothing runs.
+    private func approveRepositoryScripts(_ approval: RepositoryScriptsApproval) async throws {
+        guard let record = try await store.workspace(approval.workspaceID) else {
+            throw OreCoreError.workspaceNotFound(approval.workspaceID)
+        }
+        let scripts = OreConfiguration.load(
+            repositoryPath: URL(fileURLWithPath: record.repositoryPath)
+        ).scripts
+        guard scripts.setup == approval.setup, scripts.archive == approval.archive else {
+            continuation.yield(.repositoryScriptsNeedApproval(RepositoryScriptsApproval(
+                workspaceID: approval.workspaceID,
+                repositoryPath: record.repositoryPath,
+                setup: scripts.setup,
+                archive: scripts.archive
+            )))
+            return
+        }
+        try await store.approveRepositoryScripts(
+            repositoryPath: record.repositoryPath,
+            setup: scripts.setup,
+            archive: scripts.archive
+        )
+        if let setup = scripts.setup {
+            await runScript(
+                setup,
+                in: URL(fileURLWithPath: record.worktreePath),
+                workspaceID: approval.workspaceID
+            )
+        }
     }
 
     func archiveWorkspace(_ id: WorkspaceID) async throws {
@@ -724,7 +777,21 @@ public actor InProcessCoreClient: CoreClient {
         // Archive scripts stop containers and free ports; they have to run
         // before the checkout disappears out from under them.
         if let archiveScript = configuration.scripts.archive {
-            await runScript(archiveScript, in: worktree, workspaceID: id)
+            let approved = (try? await store.repositoryScriptsApproved(
+                repositoryPath: record.repositoryPath,
+                setup: configuration.scripts.setup,
+                archive: archiveScript
+            )) == true
+            if approved {
+                await runScript(archiveScript, in: worktree, workspaceID: id)
+            } else {
+                continuation.yield(.commandFailed(CommandFailure(
+                    workspaceID: id,
+                    message: "Skipped this project's archive script.",
+                    detail: "The scripts in ore.toml haven't been approved on this Mac, "
+                        + "so `\(archiveScript)` didn't run."
+                )))
+            }
         }
 
         await stopEngine(id)
@@ -1579,6 +1646,8 @@ private extension CoreCommand {
             return id
         case .resync(let id):
             return id
+        case .approveRepositoryScripts(let approval):
+            return approval.workspaceID
         case .addRepository, .createProject, .createWorkspace, .probeHarnesses,
              .checkHarnessUpdates,
              .resolveAssistantConfirmation, .updateDreamSettings,

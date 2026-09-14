@@ -367,6 +367,11 @@ actor CoreEventPrinter {
             print("! \(failure.message)")
             if let detail = failure.detail { print("  \(detail)") }
 
+        case .repositoryScriptsNeedApproval(let approval):
+            endLine()
+            let repository = URL(fileURLWithPath: approval.repositoryPath).lastPathComponent
+            print("? \(repository)'s ore.toml scripts didn't run: approve them in the ORE app first")
+
         case .assistantConfirmationRequested(let confirmation):
             endLine()
             print("? assistant asks: \(confirmation.summary)")

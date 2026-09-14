@@ -21,7 +21,9 @@ extension ShellCommandClassifier {
             }
             return reclassify(arguments, in: segment, depth: depth)
         case "env":
-            let rest = Array(arguments.drop { $0.hasPrefix("-") })
+            guard let rest = envCommand(arguments) else {
+                return .unknown("uses env options ORE doesn't check")
+            }
             if rest.isEmpty { return .attention("prints environment variables, which can include secrets") }
             return reclassify(rest, in: segment, depth: depth)
         case "export":
@@ -49,17 +51,24 @@ extension ShellCommandClassifier {
         case "awk", "gawk", "nawk", "mawk":
             return awk(arguments)
         case "sort":
-            let output = arguments.firstIndex { $0 == "-o" || $0 == "--output" }
-            guard let output else { return .inspect("sorts text") }
-            let target = output + 1 < arguments.count ? [arguments[output + 1]] : []
-            return writes(to: target, as: "writes sorted output to a file")
+            let targets = sortOutputs(arguments)
+            guard !targets.isEmpty else { return .inspect("sorts text") }
+            return writes(to: targets, as: "writes sorted output to a file")
         case "tee":
             return writes(to: operands, as: "writes a file")
+        case "uniq", "xxd":
+            // Both write their second file operand: `uniq in out`, `xxd -r in out`.
+            return operands.count > 1
+                ? writes(to: Array(operands.dropFirst()), as: "writes a file")
+                : .inspect("only reads")
         case "mkdir", "touch", "cp", "mv", "ln", "rmdir", "patch", "install", "ditto":
             return writes(to: operands, as: "changes files in the project")
         case "chmod":
             return writes(to: Array(operands.dropFirst()), as: "changes file permissions")
         case "tar", "bsdtar":
+            if arguments.contains(where: tarRunsAProgram) {
+                return .attention("runs a program while it reads the archive")
+            }
             let flags = arguments.first.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "-")) } ?? ""
             if flags.contains("t"), !flags.contains("x"), !flags.contains("c") {
                 return .inspect("lists an archive")
@@ -173,16 +182,80 @@ extension ShellCommandClassifier {
         "ls", "pwd", "cat", "bat", "head", "tail", "less", "more", "wc", "file", "stat",
         "du", "df", "tree", "which", "whereis", "type", "echo", "printf", "date", "cal",
         "uname", "whoami", "id", "groups", "hostname", "basename", "dirname", "realpath",
-        "readlink", "diff", "cmp", "comm", "uniq", "cut", "tr", "nl", "fold", "column",
+        "readlink", "diff", "cmp", "comm", "cut", "tr", "nl", "fold", "column",
         "paste", "join", "rev", "jq", "yq", "true", "false", "test", "[", "[[", ":",
         "sw_vers", "uptime", "cd", "pushd", "popd", "grep", "egrep", "fgrep", "ag", "ack",
-        "fd", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum", "xxd", "hexdump",
+        "fd", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum", "hexdump",
         "od", "strings", "otool", "nm", "lipo", "sleep", "seq", "expr", "ps", "pgrep", "lsof",
         "man", "tldr", "locale", "arch", "nproc", "mdfind", "mdls", "cloc", "tokei", "read",
         "exit", "wait", "unset", "alias", "fsck_hfs_dryrun",
     ]
 
     // MARK: - Files
+
+    /// What `env` will run once its own options are read, or nil for an option
+    /// that changes where or how that command runs. Dropping every dashed
+    /// argument let `env --chdir=/etc cat passwd` pass as a bare `cat passwd`,
+    /// and `-S` re-splits a string into a different command entirely.
+    static func envCommand(_ arguments: [String]) -> [String]? {
+        var index = 0
+        while index < arguments.count, arguments[index].hasPrefix("-") {
+            let option = arguments[index]
+            index += 1
+            switch option {
+            case "--":
+                return Array(arguments[index...])
+            case "-", "-i", "--ignore-environment", "-0", "--null", "-v", "--debug":
+                continue
+            case "-u", "--unset":
+                guard index < arguments.count else { return nil }
+                index += 1
+            default:
+                if option.hasPrefix("--unset=") { continue }
+                return nil
+            }
+        }
+        return Array(arguments[index...])
+    }
+
+    /// Every file `sort` would write. BSD and GNU sort both take the output
+    /// attached as well as separate — `-oout`, `-ro out`, `--output=out` — and
+    /// matching only the separate spellings let the others read as sorting.
+    static func sortOutputs(_ arguments: [String]) -> [String] {
+        var targets: [String] = []
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            index += 1
+            if argument == "--" { break }
+            if argument == "--output" {
+                if index < arguments.count { targets.append(arguments[index]); index += 1 }
+            } else if argument.hasPrefix("--output=") {
+                targets.append(String(argument.dropFirst("--output=".count)))
+            } else if argument.hasPrefix("-"), !argument.hasPrefix("--"),
+                      let flag = argument.dropFirst().firstIndex(of: "o") {
+                let attached = argument[argument.index(after: flag)...]
+                if !attached.isEmpty {
+                    targets.append(String(attached))
+                } else if index < arguments.count {
+                    targets.append(arguments[index])
+                    index += 1
+                }
+            }
+        }
+        return targets
+    }
+
+    /// GNU tar options that start a program whatever mode the archive is opened
+    /// in: `tar -tf a.tar --checkpoint-action=exec=id` lists *and* runs.
+    static func tarRunsAProgram(_ argument: String) -> Bool {
+        let programs = [
+            "--to-command", "--checkpoint-action", "--use-compress-program",
+            "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command",
+        ]
+        return programs.contains { argument == $0 || argument.hasPrefix($0 + "=") }
+            || argument == "-I" || argument == "-F"
+    }
 
     /// An edit when every path stays inside the project, attention otherwise.
     static func writes(to paths: [String], as reason: String) -> ShellCommandVerdict {

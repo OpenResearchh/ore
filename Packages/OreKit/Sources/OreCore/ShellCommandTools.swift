@@ -9,7 +9,7 @@ extension ShellCommandClassifier {
         switch action {
         case "status", "diff", "log", "show", "rev-parse", "ls-files", "grep",
              "describe", "blame", "shortlog":
-            return .inspect("reads repository state")
+            return gitReadOptionRisk(action, arguments.dropFirst()) ?? .inspect("reads repository state")
         case "branch", "tag", "remote", "worktree":
             let mutating = ["-d", "-D", "-m", "-M", "--delete", "--move", "add", "remove", "prune"]
             return arguments.contains(where: mutating.contains)
@@ -25,6 +25,30 @@ extension ShellCommandClassifier {
         case "clone", "init": return .attention("creates a repository")
         default: return .unknown("uses an unrecognised git operation")
         }
+    }
+
+    /// Options that turn a git read into something else. `--output` sends log,
+    /// show or diff output to any path — `.git/hooks/pre-commit` included — and
+    /// `git grep -O` opens the matching files in a program of the caller's
+    /// choosing.
+    private static func gitReadOptionRisk(
+        _ action: String,
+        _ arguments: ArraySlice<String>
+    ) -> ShellCommandVerdict? {
+        for argument in arguments {
+            if argument == "--" { break }
+            if argument == "--output" || argument.hasPrefix("--output=") {
+                return .attention("writes git output to a file")
+            }
+            guard action == "grep" else { continue }
+            // Short options cluster and `-O` takes its program attached, so
+            // `-O`, `-Ovim` and `-inOvim` all open the pager.
+            if argument.hasPrefix("--open-files-in-pager")
+                || (argument.hasPrefix("-") && !argument.hasPrefix("--") && argument.contains("O")) {
+                return .attention("opens the matches in another program")
+            }
+        }
+        return nil
     }
 
     static func gitHub(_ arguments: [String]) -> ShellCommandVerdict {

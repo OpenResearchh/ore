@@ -2199,6 +2199,19 @@ final class AppModel {
         Task { await client.send(.archiveWorkspace(id)) }
     }
 
+    /// `ore.toml` scripts waiting for the user to read and allow them, oldest
+    /// first. The main window asks about the first one.
+    var pendingScriptApprovals: [RepositoryScriptsApproval] = []
+
+    func approveRepositoryScripts(_ approval: RepositoryScriptsApproval) {
+        pendingScriptApprovals.removeAll { $0 == approval }
+        Task { await client.send(.approveRepositoryScripts(approval)) }
+    }
+
+    func declineRepositoryScripts(_ approval: RepositoryScriptsApproval) {
+        pendingScriptApprovals.removeAll { $0 == approval }
+    }
+
     /// A workspace staged for the archive confirmation dialog. Confirming
     /// calls `archive(_:)`; the dialog explains what archiving preserves.
     struct PendingArchive: Identifiable {
@@ -3487,6 +3500,10 @@ final class AppModel {
                 gitOpsInFlight[workspaceID] = nil
             }
             banners.append(Banner(message: failure.message, detail: failure.detail))
+
+        case .repositoryScriptsNeedApproval(let approval):
+            pendingScriptApprovals.removeAll { $0.workspaceID == approval.workspaceID }
+            pendingScriptApprovals.append(approval)
         }
     }
 

@@ -607,6 +607,24 @@ public struct AssistantTabGrantRecord: Codable, FetchableRecord, PersistableReco
     public var id: ChatID { ChatID(rawValue: chatID) }
 }
 
+/// The `ore.toml` scripts a user allowed for one repository, kept verbatim so
+/// an edited script is asked about again instead of inheriting the approval.
+public struct RepositoryScriptApprovalRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "repositoryScriptApproval"
+
+    public var repositoryPath: String
+    public var setup: String?
+    public var archive: String?
+    public var approvedAt: Date
+
+    public init(repositoryPath: String, setup: String?, archive: String?, approvedAt: Date = Date()) {
+        self.repositoryPath = repositoryPath
+        self.setup = setup
+        self.archive = archive
+        self.approvedAt = approvedAt
+    }
+}
+
 public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableRecord, Sendable, Hashable {
     public static let databaseTableName = "queuedMessage"
 

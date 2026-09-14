@@ -31,6 +31,10 @@ public enum CoreEvent: Sendable, Codable {
     case harnessUpdatesChecked([HarnessUpdateStatus])
     case modelCatalogUpdated(HarnessKind, [AgentModel])
     case commandFailed(CommandFailure)
+    /// A new workspace's repository has `ore.toml` scripts this Mac hasn't
+    /// approved, so its setup didn't run. The client shows the commands and
+    /// answers with `approveRepositoryScripts`, or leaves them unrun.
+    case repositoryScriptsNeedApproval(RepositoryScriptsApproval)
 
     // The assistant's action lane surfacing into the client: a pending
     // confirmation, its resolution (however it resolved — user, timeout, or
@@ -362,6 +366,25 @@ public struct CommandFailure: Sendable, Codable, Hashable {
         self.workspaceID = workspaceID
         self.message = message
         self.detail = detail
+    }
+}
+
+/// The `ore.toml` scripts a repository wants to run, exactly as the user is
+/// shown them. Sent back unchanged to approve, so a file edited while the
+/// prompt was open is asked about again rather than approved unseen.
+public struct RepositoryScriptsApproval: Sendable, Codable, Hashable, Identifiable {
+    public var workspaceID: WorkspaceID
+    public var repositoryPath: String
+    public var setup: String?
+    public var archive: String?
+
+    public var id: WorkspaceID { workspaceID }
+
+    public init(workspaceID: WorkspaceID, repositoryPath: String, setup: String?, archive: String?) {
+        self.workspaceID = workspaceID
+        self.repositoryPath = repositoryPath
+        self.setup = setup
+        self.archive = archive
     }
 }
 

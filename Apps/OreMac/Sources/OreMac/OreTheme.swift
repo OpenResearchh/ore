@@ -13,11 +13,6 @@ enum OreTheme {
         static let xl: CGFloat = 48
     }
 
-    /// Decorative motion (busy borders, tab dots, HUD waveform, sidebar ring).
-    /// Matches the ~12 Hz mic-level cadence and is enough for a sweep without
-    /// competing with typing on the main thread.
-    static let decorativeAnimationInterval: TimeInterval = 1.0 / 12.0
-
     /// The whole app's type scale. Chrome uses `body`; the transcript uses
     /// `prose` so a long reply is readable without looking like UI copy.
     enum Font {
@@ -509,17 +504,22 @@ struct OreVoiceGlow: View {
         let strength = level.intensity * (0.55 + 0.45 * energy)
         VStack(spacing: 0) {
             Spacer(minLength: 0)
+            // One fixed gradient, drawn and blurred once at full height and
+            // strength. Loudness moves only a scale and an opacity, so the
+            // animation between mic ticks never re-lays out or re-blurs.
             LinearGradient(
                 stops: [
                     .init(color: .clear, location: 0.0),
-                    .init(color: Color.blue.opacity(0.12 * strength), location: 0.45),
-                    .init(color: Color.cyan.opacity(0.3 * strength), location: 1.0),
+                    .init(color: Color.blue.opacity(0.12), location: 0.45),
+                    .init(color: Color.cyan.opacity(0.3), location: 1.0),
                 ],
                 startPoint: .top,
                 endPoint: .bottom
             )
-            .frame(height: 44 + 44 * energy)
+            .frame(height: 88)
             .blur(radius: 10)
+            .scaleEffect(x: 1, y: (44 + 44 * energy) / 88, anchor: .bottom)
+            .opacity(strength)
         }
         // Strictly inside the composer: clip to the exact glass shape, inset a
         // hair so no fringe peeks past the border stroke.
@@ -585,43 +585,19 @@ struct OreVoiceGlowStroke: View {
 
 /// A flowing accent highlight that sweeps around the composer's edge while the
 /// agent works. With reduced motion it settles into a steady accent outline.
+/// The sweep itself lives in CoreAnimation (`SweepingBorder`), so a busy
+/// composer costs the main thread nothing per frame.
 struct OreComposerBusyBorder: View {
     let cornerRadius: CGFloat
     let reduceMotion: Bool
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        Group {
-            if reduceMotion {
-                shape.strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5)
-            } else {
-                TimelineView(
-                    .animation(
-                        minimumInterval: OreTheme.decorativeAnimationInterval,
-                        paused: controlActiveState != .key
-                    )
-                ) { context in
-                    let period = 2.4
-                    let angle = context.date.timeIntervalSinceReferenceDate
-                        .truncatingRemainder(dividingBy: period) / period * 360
-                    shape
-                        .strokeBorder(
-                            AngularGradient(
-                                gradient: Gradient(colors: [
-                                    Color.accentColor.opacity(0.0),
-                                    Color.accentColor.opacity(0.15),
-                                    Color.accentColor.opacity(0.85),
-                                    Color.accentColor.opacity(0.15),
-                                    Color.accentColor.opacity(0.0),
-                                ]),
-                                center: .center,
-                                angle: .degrees(angle)
-                            ),
-                            lineWidth: 1.75
-                        )
-                }
-            }
+        if reduceMotion {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5)
+        } else {
+            SweepingBorder(cornerRadius: cornerRadius, isPaused: controlActiveState != .key)
         }
     }
 }

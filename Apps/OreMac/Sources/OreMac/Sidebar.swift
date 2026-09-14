@@ -610,23 +610,14 @@ private struct WorkspaceAvatar: View {
 }
 
 /// A short arc orbiting the avatar while the agent works — the row-scale
-/// version of the composer's sweeping busy border, sharing its cadence.
+/// version of the composer's sweeping busy border. Animated by the render
+/// server (`OrbitingArc`), so a sidebar full of busy rows ticks nothing here.
 private struct SpinningRing: View {
     let color: Color
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        TimelineView(
-            .animation(minimumInterval: OreTheme.decorativeAnimationInterval, paused: controlActiveState != .key)
-        ) { context in
-            let period = 1.6
-            let angle = context.date.timeIntervalSinceReferenceDate
-                .truncatingRemainder(dividingBy: period) / period * 360
-            Circle()
-                .trim(from: 0, to: 0.32)
-                .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .rotationEffect(.degrees(angle))
-        }
+        OrbitingArc(color: color, isPaused: controlActiveState != .key)
     }
 }
 

@@ -3362,47 +3362,51 @@ private struct ComposerBusyStatus: View {
         // Booting a one-shot CLI takes seconds before its first event; the
         // status row says so rather than claiming work is already happening.
         let isStarting = !chat.hasTurnEventArrived
-        TimelineView(StatusClockSchedule(
-            anchor: startedAt ?? .distantPast,
-            paused: controlActiveState != .key
-        )) { context in
-            HStack(spacing: 7) {
-                // Who is working, in the same visual language as the header's
-                // presence line: the agent's mark and a live green dot. The
-                // composer's sweeping border already supplies the motion.
-                HarnessMark(harness: harness, size: 15)
-                Circle()
-                    .fill(OreTheme.Presence.active)
-                    .frame(width: 6, height: 6)
-                Text(ComposerBusyCopy.label(
-                    harness: harness,
-                    status: status,
-                    runningToolLabel: runningToolLabel,
-                    isStarting: isStarting,
-                    lastEventAt: lastEventAt,
-                    now: context.date
-                ))
-                .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                .foregroundStyle(.secondary)
-                if let startedAt {
-                    Text(ComposerBusyCopy.turnElapsed(from: startedAt, to: context.date))
-                        .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 0)
-                Button(action: onStop) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 8, weight: .bold))
-                        Text("Stop")
-                            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+        HStack(spacing: 7) {
+            // Who is working, in the same visual language as the header's
+            // presence line: the agent's mark and a live green dot. The
+            // composer's sweeping border already supplies the motion.
+            HarnessMark(harness: harness, size: 15)
+            Circle()
+                .fill(OreTheme.Presence.active)
+                .frame(width: 6, height: 6)
+            // Only the clock-driven labels sit inside the timeline, so the
+            // mark and the Stop button aren't rebuilt every second.
+            TimelineView(StatusClockSchedule(
+                anchor: startedAt ?? .distantPast,
+                paused: controlActiveState != .key
+            )) { context in
+                HStack(spacing: 7) {
+                    Text(ComposerBusyCopy.label(
+                        harness: harness,
+                        status: status,
+                        runningToolLabel: runningToolLabel,
+                        isStarting: isStarting,
+                        lastEventAt: lastEventAt,
+                        now: context.date
+                    ))
+                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    if let startedAt {
+                        Text(ComposerBusyCopy.turnElapsed(from: startedAt, to: context.date))
+                            .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.tertiary)
                     }
-                    .foregroundStyle(.red)
                 }
-                .buttonStyle(OrePressableButtonStyle())
-                .keyboardShortcut(".", modifiers: .command)
-                .help("Stop the running turn (⌘.)")
             }
+            Spacer(minLength: 0)
+            Button(action: onStop) {
+                HStack(spacing: 4) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 8, weight: .bold))
+                    Text("Stop")
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                }
+                .foregroundStyle(.red)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .keyboardShortcut(".", modifiers: .command)
+            .help("Stop the running turn (⌘.)")
         }
         .padding(.horizontal, 2)
     }
@@ -3418,29 +3422,31 @@ private struct ComposerWaitingStatus: View {
     let tasks: [AgentBackgroundTask]
     var startedAt: Date?
     @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(StatusClockSchedule(
-            anchor: startedAt ?? .distantPast,
-            paused: controlActiveState != .key
-        )) { context in
-            HStack(spacing: 7) {
-                Image(systemName: "hourglass")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .symbolEffect(.pulse, options: .repeating)
-                Text(ComposerBusyCopy.waitingLabel(tasks))
-                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                if let startedAt {
+        HStack(spacing: 7) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+            Text(ComposerBusyCopy.waitingLabel(tasks))
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let startedAt {
+                // The clock ticks only this label, not the whole row.
+                TimelineView(StatusClockSchedule(
+                    anchor: startedAt,
+                    paused: controlActiveState != .key
+                )) { context in
                     Text(ComposerBusyCopy.elapsed(from: startedAt, to: context.date))
                         .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-                Spacer(minLength: 0)
             }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 2)
         .help(tasks.map(\.description).filter { !$0.isEmpty }.joined(separator: "\n"))
@@ -5106,16 +5112,10 @@ private struct BusyTabDot: View {
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        let paused = reduceMotion || controlActiveState != .key
-        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval, paused: paused)) { context in
-            let cycle = 1.4
-            let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
-            let pulse = 0.5 - 0.5 * cos(t * 2 * Double.pi)
-            Circle()
-                .fill(Color.accentColor)
-                .frame(width: 6, height: 6)
-                .opacity(reduceMotion ? 1 : (0.3 + 0.7 * pulse))
-        }
+        // Breathes in CoreAnimation (`PulsingDot`): a strip of busy tabs no
+        // longer wakes the main thread twelve times a second per tab.
+        PulsingDot(isAnimated: !reduceMotion, isPaused: controlActiveState != .key)
+            .frame(width: 6, height: 6)
     }
 }
 

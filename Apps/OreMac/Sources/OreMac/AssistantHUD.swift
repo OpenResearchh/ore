@@ -350,7 +350,7 @@ private struct AssistantHUDView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
 
-            WaveformBars(mode: waveform)
+            WaveformBars(mode: waveform, level: { controller.audioLevel })
                 .frame(width: 34, height: 20)
 
             StreamingTranscript(text: transcript, placeholder: placeholder)
@@ -426,7 +426,7 @@ private struct AssistantHUDView: View {
 
     private var waveform: WaveformBars.Mode {
         switch controller.phase {
-        case .listening, .answering: .listening(controller.audioLevel)
+        case .listening, .answering: .listening
         case .speaking: .speaking
         case .armed, .thinking: .thinking
         case .idle: isNarrating ? .speaking : .thinking
@@ -817,46 +817,24 @@ private struct InterruptHint: View {
 /// Shared with the new-workspace composer, which listens the same way the
 /// assistant pill does and should look like it.
 struct WaveformBars: View {
-    enum Mode: Equatable {
-        /// 0…1 microphone loudness.
-        case listening(Double)
-        case thinking
-        case speaking
-    }
+    /// Listening swings wide and scales with loudness; speaking is a steady
+    /// mid-tempo wave (there is no output meter to ride); thinking is one
+    /// slow, gentle swell — alive, but clearly not hearing.
+    typealias Mode = WaveformBarsView.Style
 
     var mode: Mode
+    /// Microphone loudness, 0…1. A closure read in this body rather than a
+    /// value the caller reads: otherwise the whole pill re-renders on every
+    /// mic tick just to hand the bars a number.
+    var level: (@MainActor () -> Double)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval)) { context in
-            let time = context.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 3) {
-                ForEach(0..<5, id: \.self) { index in
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: 3.5, height: height(bar: index, time: time))
-                }
-            }
-            .frame(height: 20, alignment: .center)
-        }
-    }
-
-    private func height(bar index: Int, time: TimeInterval) -> CGFloat {
-        switch mode {
-        case .listening(let level):
-            // Each bar rides its own phase of the same wave; loudness scales
-            // the whole figure so silence reads as a flat quiet line.
-            let wave = sin(time * 9 + Double(index) * 1.7) * 0.5 + 0.5
-            let energy = 0.15 + min(max(level, 0), 1) * 0.85
-            return 4 + CGFloat(wave * energy) * 16
-        case .speaking:
-            // No output meter to ride, so a steady mid-tempo wave stands in:
-            // busier than thinking, calmer than a voice hitting the mic.
-            let wave = sin(time * 6 + Double(index) * 1.3) * 0.5 + 0.5
-            return 4 + CGFloat(wave) * 11
-        case .thinking:
-            // One slow, gentle swell — alive, but clearly not hearing.
-            let swell = sin(time * 2.4 + Double(index) * 0.35) * 0.5 + 0.5
-            return 4 + CGFloat(swell) * 5
-        }
+        // The motion itself runs on the render server (`WaveformBarsView`).
+        WaveformBarsLayer(
+            style: mode,
+            level: mode == .listening ? (level?() ?? 0) : 0,
+            isAnimated: !reduceMotion
+        )
     }
 }

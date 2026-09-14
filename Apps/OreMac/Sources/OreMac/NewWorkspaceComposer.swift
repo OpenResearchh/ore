@@ -134,7 +134,7 @@ struct NewWorkspaceComposer: View {
         HStack(spacing: OreTheme.Space.sm) {
             micButton
             if voice.isActive {
-                WaveformBars(mode: .listening(voice.audioLevel))
+                WaveformBars(mode: .listening, level: { voice.audioLevel })
                     .frame(width: 30, height: 16)
                     .transition(.opacity)
             }

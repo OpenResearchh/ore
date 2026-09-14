@@ -51,13 +51,13 @@ struct NeedsYouPairingTests {
     @Test func anAnswerToAGatedQuestionGoesBackThroughThePermission() {
         let gate = NeedsYouPairing.gate(
             forToolCall: call,
-            pendingPermission: permission(toolCallID: call)
+            pendingPermissions: [permission(toolCallID: call)]
         )
         #expect(gate == PermissionRequestID(rawValue: "p1"))
     }
 
     @Test func anUngatedQuestionIsAnsweredAsAnOrdinaryMessage() {
-        #expect(NeedsYouPairing.gate(forToolCall: call, pendingPermission: nil) == nil)
+        #expect(NeedsYouPairing.gate(forToolCall: call, pendingPermissions: []) == nil)
     }
 
     /// A question and a permission can be open at once without being a pair —
@@ -65,7 +65,7 @@ struct NeedsYouPairingTests {
     @Test func aQuestionIsNotPairedWithWhateverElseHappensToBePending() {
         let gate = NeedsYouPairing.gate(
             forToolCall: call,
-            pendingPermission: permission(tool: "Bash", toolCallID: ToolCallID(rawValue: "call-2"))
+            pendingPermissions: [permission(tool: "Bash", toolCallID: ToolCallID(rawValue: "call-2"))]
         )
         #expect(gate == nil)
     }
@@ -76,7 +76,7 @@ struct NeedsYouPairingTests {
     @Test func anAnswerToOneQuestionNeverResolvesAnothersGate() {
         #expect(NeedsYouPairing.gate(
             forToolCall: ToolCallID(rawValue: "call-old"),
-            pendingPermission: permission(toolCallID: ToolCallID(rawValue: "call-new"))
+            pendingPermissions: [permission(toolCallID: ToolCallID(rawValue: "call-new"))]
         ) == nil)
     }
 
@@ -85,12 +85,12 @@ struct NeedsYouPairingTests {
     @Test func aGateWithoutAToolCallIDIsMatchedByName() {
         #expect(NeedsYouPairing.gate(
             forToolCall: call,
-            pendingPermission: permission()
+            pendingPermissions: [permission()]
         ) == PermissionRequestID(rawValue: "p1"))
 
         #expect(NeedsYouPairing.gate(
             forToolCall: call,
-            pendingPermission: permission(tool: "Bash")
+            pendingPermissions: [permission(tool: "Bash")]
         ) == nil)
     }
 

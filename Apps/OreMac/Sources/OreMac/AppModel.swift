@@ -1498,10 +1498,14 @@ final class AppModel {
     /// The Allow/Deny card currently on screen, if the generic buttons own it.
     /// AskUserQuestion and ExitPlanMode keep their dedicated cards instead.
     var actionablePermission: PermissionRequest? {
-        guard let chat = selectedChat, let permission = chat.pendingPermission else { return nil }
-        if permission.toolName == "AskUserQuestion" { return nil }
-        if permission.toolName == "ExitPlanMode", case .proposal = chat.plan { return nil }
-        return permission
+        guard let chat = selectedChat else { return nil }
+        // The same request the card shows: the oldest one the generic
+        // buttons own.
+        return chat.pendingPermissions.first { permission in
+            if permission.toolName == "AskUserQuestion" { return false }
+            if permission.toolName == "ExitPlanMode", case .proposal = chat.plan { return false }
+            return true
+        }
     }
 
     /// ⇧⌘A from the composer, which approves without the card being focused.
@@ -1557,7 +1561,7 @@ final class AppModel {
         }
         let gate = NeedsYouPairing.gate(
             forToolCall: question.toolCallID,
-            pendingPermission: state.pendingPermission
+            pendingPermissions: state.pendingPermissions
         )
         // Captured in ask order before the answer retires this one, so the
         // reply reads back in the order the agent asked.
@@ -4190,19 +4194,30 @@ final class AppModel {
             if case .permission(let item) = $0, item.chatID == chatID { return true }
             return false
         }
-        if let permissionID {
+        // Every ordinary request the tab has open, not only the one clicked:
+        // parallel tool calls ask at once, and a grant that answered one left
+        // the harness blocked on the rest. Question and plan gates keep their
+        // own cards — allowing those blindly would send back an empty answer.
+        let state = chat(for: chatID)
+        var allowed = state.pendingPermissions
+            .filter { $0.toolName != "AskUserQuestion" && $0.toolName != "ExitPlanMode" }
+            .map(\.id)
+        if let permissionID, !allowed.contains(permissionID) {
+            allowed.insert(permissionID, at: 0)
+        }
+        for id in allowed {
             // Authentication may take a moment; the user's click has already
-            // answered this prompt, so silence it and retire the local card
-            // before proving the standing grant.
-            voiceAssistant.permissionResolved(permissionID)
-            narration.cancelPermissionPrompt(permissionID)
-            chat(for: chatID).resolvePermission(permissionID)
+            // answered these prompts, so silence them and retire the local
+            // cards before proving the standing grant.
+            voiceAssistant.permissionResolved(id)
+            narration.cancelPermissionPrompt(id)
+            state.resolvePermission(id)
         }
         Task { @MainActor in
             let proven = await Self.authenticateStandingGrant()
-            if let permissionID {
+            for id in allowed {
                 await client.send(.resolveChatPermission(
-                    workspaceID, chatID, permissionID, .allow
+                    workspaceID, chatID, id, .allow
                 ))
             }
             if proven {

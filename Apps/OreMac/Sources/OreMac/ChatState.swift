@@ -52,7 +52,16 @@ final class ChatState {
     private(set) var hasRows = false
     private(set) var status: AgentStatus = .idle
     private(set) var usage: UsageReport?
-    private(set) var pendingPermission: PermissionRequest?
+    /// Every permission request still open, oldest first.
+    ///
+    /// A list, not a slot: parallel tool calls — two subagents each running
+    /// Bash — ask at once. A second request used to overwrite the first, so
+    /// answering the one on screen left the harness blocked on a prompt the
+    /// tab no longer showed, visible only in the HUD once ORE lost focus.
+    private(set) var pendingPermissions: [PermissionRequest] = []
+
+    /// The request the tab answers next: the oldest still open.
+    var pendingPermission: PermissionRequest? { pendingPermissions.first }
 
     /// Every question still waiting on the user, oldest first.
     ///
@@ -272,6 +281,11 @@ final class ChatState {
             if (newStatus == .idle || newStatus == .interrupted),
                case .proposal = plan {
                 status = .awaitingInput
+            } else if !pendingPermissions.isEmpty, newStatus != .interrupted {
+                // A sibling tool call or subagent still streams while one
+                // request waits; its activity must not bury the ask under
+                // "working".
+                status = .awaitingInput
             } else {
                 status = newStatus
             }
@@ -369,11 +383,15 @@ final class ChatState {
             }
 
         case .permissionRequest(let request):
-            pendingPermission = request
+            if let existing = pendingPermissions.firstIndex(where: { $0.id == request.id }) {
+                pendingPermissions[existing] = request
+            } else {
+                pendingPermissions.append(request)
+            }
             status = .awaitingInput
 
         case .permissionResolved(let resolution):
-            if pendingPermission?.id == resolution.id { pendingPermission = nil }
+            pendingPermissions.removeAll { $0.id == resolution.id }
             // The plan card is gated on the *same* permission request. Without
             // this it survived its own approval, so a second proposal left two
             // cards and answering either one left the other on screen forever.
@@ -413,6 +431,9 @@ final class ChatState {
             lastEventAt = nil
             runningToolLabel = nil
             hasTurnEventArrived = true
+            // The turn is over; nothing of its can still be waiting on an
+            // answer. The needs-you list drops these at the same moment.
+            pendingPermissions.removeAll { $0.turnID == result.turnID }
             // A proposal that arrived before we saw the Edit events still has
             // to drop: the turn already mutated the tree, so there is nothing
             // left to approve. Status was forced to `awaitingInput` by the
@@ -488,6 +509,9 @@ final class ChatState {
             // Background work belongs to the process that just exited; it will
             // not report finishing, so waiting on it would never end.
             setBackgroundTasks([])
+            // Nor can it take an answer: a card left up would be a button to
+            // a process that no longer exists.
+            pendingPermissions.removeAll()
 
         case .backgroundTasksChanged(let tasks):
             setBackgroundTasks(tasks)
@@ -739,7 +763,7 @@ final class ChatState {
     }
 
     func resolvePermission(_ id: PermissionRequestID) {
-        if pendingPermission?.id == id { pendingPermission = nil }
+        pendingPermissions.removeAll { $0.id == id }
         resolvePlan(requestID: id)
         resumeTurnAfterInput()
     }
@@ -854,7 +878,8 @@ final class ChatState {
     /// The permission/question card is gone; the turn is not. Show the
     /// composer as working until the harness's next real status arrives.
     private func resumeTurnAfterInput() {
-        guard isTurnActive, status == .awaitingInput else { return }
+        // Another request still open means the agent is still blocked.
+        guard isTurnActive, status == .awaitingInput, pendingPermissions.isEmpty else { return }
         status = .requesting
     }
 

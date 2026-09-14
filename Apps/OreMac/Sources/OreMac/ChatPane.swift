@@ -510,8 +510,11 @@ struct ChatPane: View {
             // showing the generic Allow/Deny alongside that card is two
             // prompts for the same decision. The dedicated card owns it, and
             // answering there also allows (or denies) this permission.
-            if let permission = chat.pendingPermission,
-               !hidesGenericPermission(permission, in: chat) {
+            // The oldest request the generic card owns. Parallel tool calls can
+            // have several open; answering one brings up the next.
+            if let permission = chat.pendingPermissions.first(where: {
+                !hidesGenericPermission($0, in: chat)
+            }) {
                 PermissionCard(request: permission) { decision in
                     model.resolvePermission(permission.id, decision: decision, for: workspace.id)
                 }

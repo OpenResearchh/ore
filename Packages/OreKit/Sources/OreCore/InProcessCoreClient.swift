@@ -32,6 +32,7 @@ public actor InProcessCoreClient: CoreClient {
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
     private var engineTasks: [WorkspaceID: [Task<Void, Never>]] = [:]
     private var gitClients: [String: GitClient] = [:]
+    private var backgroundPollingEnabled = true
     var harnessProbes: [HarnessProbeResult] = []
     var harnessUpdates: [HarnessUpdateStatus] = []
     private var lastHarnessUpdateCheck: Date?
@@ -1119,7 +1120,8 @@ public actor InProcessCoreClient: CoreClient {
             store: store,
             git: git,
             harnessRegistry: harnessRegistry,
-            allowAPIKeyFallback: allowAPIKeyFallback
+            allowAPIKeyFallback: allowAPIKeyFallback,
+            backgroundPollingEnabled: backgroundPollingEnabled
         )
         engines[record.workspaceID] = engine
 
@@ -1298,6 +1300,19 @@ public actor InProcessCoreClient: CoreClient {
             await engine.stop()
         }
         engineTasks.removeValue(forKey: id)?.forEach { $0.cancel() }
+    }
+
+    /// A GUI host can suspend periodic git work while hidden. Headless clients
+    /// retain polling by default; explicit actions and filesystem events are
+    /// independent of this setting.
+    public func setBackgroundPollingEnabled(_ enabled: Bool) async {
+        guard backgroundPollingEnabled != enabled else { return }
+        backgroundPollingEnabled = enabled
+        for engine in engines.values {
+            // A newer visibility change can arrive while an engine catches up.
+            guard backgroundPollingEnabled == enabled else { return }
+            await engine.setBackgroundPollingEnabled(enabled)
+        }
     }
 
     public func shutdown() async {

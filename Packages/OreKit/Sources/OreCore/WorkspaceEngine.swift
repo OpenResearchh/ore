@@ -34,6 +34,9 @@ public actor WorkspaceEngine {
     private var statusWatcher: StatusWatcher?
     private var statusTask: Task<Void, Never>?
     private var baseSyncTask: Task<Void, Never>?
+    private(set) var backgroundPollingEnabled: Bool
+    private var hasStarted = false
+    private var isStopped = false
     private var gitStatus: GitStatusSummary = GitStatusSummary()
     private var baseSync: BaseSyncStatus?
     private var chats: [ChatID: ChatRuntime] = [:]
@@ -101,7 +104,8 @@ public actor WorkspaceEngine {
         store: OreStore,
         git: GitClient,
         harnessRegistry: HarnessRegistry,
-        allowAPIKeyFallback: Bool = false
+        allowAPIKeyFallback: Bool = false,
+        backgroundPollingEnabled: Bool = true
     ) {
         self.workspaceID = record.workspaceID
         self.isAssistantWorkspace = record.workspaceKind == .assistant
@@ -111,6 +115,7 @@ public actor WorkspaceEngine {
         self.git = git
         self.harnessRegistry = harnessRegistry
         self.allowAPIKeyFallback = allowAPIKeyFallback
+        self.backgroundPollingEnabled = backgroundPollingEnabled
         self.worktreeURL = URL(fileURLWithPath: record.worktreePath)
         self.gitHub = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
         self.diffEngine = DiffEngine(git: git)
@@ -201,9 +206,20 @@ public actor WorkspaceEngine {
     // MARK: - Lifecycle
 
     public func start() async {
+        guard !isStopped else { return }
         _ = try? await loadChats()
         await startStatusWatching()
+        hasStarted = true
         startBaseSyncWatching()
+    }
+
+    public func setBackgroundPollingEnabled(_ enabled: Bool) async {
+        guard backgroundPollingEnabled != enabled else { return }
+        backgroundPollingEnabled = enabled
+        baseSyncTask?.cancel()
+        baseSyncTask = nil
+        if enabled, hasStarted { startBaseSyncWatching() }
+        await statusWatcher?.setBackgroundPollingEnabled(enabled)
     }
 
     /// Marks the workspace read. Notification hygiene is capped at one unread
@@ -224,12 +240,17 @@ public actor WorkspaceEngine {
     }
 
     public func stop() async {
+        isStopped = true
         statusTask?.cancel()
         baseSyncTask?.cancel()
+        baseSyncTask = nil
         await statusWatcher?.stop()
         for runtime in chats.values {
             runtime.sessionTask?.cancel()
             await runtime.session?.stop()
+            // Shutdown and archive cancel the event loop too, so no session
+            // boundary remains to persist the last coalesced revisions.
+            await runtime.transcript?.flush()
             runtime.session = nil
         }
         continuation.finish()
@@ -1970,8 +1991,11 @@ public actor WorkspaceEngine {
     // MARK: - Status watching
 
     private func startStatusWatching() async {
-        guard statusWatcher == nil else { return }
-        let watcher = StatusWatcher(git: git, worktreeURL: worktreeURL)
+        guard !isStopped, statusWatcher == nil else { return }
+        let watcher = StatusWatcher(
+            git: git, worktreeURL: worktreeURL,
+            backgroundPollingEnabled: backgroundPollingEnabled
+        )
         statusWatcher = watcher
 
         statusTask = Task { [weak self] in
@@ -2006,7 +2030,7 @@ public actor WorkspaceEngine {
     /// engine starts at once at launch. The fetch is not forced either, so
     /// sibling worktrees of one repository share a single fetch.
     private func startBaseSyncWatching() {
-        guard baseSyncTask == nil else { return }
+        guard backgroundPollingEnabled, !isStopped, baseSyncTask == nil else { return }
         baseSyncTask = Task { [weak self] in
             guard !Task.isCancelled else { return }
             await self?.refreshBaseSync(forceFetch: false, isLaunch: true)

@@ -146,6 +146,27 @@ struct AppStateMemoryTests {
 
     // MARK: - RefreshGate
 
+    @Test("An older diff finishing last cannot replace the newer generation")
+    func outOfOrderDiffs() {
+        let state = WorkspaceDiffState()
+        let newer = AppModel.DiffSnapshot(generation: 2, diffs: [], gitAction: .none, pullRequest: nil)
+        state.store(newer)
+        state.store(AppModel.DiffSnapshot(generation: 1, diffs: [], gitAction: .none, pullRequest: nil))
+        #expect(state.snapshot == newer)
+    }
+
+    @Test("Reopening an archived workspace does not adopt an old refresh")
+    func releasedDiffIdentity() {
+        let registry = WorkspaceDiffRegistry()
+        let id = WorkspaceID("ws-1")
+        let old = registry.state(for: id)
+        #expect(registry.contains(old, for: id))
+        registry.remove(id)
+        let reopened = registry.state(for: id)
+        #expect(!registry.contains(old, for: id))
+        #expect(registry.contains(reopened, for: id))
+    }
+
     @Test("Requests during a refresh collapse into one trailing run")
     func gateCollapses() {
         var gate = RefreshGate<String>()

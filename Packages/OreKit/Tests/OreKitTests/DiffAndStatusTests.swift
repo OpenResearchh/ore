@@ -408,6 +408,92 @@ struct DiffEngineTests {
 }
 
 struct StatusWatcherTests {
+    @Test func thePollRecoversLineChangesBeforeFilesystemEventsArrive() async throws {
+        let fixture = try await GitFixture.initialized()
+        let watcher = StatusWatcher(
+            git: fixture.git, worktreeURL: fixture.repository,
+            debounce: .seconds(30), pollInterval: .milliseconds(50)
+        )
+        var iterator = watcher.updates.makeAsyncIterator()
+        try fixture.write("README.md", "# repo\nfirst\n")
+        await watcher.start()
+        let first = try #require(await iterator.next())
+        #expect(first.files.first { $0.path == "README.md" }?.insertions == 1)
+
+        // Both states have identical porcelain: .M and the same index blob.
+        // Debouncing delays filesystem refreshes beyond the test's deadline,
+        // leaving the poll as the only way to discover the second line.
+        try fixture.write("README.md", "# repo\nfirst\nsecond\n")
+        let deadline = Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            await watcher.stop()
+        }
+        let second = await iterator.next()
+        deadline.cancel()
+        await watcher.stop()
+        #expect(second?.files.first { $0.path == "README.md" }?.insertions == 2)
+    }
+
+    @Test func aHiddenHostSuspendsThePoll() async throws {
+        let fixture = try await GitFixture.initialized()
+        let watcher = StatusWatcher(
+            git: fixture.git, worktreeURL: fixture.repository,
+            debounce: .seconds(30), pollInterval: .milliseconds(50),
+            backgroundPollingEnabled: false
+        )
+        var iterator = watcher.updates.makeAsyncIterator()
+        try fixture.write("README.md", "# repo\nfirst\n")
+        await watcher.start()
+        let first = try #require(await iterator.next())
+        #expect(first.files.first { $0.path == "README.md" }?.insertions == 1)
+
+        // Same porcelain, and the debounce holds filesystem refreshes back:
+        // only the poll could publish the second line, and it is suspended.
+        // Several poll intervals later the stream is closed still unpublished.
+        try fixture.write("README.md", "# repo\nfirst\nsecond\n")
+        let deadline = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            await watcher.stop()
+        }
+        let second = await iterator.next()
+        deadline.cancel()
+        #expect(second == nil)
+    }
+
+    @Test func showingTheHostCatchesUpAndResumesThePoll() async throws {
+        let fixture = try await GitFixture.initialized()
+        let watcher = StatusWatcher(
+            git: fixture.git, worktreeURL: fixture.repository,
+            debounce: .seconds(30), pollInterval: .milliseconds(50),
+            backgroundPollingEnabled: false
+        )
+        var iterator = watcher.updates.makeAsyncIterator()
+        try fixture.write("README.md", "# repo\nfirst\n")
+        await watcher.start()
+        _ = try #require(await iterator.next())
+
+        // Enabling reads once straight away, so a change made while hidden
+        // shows the moment the app does, not a poll interval later.
+        try fixture.write("README.md", "# repo\nfirst\nsecond\n")
+        await watcher.setBackgroundPollingEnabled(true)
+        let second = try #require(await iterator.next())
+        #expect(second.files.first { $0.path == "README.md" }?.insertions == 2)
+
+        // The debounce still holds filesystem refreshes, so the third line can
+        // only arrive through the resumed poll.
+        try fixture.write("README.md", "# repo\nfirst\nsecond\nthird\n")
+        let deadline = Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            await watcher.stop()
+        }
+        let third = await iterator.next()
+        deadline.cancel()
+        await watcher.stop()
+        #expect(third?.files.first { $0.path == "README.md" }?.insertions == 3)
+    }
+
     @Test func statusIsPublishedAndAnnotatedWithLineCounts() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

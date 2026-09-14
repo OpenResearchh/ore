@@ -185,9 +185,10 @@ struct ReviewPane: View {
         // Silent catch-up: the agent writing files should grow this list in
         // place, not flash a spinner over it. Debounced — the task restarts on
         // every generation, so a burst of writes lands as one diff read.
-        .task(id: model.gitGeneration(for: workspace.id)) {
+        .task(id: "\(model.gitGeneration(for: workspace.id))-\(model.isBackgroundPollingEnabled)") {
             try? await Task.sleep(for: ReviewRefreshPolicy.gitDebounce)
-            guard !Task.isCancelled, refreshKey != lastRefreshKey else { return }
+            guard !Task.isCancelled, model.isBackgroundPollingEnabled,
+                  refreshKey != lastRefreshKey else { return }
             await refresh()
         }
         // The full workspace walk only feeds "All files", so it runs only
@@ -195,8 +196,9 @@ struct ReviewPane: View {
         .task(id: FileTreeRefreshKey(
             workspaceID: workspace.id,
             generation: model.gitGeneration(for: workspace.id),
-            isVisible: tab == .allFiles
+            isVisible: tab == .allFiles && model.isBackgroundPollingEnabled
         )) {
+            guard model.isBackgroundPollingEnabled else { return }
             await refreshFileTree()
         }
         // Agent PostDiffComment writes a gitignored file, so status generation

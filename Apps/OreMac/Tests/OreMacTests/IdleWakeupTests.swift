@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import OreCore
 import OreProtocol
 import Testing
 
@@ -143,6 +144,40 @@ struct DreamEnvironmentChangeTests {
         ))
         #expect(DreamEnvironmentMonitor.shouldPush(
             key: key, lastKey: nil, lastPushedAt: .distantPast, now: base, force: false
+        ))
+    }
+
+    @Test func eligibleEnvironmentKeepsAdvancingTheSchedulerUntilARunStarts() {
+        let settings = settings()
+        let environment = DreamEnvironmentSnapshot(
+            secondsSinceInput: TimeInterval(settings.idleMinutes * 60 + 60), now: base
+        )
+        let key = DreamEnvironmentChangeKey(settings: settings, environment: environment)
+        let (watching, initialActions) = DreamScheduler.step(
+            state: .init(phase: .armed), settings: settings, environment: environment
+        )
+        #expect(watching.phase == .watching)
+        #expect(initialActions.isEmpty)
+
+        var nextEnvironment = environment
+        nextEnvironment.now = base.addingTimeInterval(DreamEnvironmentMonitor.tickInterval)
+        let nextKey = DreamEnvironmentChangeKey(settings: settings, environment: nextEnvironment)
+        #expect(nextKey == key)
+        let shouldAdvance = DreamEnvironmentMonitor.shouldPush(
+            key: nextKey, lastKey: key, lastPushedAt: base,
+            now: nextEnvironment.now, force: false, isDreaming: false
+        )
+        #expect(shouldAdvance)
+        if shouldAdvance {
+            let (dreaming, actions) = DreamScheduler.step(
+                state: watching, settings: settings, environment: nextEnvironment
+            )
+            #expect(dreaming.phase == .dreaming)
+            #expect(actions == [.startRun(manual: false)])
+        }
+        #expect(!DreamEnvironmentMonitor.shouldPush(
+            key: nextKey, lastKey: key, lastPushedAt: base,
+            now: nextEnvironment.now, force: false, isDreaming: true
         ))
     }
 }

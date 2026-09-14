@@ -138,6 +138,53 @@ struct CoreClientTests {
         await client.shutdown()
     }
 
+    @Test func hidingTheHostReachesEveryEngineAndTheOnesMadeMeanwhile() async throws {
+        let fixture = try await GitFixture.initialized()
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "first"
+        )))
+        guard case .workspaceAdded(let first)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no workspaceAdded event")
+            return
+        }
+        let firstEngine = try await client.engine(for: first.id)
+        #expect(await firstEngine.backgroundPollingEnabled)
+
+        await client.setBackgroundPollingEnabled(false)
+        #expect(await !firstEngine.backgroundPollingEnabled)
+
+        // An engine created while hidden must not start polling on its own.
+        let checkpoint = await recorder.checkpoint()
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "second"
+        )))
+        guard case .workspaceAdded(let second)? = await recorder.waitFor(
+            after: checkpoint,
+            matching: {
+                if case .workspaceAdded = $0 { return true }
+                return false
+            }
+        ) else {
+            Issue.record("no second workspaceAdded event")
+            return
+        }
+        let secondEngine = try await client.engine(for: second.id)
+        #expect(await !secondEngine.backgroundPollingEnabled)
+
+        await client.setBackgroundPollingEnabled(true)
+        #expect(await firstEngine.backgroundPollingEnabled)
+        #expect(await secondEngine.backgroundPollingEnabled)
+
+        await client.shutdown()
+    }
+
     @Test func oreTomlDrivesBranchPrefixAndCopiedFiles() async throws {
         // The config is checked in so a teammate gets the project's setup
         // without being told; that only works if the core actually reads it.

@@ -269,12 +269,19 @@ final class AppModel {
     static func running() -> AppModel? { shared }
 
     private var started = false
+    private(set) var isBackgroundPollingEnabled = true
 
     func start() {
         // Idempotent: called from app init (so intents and the menu bar work
         // before any window exists) and again from the window's task.
         guard !started else { return }
         started = true
+        updateBackgroundPolling()
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.updateBackgroundPolling() }
+            }
+        }
         AppModel.shared = self
         voiceAssistant.model = self
         // The pill follows tabNeedsYou + the voice phase from here on, so a
@@ -332,6 +339,18 @@ final class AppModel {
             Task { @MainActor in
                 self?.handleNotificationAction(info)
             }
+        }
+    }
+
+    private func updateBackgroundPolling() {
+        let enabled = !NSApp.isHidden
+        isBackgroundPollingEnabled = enabled
+        Task { [weak self] in
+            guard let self else { return }
+            await client.setBackgroundPollingEnabled(enabled)
+            guard enabled, isBackgroundPollingEnabled, let workspace = selectedWorkspace else { return }
+            prefetchDiff(for: workspace)
+            await refreshGitAction(for: workspace.id)
         }
     }
 
@@ -2844,11 +2863,15 @@ final class AppModel {
     /// on the slower of the two rather than their sum.
     @discardableResult
     func refreshDiff(for workspace: WorkspaceSummary) async throws -> DiffSnapshot {
+        // A write during either read belongs to the next refresh, not this
+        // one. Otherwise the trailing prefetch mistakes old data for current.
+        let generation = gitGeneration(for: workspace.id)
+        let state = diffCache.state(for: workspace.id)
         async let diffs = loadDiff(for: workspace.id)
         async let gitStatus = loadGitStatus(for: workspace.id)
         let status = try await gitStatus
         let snapshot = DiffSnapshot(
-            generation: gitGeneration(for: workspace.id),
+            generation: generation,
             diffs: try await diffs,
             gitAction: status.action,
             pullRequest: status.pullRequest
@@ -2860,12 +2883,11 @@ final class AppModel {
         // agent wrote anything — the "Changes 0 even though files are
         // modified" that only showed up sometimes. The newest generation wins,
         // and a stale caller is handed the newer snapshot rather than its own.
-        let state = diffCache.state(for: workspace.id)
-        if let cached = state.snapshot, cached.generation > snapshot.generation {
-            return cached
-        }
+        // Archive/removal may have released the cache during the reads. Do
+        // not recreate it (or fill a state still held by an outgoing pane).
+        guard diffCache.contains(state, for: workspace.id) else { return snapshot }
         state.store(snapshot)
-        return snapshot
+        return state.snapshot ?? snapshot
     }
 
     /// Recomputes just the suggested git action, leaving the cached diff alone.
@@ -2881,6 +2903,7 @@ final class AppModel {
     /// Cheap enough to call on turn boundaries and workspace switches: it is one
     /// `gh pr view` and a `git status`, and it never refetches the diff.
     func refreshGitAction(for workspaceID: WorkspaceID) async {
+        guard isBackgroundPollingEnabled else { return }
         guard let status = try? await loadGitStatus(for: workspaceID) else { return }
         guard var snapshot = cachedDiff(for: workspaceID) else { return }
         guard snapshot.gitAction != status.action
@@ -2912,6 +2935,7 @@ final class AppModel {
     /// does collapse into a single trailing read after a short debounce, so an
     /// agent writing files does not queue a `git diff` per write.
     func prefetchDiff(for workspace: WorkspaceSummary) {
+        guard isBackgroundPollingEnabled, !workspace.isArchived else { return }
         if cachedDiff(for: workspace.id)?.generation == gitGeneration(for: workspace.id) { return }
         guard diffPrefetches.request(workspace.id) else { return }
         Task(priority: .utility) { [weak self] in
@@ -2922,10 +2946,15 @@ final class AppModel {
     /// Only call after `diffPrefetches.request` returned true.
     private func runDiffPrefetch(for id: WorkspaceID) async {
         repeat {
+            guard isBackgroundPollingEnabled else {
+                diffPrefetches.cancel(id)
+                return
+            }
             let generation = gitGeneration(for: id)
             if cachedDiff(for: id)?.generation != generation,
                var stamped = workspaces.first(where: { $0.id == id })
-                ?? (assistantWorkspace?.id == id ? assistantWorkspace : nil) {
+                ?? (assistantWorkspace?.id == id ? assistantWorkspace : nil),
+               !stamped.isArchived {
                 stamped.gitStatus.generation = generation
                 _ = try? await refreshDiff(for: stamped)
             }
@@ -4718,6 +4747,7 @@ final class WorkspaceDiffState {
 
     /// Equal re-reads — the common case for a refresh — do not notify.
     func store(_ next: AppModel.DiffSnapshot?) {
+        if let next, let snapshot, snapshot.generation > next.generation { return }
         if snapshot != next { snapshot = next }
     }
 }
@@ -4731,6 +4761,10 @@ final class WorkspaceDiffRegistry {
         let created = WorkspaceDiffState()
         states[id] = created
         return created
+    }
+
+    func contains(_ state: WorkspaceDiffState, for id: WorkspaceID) -> Bool {
+        states[id] === state
     }
 
     /// Cleared before it is dropped, so a pane still showing it redraws.

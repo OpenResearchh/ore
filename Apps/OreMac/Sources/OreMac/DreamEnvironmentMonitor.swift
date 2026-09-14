@@ -52,6 +52,7 @@ struct DreamEnvironmentChangeKey: Equatable, Sendable {
     var isOnACPower: Bool
     var thermalPressure: Bool
     var isSleepImminent: Bool
+    var canStartRun: Bool
 
     init(settings: DreamSettings, environment: DreamEnvironmentSnapshot) {
         isEnabled = settings.enabled
@@ -64,6 +65,9 @@ struct DreamEnvironmentChangeKey: Equatable, Sendable {
         isOnACPower = environment.isOnACPower
         thermalPressure = environment.thermalPressure
         isSleepImminent = environment.isSleepImminent
+        canStartRun = isEnabled && isInQuietHours && isIdle
+            && (!settings.requireACPower || isOnACPower)
+            && !thermalPressure && !isSleepImminent
     }
 }
 
@@ -170,7 +174,8 @@ final class DreamEnvironmentMonitor {
             lastKey: lastPushedKey,
             lastPushedAt: lastPushedAt,
             now: environment.now,
-            force: force
+            force: force,
+            isDreaming: isDreaming
         ) {
             lastPushedKey = key
             lastPushedAt = environment.now
@@ -184,9 +189,16 @@ final class DreamEnvironmentMonitor {
         lastKey: DreamEnvironmentChangeKey?,
         lastPushedAt: Date,
         now: Date,
-        force: Bool
+        force: Bool,
+        isDreaming: Bool = false
     ) -> Bool {
         if force || key != lastKey { return true }
+        // The scheduler advances one phase per push: entering quiet hours
+        // can move armed -> watching without starting a run. Keep its normal
+        // cadence while eligible so watching -> dreaming is not postponed
+        // until the ten-minute backstop. An active run or an ineligible Mac
+        // can still skip unchanged snapshots.
+        if key.canStartRun, !isDreaming { return true }
         return now.timeIntervalSince(lastPushedAt) >= unchangedPushBackstop
     }
 

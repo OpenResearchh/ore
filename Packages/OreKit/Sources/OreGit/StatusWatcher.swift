@@ -26,6 +26,7 @@ public actor StatusWatcher {
     private let git: GitClient
     private let debounce: Duration
     private let pollInterval: Duration
+    private var backgroundPollingEnabled: Bool
 
     private var fileSystemWatcher: FileSystemWatcher?
     private var pollTask: Task<Void, Never>?
@@ -53,12 +54,14 @@ public actor StatusWatcher {
         git: GitClient,
         worktreeURL: URL,
         debounce: Duration = .milliseconds(300),
-        pollInterval: Duration = .seconds(60)
+        pollInterval: Duration = .seconds(60),
+        backgroundPollingEnabled: Bool = true
     ) {
         self.git = git
         self.worktreeURL = worktreeURL
         self.debounce = debounce
         self.pollInterval = pollInterval
+        self.backgroundPollingEnabled = backgroundPollingEnabled
 
         let (stream, continuation) = AsyncStream<GitStatusSnapshot>.makeStream(
             bufferingPolicy: .bufferingNewest(4)
@@ -74,6 +77,7 @@ public actor StatusWatcher {
         // a commit changes the status without touching a single tracked file.
         let head = try? await git.gitPath("HEAD", in: worktreeURL)
         let index = try? await git.gitPath("index", in: worktreeURL)
+        guard !isStopped else { return }
         gitStateFiles = [index, head].compactMap { $0 }
         let paths = Set([
             worktreeURL.path,
@@ -94,15 +98,34 @@ public actor StatusWatcher {
         watcher.start()
         fileSystemWatcher = watcher
 
+        startPolling()
+        await refreshNow()
+    }
+
+    /// Visibility only controls the periodic backstop. Filesystem events and
+    /// explicit refreshes remain available while the host app is hidden.
+    public func setBackgroundPollingEnabled(_ enabled: Bool) async {
+        guard backgroundPollingEnabled != enabled else { return }
+        backgroundPollingEnabled = enabled
+        pollTask?.cancel()
+        pollTask = nil
+        guard enabled, !isStopped, fileSystemWatcher != nil else { return }
+        startPolling()
+        await refreshNow()
+    }
+
+    private func startPolling() {
+        guard backgroundPollingEnabled, !isStopped, pollTask == nil else { return }
         pollTask = Task { [weak self, pollInterval] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: pollInterval)
                 guard !Task.isCancelled else { return }
-                await self?.refresh(countLines: false)
+                // This is the backstop for missed filesystem events. Working
+                // contents can change while porcelain stays identical, so a
+                // poll must also recover their latest line counts.
+                await self?.refreshNow()
             }
         }
-
-        await refreshNow()
     }
 
     public func stop() {
@@ -110,6 +133,7 @@ public actor StatusWatcher {
         fileSystemWatcher?.stop()
         fileSystemWatcher = nil
         pollTask?.cancel()
+        pollTask = nil
         refreshTask?.cancel()
         continuation.finish()
     }
@@ -126,9 +150,9 @@ public actor StatusWatcher {
     /// Porcelain v2 already encodes HEAD, upstream divergence and the index
     /// blob of every changed file, so an unchanged output means only working
     /// file contents can differ — and those change only when a working file is
-    /// written, which is when callers pass `countLines`. The backstop poll and
-    /// `.git`-only events skip the two `git diff --numstat` runs a dirty tree
-    /// would otherwise cost on every reading.
+    /// written, which is when callers pass `countLines`. Metadata-only events
+    /// skip the two `git diff --numstat` runs a dirty tree would otherwise cost
+    /// on every reading; the slow poll recounts in case file events were lost.
     private func refresh(countLines: Bool) async {
         guard !isStopped else { return }
         generation += 1

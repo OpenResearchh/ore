@@ -443,7 +443,7 @@ struct AssistantActivityView: View {
     private func placeLabel(_ item: TabNeedsYou) -> String {
         item.placeLabel(
             workspace: model.workspaces.first { $0.id == item.workspaceID }?.name,
-            tab: model.chatSummaries.first { $0.id == item.chatID }?.title
+            tab: model.chatIndex.summary(for: item.chatID)?.title
         )
     }
 
@@ -712,7 +712,7 @@ private struct AssistantAuditView: View {
     }
 
     private func tabGrantLabel(_ chatID: ChatID) -> String {
-        if let chat = model.chatSummaries.first(where: { $0.id == chatID }) {
+        if let chat = model.chatIndex.summary(for: chatID) {
             return "Auto-allow “\(chat.title)”"
         }
         return "Auto-allow a tab"

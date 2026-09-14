@@ -4268,12 +4268,17 @@ final class AppModel {
     /// back: a closed chat can be reopened, so drafts, scheduled continuations
     /// and its narration toggle stay, and `chat(for:)` reloads the transcript.
     private func release(_ chatID: ChatID) {
-        // Narration's per-chat buffers are its own to drop; `narration.forget`
-        // also turns the tab's speaker off, which a reopened tab should keep.
+        // `narration.release` frees the chat's buffers but, unlike `forget`,
+        // keeps the tab's speaker on, which a reopened tab should keep.
+        narration.release(chatID)
         chatOwners.removeValue(forKey: chatID)
         coalescers.removeValue(forKey: chatID)
         lastBackgroundFlush.removeValue(forKey: chatID)
-        if chatStates[chatID] != nil { chatStates.removeValue(forKey: chatID) }
+        if let state = chatStates[chatID] {
+            // Rendered rows are cached by turn; a reopened chat re-renders.
+            TranscriptCell.dropRenderCache(turnIDs: state.rows.map(\.turnID))
+            chatStates.removeValue(forKey: chatID)
+        }
         dismissedCommentKeys.removeValue(forKey: chatID)
         // A closed tab can no longer be answered, so its asks leave the HUD.
         removeNeedsYou { $0.chatID == chatID }

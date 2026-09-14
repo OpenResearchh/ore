@@ -1023,6 +1023,10 @@ public actor InProcessCoreClient: CoreClient {
     func push(_ id: WorkspaceID) async throws {
         let (record, git, worktree) = try await workspaceAndGit(id)
         try await git.runSerialized(["push", "-u", "origin", record.branch], in: worktree)
+        // A push moves the PR's checks without going through `gh`, so the
+        // remembered PR (and its check status) is stale now.
+        await GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
+            .forgetCachedPullRequests()
         try await resync(id)
     }
 

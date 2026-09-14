@@ -23,8 +23,8 @@ struct AppStateMemoryTests {
         isClosed: Bool = false
     ) -> ChatSummary {
         ChatSummary(
-            id: ChatID(id),
-            workspaceID: WorkspaceID(workspace),
+            id: ChatID(rawValue: id),
+            workspaceID: WorkspaceID(rawValue: workspace),
             title: title,
             harness: .claudeCode,
             isClosed: isClosed,
@@ -149,25 +149,35 @@ struct AppStateMemoryTests {
     @Test("Requests during a refresh collapse into one trailing run")
     func gateCollapses() {
         var gate = RefreshGate<String>()
-        #expect(gate.request("ws"))
-        #expect(!gate.request("ws"))
-        #expect(!gate.request("ws"))
-        #expect(gate.finish("ws"), "one trailing run for the requests that arrived")
+        let request1 = gate.request("ws")
+        #expect(request1)
+        let request2 = gate.request("ws")
+        #expect(!request2)
+        let request3 = gate.request("ws")
+        #expect(!request3)
+        let finish4 = gate.finish("ws")
+        #expect(finish4, "one trailing run for the requests that arrived")
         #expect(gate.isInFlight("ws"))
-        #expect(!gate.finish("ws"), "nothing arrived during the trailing run")
+        let finish5 = gate.finish("ws")
+        #expect(!finish5, "nothing arrived during the trailing run")
         #expect(!gate.isInFlight("ws"))
-        #expect(gate.request("ws"))
+        let request6 = gate.request("ws")
+        #expect(request6)
     }
 
     @Test("Keys are independent, and cancelling clears both flags")
     func gateKeys() {
         var gate = RefreshGate<String>()
-        #expect(gate.request("a"))
-        #expect(gate.request("b"))
-        #expect(!gate.request("a"))
+        let request7 = gate.request("a")
+        #expect(request7)
+        let request8 = gate.request("b")
+        #expect(request8)
+        let request9 = gate.request("a")
+        #expect(!request9)
         gate.cancel("a")
         #expect(!gate.isInFlight("a"))
-        #expect(gate.request("a"))
+        let request10 = gate.request("a")
+        #expect(request10)
         #expect(gate.isInFlight("b"))
     }
 

@@ -395,7 +395,7 @@ private struct AssistantHUDView: View {
     /// The tab whose narration is playing, by the name its tab shows.
     private var narratingPlace: String? {
         guard let model, let id = model.narration.speakingChatID else { return nil }
-        return model.chatSummaries.first { $0.id == id }?.title
+        return model.chatIndex.summary(for: id)?.title
     }
 
     /// A tab or the fleet is speaking while the assistant itself is idle.

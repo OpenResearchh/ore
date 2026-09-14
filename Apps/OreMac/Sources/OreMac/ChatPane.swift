@@ -5031,7 +5031,9 @@ struct TranscriptHost: View, Equatable {
             // when the reader scrolls away.
             scrollAnchor: scrollAnchor,
             bottomInset: bottomInset,
-            topInset: topInset
+            topInset: topInset,
+            // Read after `displayRows` above, which is what bumps it.
+            structureToken: memo.structureToken
         )
         // An NSViewRepresentable keeps its coordinator when only its inputs
         // change. Without an explicit conversation identity, switching tabs
@@ -5059,7 +5061,8 @@ struct TranscriptHost: View, Equatable {
                 if case .proposal = chat.plan { return chat.planTurnID }
                 return nil
             }(),
-            revision: chat.rowsRevision
+            revision: chat.rowsRevision,
+            structuralRevision: chat.structuralRevision
         )
     }
 }

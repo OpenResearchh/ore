@@ -264,6 +264,13 @@ final class NarrationEngine {
         planReadiness.reset(scope: chatID.rawValue)
     }
 
+    /// A closed tab: frees its per-chat buffers without touching its speaker
+    /// toggle, so a reopened tab still narrates if it did before.
+    func release(_ chatID: ChatID) {
+        dropState(for: chatID)
+        planReadiness.reset(scope: chatID.rawValue)
+    }
+
     func activeChatChanged(_ chatID: ChatID?) {
         guard activeChatID != chatID else { return }
         // No back-fill of what was missed: narration describes now, and the

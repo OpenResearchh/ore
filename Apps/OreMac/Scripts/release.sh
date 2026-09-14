@@ -2,10 +2,10 @@
 # Builds a signed, notarized, stapled ORE.app and packages it for release.
 #
 #   ./Scripts/release.sh 0.2.0
-#       → .build/ORE-<version>.zip   (stapled)
-#       → .build/ORE-<version>.dmg   (stapled)
-#       → .build/SHA256SUMS
-#       → .build/RELEASE
+#       → .build/dist/ORE-<version>.zip   (stapled)
+#       → .build/dist/ORE-<version>.dmg   (stapled)
+#       → .build/dist/SHA256SUMS
+#       → .build/dist/RELEASE
 #
 # Same three artifacts, same names, same packaging code as the ad-hoc route —
 # see make-artifacts.sh. The only difference is the signature and the trip to
@@ -73,7 +73,7 @@ spctl --assess --type execute --verbose=2 "$APP"
 echo "==> Packaging"
 "$ROOT/Scripts/make-artifacts.sh" release --no-build
 
-ARCHIVE="$BUILD/ORE-$VERSION.zip"
+ARCHIVE="$BUILD/dist/ORE-$VERSION.zip"
 
 if [[ -n "${ORE_SPARKLE_KEY:-}" ]]; then
   echo "==> Signing the appcast entry"

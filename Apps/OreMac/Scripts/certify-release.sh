@@ -95,10 +95,11 @@ else
   "$MAC/Scripts/make-artifacts.sh" release
 fi
 
-DMG="$MAC/.build/ORE-$VERSION.dmg"
-ZIP="$MAC/.build/ORE-$VERSION.zip"
-SUMS="$MAC/.build/SHA256SUMS"
-MANIFEST="$MAC/.build/RELEASE"
+DIST="$MAC/.build/dist"
+DMG="$DIST/ORE-$VERSION.dmg"
+ZIP="$DIST/ORE-$VERSION.zip"
+SUMS="$DIST/SHA256SUMS"
+MANIFEST="$DIST/RELEASE"
 for artifact in "$DMG" "$ZIP" "$SUMS" "$MANIFEST"; do
   if [[ ! -f "$artifact" ]]; then
     echo "error: expected $artifact" >&2

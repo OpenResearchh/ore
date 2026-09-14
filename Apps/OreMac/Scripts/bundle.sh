@@ -148,35 +148,37 @@ fi
 # write after the signature — a resource, an rpath, an Info.plist key — breaks
 # the seal, and the failure surfaces on the user's Mac as "damaged and can't
 # be opened", not here.
+#
+# The hardened runtime is required for notarization, and a timestamp is what
+# keeps the signature valid after the certificate expires. Neither is possible
+# ad-hoc, so the flags are chosen per invocation rather than held in an array:
+# /bin/bash here is 3.2, where expanding an empty array under `set -u` is an
+# unbound-variable error and would abort the release build.
 sign() {
   local target="$1"
   shift
-  codesign --force --sign "$IDENTITY" "$@" "$target"
+  if [[ "$IDENTITY" == "-" ]]; then
+    codesign --force --sign "$IDENTITY" "$@" "$target"
+  else
+    codesign --force --sign "$IDENTITY" --options runtime --timestamp "$@" "$target"
+  fi
 }
-
-SIGN_OPTIONS=()
-# The hardened runtime is required for notarization, and a timestamp is what
-# keeps the signature valid after the certificate expires. Neither is possible
-# ad-hoc.
-if [[ "$IDENTITY" != "-" ]]; then
-  SIGN_OPTIONS=(--options runtime --timestamp)
-fi
 
 signing_failed=0
 {
   # Inside out: nested code signs first, the outermost bundle last.
   if [[ -d "$APP/Contents/Frameworks" ]]; then
     while IFS= read -r -d '' nested; do
-      sign "$nested" "${SIGN_OPTIONS[@]}"
+      sign "$nested"
     done < <(find "$APP/Contents/Frameworks" \
       \( -name '*.xpc' -o -name 'Autoupdate' -o -name 'Updater.app' \) -print0)
     for framework in "$APP/Contents/Frameworks"/*.framework; do
       [[ -d "$framework" ]] || continue
-      sign "$framework" "${SIGN_OPTIONS[@]}"
+      sign "$framework"
     done
   fi
-  sign "$APP/Contents/MacOS/ore-cli" "${SIGN_OPTIONS[@]}"
-  sign "$APP" "${SIGN_OPTIONS[@]}" --entitlements "$ROOT/Resources/ORE.entitlements"
+  sign "$APP/Contents/MacOS/ore-cli"
+  sign "$APP" --entitlements "$ROOT/Resources/ORE.entitlements"
   codesign --verify --deep --strict --verbose=2 "$APP"
 } || signing_failed=1
 

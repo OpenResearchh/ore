@@ -103,7 +103,7 @@ jobs:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -eu
-          cd .build
+          cd .build/dist
           for file in "ORE-$VERSION.zip" "ORE-$VERSION.dmg" SHA256SUMS RELEASE; do
             [ -f "$file" ] || { echo "::error::missing $file"; exit 1; }
           done
@@ -133,9 +133,9 @@ jobs:
           # The checksum file too: the README tells people to verify what they
           # downloaded against it, so it has to be covered by the same claim.
           subject-path: |
-            Apps/OreMac/.build/ORE-${{ steps.bump.outputs.version }}.zip
-            Apps/OreMac/.build/ORE-${{ steps.bump.outputs.version }}.dmg
-            Apps/OreMac/.build/SHA256SUMS
+            Apps/OreMac/.build/dist/ORE-${{ steps.bump.outputs.version }}.zip
+            Apps/OreMac/.build/dist/ORE-${{ steps.bump.outputs.version }}.dmg
+            Apps/OreMac/.build/dist/SHA256SUMS
 
       # Published as a draft first, so a failed download check never leaves a
       # half-usable release visible to users.
@@ -145,10 +145,10 @@ jobs:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           gh release create "v$VERSION" \
-            "Apps/OreMac/.build/ORE-$VERSION.zip" \
-            "Apps/OreMac/.build/ORE-$VERSION.dmg" \
-            "Apps/OreMac/.build/SHA256SUMS" \
-            "Apps/OreMac/.build/RELEASE" \
+            "Apps/OreMac/.build/dist/ORE-$VERSION.zip" \
+            "Apps/OreMac/.build/dist/ORE-$VERSION.dmg" \
+            "Apps/OreMac/.build/dist/SHA256SUMS" \
+            "Apps/OreMac/.build/dist/RELEASE" \
             --title "ORE v$VERSION" \
             --generate-notes \
             --notes-start-tag "$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo '')" \

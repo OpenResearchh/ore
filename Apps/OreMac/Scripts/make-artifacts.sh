@@ -2,10 +2,15 @@
 # Packages every release artifact from one ORE.app.
 #
 #   ./Scripts/make-artifacts.sh [debug|release] [--no-build]
-#       → .build/ORE-<version>.zip
-#       → .build/ORE-<version>.dmg
-#       → .build/SHA256SUMS
-#       → .build/RELEASE
+#       → .build/dist/ORE-<version>.zip
+#       → .build/dist/ORE-<version>.dmg
+#       → .build/dist/SHA256SUMS
+#       → .build/dist/RELEASE
+#
+# The subdirectory is not cosmetic. SwiftPM owns `.build/release`, and macOS
+# filesystems are case-insensitive by default, so a `RELEASE` manifest written
+# beside it resolves to that directory: the redirection fails and the release
+# goes out missing the one asset install.sh cannot proceed without.
 #
 # Three artifacts, one build. make-dmg.sh calls bundle.sh itself, so producing
 # a zip alongside it used to mean compiling the app twice and shipping two
@@ -35,7 +40,7 @@ for argument in "$@"; do
 done
 
 APP="$ROOT/.build/ORE.app"
-OUT="$ROOT/.build"
+OUT="$ROOT/.build/dist"
 
 if [[ "$BUILD" -eq 1 ]]; then
   "$ROOT/Scripts/bundle.sh" "$CONFIGURATION"
@@ -52,6 +57,8 @@ echo "==> Verifying the bundle"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo "0.1.0")"
+
+mkdir -p "$OUT"
 
 ZIP="$OUT/ORE-$VERSION.zip"
 DMG="$OUT/ORE-$VERSION.dmg"
@@ -98,6 +105,16 @@ echo "==> Manifest"
   echo "dmg=ORE-$VERSION.dmg"
   echo "sums=SHA256SUMS"
 } > "$MANIFEST"
+
+# Say it only if it is true. A failed redirection above does not stop bash from
+# reaching this point, and a release that reports four files while shipping
+# three fails on the user's machine instead of on ours.
+for artifact in "$ZIP" "$DMG" "$SUMS" "$MANIFEST"; do
+  if [[ ! -f "$artifact" ]]; then
+    echo "error: $artifact was not written" >&2
+    exit 1
+  fi
+done
 
 echo
 echo "Wrote:"

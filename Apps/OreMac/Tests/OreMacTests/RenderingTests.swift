@@ -723,6 +723,97 @@ struct TranscriptAppearanceTests {
         #expect(footerHeight >= processHeight + 6)
     }
 
+    @Test func activityGroupChevronSitsOnTheTextBaseline() {
+        // The collapsed summary used to park every SF Symbol in a 12×12 box at
+        // y = -2, so the chevron floated off the caption line.
+        let thinking = TranscriptRow(
+            id: "th",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .thinking,
+            text: "Reasoning"
+        )
+        let tool = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Read",
+            toolName: "Read"
+        )
+        let group = TranscriptRow(
+            id: "activity-t1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "2 steps",
+            groupedRows: [thinking, tool]
+        )
+        let rendered = TranscriptCell.attributedText(for: group)
+        #expect(rendered.string.contains("2 steps"))
+        #expect(!rendered.string.contains("tool call"))
+
+        let font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        var attachments: [NSTextAttachment] = []
+        rendered.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            if let attachment = value as? NSTextAttachment {
+                attachments.append(attachment)
+            }
+        }
+        #expect(attachments.count == 1)
+        for attachment in attachments {
+            let expectedY = (font.capHeight - attachment.bounds.height) / 2
+            #expect(abs(attachment.bounds.origin.y - expectedY) < 0.05)
+        }
+    }
+
+    @Test func activityGroupCallsOutIssuesInRed() {
+        var failed = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Bash",
+            toolName: "Bash"
+        )
+        failed.isError = true
+        let group = TranscriptRow(
+            id: "activity-t1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "1 step",
+            groupedRows: [failed]
+        )
+        let rendered = TranscriptCell.attributedText(for: group)
+        #expect(rendered.string.contains("1 issue"))
+        var issueColor: NSColor?
+        let range = (rendered.string as NSString).range(of: "1 issue")
+        #expect(range.location != NSNotFound)
+        if range.location != NSNotFound {
+            issueColor = rendered.attribute(
+                .foregroundColor, at: range.location, effectiveRange: nil
+            ) as? NSColor
+        }
+        #expect(issueColor == NSColor.systemRed)
+    }
+
+    @Test func turnFooterOmitsElapsedTime() {
+        let start = Date(timeIntervalSince1970: 0)
+        var edit = editRow()
+        edit.createdAt = start
+        var later = edit
+        later.createdAt = start.addingTimeInterval(90)
+        let footer = TranscriptRow(
+            id: "footer",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [edit, later]
+        )
+        let rendered = TranscriptCell.attributedText(for: footer)
+        #expect(!rendered.string.contains("1m 30s"))
+        #expect(!rendered.string.contains("90s"))
+    }
+
     /// The PNG bytes of the row's first inline image — the file chip.
     private func chipPixels(in text: NSAttributedString) -> Data? {
         guard let found = chipImage(in: text), let tiff = found.tiffRepresentation else { return nil }

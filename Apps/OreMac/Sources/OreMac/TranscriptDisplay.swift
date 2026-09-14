@@ -272,16 +272,12 @@ enum TranscriptDisplay {
     }
 
     static func activitySummary(for rows: [TranscriptRow]) -> String {
-        let tools = rows.filter { $0.kind == .toolCall }.count
-        let thoughts = rows.filter { $0.kind == .thinking }.count
-        let notes = rows.filter { $0.kind == .assistantText }.count
-        let errors = rows.filter { $0.kind == .error || $0.isError }.count
-        var parts: [String] = []
-        if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
-        if thoughts > 0 { parts.append("\(thoughts) thought\(thoughts == 1 ? "" : "s")") }
-        if notes > 0 { parts.append("\(notes) note\(notes == 1 ? "" : "s")") }
-        if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
-        return parts.isEmpty ? "Activity" : parts.joined(separator: ", ")
+        // One count for the fold — not tool calls vs thoughts vs notes, which
+        // is harness jargon. Issues are drawn separately on the row so they
+        // don't hide in a comma list.
+        let steps = rows.count
+        guard steps > 0 else { return "Activity" }
+        return "\(steps) step\(steps == 1 ? "" : "s")"
     }
 
     // MARK: - Source prep

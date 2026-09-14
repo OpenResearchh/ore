@@ -229,7 +229,8 @@ struct TranscriptView: NSViewRepresentable {
         private var collapsedResponses: Set<String> = []
         private var didSeedCollapsedResponses = false
         /// The rows carrying the "Claude · 2:41 PM" turn header: the first
-        /// top-level prose row of each turn.
+        /// top-level agent row of each turn — the activity fold when there is
+        /// one, otherwise the first prose.
         private var agentHeaderRowIDs: Set<String> = []
         /// Height per row id. Measuring a row means laying out its text, which
         /// is the single most expensive thing this view does, so it happens
@@ -605,7 +606,8 @@ struct TranscriptView: NSViewRepresentable {
             var ids = Set<String>()
             var seenTurns = Set<TurnID>()
             for row in rows where row.parentToolCallID == nil {
-                guard row.kind == .assistantText || row.kind == .plan else { continue }
+                guard row.kind == .activityGroup || row.kind == .assistantText || row.kind == .plan
+                else { continue }
                 if seenTurns.insert(row.turnID).inserted { ids.insert(row.id) }
             }
             guard ids != agentHeaderRowIDs else { return [] }
@@ -1237,6 +1239,7 @@ final class TranscriptCell: NSTableCellView {
     private var trailingConstraint: NSLayoutConstraint!
     private var bubbleTopConstraint: NSLayoutConstraint!
     private var bubbleBottomConstraint: NSLayoutConstraint!
+    private var badgeTopConstraint: NSLayoutConstraint!
     private var preferredWidthConstraint: NSLayoutConstraint!
     private var userWidthConstraint: NSLayoutConstraint!
     private var labelBottomConstraint: NSLayoutConstraint!
@@ -1343,6 +1346,7 @@ final class TranscriptCell: NSTableCellView {
         bubble.addSubview(responseToggle)
 
         badgeHeightZero = badge.heightAnchor.constraint(equalToConstant: 0)
+        badgeTopConstraint = badge.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 6)
         labelTrailingConstraint = label.trailingAnchor.constraint(
             equalTo: bubble.trailingAnchor, constant: -10
         )
@@ -1403,7 +1407,7 @@ final class TranscriptCell: NSTableCellView {
             bubbleBottomConstraint,
 
             badge.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
-            badge.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 6),
+            badgeTopConstraint,
 
             label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 10),
             labelTrailingConstraint,
@@ -1461,14 +1465,17 @@ final class TranscriptCell: NSTableCellView {
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
 
-        // The turn header borrows the badge line: "Claude · 2:41 PM" above the
-        // turn's first prose row. A real badge (QUEUED, PLAN) still wins — it
-        // carries state the header doesn't.
+        // The turn header borrows the badge line: "Claude · 2:41 PM" on the
+        // first agent row of the turn. A real badge (QUEUED, PLAN) still wins —
+        // it carries state the header doesn't.
         let ownBadge = Self.badgeText(for: row)
         let badgeString = ownBadge.isEmpty ? (turnHeader ?? "") : ownBadge
         badge.stringValue = badgeString
         badge.isHidden = badgeString.isEmpty
         badgeHeightZero.isActive = badgeString.isEmpty
+        // The agent name/time line, not a state badge like PLAN or QUEUED.
+        let isAgentHeader = ownBadge.isEmpty && !badgeString.isEmpty
+            && (row.kind == .activityGroup || row.kind == .assistantText || row.kind == .plan)
         responseToggleAction = onToggleResponse
         applyResponseCollapse(responseCollapse)
 
@@ -1481,6 +1488,11 @@ final class TranscriptCell: NSTableCellView {
         let inset = Self.verticalInset(for: row)
         bubbleTopConstraint.constant = inset
         bubbleBottomConstraint.constant = -inset
+        // Activity is a caption, not a prose card — even when it carries the
+        // turn header above the summary.
+        let compactActivity = row.kind == .activityGroup
+        badgeTopConstraint.constant = (compactActivity || isAgentHeader) ? 2 : 6
+        labelBottomConstraint.constant = compactActivity ? -2 : -8
 
         let indent = row.parentToolCallID != nil ? Self.subagentIndent : 0
         leadingConstraint.constant = indent
@@ -1802,10 +1814,13 @@ final class TranscriptCell: NSTableCellView {
         // keeps those two numbers identical.
         let textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
         let toggleBand: CGFloat = responseCollapse == .none ? 0 : responseToggleBand
-        let hasBadgeLine = !badgeText(for: row).isEmpty
-            || !(turnHeader ?? "").isEmpty
+        let ownBadge = badgeText(for: row)
+        let hasBadgeLine = !ownBadge.isEmpty || !(turnHeader ?? "").isEmpty
+        let isAgentHeader = ownBadge.isEmpty && !(turnHeader ?? "").isEmpty
+            && (row.kind == .assistantText || row.kind == .plan)
         let badgeLine: CGFloat = hasBadgeLine ? 14 : 0
-        return ceil(textHeight) + 16 + verticalInset(for: row) * 2 + badgeLine + toggleBand
+        let inner = innerPadding(for: row, isAgentHeader: isAgentHeader)
+        return ceil(textHeight) + inner + verticalInset(for: row) * 2 + badgeLine + toggleBand
     }
 
     /// Placeholder used only before the table has a real width. Kind-specific
@@ -1814,7 +1829,7 @@ final class TranscriptCell: NSTableCellView {
     static func estimatedHeight(for row: TranscriptRow) -> CGFloat {
         switch row.kind {
         case .assistantText, .plan: return 72
-        case .userMessage: return 44
+        case .userMessage: return 52
         case .turnFooter: return 28
         case .divider: return 38
         case .toolCall, .thinking, .activityGroup, .error: return 28
@@ -1823,13 +1838,28 @@ final class TranscriptCell: NSTableCellView {
 
     /// Process rows — tool calls, thinking, the collapsed activity group — sit
     /// closer together than prose so a run of them reads as one quiet block
-    /// rather than a widely-spaced list competing with the answer.
+    /// rather than a widely-spaced list competing with the answer. Extra air
+    /// on the user's bubble separates turns without a card around the agent.
     private static func verticalInset(for row: TranscriptRow) -> CGFloat {
         switch row.kind {
-        case .toolCall, .thinking, .activityGroup, .error: return 4
-        case .turnFooter, .divider: return 4
-        default: return verticalInset
+        case .activityGroup: return 2
+        case .userMessage: return 12
+        case .toolCall, .thinking, .error, .turnFooter, .divider, .assistantText, .plan:
+            return 4
         }
+    }
+
+    /// Bubble padding above and below the label. Matches the constraints
+    /// `configure` applies so measured height equals what is drawn.
+    private static func innerPadding(
+        for row: TranscriptRow,
+        isAgentHeader: Bool
+    ) -> CGFloat {
+        if row.kind == .activityGroup { return 6 }
+        // Agent header uses a 2pt badge top + 2pt label gap (4) and the usual
+        // 8pt under the label, instead of the 8+8 prose card padding.
+        if isAgentHeader { return 12 }
+        return 16
     }
 
     /// The row's rendered content.
@@ -2488,93 +2518,108 @@ final class TranscriptCell: NSTableCellView {
     }
 
     private static func activityGroupText(for row: TranscriptRow) -> NSAttributedString {
+        let font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
         let secondary: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+            .font: font,
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
         let result = NSMutableAttributedString()
-        result.append(NSAttributedString(
-            string: row.isExpanded ? "⌄  " : "›  ",
-            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.tertiaryLabelColor]
-        ))
+        if let chevron = inlineSymbol(
+            row.isExpanded ? "chevron.down" : "chevron.right",
+            pointSize: 9,
+            weight: .semibold,
+            color: .tertiaryLabelColor,
+            font: font
+        ) {
+            result.append(NSAttributedString(attachment: chevron))
+            result.append(NSAttributedString(string: "  ", attributes: secondary))
+        } else {
+            result.append(NSAttributedString(
+                string: row.isExpanded ? "⌄  " : "›  ",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ]
+            ))
+        }
         result.append(NSAttributedString(string: row.text, attributes: secondary))
 
         // How long the turn's activity took, from its first to last event.
+        // Elapsed time lives here once — the footer used to repeat it.
         if let first = row.groupedRows.first?.createdAt,
            let last = row.groupedRows.last?.createdAt,
            last.timeIntervalSince(first) >= 1 {
+            result.append(NSAttributedString(string: "  ·  ", attributes: secondary))
             result.append(NSAttributedString(
-                string: "  ·  \(elapsedLabel(last.timeIntervalSince(first)))",
-                attributes: secondary
+                string: elapsedLabel(last.timeIntervalSince(first)),
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
             ))
         }
 
-        // The icon and file-pill summaries stand in for the work while it's
-        // folded away; once expanded, every tool row shows its own icon and
-        // chip in the right place, so repeating them on the header is just
-        // noise. Collapsed only.
-        guard !row.isExpanded else { return result }
-
-        var seenIcons: Set<String> = []
-        for child in row.groupedRows {
-            let icon = processPresentation(for: child).icon
-            guard seenIcons.insert(icon).inserted else { continue }
-            guard let image = NSImage(
-                systemSymbolName: icon,
-                accessibilityDescription: nil
-            )?.withSymbolConfiguration(.init(pointSize: 10.5, weight: .regular))?
-                .withSymbolConfiguration(.init(paletteColors: [NSColor.secondaryLabelColor]))
-            else { continue }
-            image.isTemplate = false
-            result.append(NSAttributedString(string: "   "))
-            let attachment = NSTextAttachment()
-            attachment.image = image
-            attachment.bounds = NSRect(x: 0, y: -2, width: 12, height: 12)
-            result.append(NSAttributedString(attachment: attachment))
-            if seenIcons.count == 6 { break }
+        let issues = row.groupedRows.filter { $0.kind == .error || $0.isError }.count
+        if issues > 0 {
+            result.append(NSAttributedString(string: "  ·  ", attributes: secondary))
+            result.append(NSAttributedString(
+                string: "\(issues) issue\(issues == 1 ? "" : "s")",
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.systemRed,
+                ]
+            ))
         }
-        // The files this turn changed used to hang off this line too. They
-        // belong to the turn, not to its hidden work, so they live in the
-        // footer now — where they stay visible whether or not the section is
-        // expanded.
         return result
     }
 
-    /// The closing line of a finished turn: how long it took and what it
-    /// actually changed.
+    /// An SF Symbol sitting on the same optical line as `font`. A fixed square
+    /// attachment used to scale the chevron to 12pt and park it at y = -2,
+    /// which is why it did not share a baseline with the caption.
+    private static func inlineSymbol(
+        _ name: String,
+        pointSize: CGFloat,
+        weight: NSFont.Weight,
+        color: NSColor,
+        font: NSFont
+    ) -> NSTextAttachment? {
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: pointSize, weight: weight))?
+            .withSymbolConfiguration(.init(paletteColors: [color]))
+        else { return nil }
+        image.isTemplate = false
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        let attachment = NSTextAttachment()
+        attachment.image = image
+        attachment.bounds = NSRect(
+            x: 0,
+            y: (font.capHeight - size.height) / 2,
+            width: size.width,
+            height: size.height
+        )
+        return attachment
+    }
+
+    /// The closing line of a finished turn: what it actually changed.
     ///
-    /// The same facts are available by expanding the activity section and
-    /// reading every Edit, which is precisely the work this saves. Files come
-    /// from the turn's own edit calls rather than the working tree, so the line
-    /// keeps describing *that* turn after later turns change more.
+    /// Elapsed time lives on the activity fold, and the clock lives on the
+    /// turn header — repeating either here made the same fact look like three
+    /// facts. Files come from the turn's own edit calls rather than the
+    /// working tree, so the line keeps describing *that* turn after later
+    /// turns change more.
     private static func turnFooterText(for row: TranscriptRow) -> NSAttributedString {
         let secondary: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
             .foregroundColor: NSColor.tertiaryLabelColor,
         ]
         let result = NSMutableAttributedString()
-
-        if let first = row.groupedRows.first?.createdAt,
-           let last = row.groupedRows.last?.createdAt,
-           last.timeIntervalSince(first) >= 1 {
-            result.append(NSAttributedString(
-                string: elapsedLabel(last.timeIntervalSince(first)),
-                attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
-                    .foregroundColor: NSColor.secondaryLabelColor,
-                ]
-            ))
-        }
-
         let changed = changedFiles(in: row.groupedRows)
         if changed.isEmpty {
-            if result.length == 0 {
-                result.append(NSAttributedString(string: "No files changed", attributes: secondary))
-            }
+            result.append(NSAttributedString(string: "No files changed", attributes: secondary))
             return result
         }
 
-        if result.length > 0 { result.append(NSAttributedString(string: "   ", attributes: secondary)) }
         for (index, file) in changed.prefix(8).enumerated() {
             if index > 0 { result.append(NSAttributedString(string: "   ", attributes: secondary)) }
             // The chip carries its own +/− counts, so the footer doesn't append

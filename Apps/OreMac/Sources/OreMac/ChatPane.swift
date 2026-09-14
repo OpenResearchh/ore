@@ -4816,9 +4816,10 @@ private struct MessageQueueCard: View {
     @Binding var messages: [QueuedMessageRecord]
     let onSave: (QueuedMessageRecord, String) async -> Void
     let onDelete: (QueuedMessageRecord) async -> Void
+    @State private var isExpanded = false
 
     var body: some View {
-        DisclosureGroup("Queued messages (\(messages.count))") {
+        DisclosureGroup(isExpanded: $isExpanded) {
             VStack(spacing: 6) {
                 ForEach(messages.indices, id: \.self) { index in
                     HStack {
@@ -4836,6 +4837,18 @@ private struct MessageQueueCard: View {
                 }
             }
             .padding(.top, 6)
+        } label: {
+            // The whole bar toggles, not just the chevron: a macOS disclosure
+            // label is inert text unless it is made a button.
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { isExpanded.toggle() }
+            } label: {
+                Text("Queued messages (\(messages.count))")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "Hide queued messages" : "Show queued messages")
         }
         .oreCard(padding: 12, radius: 14)
     }

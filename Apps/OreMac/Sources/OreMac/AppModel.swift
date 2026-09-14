@@ -343,7 +343,9 @@ final class AppModel {
     }
 
     private func updateBackgroundPolling() {
-        let enabled = !NSApp.isHidden
+        // `start()` runs from the App's init, before NSApplication exists; a
+        // launching app isn't hidden, and the hide/unhide observers take over.
+        let enabled = !(NSApp?.isHidden ?? false)
         isBackgroundPollingEnabled = enabled
         Task { [weak self] in
             guard let self else { return }

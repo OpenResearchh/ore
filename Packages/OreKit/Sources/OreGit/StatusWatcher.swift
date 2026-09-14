@@ -35,6 +35,19 @@ public actor StatusWatcher {
     private var lastPorcelain: String?
     private var pendingLineCount = false
     private var isStopped = false
+    /// Bumped on every relevant filesystem event. A read remembers the value
+    /// it started under, so a snapshot is only reused while nothing has
+    /// touched the tree since that read began.
+    private var changeCounter: UInt64 = 0
+    /// The index and HEAD files. A commit or stage made just before a caller
+    /// asks can beat its FSEvents delivery; their modification times can't.
+    private var gitStateFiles: [URL] = []
+    private var latestRead: (
+        snapshot: GitStatusSnapshot,
+        at: ContinuousClock.Instant,
+        changeCounter: UInt64,
+        gitState: [Date?]
+    )?
 
     public init(
         git: GitClient,
@@ -61,6 +74,7 @@ public actor StatusWatcher {
         // a commit changes the status without touching a single tracked file.
         let head = try? await git.gitPath("HEAD", in: worktreeURL)
         let index = try? await git.gitPath("index", in: worktreeURL)
+        gitStateFiles = [index, head].compactMap { $0 }
         let paths = Set([
             worktreeURL.path,
             head?.deletingLastPathComponent().path,
@@ -119,6 +133,8 @@ public actor StatusWatcher {
         guard !isStopped else { return }
         generation += 1
         let currentGeneration = generation
+        let startedUnder = changeCounter
+        let gitState = gitStateStamp()
 
         guard let output = try? await git.run(
             ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=normal"],
@@ -133,6 +149,7 @@ public actor StatusWatcher {
         var snapshot = GitStatusParser.parse(porcelain, generation: currentGeneration)
         await annotateLineCounts(&snapshot)
         lastPorcelain = porcelain
+        remember(snapshot, startedUnder: startedUnder, gitState: gitState)
 
         // Publishing an identical snapshot would wake the UI for nothing; an
         // agent that reads files without writing generates a lot of events.
@@ -150,17 +167,56 @@ public actor StatusWatcher {
     /// the last publish, which the deduped stream would swallow.
     public func currentSnapshot() async -> GitStatusSnapshot? {
         guard !isStopped else { return nil }
+        let startedUnder = changeCounter
+        let gitState = gitStateStamp()
         guard let output = try? await git.run(
             ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=normal"],
             in: worktreeURL
         ) else { return nil }
         var snapshot = GitStatusParser.parse(output.standardOutput, generation: generation)
         await annotateLineCounts(&snapshot)
+        remember(snapshot, startedUnder: startedUnder, gitState: gitState)
         return snapshot
+    }
+
+    /// The last full read when it is provably current — no filesystem event
+    /// since it began, and younger than `maxAge` as a backstop for changes
+    /// FSEvents is slow to report or misses — otherwise a live read. Saves
+    /// three git processes on the git-action refreshes that follow a publish.
+    ///
+    /// Without FSEvents nothing proves the tree unchanged, so every call
+    /// reads live.
+    public func recentSnapshot(maxAge: Duration = .seconds(5)) async -> GitStatusSnapshot? {
+        guard !isStopped else { return nil }
+        #if canImport(CoreServices)
+        if let latestRead, latestRead.changeCounter == changeCounter,
+           latestRead.at.duration(to: .now) <= maxAge,
+           latestRead.gitState == gitStateStamp() {
+            return latestRead.snapshot
+        }
+        #endif
+        return await currentSnapshot()
+    }
+
+    private func remember(
+        _ snapshot: GitStatusSnapshot, startedUnder counter: UInt64, gitState: [Date?]
+    ) {
+        // An overlapping read that began before a newer event must not
+        // replace one that began after it.
+        if let latestRead, latestRead.changeCounter > counter { return }
+        latestRead = (snapshot, .now, counter, gitState)
+    }
+
+    /// Modification times of the index and HEAD, taken when a read starts.
+    private func gitStateStamp() -> [Date?] {
+        gitStateFiles.map { url in
+            (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        }
     }
 
     private func scheduleRefresh(countLines: Bool) {
         guard !isStopped else { return }
+        changeCounter &+= 1
         // Debouncing cancels the earlier task, so what it needed carries over.
         pendingLineCount = pendingLineCount || countLines
         refreshTask?.cancel()

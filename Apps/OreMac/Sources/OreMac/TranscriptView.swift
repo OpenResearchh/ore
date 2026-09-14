@@ -727,6 +727,7 @@ struct TranscriptView: NSViewRepresentable {
                 isSearchHighlighted: isSearchHighlighted(item),
                 responseCollapse: responseCollapse(for: item),
                 turnHeader: turnHeader(for: item),
+                appearance: tableView.effectiveAppearance,
                 onRevert: onRevert,
                 onToggleActivity: onToggleActivity,
                 onOpenFile: onOpenFile,
@@ -1207,6 +1208,11 @@ private extension Array where Element == TranscriptRow {
     }
 }
 
+/// An image inside a button that leaves the click to the button.
+final class ClickThroughImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// Lays out transcript text the same way the cell's `NSTextView` does, so a
 /// row's table height matches what is actually drawn. `NSAttributedString.boundingRect`
 /// disagrees with TextKit once code-block `NSTextTable`s or attachment chips
@@ -1297,6 +1303,14 @@ final class TranscriptCell: NSTableCellView {
     private let menuButton = NSButton()
     private var copyableText = ""
     private var isUserMessage = false
+    private let copyIcon = ClickThroughImageView()
+    /// Bumped per copy and per reuse, so a stale reset can't strip the tick
+    /// from a newer copy or from a different row.
+    private var copyGeneration = 0
+    private var isCopyConfirmed = false
+    private var isHovering = false
+    private var configuredRowID: String?
+    private var menuButtonCenterConstraint: NSLayoutConstraint!
     private var copyTrackingArea: NSTrackingArea?
     /// The turn a footer row's ⋯ menu acts on, and what it may offer.
     private var footerTurnID: TurnID?
@@ -1317,16 +1331,23 @@ final class TranscriptCell: NSTableCellView {
 
         // A copy affordance for user messages, revealed on hover in the gutter
         // beside the bubble so it never overlaps the text.
+        // The glyph is an image view inside the button, not the button's own
+        // image: only an image view can swap symbols with the replace
+        // transition the SwiftUI `CopyButton` uses for its green tick.
         copyButton.isBordered = false
         copyButton.bezelStyle = .regularSquare
-        copyButton.imagePosition = .imageOnly
-        copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy message")
-        copyButton.contentTintColor = .secondaryLabelColor
+        copyButton.imagePosition = .noImage
+        copyButton.title = ""
+        copyButton.setAccessibilityLabel("Copy message")
         copyButton.target = self
         copyButton.action = #selector(copyMessage)
         copyButton.translatesAutoresizingMaskIntoConstraints = false
         copyButton.isHidden = true
         copyButton.toolTip = "Copy message"
+        copyIcon.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy message")
+        copyIcon.contentTintColor = .secondaryLabelColor
+        copyIcon.translatesAutoresizingMaskIntoConstraints = false
+        copyButton.addSubview(copyIcon)
         addSubview(copyButton)
 
         // The turn footer's overflow menu. A real button rather than a glyph in
@@ -1427,6 +1448,9 @@ final class TranscriptCell: NSTableCellView {
         // rows (tool calls, thinking, activity) sit closer together than prose.
         bubbleTopConstraint = bubble.topAnchor.constraint(equalTo: topAnchor, constant: Self.verticalInset)
         bubbleBottomConstraint = bubble.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.verticalInset)
+        // Centred on the footer's first line of chips (see `configure`), not
+        // pinned to the row's top edge, where it floated above them.
+        menuButtonCenterConstraint = menuButton.centerYAnchor.constraint(equalTo: label.topAnchor, constant: 11)
 
         NSLayoutConstraint.activate([
             contentGuide.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -1470,9 +1494,11 @@ final class TranscriptCell: NSTableCellView {
             copyButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
             copyButton.widthAnchor.constraint(equalToConstant: 22),
             copyButton.heightAnchor.constraint(equalToConstant: 22),
+            copyIcon.centerXAnchor.constraint(equalTo: copyButton.centerXAnchor),
+            copyIcon.centerYAnchor.constraint(equalTo: copyButton.centerYAnchor),
 
             menuButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -4),
-            menuButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
+            menuButtonCenterConstraint,
             menuButton.widthAnchor.constraint(equalToConstant: 24),
             menuButton.heightAnchor.constraint(equalToConstant: 22),
         ])
@@ -1489,6 +1515,7 @@ final class TranscriptCell: NSTableCellView {
         isSearchHighlighted: Bool = false,
         responseCollapse: ResponseCollapse = .none,
         turnHeader: String? = nil,
+        appearance: NSAppearance? = nil,
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
@@ -1512,8 +1539,10 @@ final class TranscriptCell: NSTableCellView {
         // The turn header borrows the badge line: "Claude · 2:41 PM" on the
         // first agent row of the turn. A real badge (QUEUED, PLAN) still wins —
         // it carries state the header doesn't.
+        // The activity fold carries it inline instead (`displayedText`).
         let ownBadge = Self.badgeText(for: row)
-        let badgeString = ownBadge.isEmpty ? (turnHeader ?? "") : ownBadge
+        let headerOnBadgeLine = row.kind == .activityGroup ? nil : turnHeader
+        let badgeString = ownBadge.isEmpty ? (headerOnBadgeLine ?? "") : ownBadge
         badge.stringValue = badgeString
         badge.isHidden = badgeString.isEmpty
         badgeHeightZero.isActive = badgeString.isEmpty
@@ -1523,9 +1552,21 @@ final class TranscriptCell: NSTableCellView {
         responseToggleAction = onToggleResponse
         applyResponseCollapse(responseCollapse)
 
+        // The table's appearance, not the cell's: a freshly made cell isn't in
+        // the window yet, so its own appearance is still the app's. With the
+        // Mac in light mode that baked light-mode chips — dark labels — into
+        // rows shown on the always-dark glass window.
+        let renderAppearance = appearance ?? effectiveAppearance
         let isUser = row.kind == .userMessage
         copyableText = Self.copyableText(for: row)
         isUserMessage = isUser
+        // A reused cell starts with a fresh copy glyph, not the last row's tick.
+        if row.id != configuredRowID, isCopyConfirmed {
+            copyGeneration += 1
+            setCopyIcon(confirmed: false, animated: false)
+            copyButton.isHidden = true
+        }
+        configuredRowID = row.id
         // The copy button belongs to user messages; it stays hidden until the
         // row is hovered (see mouseEntered/Exited).
         if !isUser { copyButton.isHidden = true }
@@ -1547,7 +1588,7 @@ final class TranscriptCell: NSTableCellView {
         userWidthConstraint.isActive = isUser
 
         if isUser {
-            let natural = Self.usingAppearance(effectiveAppearance) {
+            let natural = Self.usingAppearance(renderAppearance) {
                 Self.attributedText(for: row, worktreePath: worktreePath).boundingRect(
                     with: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude),
                     options: [.usesLineFragmentOrigin, .usesFontLeading]
@@ -1565,13 +1606,19 @@ final class TranscriptCell: NSTableCellView {
 
         // A collapsed response swaps in its truncated render — the same string
         // `height(for:)` measured, which is what keeps row height honest.
-        let attributedText = Self.usingAppearance(effectiveAppearance) {
-            responseCollapse == .collapsed
-                ? Self.collapsedAttributedText(for: row)
-                : Self.attributedText(for: row, worktreePath: worktreePath)
+        let attributedText = Self.usingAppearance(renderAppearance) {
+            Self.displayedText(
+                for: row,
+                worktreePath: worktreePath,
+                responseCollapse: responseCollapse,
+                turnHeader: turnHeader
+            )
         }
         label.dismissAttachmentPreview()
         label.textStorage?.setAttributedString(attributedText)
+        if isFooter {
+            menuButtonCenterConstraint.constant = Self.firstLineHeight(of: attributedText) / 2
+        }
         label.onOpenFile = onOpenFile
         label.skipHoverTracking = skipHoverTracking
         // Activity groups toggle on a click, so their text isn't selectable;
@@ -1599,7 +1646,7 @@ final class TranscriptCell: NSTableCellView {
         // while the system runs light, is the *wrong* appearance. Resolve
         // against the bubble's own effective appearance so the wash comes out
         // in the window's palette, not the system's.
-        bubble.effectiveAppearance.performAsCurrentDrawingAppearance {
+        renderAppearance.performAsCurrentDrawingAppearance {
             bubble.layer?.backgroundColor = Self.background(for: row).cgColor
         }
         // The find bar's active match wears an accent ring; everything else
@@ -1737,16 +1784,50 @@ final class TranscriptCell: NSTableCellView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        isHovering = true
         if isUserMessage { copyButton.isHidden = false }
     }
 
     override func mouseExited(with event: NSEvent) {
-        copyButton.isHidden = true
+        isHovering = false
+        // A tick mid-confirmation stays until its beat ends.
+        if !isCopyConfirmed { copyButton.isHidden = true }
     }
 
     @objc private func copyMessage() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(copyableText, forType: .string)
+        showCopyConfirmation()
+    }
+
+    /// The same beat as SwiftUI's `CopyButton`: the glyph swaps to a green
+    /// tick, holds for 1.4 s, then swaps back.
+    private func showCopyConfirmation() {
+        copyGeneration += 1
+        let generation = copyGeneration
+        setCopyIcon(confirmed: true, animated: true)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1.4))
+            guard let self, self.copyGeneration == generation else { return }
+            self.setCopyIcon(confirmed: false, animated: true)
+            self.copyButton.isHidden = !(self.isHovering && self.isUserMessage)
+        }
+    }
+
+    private func setCopyIcon(confirmed: Bool, animated: Bool) {
+        isCopyConfirmed = confirmed
+        let label = confirmed ? "Copied" : "Copy message"
+        guard let image = NSImage(
+            systemSymbolName: confirmed ? "checkmark" : "doc.on.doc",
+            accessibilityDescription: label
+        ) else { return }
+        copyIcon.contentTintColor = confirmed ? .systemGreen : .secondaryLabelColor
+        if animated {
+            copyIcon.setSymbolImage(image, contentTransition: .replace)
+        } else {
+            copyIcon.image = image
+        }
+        copyButton.toolTip = label
     }
 
     @objc private func showTurnMenu() {
@@ -1842,6 +1923,36 @@ final class TranscriptCell: NSTableCellView {
         row.kind == .turnFooter ? 34 : 10
     }
 
+    /// What a row's text view shows — the one string `height(for:)` measures
+    /// and `configure` draws.
+    ///
+    /// The activity fold carries its turn's header inline, "› 17 steps ·
+    /// Claude · 11:35 PM", rather than on a line of its own above a one-line
+    /// summary. Prose and plans keep the header line: there it labels a block.
+    static func displayedText(
+        for row: TranscriptRow,
+        worktreePath: String,
+        responseCollapse: ResponseCollapse,
+        turnHeader: String?
+    ) -> NSAttributedString {
+        let base = responseCollapse == .collapsed
+            ? collapsedAttributedText(for: row)
+            : attributedText(for: row, worktreePath: worktreePath)
+        guard row.kind == .activityGroup, badgeText(for: row).isEmpty,
+              let turnHeader, !turnHeader.isEmpty
+        else { return base }
+        let line = NSMutableAttributedString(attributedString: base)
+        line.append(NSAttributedString(
+            // The fold's own separator spacing, so the three parts read as one line.
+            string: "  ·  " + turnHeader.replacingOccurrences(of: " · ", with: "  ·  "),
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]
+        ))
+        return line
+    }
+
     static func height(
         for row: TranscriptRow,
         width: CGFloat,
@@ -1856,9 +1967,12 @@ final class TranscriptCell: NSTableCellView {
         // every compacted assistant conversation.
         // The collapsed variant measures the same truncated string the cell
         // draws — never the full text clamped after the fact.
-        let attributed = responseCollapse == .collapsed
-            ? collapsedAttributedText(for: row)
-            : attributedText(for: row, worktreePath: worktreePath)
+        let attributed = displayedText(
+            for: row,
+            worktreePath: worktreePath,
+            responseCollapse: responseCollapse,
+            turnHeader: turnHeader
+        )
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
         let textWidth = max(1, bubbleWidth - 10 - trailingInset(for: row))
@@ -1870,7 +1984,8 @@ final class TranscriptCell: NSTableCellView {
         let textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
         let toggleBand: CGFloat = responseCollapse == .none ? 0 : responseToggleBand
         let ownBadge = badgeText(for: row)
-        let hasBadgeLine = !ownBadge.isEmpty || !(turnHeader ?? "").isEmpty
+        let hasBadgeLine = !ownBadge.isEmpty
+            || (row.kind != .activityGroup && !(turnHeader ?? "").isEmpty)
         let isAgentHeader = ownBadge.isEmpty && !(turnHeader ?? "").isEmpty
             && (row.kind == .assistantText || row.kind == .plan)
         let badgeLine: CGFloat = hasBadgeLine ? 14 : 0
@@ -2540,8 +2655,6 @@ final class TranscriptCell: NSTableCellView {
     ) -> NSImage {
         let appearance = currentAppearance
         let label = color(.labelColor, in: appearance)
-        let secondary = color(.secondaryLabelColor, in: appearance)
-        let separator = color(.separatorColor, in: appearance)
         let plusColor = color(.systemGreen, in: appearance)
         let minusColor = color(.systemRed, in: appearance)
         let resolvedTint = color(tint, in: appearance)
@@ -2580,12 +2693,17 @@ final class TranscriptCell: NSTableCellView {
                 + hPad
         )
         let height = ceil(textSize.height + vPad * 2)
+        // A file chip is a clear lens on the glass, not a grey tile: a wash of
+        // the appearance's own ink — white on the smoked window, black on
+        // paper — under a slightly brighter rim where the glass catches light.
+        let onDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let ink: NSColor = onDark ? .white : .black
         let fill = identity == nil
             ? resolvedTint.withAlphaComponent(0.16)
-            : secondary.withAlphaComponent(0.10)
+            : ink.withAlphaComponent(onDark ? 0.10 : 0.05)
         let stroke = identity == nil
             ? resolvedTint.withAlphaComponent(0.35)
-            : separator.withAlphaComponent(0.55)
+            : ink.withAlphaComponent(onDark ? 0.18 : 0.12)
         let image = NSImage(size: NSSize(width: max(1, width), height: max(1, height)), flipped: false) { _ in
             let rect = NSRect(x: 0.5, y: 0.5, width: width - 1, height: height - 1)
             let path = NSBezierPath(roundedRect: rect, xRadius: OreTheme.chipRadius, yRadius: OreTheme.chipRadius)
@@ -2804,21 +2922,7 @@ final class TranscriptCell: NSTableCellView {
         }
         result.append(NSAttributedString(string: row.text, attributes: secondary))
 
-        // How long the turn's activity took, from its first to last event.
-        // Elapsed time lives here once — the footer used to repeat it.
-        if let first = row.groupedRows.first?.createdAt,
-           let last = row.groupedRows.last?.createdAt,
-           last.timeIntervalSince(first) >= 1 {
-            result.append(NSAttributedString(string: "  ·  ", attributes: secondary))
-            result.append(NSAttributedString(
-                string: elapsedLabel(last.timeIntervalSince(first)),
-                attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .regular),
-                    .foregroundColor: NSColor.secondaryLabelColor,
-                ]
-            ))
-        }
-
+        // Elapsed time closes the turn footer, beside what the turn changed.
         let issues = row.groupedRows.filter { $0.kind == .error || $0.isError }.count
         if issues > 0 {
             result.append(NSAttributedString(string: "  ·  ", attributes: secondary))
@@ -2863,11 +2967,11 @@ final class TranscriptCell: NSTableCellView {
 
     /// The closing line of a finished turn: what it actually changed.
     ///
-    /// Elapsed time lives on the activity fold, and the clock lives on the
-    /// turn header — repeating either here made the same fact look like three
-    /// facts. Files come from the turn's own edit calls rather than the
-    /// working tree, so the line keeps describing *that* turn after later
-    /// turns change more.
+    /// The files, then how long the turn took: cost reads beside the result.
+    /// The clock lives on the turn header and the activity fold only counts
+    /// steps, so each fact appears once. Files come from the turn's own edit
+    /// calls rather than the working tree, so the line keeps describing
+    /// *that* turn after later turns change more.
     private static func turnFooterText(for row: TranscriptRow) -> NSAttributedString {
         let secondary: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
@@ -2877,6 +2981,7 @@ final class TranscriptCell: NSTableCellView {
         let changed = changedFiles(in: row.groupedRows)
         if changed.isEmpty {
             result.append(NSAttributedString(string: "No files changed", attributes: secondary))
+            appendElapsed(of: row, to: result)
             return result
         }
 
@@ -2914,7 +3019,37 @@ final class TranscriptCell: NSTableCellView {
                 string: "   +\(changed.count - 8) more", attributes: secondary
             ))
         }
+        appendElapsed(of: row, to: result)
         return result
+    }
+
+    /// "  ·  2m 18s" — first event to last. A turn under a second says nothing.
+    private static func appendElapsed(of row: TranscriptRow, to result: NSMutableAttributedString) {
+        guard let first = row.groupedRows.first?.createdAt,
+              let last = row.groupedRows.last?.createdAt,
+              last.timeIntervalSince(first) >= 1
+        else { return }
+        result.append(NSAttributedString(string: "  ·  ", attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+        ]))
+        result.append(NSAttributedString(
+            string: elapsedLabel(last.timeIntervalSince(first)),
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+        ))
+    }
+
+    /// The height of a row's first line: its first glyph is a chip (or the
+    /// "No files changed" text), and nothing later on that line is taller.
+    static func firstLineHeight(of text: NSAttributedString) -> CGFloat {
+        guard text.length > 0 else { return 22 }
+        return TranscriptHeightMeasurer.height(
+            of: text.attributedSubstring(from: NSRange(location: 0, length: 1)),
+            width: 10_000
+        )
     }
 
     /// Extra height around a wrapping footer chip. Half sits above the stroke

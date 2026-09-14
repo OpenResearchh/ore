@@ -794,6 +794,33 @@ struct TranscriptAppearanceTests {
         }
     }
 
+    @Test func theActivityFoldCarriesTheTurnHeaderInlineAfterItsSteps() {
+        let tool = TranscriptRow(
+            id: "tool-inline-header",
+            turnID: TurnID(rawValue: "t9"),
+            kind: .toolCall,
+            text: "Read",
+            toolName: "Read"
+        )
+        let group = TranscriptRow(
+            id: "activity-inline-header",
+            turnID: TurnID(rawValue: "t9"),
+            kind: .activityGroup,
+            text: "17 steps",
+            groupedRows: [tool]
+        )
+        let header = "Claude · 11:35 PM"
+        let shown = TranscriptCell.displayedText(
+            for: group, worktreePath: "", responseCollapse: .none, turnHeader: header
+        ).string
+        #expect(shown.hasSuffix("17 steps  ·  Claude  ·  11:35 PM"))
+
+        // One line, not a header line stacked over the summary.
+        let withHeader = TranscriptCell.height(for: group, width: 600, turnHeader: header)
+        let without = TranscriptCell.height(for: group, width: 600)
+        #expect(abs(withHeader - without) < 1)
+    }
+
     @Test func activityGroupCallsOutIssuesInRed() {
         var failed = TranscriptRow(
             id: "tool",
@@ -823,22 +850,96 @@ struct TranscriptAppearanceTests {
         #expect(issueColor == NSColor.systemRed)
     }
 
-    @Test func turnFooterOmitsElapsedTime() {
+    @Test func elapsedTimeClosesTheFooterAndLeavesTheActivityFold() {
         let start = Date(timeIntervalSince1970: 0)
-        var edit = editRow()
+        var edit = editRow(id: "tool-elapsed")
         edit.createdAt = start
         var later = edit
         later.createdAt = start.addingTimeInterval(90)
         let footer = TranscriptRow(
-            id: "footer",
+            id: "footer-elapsed",
             turnID: TurnID(rawValue: "t1"),
             kind: .turnFooter,
             text: "",
             groupedRows: [edit, later]
         )
         let rendered = TranscriptCell.attributedText(for: footer)
-        #expect(!rendered.string.contains("1m 30s"))
-        #expect(!rendered.string.contains("90s"))
+        #expect(rendered.string.hasSuffix("  ·  1m 30s"))
+        #expect(chipImage(in: rendered) != nil, "the files come first")
+
+        let group = TranscriptRow(
+            id: "activity-elapsed",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "2 steps",
+            groupedRows: [edit, later]
+        )
+        #expect(!TranscriptCell.attributedText(for: group).string.contains("1m 30s"))
+    }
+
+    @Test func aTurnWithoutEditsStillReportsItsTime() {
+        let start = Date(timeIntervalSince1970: 0)
+        var asked = TranscriptRow(
+            id: "user-elapsed", turnID: TurnID(rawValue: "t2"), kind: .userMessage, text: "hi"
+        )
+        asked.createdAt = start
+        var answered = TranscriptRow(
+            id: "reply-elapsed", turnID: TurnID(rawValue: "t2"), kind: .assistantText, text: "hello"
+        )
+        answered.createdAt = start.addingTimeInterval(138)
+        let footer = TranscriptRow(
+            id: "footer-no-edits",
+            turnID: TurnID(rawValue: "t2"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [asked, answered]
+        )
+        #expect(TranscriptCell.attributedText(for: footer).string == "No files changed  ·  2m 18s")
+    }
+
+    @Test func aCellConfiguredBeforeJoiningTheWindowDrawsTheTablesAppearance() throws {
+        // A fresh cell isn't in the window yet, so its own appearance is the
+        // app's. With the Mac light, that baked dark-label chips into the
+        // always-dark glass window — some rows readable, others not.
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+        application.appearance = NSAppearance(named: .aqua)
+
+        let cell = TranscriptCell(identifier: NSUserInterfaceItemIdentifier("cell"))
+        cell.configure(
+            with: editRow(id: "tool-unattached"),
+            appearance: NSAppearance(named: .darkAqua),
+            onRevert: { _ in },
+            onToggleActivity: { _ in },
+            onOpenFile: { _ in }
+        )
+        let label = try #require(firstTextView(in: cell))
+        let text = try #require(label.textStorage)
+        let fill = try #require(chipFill(chipImage(in: text)))
+        #expect(fill.redComponent > 0.5, "a dark-glass chip is a light wash")
+    }
+
+    private func firstTextView(in view: NSView) -> NSTextView? {
+        if let text = view as? NSTextView { return text }
+        for subview in view.subviews {
+            if let found = firstTextView(in: subview) { return found }
+        }
+        return nil
+    }
+
+    @Test func darkGlassFileChipsAreALightWashNotAGreyTile() {
+        let row = editRow(id: "tool-glass")
+        let darkChip = TranscriptCell.usingAppearance(NSAppearance(named: .darkAqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let fill = chipFill(darkChip)
+        #expect(fill != nil)
+        if let fill {
+            // White ink over nothing: every channel equal and bright.
+            #expect(abs(fill.redComponent - fill.blueComponent) < 0.02)
+            #expect(fill.redComponent > 0.5)
+        }
     }
 
     /// The PNG bytes of the row's first inline image — the file chip.

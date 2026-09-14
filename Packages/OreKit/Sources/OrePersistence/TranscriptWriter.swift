@@ -75,6 +75,16 @@ public actor TranscriptWriter {
     private var pendingAttachments: [Attachment] = []
     private var pendingOrigin: MessageOrigin = .user
 
+    /// Whether `handle` has anything to do with the event. Text and thinking
+    /// deltas arrive at token rate and are never written, so the engine can
+    /// skip the hop onto this actor for them.
+    public static func persists(_ event: AgentEvent) -> Bool {
+        switch event {
+        case .textDelta, .thinkingDelta: false
+        default: true
+        }
+    }
+
     public func handle(_ event: AgentEvent) async {
         do {
             try await apply(event)

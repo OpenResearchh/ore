@@ -2141,7 +2141,9 @@ public actor WorkspaceEngine {
     private func handle(_ rawEvent: AgentEvent, chatID: ChatID) async {
         guard let runtime = chats[chatID] else { return }
         let event = enriched(rawEvent, runtime: runtime)
-        await runtime.transcript?.handle(event)
+        if TranscriptWriter.persists(event) {
+            await runtime.transcript?.handle(event)
+        }
 
         switch event {
         case .statusChanged(let newStatus):

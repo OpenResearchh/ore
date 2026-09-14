@@ -1907,12 +1907,22 @@ struct ChatPane: View {
     /// spoken aloud, even when the tab is in the background (where it only
     /// interjects for things that need the user).
     private func speakerButton(_ chatSummary: ChatSummary?) -> some View {
-        let narrationOn = chatSummary.map { model.narration.isEnabled($0.id) } ?? false
+        let assistantMuted = model.narration.isMuted
+        let narrationOn = !assistantMuted
+            && (chatSummary.map { model.narration.isEnabled($0.id) } ?? false)
         let isSpeaking = narrationOn && chatSummary != nil
             && model.narration.speakingChatID == chatSummary?.id
         return Button {
             guard let chatID = chatSummary?.id else { return }
-            model.narration.toggle(chatID)
+            if assistantMuted {
+                // Muted everywhere: flipping a toggle nobody can hear would
+                // look broken, so this speaker lifts the mute and narrates
+                // this tab.
+                model.narration.setMuted(false)
+                if !model.narration.isEnabled(chatID) { model.narration.toggle(chatID) }
+            } else {
+                model.narration.toggle(chatID)
+            }
         } label: {
             Image(systemName: narrationOn ? "speaker.wave.2.fill" : "speaker.slash")
                 .font(.system(size: 13, weight: .semibold))
@@ -1936,9 +1946,11 @@ struct ChatPane: View {
         // ⌥⌘S next to the mic's ⌥⌘M: the two voice controls are one pair, and
         // S is the only free letter that names what it does.
         .keyboardShortcut("s", modifiers: [.option, .command])
-        .help(narrationOn
-            ? "Stop narrating agent activity (⌥⌘S)"
-            : "Narrate agent activity aloud (⌥⌘S)")
+        .help(assistantMuted
+            ? "The assistant is muted — unmute and narrate this tab (⌥⌘S)"
+            : narrationOn
+                ? "Stop narrating agent activity (⌥⌘S)"
+                : "Narrate agent activity aloud (⌥⌘S)")
     }
 
     private var micButton: some View {

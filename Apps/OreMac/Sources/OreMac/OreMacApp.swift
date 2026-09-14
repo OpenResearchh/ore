@@ -296,6 +296,11 @@ struct OreMacApp: App {
                 OpenAssistantCommand()
                 OpenDreamsCommand().environment(model)
 
+                Button(model.narration.isMuted ? "Unmute Assistant" : "Mute Assistant") {
+                    model.narration.setMuted(!model.narration.isMuted)
+                }
+                .keyboardShortcut("s", modifiers: [.shift, .option, .command])
+
                 Button("Command Palette") { isShowingPalette = true }
                     .keyboardShortcut("k", modifiers: .command)
 

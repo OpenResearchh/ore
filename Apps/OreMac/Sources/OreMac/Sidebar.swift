@@ -252,6 +252,22 @@ struct Sidebar: View {
             HStack(spacing: OreTheme.Space.sm) {
                 connectedPill(working: workingCount, total: workspaces.count)
                 Spacer()
+                // The assistant's global mute sits with the app-wide controls,
+                // not in a tab: it silences every workspace at once.
+                Button {
+                    model.narration.setMuted(!model.narration.isMuted)
+                } label: {
+                    Image(systemName: model.narration.isMuted ? "speaker.slash" : "speaker.wave.2")
+                        .font(.system(size: OreTheme.Font.body))
+                        .contentTransition(.symbolEffect(.replace))
+                        .frame(width: 28, height: OreTheme.RowHeight.bar)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(model.narration.isMuted
+                    ? "Unmute the assistant (⇧⌥⌘S)"
+                    : "Mute the assistant (⇧⌥⌘S)")
+                .accessibilityLabel(model.narration.isMuted ? "Unmute assistant" : "Mute assistant")
                 SettingsLink {
                     Image(systemName: "gearshape")
                         .font(.system(size: OreTheme.Font.body))

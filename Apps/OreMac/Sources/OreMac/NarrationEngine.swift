@@ -20,8 +20,14 @@ final class NarrationEngine {
     static let masterSwitchKey = "ore.narration.enabled"
     static let voiceKindKey = "ore.narration.voiceKind"
     static let fleetSwitchKey = "ore.narration.fleet"
+    static let mutedKey = "ore.narration.muted"
 
     private(set) var enabledChats: Set<ChatID>
+    /// The assistant's one global mute — the sidebar's speaker. Unlike "Allow
+    /// spoken narration" it silences everything ORE says, answers to spoken
+    /// questions included, and cuts off the line already playing. Stored, not
+    /// read from defaults, so the controls showing it redraw when it flips.
+    private(set) var isMuted: Bool
     /// Which chat's words are coming out of the speakers, for the UI pulse.
     private(set) var speakingChatID: ChatID?
     /// The utterance currently being spoken, for the assistant HUD.
@@ -154,6 +160,7 @@ final class NarrationEngine {
     init() {
         let saved = UserDefaults.standard.stringArray(forKey: Self.enabledChatsKey) ?? []
         enabledChats = Set(saved.map(ChatID.init(rawValue:)))
+        isMuted = UserDefaults.standard.bool(forKey: Self.mutedKey)
         systemVoice.onEnd = { [weak self] in self?.utteranceEnded() }
         neuralVoice.onEnd = { [weak self] in self?.utteranceEnded() }
         systemVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
@@ -315,6 +322,13 @@ final class NarrationEngine {
         flushQuietWaitersIfIdle()
     }
 
+    func setMuted(_ muted: Bool) {
+        guard isMuted != muted else { return }
+        isMuted = muted
+        UserDefaults.standard.set(muted, forKey: Self.mutedKey)
+        if muted { stopAll() }
+    }
+
     /// Whether some dictation currently owns the audio. The assistant's
     /// hold-to-talk reads this to know a composer mic is live before taking
     /// the microphone over.
@@ -386,7 +400,8 @@ final class NarrationEngine {
         chatID: ChatID,
         origin: NarrationOrigin
     ) {
-        guard isMasterEnabled else { return }
+        // Muted skips the digest work too: nothing it produces would be heard.
+        guard isMasterEnabled, !isMuted else { return }
         guard enabledChats.contains(chatID) else {
             observeFleet(event: event, chatID: chatID, origin: origin)
             return
@@ -776,6 +791,9 @@ final class NarrationEngine {
     }
 
     private func enqueue(_ utterance: SpokenUtterance) {
+        // Every spoken line funnels through here — narration, fleet
+        // milestones, the greeting and the assistant's own answers.
+        guard !isMuted else { return }
         loadNeuralVoiceIfNeeded()
         defer { ensureTicker() }
         switch queue.enqueue(utterance) {

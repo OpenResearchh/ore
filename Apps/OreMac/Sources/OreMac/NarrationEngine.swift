@@ -158,17 +158,72 @@ final class NarrationEngine {
         neuralVoice.onEnd = { [weak self] in self?.utteranceEnded() }
         systemVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
         neuralVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
-        // Weights already fetched on a previous run load in the background, so
-        // the first narrated turn doesn't fall back to the system voice.
-        if voiceKind == .neural, neuralVoice.wasInstalledPreviously {
-            neuralVoice.install()
-        }
+        // No voice load and no ticker here. Both used to start at launch and
+        // ran for the whole session even with narration off: the neural
+        // weights now load on the first line there is to say
+        // (`loadNeuralVoiceIfNeeded`), and the ticker runs only while there is
+        // something for it to do (`ensureTicker`).
+    }
+
+    /// Weights already fetched on a previous run load the first time a line is
+    /// queued — early enough that the quiet gap usually covers the load, late
+    /// enough that a session that never speaks never pays for it.
+    private var neuralLoadRequested = false
+
+    private func loadNeuralVoiceIfNeeded() {
+        guard !neuralLoadRequested, voiceKind == .neural,
+              !neuralVoice.isReady, neuralVoice.wasInstalledPreviously
+        else { return }
+        // Once per session: a load that failed shows its error in Settings,
+        // which offers the retry, rather than being re-attempted per line.
+        neuralLoadRequested = true
+        neuralVoice.install()
+    }
+
+    /// Whether the once-a-second tick has anything to do: age out a tool
+    /// batch, retry a gap-blocked pump, or catch an ending a voice lost.
+    /// When none of those holds, the ticker stops instead of waking the main
+    /// thread every second for a feature that is usually silent.
+    nonisolated static func tickerIsNeeded(
+        hasQueuedSpeech: Bool,
+        isMidUtterance: Bool,
+        isAudible: Bool,
+        hasQuietWaiters: Bool,
+        hasPendingToolBatch: Bool
+    ) -> Bool {
+        hasQueuedSpeech || isMidUtterance || isAudible || hasQuietWaiters || hasPendingToolBatch
+    }
+
+    private var hasTickerWork: Bool {
+        // Only the active chat's batch is ever flushed by the tick, so only it
+        // can keep the ticker alive.
+        let hasPendingBatch = activeChatID.map { id in
+            enabledChats.contains(id) && coalescers[id]?.pending.isEmpty == false
+        } ?? false
+        return Self.tickerIsNeeded(
+            hasQueuedSpeech: queue.peek != nil,
+            isMidUtterance: currentUtterance != nil,
+            isAudible: isVoiceSpeaking,
+            hasQuietWaiters: !quietWaiters.isEmpty,
+            hasPendingToolBatch: hasPendingBatch
+        )
+    }
+
+    /// Starts the ticker if it isn't running. Called wherever work for it can
+    /// appear; it stops itself once `hasTickerWork` goes false.
+    private func ensureTicker() {
+        guard tickerTask == nil, hasTickerWork else { return }
         // Tool batches age out on a coarse cadence; the same tick retries a
         // pump that was gap-blocked.
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                self?.tick()
+                guard let self else { return }
+                self.tick()
+                if !self.hasTickerWork {
+                    self.tickerTask = nil
+                    return
+                }
             }
         }
     }
@@ -196,9 +251,17 @@ final class NarrationEngine {
     }
 
     /// The chat no longer exists; neither should anything keyed by it.
+    ///
+    /// Not only for narrated chats: fleet awareness fills the per-chat maps
+    /// for every chat, so skipping untoggled ones leaked one entry per chat
+    /// ever deleted.
     func forget(_ chatID: ChatID) {
-        guard enabledChats.contains(chatID) else { return }
-        toggle(chatID)
+        if enabledChats.contains(chatID) {
+            toggle(chatID)
+        } else {
+            dropState(for: chatID)
+        }
+        planReadiness.reset(scope: chatID.rawValue)
     }
 
     func activeChatChanged(_ chatID: ChatID?) {
@@ -211,6 +274,7 @@ final class NarrationEngine {
         }
         activeChatID = chatID
         pump()
+        ensureTicker()
     }
 
     /// Dictation owns the audio: stop speaking for the mic's whole lifetime —
@@ -226,12 +290,14 @@ final class NarrationEngine {
                 _ = queue.enqueue(current)
             }
             stopSpeaking(immediate: false)
+            ensureTicker()
         } else {
             // A beat after the mic closes, so speech doesn't collide with the
             // settle-hold send.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(300))
                 self?.pump()
+                self?.ensureTicker()
             }
         }
     }
@@ -294,6 +360,7 @@ final class NarrationEngine {
             return
         }
         quietWaiters.append(handler)
+        ensureTicker()
     }
 
     private var quietWaiters: [@MainActor () -> Void] = []
@@ -347,6 +414,8 @@ final class NarrationEngine {
             let phrase = coalescer.absorb(activity, at: Date())
             coalescers[chatID] = coalescer
             if let phrase { enqueueProgress(phrase, kind: .toolActivity, chatID: chatID) }
+            // A batch left pending ages out on the tick.
+            ensureTicker()
 
         case .toolResult(let result):
             guard background == nil, result.isError else { return }
@@ -700,6 +769,8 @@ final class NarrationEngine {
     }
 
     private func enqueue(_ utterance: SpokenUtterance) {
+        loadNeuralVoiceIfNeeded()
+        defer { ensureTicker() }
         switch queue.enqueue(utterance) {
         case .interruptCurrent:
             if let current = currentUtterance, current.priority < .interrupt,
@@ -805,6 +876,7 @@ final class NarrationEngine {
         lastUtteranceEndedAt = Date()
         pump()
         flushQuietWaitersIfIdle()
+        ensureTicker()
     }
 
     private func dropState(for chatID: ChatID) {

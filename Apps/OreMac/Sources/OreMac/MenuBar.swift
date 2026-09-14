@@ -59,6 +59,7 @@ enum FleetSuggestionResolver {
 struct MenuBarDashboard: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.controlActiveState) private var controlActiveState
     @State private var questionDrafts: [String: String] = [:]
 
     var body: some View {
@@ -86,8 +87,17 @@ struct MenuBarDashboard: View {
                     .foregroundStyle(.secondary)
                     .padding(OreTheme.Space.md)
             } else {
-                TimelineView(.periodic(from: Date(), by: 30)) { context in
-                    workspaceList(at: context.date)
+                if controlActiveState == .inactive {
+                    // The menu's window is closed (or at least not in use):
+                    // a static list, no timer. Opening it flips the state and
+                    // brings the timeline back with a fresh date.
+                    workspaceList(at: Date())
+                } else {
+                    // Only the ten-minute "recently finished" window ages on
+                    // this clock; model changes re-render on their own.
+                    TimelineView(.periodic(from: Date(), by: 60)) { context in
+                        workspaceList(at: context.date)
+                    }
                 }
             }
             Divider()

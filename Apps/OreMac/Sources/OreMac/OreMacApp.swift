@@ -7,11 +7,119 @@ import OreTelemetry
 import SwiftUI
 import UserNotifications
 
+/// Launch work that must not hold up the first frame. Runs once: shortly after
+/// the first window appears, or from a fallback timer when no window does.
+@MainActor
+enum DeferredLaunchWork {
+    private static var pending: (@MainActor () -> Void)?
+
+    static func schedule(_ work: @escaping @MainActor () -> Void) {
+        pending = work
+    }
+
+    static func runIfNeeded() {
+        guard let work = pending else { return }
+        pending = nil
+        work()
+    }
+}
+
+/// Stands in for the telemetry client until `TelemetryClient.make` has run
+/// after the first frame. Events recorded before then are held and handed
+/// over in order; an opt-out before then drops them and is passed on.
+final class DeferredTelemetryRecorder: TelemetryRecorder, @unchecked Sendable {
+    private let lock = NSLock()
+    private var target: (any TelemetryRecorder)?
+    private var buffered: [TelemetryEvent] = []
+    private var optedOutEarly = false
+    /// Launch-window events are a handful; the cap only guards a runaway.
+    static let bufferLimit = 256
+
+    init() {}
+
+    func install(_ recorder: any TelemetryRecorder) {
+        guard let forwardOptOut = attach(recorder) else { return }
+        if forwardOptOut {
+            Task { await recorder.optOut() }
+        }
+    }
+
+    /// `nil` when a recorder is already installed; otherwise whether an early
+    /// opt-out still has to reach the real one.
+    private func attach(_ recorder: any TelemetryRecorder) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard target == nil else { return nil }
+        target = recorder
+        if !optedOutEarly {
+            for event in buffered { recorder.record(event) }
+        }
+        buffered = []
+        return optedOutEarly
+    }
+
+    func record(_ event: TelemetryEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let target {
+            target.record(event)
+        } else if !optedOutEarly, buffered.count < Self.bufferLimit {
+            buffered.append(event)
+        }
+    }
+
+    func recordBlocking(_ event: TelemetryEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let target {
+            target.recordBlocking(event)
+        } else if !optedOutEarly, buffered.count < Self.bufferLimit {
+            // Lost if the process dies first — a quit within a second of
+            // launch, before there is a store to write to.
+            buffered.append(event)
+        }
+    }
+
+    func optOut() async {
+        await currentTarget(optingOut: true)?.optOut()
+    }
+
+    func optIn() async {
+        await currentTarget(optingIn: true)?.optIn()
+    }
+
+    func flush() async {
+        await currentTarget()?.flush()
+    }
+
+    func pendingDescriptions() async -> [String] {
+        await currentTarget()?.pendingDescriptions() ?? []
+    }
+
+    /// Synchronous so the lock is never held across a suspension.
+    private func currentTarget(
+        optingOut: Bool = false,
+        optingIn: Bool = false
+    ) -> (any TelemetryRecorder)? {
+        lock.lock()
+        defer { lock.unlock() }
+        if target == nil {
+            if optingOut {
+                optedOutEarly = true
+                buffered = []
+            } else if optingIn {
+                optedOutEarly = false
+            }
+        }
+        return target
+    }
+}
+
 @main
 struct OreMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
-    @State private var updater = Updater()
+    @State private var updater: Updater
     @State private var githubUpdater = GitHubUpdater()
     @State private var launchFailure: String?
     @State private var isShowingNewWorkspace = false
@@ -29,25 +137,13 @@ struct OreMacApp: App {
         AppModel.registerDefaults()
         TelemetryConsent.registerDefaults()
 
-        // Anonymous usage analytics, built first so a launch is still counted
-        // when the store below fails to open — that failure is exactly the
-        // thing worth knowing about.
-        //
-        // `make` returns a no-op for debug builds, for any build with no key
-        // stamped into Info.plist (every contributor's, and every fork's),
-        // when ORE_TELEMETRY=0, and when the user has opted out — which it
-        // checks itself, synchronously, before returning a recording client,
-        // so the two calls below cannot beat consent to the queue. Silence is
-        // the default, and nothing downstream needs to know it might be off.
-        // See PRIVACY.md.
-        let telemetry = TelemetryClient.make(home: OreHome.directory)
-        let recorder = telemetry.recorder
-        if let facts = telemetry.launch {
-            if facts.isNewInstall {
-                recorder.record(.appInstalled(channel: facts.channel))
-            }
-            recorder.record(.appLaunched(reason: .cold, daysSinceInstall: facts.daysSinceInstall))
-        }
+        // Anonymous usage analytics. The client itself is built after the
+        // first frame (see `DeferredLaunchWork` below) — `make` opens its own
+        // SQLite store, which has no business delaying the window. Until then
+        // this stand-in buffers, so a launch is still counted when the store
+        // below fails to open — that failure is exactly the thing worth
+        // knowing about.
+        let recorder = DeferredTelemetryRecorder()
 
         // The store and the core are created before the first window exists, so
         // a broken database surfaces as a message rather than a blank window.
@@ -81,6 +177,39 @@ struct OreMacApp: App {
         // any window existing. `start()` is idempotent, so the window calling
         // it again is harmless.
         created.start()
+
+        // Created stopped; started with the rest of the deferred work.
+        let updater = Updater()
+        _updater = State(initialValue: updater)
+        DeferredLaunchWork.schedule {
+            updater.startIfNeeded()
+            Task.detached(priority: .utility) {
+                // `make` returns a no-op for debug builds, for any build with
+                // no key stamped into Info.plist (every contributor's, and
+                // every fork's), when ORE_TELEMETRY=0, and when the user has
+                // opted out — which it checks itself, synchronously, before
+                // returning a recording client, so the launch events below
+                // cannot beat consent to the queue. Silence is the default,
+                // and nothing downstream needs to know it might be off.
+                // See PRIVACY.md.
+                let telemetry = TelemetryClient.make(home: OreHome.directory)
+                if let facts = telemetry.launch {
+                    if facts.isNewInstall {
+                        telemetry.recorder.record(.appInstalled(channel: facts.channel))
+                    }
+                    telemetry.recorder.record(
+                        .appLaunched(reason: .cold, daysSinceInstall: facts.daysSinceInstall)
+                    )
+                }
+                recorder.install(telemetry.recorder)
+            }
+        }
+        // A launch can show no window at all (the menu bar keeps ORE alive),
+        // and the window's task is what normally runs this.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            DeferredLaunchWork.runIfNeeded()
+        }
     }
 
     var body: some Scene {
@@ -108,6 +237,11 @@ struct OreMacApp: App {
                 // already sat through.
                 githubUpdater.reconcilePendingRestart()
                 model.start()
+                // Sparkle and telemetry setup, a beat after the window is up.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    DeferredLaunchWork.runIfNeeded()
+                }
                 // Tap ⌥⌘ anywhere to dictate. Without Accessibility this still
                 // works while ORE is frontmost, so it is never dead.
                 VoiceHotkeyMonitor.shared.start()

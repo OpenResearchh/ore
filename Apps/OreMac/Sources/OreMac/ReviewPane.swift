@@ -83,6 +83,7 @@ private struct VisibleWorkspaceFileNode: Identifiable {
 /// meant.
 struct ReviewPane: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.controlActiveState) private var controlActiveState
     let workspace: WorkspaceSummary
 
     @State private var diffs: [FileDiff] = []
@@ -107,6 +108,13 @@ struct ReviewPane: View {
     @State private var reviewSetup: ReviewSetup?
     @State private var reviewInstructions = ""
     @State private var reviewModel = ""
+    /// Workspace and git generation of the last diff refresh, so the
+    /// generation task doesn't repeat the read the workspace task just did.
+    @State private var lastRefreshKey: String?
+    /// Whose files `fileTree` holds, and whose walk is the latest requested —
+    /// a slow walk for a workspace the user already left must not land.
+    @State private var fileTreeWorkspaceID: WorkspaceID?
+    @State private var fileTreeRequestedFor: WorkspaceID?
 
     private enum DiffScope: Hashable {
         case all
@@ -175,16 +183,56 @@ struct ReviewPane: View {
             stackChildren = stack.children
         }
         // Silent catch-up: the agent writing files should grow this list in
-        // place, not flash a spinner over it.
-        .task(id: model.gitGeneration(for: workspace.id)) { await refresh() }
+        // place, not flash a spinner over it. Debounced — the task restarts on
+        // every generation, so a burst of writes lands as one diff read.
+        .task(id: model.gitGeneration(for: workspace.id)) {
+            try? await Task.sleep(for: ReviewRefreshPolicy.gitDebounce)
+            guard !Task.isCancelled, refreshKey != lastRefreshKey else { return }
+            await refresh()
+        }
+        // The full workspace walk only feeds "All files", so it runs only
+        // while that tab is showing, and again when it is shown after changes.
+        .task(id: FileTreeRefreshKey(
+            workspaceID: workspace.id,
+            generation: model.gitGeneration(for: workspace.id),
+            isVisible: tab == .allFiles
+        )) {
+            await refreshFileTree()
+        }
         // Agent PostDiffComment writes a gitignored file, so status generation
-        // does not move. Poll while this pane is up so numbered anchors appear.
-        .task(id: "comments-\(workspace.id.rawValue)") {
+        // does not move. Poll so numbered anchors appear — but only while the
+        // window is key, and quickly only while an agent here is mid-turn.
+        // Becoming key restarts the task, which pulls straight away.
+        .task(id: CommentPollKey(
+            workspaceID: workspace.id,
+            isWindowKey: controlActiveState == .key,
+            isAgentBusy: ReviewRefreshPolicy.isAgentBusy(workspace.status)
+        )) {
+            guard let interval = ReviewRefreshPolicy.commentPollInterval(
+                isWindowKey: controlActiveState == .key,
+                isAgentBusy: ReviewRefreshPolicy.isAgentBusy(workspace.status)
+            ) else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
                 await model.pullDraftComments(for: workspace.id)
+                try? await Task.sleep(for: interval)
             }
         }
+    }
+
+    private struct FileTreeRefreshKey: Hashable {
+        let workspaceID: WorkspaceID
+        let generation: UInt64
+        let isVisible: Bool
+    }
+
+    private struct CommentPollKey: Hashable {
+        let workspaceID: WorkspaceID
+        let isWindowKey: Bool
+        let isAgentBusy: Bool
+    }
+
+    private var refreshKey: String {
+        "\(workspace.id.rawValue)#\(model.gitGeneration(for: workspace.id))"
     }
 
     /// Show the cached diff for this workspace at once, or clear whatever diff
@@ -948,15 +996,13 @@ struct ReviewPane: View {
     // MARK: - Behaviour
 
     private func refresh() async {
+        lastRefreshKey = refreshKey
         let showLoader = !hasLoadedOnce && diffs.isEmpty
         if showLoader { isLoading = true }
-        if fileTree.isEmpty { isLoadingFiles = true }
         defer {
             isLoading = false
-            isLoadingFiles = false
             hasLoadedOnce = true
         }
-        async let files = model.workspaceFiles(for: workspace)
         async let tree = model.loadWorkingTreeStatus(for: workspace.id)
         do {
             // Load through the shared cache so the diff we just read also warms
@@ -978,7 +1024,31 @@ struct ReviewPane: View {
             loadError = error.localizedDescription
             workingTree = await tree
         }
-        fileTree = await files
+    }
+
+    /// Walks the workspace for "All files". A no-op while that tab is hidden;
+    /// the refresh key includes visibility, so showing the tab runs it.
+    private func refreshFileTree() async {
+        guard tab == .allFiles else { return }
+        let workspaceID = workspace.id
+        fileTreeRequestedFor = workspaceID
+        if fileTreeWorkspaceID != workspaceID {
+            // Another workspace's tree must not stand in while this one loads.
+            fileTree = []
+        } else {
+            // Already showing this workspace: coalesce a burst of changes.
+            try? await Task.sleep(for: ReviewRefreshPolicy.gitDebounce)
+            guard !Task.isCancelled else { return }
+        }
+        if fileTree.isEmpty { isLoadingFiles = true }
+        let files = await model.workspaceFiles(for: workspace)
+        // Not gated on cancellation: while an agent writes steadily, every
+        // walk would be cancelled by the next change and the tree would never
+        // update. Only a walk for a workspace no longer requested is dropped.
+        guard fileTreeRequestedFor == workspaceID else { return }
+        fileTree = files
+        fileTreeWorkspaceID = workspaceID
+        isLoadingFiles = false
     }
 
     /// Folders the user hasn't seen yet start expanded so a live agent writing
@@ -1013,6 +1083,30 @@ struct ReviewPane: View {
         case .deleted: return .red
         case .conflicted: return .orange
         default: return .blue
+        }
+    }
+}
+
+/// When the review pane re-reads git and the agent's posted comments. Pulled
+/// out of the view so the cadence is testable.
+enum ReviewRefreshPolicy {
+    /// Git changes arrive in bursts while an agent writes; one read per burst.
+    static let gitDebounce = Duration.milliseconds(300)
+    static let busyCommentPoll = Duration.seconds(1)
+    static let idleCommentPoll = Duration.seconds(5)
+
+    /// `nil` means don't poll: nobody is looking, and becoming key restarts
+    /// polling with an immediate pull.
+    static func commentPollInterval(isWindowKey: Bool, isAgentBusy: Bool) -> Duration? {
+        guard isWindowKey else { return nil }
+        return isAgentBusy ? busyCommentPoll : idleCommentPoll
+    }
+
+    /// Mid-turn — the only time an agent can be posting a comment.
+    static func isAgentBusy(_ status: AgentStatus) -> Bool {
+        switch status {
+        case .thinking, .requesting, .runningTool: true
+        case .idle, .awaitingInput, .interrupted, .failed: false
         }
     }
 }

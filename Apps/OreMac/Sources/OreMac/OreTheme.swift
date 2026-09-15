@@ -185,80 +185,188 @@ final class OreAdaptiveGlassView: NSVisualEffectView {
     }
 }
 
-/// macOS `List` ignores `.scrollIndicators(.hidden)`: it is NSTableView-backed,
-/// and the modifier only reaches SwiftUI's own scrollers. With "Show scroll
-/// bars: Always" set system-wide, every List kept drawing the opaque legacy
-/// track — the one rectangle the glass window can't absorb. This probe sits in
-/// a List's `.background`, finds the backing scroll view, and forces the same
-/// overlay/light-knob answer every AppKit scroll surface in the app uses.
-struct OreListScrollerOverlay: NSViewRepresentable {
-    /// The scroll view found by the last search. Weak: when the List rebuilds
+/// The scroller answer every scroll surface in the app shares: overlay style, a
+/// light knob (the window is always dark), autohide.
+enum OreScrollerStyle {
+    /// Debug A/B switch for the trackpad-to-momentum handoff hitch: responsive
+    /// scrolling draws ahead of the main thread, which is usually smoother but
+    /// has a known handoff stutter on some content. Off unless set with
+    /// `defaults write <bundle id> ore.debug.disableResponsiveScrolling -bool YES`.
+    static let responsiveScrollingDisabled =
+        UserDefaults.standard.bool(forKey: "ore.debug.disableResponsiveScrolling")
+
+    static func isStyled(_ scroll: NSScrollView) -> Bool {
+        scroll.scrollerStyle == .overlay
+            && scroll.scrollerKnobStyle == .light
+            && scroll.autohidesScrollers
+    }
+
+    static func style(_ scroll: NSScrollView) {
+        if scroll.scrollerStyle != .overlay { scroll.scrollerStyle = .overlay }
+        if scroll.scrollerKnobStyle != .light { scroll.scrollerKnobStyle = .light }
+        if !scroll.autohidesScrollers { scroll.autohidesScrollers = true }
+    }
+}
+
+/// An NSScrollView that cannot fall back to the legacy scroller. AppKit re-sets
+/// `scrollerStyle` on every scroll view when the system preference changes
+/// (plugging in a mouse, "Show scroll bars: Always"); a view styled once in
+/// `makeNSView` then grows an opaque track, and on the transcript the narrower
+/// clip view invalidates every cached row height. Clamping the setter keeps the
+/// overlay answer without anyone having to notice the change.
+final class OreOverlayScrollView: NSScrollView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        super.scrollerStyle = .overlay
+        scrollerKnobStyle = .light
+        autohidesScrollers = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        super.scrollerStyle = .overlay
+        scrollerKnobStyle = .light
+        autohidesScrollers = true
+    }
+
+    override var scrollerStyle: NSScroller.Style {
+        get { super.scrollerStyle }
+        set { super.scrollerStyle = .overlay }
+    }
+
+    override class var isCompatibleWithResponsiveScrolling: Bool {
+        !OreScrollerStyle.responsiveScrollingDisabled
+    }
+}
+
+/// SwiftUI owns the scroll views behind `List` and `ScrollView`, so they can't
+/// be `OreOverlayScrollView`s. `.scrollIndicators(.hidden)` was the old escape
+/// hatch, but it removed position feedback entirely, and `List` ignores it. This
+/// probe sits in the scrolling view's `.background`, finds the backing
+/// NSScrollView, and forces the shared overlay answer — again whenever the
+/// system scroller preference changes.
+struct OreScrollerOverlay: NSViewRepresentable {
+    /// The scroll view found by the last search. Weak: when SwiftUI rebuilds
     /// its scroll view the old one goes away and the next update searches again.
     @MainActor
     final class Coordinator {
         weak var scrollView: NSScrollView?
     }
 
+    /// Styles as soon as it lands in a window, so the first frame never shows
+    /// the legacy track, and re-styles when the system preference flips.
+    final class Probe: NSView {
+        var coordinator: Coordinator?
+        private var isObserving = false
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            restyle()
+            if !isObserving {
+                isObserving = true
+                // Selector-based, so the center drops it when the probe goes.
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(preferredScrollerStyleChanged),
+                    name: NSScroller.preferredScrollerStyleDidChangeNotification,
+                    object: nil
+                )
+            }
+        }
+
+        @objc private func preferredScrollerStyleChanged(_ note: Notification) {
+            // AppKit applies the new style to its scroll views after posting;
+            // re-assert on the next turn.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.restyle() }
+            }
+        }
+
+        func restyle() {
+            guard let coordinator else { return }
+            if OreScrollerOverlay.apply(near: self, coordinator: coordinator) { return }
+            // The sibling scroll view may not be installed yet on the pass the
+            // probe arrives in.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, let coordinator = self.coordinator else { return }
+                    _ = OreScrollerOverlay.apply(near: self, coordinator: coordinator)
+                }
+            }
+        }
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeNSView(context: Context) -> NSView {
-        let probe = NSView()
-        let coordinator = context.coordinator
-        DispatchQueue.main.async { Self.apply(near: probe, coordinator: coordinator) }
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.coordinator = context.coordinator
         return probe
     }
 
-    func updateNSView(_ probe: NSView, context: Context) {
-        // Re-applied on SwiftUI updates: AppKit resets scroller style when the
-        // system preference changes, and the List can rebuild its scroll view.
+    func updateNSView(_ probe: Probe, context: Context) {
         // The sidebar updates constantly, so the subview search only runs until
         // the scroll view is found; after that an update is three property reads.
         let coordinator = context.coordinator
-        if let scroll = coordinator.scrollView, scroll.window != nil {
-            guard !Self.isStyled(scroll) else { return }
-        }
-        DispatchQueue.main.async { Self.apply(near: probe, coordinator: coordinator) }
-    }
-
-    private static func isStyled(_ scroll: NSScrollView) -> Bool {
-        scroll.scrollerStyle == .overlay
-            && scroll.scrollerKnobStyle == .light
-            && scroll.autohidesScrollers
-    }
-
-    private static func style(_ scroll: NSScrollView) {
-        scroll.scrollerStyle = .overlay
-        scroll.scrollerKnobStyle = .light
-        scroll.autohidesScrollers = true
-    }
-
-    private static func apply(near probe: NSView, coordinator: Coordinator) {
-        if let scroll = coordinator.scrollView, scroll.window != nil {
-            style(scroll)
+        if let scroll = coordinator.scrollView, scroll.window != nil,
+           OreScrollerStyle.isStyled(scroll) {
             return
         }
-        // The background probe is a sibling of the list's scroll view, not an
-        // ancestor — climb a few levels, searching down at each.
+        probe.restyle()
+    }
+
+    /// Returns whether a scroll view was found and styled.
+    @discardableResult
+    fileprivate static func apply(near probe: NSView, coordinator: Coordinator) -> Bool {
+        if let scroll = coordinator.scrollView, scroll.window != nil {
+            OreScrollerStyle.style(scroll)
+            return true
+        }
+        guard let window = probe.window else { return false }
+        // The background probe is a sibling of the scroll view, not an
+        // ancestor — climb a few levels, searching down at each. Prefer the
+        // smallest scroll view whose frame holds the probe's centre, so a probe
+        // on a nested ScrollView never styles its outer page instead.
+        let centre = probe.convert(NSPoint(x: probe.bounds.midX, y: probe.bounds.midY), to: nil)
         var root: NSView? = probe.superview
-        for _ in 0..<4 {
-            guard let candidate = root else { return }
-            if let scroll = firstTableScrollView(in: candidate) {
-                coordinator.scrollView = scroll
-                style(scroll)
-                return
+        for _ in 0..<5 {
+            guard let candidate = root else { break }
+            var best: (scroll: NSScrollView, area: CGFloat)?
+            collectScrollViews(in: candidate) { scroll in
+                guard scroll.window === window else { return }
+                let frame = scroll.convert(scroll.bounds, to: nil)
+                guard frame.contains(centre) else { return }
+                let area = frame.width * frame.height
+                if best == nil || area < best!.area { best = (scroll, area) }
+            }
+            if let best {
+                coordinator.scrollView = best.scroll
+                OreScrollerStyle.style(best.scroll)
+                return true
             }
             root = candidate.superview
         }
+        return false
     }
 
-    private static func firstTableScrollView(in view: NSView) -> NSScrollView? {
-        if let scroll = view as? NSScrollView, scroll.documentView is NSTableView {
-            return scroll
-        }
+    private static func collectScrollViews(in view: NSView, _ visit: (NSScrollView) -> Void) {
+        if let scroll = view as? NSScrollView { visit(scroll) }
         for subview in view.subviews {
-            if let found = firstTableScrollView(in: subview) { return found }
+            collectScrollViews(in: subview, visit)
         }
-        return nil
+    }
+}
+
+/// The name the List call sites were written against.
+typealias OreListScrollerOverlay = OreScrollerOverlay
+
+extension View {
+    /// Overlay, light-knob, autohiding scrollers for a SwiftUI `ScrollView` or
+    /// `List` — visible position feedback that never draws the legacy track.
+    func oreOverlayScrollers() -> some View {
+        scrollIndicators(.automatic)
+            .background(OreScrollerOverlay())
     }
 }
 
@@ -328,6 +436,8 @@ struct OreGlassSurface: ViewModifier {
     var interactive: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
+    /// Set by a scrolling page that asked for flat cards; see `OreGlassDebug`.
+    @Environment(\.oreFlatGlass) private var isFlat
 
     func body(content: Content) -> some View {
         switch shape {
@@ -340,12 +450,43 @@ struct OreGlassSurface: ViewModifier {
 
     @ViewBuilder
     private func decorate<S: InsettableShape>(_ content: Content, shape: S) -> some View {
-        if #available(macOS 26.0, *) {
+        if isFlat {
+            // A card riding a scroll view resamples the moving page behind it
+            // on every frame. A flat paper fill costs one blend instead — the
+            // look changes, so it only happens behind a debug switch.
+            content
+                .background {
+                    ZStack {
+                        shape.fill(OreTheme.Surface.content.opacity(0.6))
+                        if let tint { shape.fill(tint) }
+                    }
+                }
+                .overlay {
+                    shape.strokeBorder(OreTheme.hairline, lineWidth: 1)
+                        .allowsHitTesting(false)
+                }
+        } else if #available(macOS 26.0, *) {
             // The system's glass carries its own edge lighting, optical
             // response, *and depth*; hands off entirely. A manual `.shadow`
             // here silhouetted the view's rectangular frame — not the glass
             // shape — and printed square halos at the foot of every pane.
             content.glassEffect(glass, in: shape)
+        } else if OreGlassDebug.groupsGlass {
+            // The same stand-in, with the shadow cast by the material's shape
+            // rather than by the whole composited view: SwiftUI no longer has
+            // to render the content offscreen to find its silhouette on every
+            // scroll frame.
+            content
+                .background {
+                    shape.fill(.ultraThinMaterial)
+                        .shadow(
+                            color: .black.opacity(elevation.shadowOpacity),
+                            radius: elevation.shadowRadius,
+                            y: elevation.shadowY
+                        )
+                }
+                .background { if let tint { shape.fill(tint) } }
+                .overlay { specularRim(shape) }
         } else {
             content
                 .background(.ultraThinMaterial, in: shape)
@@ -386,6 +527,41 @@ struct OreGlassSurface: ViewModifier {
         if let tint { glass = glass.tint(tint) }
         if interactive { glass = glass.interactive() }
         return glass
+    }
+}
+
+/// Unmeasured glass costs over scrolling content, kept as A/B switches until
+/// Instruments says which are worth their look. Read once at launch — never
+/// from a body — and off unless set with
+/// `defaults write <bundle id> ore.debug.<name> -bool YES`.
+enum OreGlassDebug {
+    /// Group sibling glass into one `GlassEffectContainer` on macOS 26, and on
+    /// earlier releases cast the stand-in's shadow from its shape rather than
+    /// from the composited view.
+    static let groupsGlass = UserDefaults.standard.bool(forKey: "ore.debug.groupedGlass")
+    /// Flat paper fills instead of glass for cards inside scroll views.
+    static let flatScrollingCards = UserDefaults.standard.bool(forKey: "ore.debug.flatScrollingCards")
+}
+
+extension EnvironmentValues {
+    /// Whether `OreGlassSurface` draws a flat fill instead of glass here.
+    @Entry var oreFlatGlass = false
+}
+
+extension View {
+    /// Wraps sibling glass surfaces in one `GlassEffectContainer` on macOS 26
+    /// when `OreGlassDebug.groupsGlass` is on; otherwise returns the view as is.
+    @ViewBuilder
+    func oreGlassGroup() -> some View {
+        if OreGlassDebug.groupsGlass {
+            if #available(macOS 26.0, *) {
+                GlassEffectContainer { self }
+            } else {
+                self
+            }
+        } else {
+            self
+        }
     }
 }
 

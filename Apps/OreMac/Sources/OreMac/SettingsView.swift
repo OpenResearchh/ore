@@ -213,7 +213,12 @@ private struct SettingsPanes: View {
                 .padding(.vertical, 26)
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+                // Every card on the page slides under the pointer while this
+                // scrolls; both are no-ops unless their debug switch is set.
+                .environment(\.oreFlatGlass, OreGlassDebug.flatScrollingCards)
+                .oreGlassGroup()
             }
+            .oreOverlayScrollers()
             .background(Color.clear)
         }
         .frame(width: 950, height: 650)
@@ -1017,8 +1022,10 @@ private struct PrivacySettings: View {
     @State private var pending: [TelemetryInspection.PendingEvent] = []
     @State private var showsPending = false
     @State private var copiedInstallID = false
-
-    private var installID: String? { TelemetryInspection.installID(home: OreHome.directory) }
+    /// Loaded once per appearance, off the main actor: it opens the telemetry
+    /// SQLite store, and used to do so from a computed property read twice in
+    /// `body`.
+    @State private var installID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1101,6 +1108,11 @@ private struct PrivacySettings: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
+        }
+        .task {
+            installID = await Task.detached(priority: .userInitiated) {
+                TelemetryInspection.installID(home: OreHome.directory)
+            }.value
         }
         // Recording has to stop the moment the switch moves, not at the next
         // launch: the queue is purged here, and `make` refuses to build a
@@ -1364,6 +1376,12 @@ private struct ProjectsSettings: View {
     @State private var configs: [String: OreConfiguration] = [:]
     @State private var newEntry: [String: String] = [:]
     @State private var loaded = false
+    /// Edits not yet written to `ore.toml`. Every keystroke in a script field
+    /// is an edit, and each used to be a TOML encode plus an atomic file write
+    /// on the main actor; now they settle for a moment and write once.
+    @State private var unsaved: [String: OreConfiguration] = [:]
+
+    private static let persistDebounce: Duration = .milliseconds(400)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1374,7 +1392,7 @@ private struct ProjectsSettings: View {
             ForEach(repositories, id: \.self) { repo in
                 let config = Binding(
                     get: { configs[repo] ?? OreConfiguration() },
-                    set: { configs[repo] = $0; persist(repo, $0) }
+                    set: { configs[repo] = $0; unsaved[repo] = $0 }
                 )
                 SettingsCard(title: (repo as NSString).lastPathComponent, icon: "folder") {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1389,10 +1407,36 @@ private struct ProjectsSettings: View {
         }
         .task {
             guard !loaded else { return }
-            for repo in repositories {
-                configs[repo] = OreConfiguration.load(repositoryPath: URL(fileURLWithPath: repo))
-            }
+            let repos = repositories
+            let found = await Task.detached(priority: .userInitiated) {
+                Dictionary(uniqueKeysWithValues: repos.map {
+                    ($0, OreConfiguration.load(repositoryPath: URL(fileURLWithPath: $0)))
+                })
+            }.value
+            // An edit made while the files were loading wins over the file.
+            configs.merge(found) { edited, _ in edited }
             loaded = true
+        }
+        // Restarts on every edit, so only a pause in typing reaches the disk.
+        .task(id: unsaved) {
+            guard !unsaved.isEmpty else { return }
+            try? await Task.sleep(for: Self.persistDebounce)
+            guard !Task.isCancelled else { return }
+            flushUnsaved()
+        }
+        // Leaving the pane cancels the debounce above; the last edit must
+        // still land.
+        .onDisappear { flushUnsaved() }
+    }
+
+    private func flushUnsaved() {
+        guard !unsaved.isEmpty else { return }
+        let writes = unsaved
+        unsaved = [:]
+        Task.detached(priority: .utility) {
+            for (repo, config) in writes {
+                Self.persist(repo, config)
+            }
         }
     }
 
@@ -1534,7 +1578,7 @@ private struct ProjectsSettings: View {
         config.wrappedValue = next
     }
 
-    private func persist(_ repo: String, _ config: OreConfiguration) {
+    private nonisolated static func persist(_ repo: String, _ config: OreConfiguration) {
         let url = URL(fileURLWithPath: repo)
         try? config.toTOML().write(
             to: url.appendingPathComponent(OreConfiguration.fileName),

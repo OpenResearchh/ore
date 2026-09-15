@@ -8,6 +8,10 @@ struct DreamReviewWindow: View {
     @State private var selectedID: DreamFindingID?
     @State private var hideLowConfidence = true
     @State private var transcriptFinding: DreamFindingSummary?
+    /// The grouped inbox, rebuilt only when the findings or the filter change.
+    /// This body also re-runs for every run-progress update while a dream is
+    /// under way, and used to re-group the whole inbox each time.
+    @State private var inboxMemo = DreamInboxSections.Memo()
 
     var body: some View {
         NavigationSplitView {
@@ -67,14 +71,11 @@ struct DreamReviewWindow: View {
         visibleFindings.first { $0.id == selectedID } ?? visibleFindings.first
     }
 
-    private var visibleFindings: [DreamFindingSummary] {
-        model.dreamInbox.findings.filter { finding in
-            if hideLowConfidence, finding.confidence < 0.5, finding.status == .new {
-                return false
-            }
-            return true
-        }
+    private var sections: DreamInboxSections {
+        inboxMemo.resolve(model.dreamInbox.findings, hideLowConfidence: hideLowConfidence)
     }
+
+    private var visibleFindings: [DreamFindingSummary] { sections.visible }
 
     private var inbox: some View {
         List(selection: $selectedID) {
@@ -82,15 +83,11 @@ struct DreamReviewWindow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            let grouped = Dictionary(grouping: visibleFindings) {
-                Calendar.current.startOfDay(for: $0.createdAt)
-            }
-            ForEach(grouped.keys.sorted(by: >), id: \.self) { day in
-                Section(day.formatted(date: .abbreviated, time: .omitted)) {
-                    let byRepo = Dictionary(grouping: grouped[day] ?? []) { $0.repositoryName }
-                    ForEach(byRepo.keys.sorted(), id: \.self) { repo in
-                        Section(repo) {
-                            ForEach(byRepo[repo] ?? []) { finding in
+            ForEach(sections.days) { day in
+                Section(day.start.formatted(date: .abbreviated, time: .omitted)) {
+                    ForEach(day.projects) { project in
+                        Section(project.name) {
+                            ForEach(project.findings) { finding in
                                 DreamFindingRow(finding: finding)
                                     .tag(finding.id)
                             }
@@ -100,6 +97,7 @@ struct DreamReviewWindow: View {
             }
         }
         .listStyle(.sidebar)
+        .oreOverlayScrollers()
     }
 
     @ViewBuilder
@@ -165,6 +163,69 @@ struct DreamReviewWindow: View {
             )
         case .opportunistic, .disabled:
             return nil
+        }
+    }
+}
+
+/// The inbox as the list draws it: findings the filter lets through, grouped
+/// by day (newest first), then by project (A to Z), each group keeping the
+/// inbox's own order.
+struct DreamInboxSections: Equatable {
+    struct Project: Equatable, Identifiable {
+        let name: String
+        let findings: [DreamFindingSummary]
+        var id: String { name }
+    }
+
+    struct Day: Equatable, Identifiable {
+        let start: Date
+        let projects: [Project]
+        var id: Date { start }
+    }
+
+    private(set) var visible: [DreamFindingSummary] = []
+    private(set) var days: [Day] = []
+
+    init() {}
+
+    init(
+        findings: [DreamFindingSummary],
+        hideLowConfidence: Bool,
+        calendar: Calendar = .current
+    ) {
+        visible = findings.filter { finding in
+            !(hideLowConfidence && finding.confidence < 0.5 && finding.status == .new)
+        }
+        let byDay = Dictionary(grouping: visible) { calendar.startOfDay(for: $0.createdAt) }
+        days = byDay.keys.sorted(by: >).map { day in
+            let byProject = Dictionary(grouping: byDay[day] ?? []) { $0.repositoryName }
+            return Day(
+                start: day,
+                projects: byProject.keys.sorted().map {
+                    Project(name: $0, findings: byProject[$0] ?? [])
+                }
+            )
+        }
+    }
+
+    /// Remembers the last grouping. An unchanged inbox is the same array
+    /// storage, so the equality check that guards a rebuild is usually a
+    /// pointer comparison.
+    @MainActor
+    final class Memo {
+        private var findings: [DreamFindingSummary]?
+        private var hideLowConfidence = false
+        private var cached = DreamInboxSections()
+
+        func resolve(_ findings: [DreamFindingSummary], hideLowConfidence: Bool) -> DreamInboxSections {
+            if let previous = self.findings, previous == findings,
+               self.hideLowConfidence == hideLowConfidence {
+                return cached
+            }
+            self.findings = findings
+            self.hideLowConfidence = hideLowConfidence
+            cached = DreamInboxSections(findings: findings, hideLowConfidence: hideLowConfidence)
+            return cached
         }
     }
 }
@@ -257,6 +318,7 @@ private struct DreamFindingDetail: View {
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .oreOverlayScrollers()
                         .frame(maxHeight: 280)
                     }
                 }
@@ -285,6 +347,7 @@ private struct DreamFindingDetail: View {
             .padding(24)
             .frame(maxWidth: 720, alignment: .leading)
         }
+        .oreOverlayScrollers()
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -308,6 +371,10 @@ private struct DreamTranscriptSheet: View {
     @Environment(AppModel.self) private var model
     let finding: DreamFindingSummary
     @Environment(\.dismiss) private var dismiss
+    @State private var expandedActivityGroups: Set<String> = []
+    /// Held here so its identity survives every body pass — `TranscriptHost`
+    /// compares it by reference.
+    @State private var scrollAnchor = TranscriptScrollAnchor()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -319,22 +386,67 @@ private struct DreamTranscriptSheet: View {
                     .keyboardShortcut(.cancelAction)
             }
             if let chatID = finding.chatID {
-                let state = model.chat(for: chatID)
-                let text = state.rows
-                    .filter { $0.kind == .userMessage || $0.kind == .assistantText }
-                    .map(\.text)
-                    .joined(separator: "\n\n")
-                ScrollView {
-                    Text(text.isEmpty ? "Loading transcript…" : text)
-                        .font(.body)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                transcript(chatID)
             } else {
                 Text("No transcript is attached to this finding.")
                     .foregroundStyle(.secondary)
             }
         }
         .padding(20)
+    }
+
+    /// The same `Equatable` host the chat pane and the Assistant window use.
+    /// This sheet used to join every message into one selectable `Text` on
+    /// each row update — while a dream streamed, the whole transcript was
+    /// re-joined and re-laid out per delta, with nothing holding the reader's
+    /// place. `state.rows` must not be read here; see `TranscriptHost.==`.
+    @ViewBuilder
+    private func transcript(_ chatID: ChatID) -> some View {
+        let state = model.chat(for: chatID)
+        if state.hasRows {
+            TranscriptHost(
+                chat: state,
+                worktreePath: model.workspaces.first { $0.id == finding.workspaceID }?.worktreePath
+                    ?? finding.repositoryPath,
+                agentName: model.chatIndex.summary(for: chatID)?.harness.displayName ?? "Agent",
+                agentHarness: model.chatIndex.summary(for: chatID)?.harness,
+                searchQuery: "",
+                persistenceKey: "dream-\(chatID.rawValue)",
+                expandedActivityGroups: expandedActivityGroups,
+                canFork: false,
+                onRevert: { _ in },
+                onToggleActivity: { group in
+                    if !expandedActivityGroups.insert(group).inserted {
+                        expandedActivityGroups.remove(group)
+                    }
+                },
+                onOpenFile: { _ in },
+                onTurnAction: { _, _ in },
+                scrollAnchor: scrollAnchor
+            )
+            .equatable()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .bottomLeading) {
+                DreamTranscriptJumpToLatest(anchor: scrollAnchor)
+            }
+        } else {
+            Text("Loading transcript…")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+/// Reads `isAwayFromBottom` in its own body, so the sheet isn't re-run each
+/// time the reader leaves or returns to the foot of the transcript.
+private struct DreamTranscriptJumpToLatest: View {
+    let anchor: TranscriptScrollAnchor
+
+    var body: some View {
+        if anchor.isAwayFromBottom {
+            JumpToLatestButton { anchor.jumpToBottom() }
+                .padding(OreTheme.Space.md)
+                .transition(.opacity)
+        }
     }
 }

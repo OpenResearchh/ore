@@ -47,9 +47,6 @@ struct NewWorkspaceComposer: View {
         ))
     }
 
-    private var intent: WorkspaceIntent { plan.intent }
-    private var choice: WorkspaceInference.Choice? { plan.repository }
-
     /// Start is for starting work.
     ///
     /// Having somewhere to work is deliberately *not* a condition: with no
@@ -57,17 +54,21 @@ struct NewWorkspaceComposer: View {
     /// the *right* somewhere is: an ambiguous project, or a name ORE cannot
     /// place, has to be settled before a worktree appears in a repository the
     /// user never mentioned.
-    private var canStart: Bool {
+    private func canStart(_ plan: WorkspaceLaunchPlan) -> Bool {
         plan.canStart && !isCreating
     }
 
     var body: some View {
+        // Resolved once per pass and handed down. `plan` is computed, and the
+        // chips, the footer, Start and its tooltip each used to resolve it
+        // again — about nine times per keystroke.
+        let plan = self.plan
         VStack(alignment: .leading, spacing: OreTheme.Space.md) {
             Text("What do you want ORE to work on?")
                 .font(.system(size: 20, weight: .semibold))
 
-            surface
-            footer
+            surface(plan)
+            footer(plan)
         }
         .padding(OreTheme.Space.lg)
         .frame(width: 560)
@@ -85,7 +86,7 @@ struct NewWorkspaceComposer: View {
 
     /// Text above, controls below, in a single surface — the same shape as the
     /// chat composer, because it is the same gesture.
-    private var surface: some View {
+    private func surface(_ plan: WorkspaceLaunchPlan) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .topLeading) {
                 if instruction.isEmpty {
@@ -101,14 +102,16 @@ struct NewWorkspaceComposer: View {
                 TextEditor(text: $instruction)
                     .font(.system(size: OreTheme.Font.title))
                     .scrollContentBackground(.hidden)
-                    .scrollIndicators(.hidden)
+                    // Three lines tall: a longer instruction scrolls, and the
+                    // overlay knob is the only sign there is more above.
+                    .oreOverlayScrollers()
                     .padding(.vertical, 8)
                     .focused($writing)
                     .frame(height: 72)
             }
             .padding(.horizontal, 10)
 
-            controlBar
+            controlBar(plan)
         }
         // The app's own glass, not a flat fill: this is the one high-value
         // surface on the panel, which is exactly what `OreGlassSurface` is
@@ -130,8 +133,9 @@ struct NewWorkspaceComposer: View {
         .onTapGesture { writing = true }
     }
 
-    private var controlBar: some View {
-        HStack(spacing: OreTheme.Space.sm) {
+    private func controlBar(_ plan: WorkspaceLaunchPlan) -> some View {
+        let startable = canStart(plan)
+        return HStack(spacing: OreTheme.Space.sm) {
             micButton
             if voice.isActive {
                 WaveformBars(mode: .listening, level: { voice.audioLevel })
@@ -139,13 +143,13 @@ struct NewWorkspaceComposer: View {
                     .transition(.opacity)
             }
             HStack(spacing: 5) {
-                HarnessMark(harness: effectiveHarness, size: 14)
-                modelPicker
+                HarnessMark(harness: plan.harness, size: 14)
+                modelPicker(plan)
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(OreTheme.glassControlFill, in: Capsule())
-            readings
+            readings(plan.intent)
             Spacer(minLength: OreTheme.Space.sm)
             Button(action: onStart) {
                 HStack(spacing: 5) {
@@ -160,8 +164,8 @@ struct NewWorkspaceComposer: View {
             }
             .buttonStyle(OrePrimaryButtonStyle())
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!canStart)
-            .help(canStart
+            .disabled(!startable)
+            .help(startable
                 ? "Start work (⌘↩)"
                 : plan.blockerMessage ?? "Say what you want ORE to work on")
         }
@@ -176,7 +180,7 @@ struct NewWorkspaceComposer: View {
     /// shows the mark of whatever will actually run, so the default is legible
     /// at a glance and changing it is one click, without model choice becoming
     /// a question the user has to answer before starting.
-    private var modelPicker: some View {
+    private func modelPicker(_ plan: WorkspaceLaunchPlan) -> some View {
         Menu {
             ForEach(model.readyHarnesses, id: \.self) { kind in
                 Section(kind.displayName) {
@@ -187,7 +191,7 @@ struct NewWorkspaceComposer: View {
                 }
             }
         } label: {
-            Text(effectiveModelLabel)
+            Text(modelLabel(plan))
                 .lineLimit(1)
                 .font(.system(size: OreTheme.Font.caption))
                 .foregroundStyle(.secondary)
@@ -204,9 +208,7 @@ struct NewWorkspaceComposer: View {
         .help("The agent and model this workspace starts with")
     }
 
-    private var effectiveHarness: HarnessKind { plan.harness }
-
-    private var effectiveModelLabel: String {
+    private func modelLabel(_ plan: WorkspaceLaunchPlan) -> String {
         guard let chosen = plan.model ?? plan.unavailableModel else { return "Default" }
         return model.knownModels(for: plan.harness)
             .first { $0.id == chosen }?.displayName ?? chosen
@@ -243,9 +245,9 @@ struct NewWorkspaceComposer: View {
     /// One quiet line: where the work will happen, and the way out to the
     /// controls. Both trailing-aligned against the project so the row reads
     /// left-to-right as statement then correction.
-    private var footer: some View {
+    private func footer(_ plan: WorkspaceLaunchPlan) -> some View {
         HStack(spacing: OreTheme.Space.sm) {
-            if let choice {
+            if let choice = plan.repository {
                 Image(systemName: choice.isSettled ? "folder" : "questionmark.circle")
                     .foregroundStyle(choice.isSettled ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
                 // A project ORE is unsure about is not announced as the
@@ -302,8 +304,7 @@ struct NewWorkspaceComposer: View {
     /// Only what was actually heard. Empty means ORE is using its defaults,
     /// which is the normal case and needs no explaining.
     @ViewBuilder
-    private var readings: some View {
-        let intent = intent
+    private func readings(_ intent: WorkspaceIntent) -> some View {
         if intent.harness != nil || intent.model != nil || intent.baseBranch != nil {
             HStack(spacing: 4) {
                 if let harness = intent.harness { chip(harness.displayName) }

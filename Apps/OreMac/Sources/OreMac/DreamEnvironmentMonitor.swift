@@ -115,7 +115,10 @@ final class DreamEnvironmentMonitor {
         // Idle minutes and quiet-hour edges don't need second precision; the
         // slack lets the system batch this wakeup with others.
         timer.tolerance = 10
-        RunLoop.main.add(timer, forMode: .common)
+        // Default mode, not `.common`: nothing here is urgent enough to run in
+        // the middle of a scroll, a menu or a window drag. A tick that lands
+        // during event tracking just waits for the gesture to end.
+        RunLoop.main.add(timer, forMode: .default)
         self.timer = timer
         let center = NSWorkspace.shared.notificationCenter
         sleepObservers = [

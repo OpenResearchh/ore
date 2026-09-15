@@ -20,7 +20,6 @@ struct NewWorkspaceSheet: View {
     @State private var repositorySource = RepositorySource.local
     @State private var githubStatus: GitHubClient.Status?
     @State private var githubRepositories: [GitHubClient.Repository] = []
-    @State private var githubQuery = ""
     @State private var githubReference = ""
     @State private var isLoadingGitHub = false
     @State private var isAuthenticatingGitHub = false
@@ -363,59 +362,10 @@ struct NewWorkspaceSheet: View {
             }
 
             if githubStatus?.isAuthenticated == true {
-                HStack(spacing: 7) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
-                    TextField("Find a repository", text: $githubQuery)
-                        .textFieldStyle(.plain)
-                }
-                .padding(.horizontal, 10)
-                .frame(height: 32)
-                .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
-
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(filteredGitHubRepositories.prefix(40)) { repository in
-                            Button {
-                                githubReference = repository.nameWithOwner
-                            } label: {
-                                HStack(alignment: .top, spacing: 9) {
-                                    Image(systemName: repository.isPrivate ? "lock.fill" : "book.closed")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 16)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(repository.nameWithOwner)
-                                            .fontWeight(.medium)
-                                        if let detail = repository.description, !detail.isEmpty {
-                                            Text(detail)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                    Spacer(minLength: 0)
-                                    if githubReference == repository.nameWithOwner {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(Color.accentColor)
-                                    }
-                                }
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 7)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(
-                                    githubReference == repository.nameWithOwner
-                                        ? OreTheme.selectedFill : .clear,
-                                    in: RoundedRectangle(cornerRadius: 8)
-                                )
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(4)
-                }
-                .frame(height: 155)
-                .background(OreTheme.subduedFill.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(OreTheme.hairline))
+                GitHubRepositoryList(
+                    repositories: githubRepositories,
+                    selection: $githubReference
+                )
             }
 
             TextField("owner/repository or GitHub URL", text: $githubReference)
@@ -423,14 +373,6 @@ struct NewWorkspaceSheet: View {
             Text("Paste a public repository even before signing in; private repositories use your GitHub CLI account.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
-        }
-    }
-
-    private var filteredGitHubRepositories: [GitHubClient.Repository] {
-        guard !githubQuery.isEmpty else { return githubRepositories }
-        return githubRepositories.filter {
-            $0.nameWithOwner.localizedCaseInsensitiveContains(githubQuery)
-                || ($0.description?.localizedCaseInsensitiveContains(githubQuery) ?? false)
         }
     }
 
@@ -676,6 +618,117 @@ struct NewWorkspaceSheet: View {
     }
 }
 
+/// The signed-in account's repositories, searchable, as a short pick list.
+///
+/// Its own view so the query is its own state: a keystroke in any other field
+/// of the form no longer re-filters the list, and a keystroke here redraws
+/// only the list — after a short pause, not per character.
+private struct GitHubRepositoryList: View {
+    let repositories: [GitHubClient.Repository]
+    @Binding var selection: String
+
+    @State private var query = ""
+    @State private var shown: [GitHubClient.Repository]
+
+    /// A pick list, not a browser: past this the user should type.
+    static let shownLimit = 40
+    private static let filterDebounce: Duration = .milliseconds(120)
+
+    init(repositories: [GitHubClient.Repository], selection: Binding<String>) {
+        self.repositories = repositories
+        _selection = selection
+        _shown = State(initialValue: Self.matching(repositories, query: ""))
+    }
+
+    private struct FilterInput: Equatable {
+        var query: String
+        var repositories: [GitHubClient.Repository]
+    }
+
+    static func matching(_ repositories: [GitHubClient.Repository], query: String) -> [GitHubClient.Repository] {
+        guard !query.isEmpty else { return Array(repositories.prefix(shownLimit)) }
+        return Array(repositories.lazy.filter {
+            $0.nameWithOwner.localizedCaseInsensitiveContains(query)
+                || ($0.description?.localizedCaseInsensitiveContains(query) ?? false)
+        }.prefix(shownLimit))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
+                TextField("Find a repository", text: $query)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(shown) { repository in
+                        row(repository)
+                    }
+                }
+                .padding(4)
+            }
+            .oreOverlayScrollers()
+            // It sits inside the form's own scroll view; a short list that
+            // doesn't fill 155 pt shouldn't rubber-band and swallow the
+            // gesture meant for the form.
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: 155)
+            .background(OreTheme.subduedFill.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(OreTheme.hairline))
+        }
+        .task(id: FilterInput(query: query, repositories: repositories)) {
+            if !query.isEmpty {
+                try? await Task.sleep(for: Self.filterDebounce)
+                guard !Task.isCancelled else { return }
+            }
+            let next = Self.matching(repositories, query: query)
+            if next != shown { shown = next }
+        }
+    }
+
+    private func row(_ repository: GitHubClient.Repository) -> some View {
+        let isSelected = selection == repository.nameWithOwner
+        return Button {
+            selection = repository.nameWithOwner
+        } label: {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: repository.isPrivate ? "lock.fill" : "book.closed")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(repository.nameWithOwner)
+                        .fontWeight(.medium)
+                    if let detail = repository.description, !detail.isEmpty {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isSelected ? OreTheme.selectedFill : .clear,
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 /// ⌘K. Jumps to a workspace, or searches every transcript.
 ///
 /// Search matters more than it looks: with several agents working in parallel,
@@ -802,6 +855,7 @@ struct CommandPalette: View {
                 }
             }
             .listStyle(.inset)
+            .oreOverlayScrollers()
         }
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: OreTheme.cardRadius))

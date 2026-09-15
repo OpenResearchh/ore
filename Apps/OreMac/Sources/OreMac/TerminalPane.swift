@@ -158,15 +158,28 @@ final class TerminalRegistry {
 final class OreTerminalView: LocalProcessTerminalView {
     var onDetectedURL: ((URL) -> Void)?
 
-    /// Output arrives in arbitrary chunks, so a URL can be split across two of
-    /// them. A small trailing buffer is kept so the match doesn't depend on
-    /// where the chunk boundary happened to fall.
-    private var pendingText = ""
+    private var urlScanner = TerminalURLScanner()
 
-    private static let urlExpression = try? NSRegularExpression(
-        pattern: #"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:/[^\s"'<>]*)?"#,
-        options: [.caseInsensitive]
-    )
+    /// GPU rendering through SwiftTerm's Metal path. SwiftTerm's CoreGraphics
+    /// renderer redraws the whole grid for every line scrolled, which competes
+    /// with the rest of the window's scroll frames during a build or a log
+    /// tail. The Metal path is still marked experimental upstream, so it stays
+    /// off unless set with
+    /// `defaults write <bundle id> ore.debug.terminalMetal -bool YES`.
+    static let metalRendererRequested =
+        UserDefaults.standard.bool(forKey: "ore.debug.terminalMetal")
+
+    /// SwiftTerm's scroller, styled to match the rest of the window. It is a
+    /// standalone `NSScroller`, not part of an `NSScrollView`, so AppKit never
+    /// fades it the way it fades every other overlay knob in ORE; the view
+    /// does that itself below.
+    private weak var styledScroller: NSScroller?
+    private var lastScrollPosition: Double = 0
+    private var lastScrollActivity: CFTimeInterval = 0
+    private var scrollerFadeScheduled = false
+    /// How long the knob stays after the last movement, roughly what AppKit
+    /// gives its own overlay scrollers.
+    private static let scrollerIdleDelay: CFTimeInterval = 1.0
 
     func configureAppearance() {
         // Match the app's own text rendering rather than SwiftTerm's default,
@@ -187,47 +200,249 @@ final class OreTerminalView: LocalProcessTerminalView {
             nativeBackgroundColor = .textBackgroundColor
             nativeForegroundColor = .labelColor
         }
+
+        // The light knob is what every other scroll view in the window uses —
+        // the window is always dark. It starts hidden and appears only while
+        // the scrollback moves. `alphaValue` rather than `isHidden`: SwiftTerm
+        // stops reserving the scroller's width when it is hidden, which would
+        // reflow every line each time the knob came and went.
+        if let scroller = subviews.lazy.compactMap({ $0 as? NSScroller }).first {
+            scroller.knobStyle = .light
+            scroller.alphaValue = 0
+            styledScroller = scroller
+        }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // SwiftTerm wants a window before its Metal view is built, and rebinds
+        // the renderer itself when the view later moves between windows, so
+        // this only has to switch it on once. On failure it keeps drawing with
+        // CoreGraphics, which is the right fallback.
+        guard Self.metalRendererRequested, window != nil, !isUsingMetalRenderer else { return }
+        try? setUseMetal(true)
+    }
+
+    override func scrolled(source: TerminalView, position: Double) {
+        super.scrolled(source: source, position: position)
+        // Output arriving while the view is pinned to the bottom keeps the
+        // position at 1, so a build log doesn't hold the knob on screen; only
+        // real movement through the scrollback shows it.
+        guard position != lastScrollPosition else { return }
+        lastScrollPosition = position
+        guard canScroll else { return }
+        revealScroller()
+    }
+
+    // A wheel flick that lands on the first or the last line moves nothing, so
+    // the knob stays hidden even though that is when the reader most wants it.
+    // `TerminalView.scrollWheel` is `public override`, not `open`, so it can't
+    // be hooked from here; any movement at all does reveal the knob, which
+    // covers everything except a flick against an end stop.
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        // A faded knob is invisible but still a view. Without this, a click
+        // anywhere down the trailing edge grabs a scrollbar the user can't see
+        // and jumps the scrollback; the terminal gets the click instead, the
+        // way it does everywhere else in the pane. Once the knob is on screen
+        // it takes its own clicks again, and a drag already in progress keeps
+        // them regardless of what this returns.
+        if let scroller = styledScroller, scroller.alphaValue < 0.05,
+           hit === scroller || hit?.isDescendant(of: scroller) == true {
+            return self
+        }
+        return hit
+    }
+
+    /// Runs on the main thread: `LocalProcessTerminalView.setup()` builds its
+    /// `LocalProcess` with the default main queue and is internal to SwiftTerm,
+    /// so the only way to move the read off main is to stop using this class
+    /// and re-own the process, the window size and the termination wiring. That
+    /// wouldn't buy the frame back anyway — the terminal's state is main-only,
+    /// so `feed` has to hop straight back. What is worth doing is making the
+    /// part ORE adds cost nothing; see `TerminalURLScanner`.
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
-        scanForURLs(in: slice)
+        let urls = urlScanner.scan(slice)
+        guard !urls.isEmpty else { return }
+        // A turn later: recording a URL mutates observed registry state, which
+        // shouldn't happen from inside SwiftTerm's feed.
+        let deliver = onDetectedURL
+        DispatchQueue.main.async { urls.forEach { deliver?($0) } }
     }
 
-    private func scanForURLs(in slice: ArraySlice<UInt8>) {
-        guard let expression = Self.urlExpression else { return }
+    private func revealScroller() {
+        guard let scroller = styledScroller else { return }
+        // SwiftTerm styles the scroller once; put the app's answer back in case
+        // anything reset it since.
+        if scroller.scrollerStyle != .overlay { scrollerStyle = .overlay }
+        if scroller.knobStyle != .light { scroller.knobStyle = .light }
 
-        pendingText += String(decoding: slice, as: UTF8.self)
-        // Bound the buffer: it exists to bridge a chunk boundary, not to hold
-        // the session's output.
-        if pendingText.count > 4096 {
-            pendingText = String(pendingText.suffix(2048))
-        }
-
-        let range = NSRange(pendingText.startIndex..., in: pendingText)
-        var lastMatchEnd = pendingText.startIndex
-
-        for match in expression.matches(in: pendingText, range: range) {
-            guard let matchRange = Range(match.range, in: pendingText) else { continue }
-            // A match touching the end may be truncated; wait for more output.
-            if matchRange.upperBound == pendingText.endIndex { break }
-
-            let text = String(pendingText[matchRange])
-            if let url = URL(string: stripped(text)) {
-                let deliver = onDetectedURL
-                DispatchQueue.main.async { deliver?(url) }
+        lastScrollActivity = CACurrentMediaTime()
+        if scroller.alphaValue < 1 {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                scroller.animator().alphaValue = 1
             }
-            lastMatchEnd = matchRange.upperBound
+        }
+        scheduleScrollerFade(after: Self.scrollerIdleDelay)
+    }
+
+    /// One pending check rather than a fresh timer per scrolled line: when it
+    /// fires early because the reader kept scrolling, it re-arms for the
+    /// remainder.
+    private func scheduleScrollerFade(after delay: CFTimeInterval) {
+        guard !scrollerFadeScheduled else { return }
+        scrollerFadeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.scrollerFadeScheduled = false
+            let idle = CACurrentMediaTime() - self.lastScrollActivity
+            // A held knob can sit still without the reader being done with it.
+            if idle < Self.scrollerIdleDelay || NSEvent.pressedMouseButtons & 1 != 0 {
+                self.scheduleScrollerFade(after: max(0.1, Self.scrollerIdleDelay - idle))
+                return
+            }
+            guard let scroller = self.styledScroller else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.3
+                scroller.animator().alphaValue = 0
+            }
+        }
+    }
+}
+
+/// Finds local server addresses in a terminal's output stream.
+///
+/// This runs on the main thread for every chunk SwiftTerm feeds, next to the
+/// parser, so it has to cost close to nothing for output that holds no URL — a
+/// build log, `seq`, a `yes` flood. Every match needs `://`, so a byte search
+/// for that separator decides whether a chunk is decoded at all; only chunks
+/// that contain one pay for a String and the regex.
+///
+/// Output arrives in arbitrary chunks, so a URL can be split across two of
+/// them. A small carry of undecided bytes is kept so the match doesn't depend
+/// on where the chunk boundary happened to fall, and it is trimmed after every
+/// scan to just the part that could still become an address.
+struct TerminalURLScanner {
+    /// "https:/" — the longest run a chunk boundary can cut before its `://`
+    /// is whole.
+    static let schemeCarry = 7
+    /// Bound on the carry: it exists to bridge a chunk boundary, not to hold
+    /// the session's output.
+    static let carryLimit = 2048
+    /// How close to the end an unmatched `://` must be to still be the start
+    /// of an address. The host follows the separator directly, and the
+    /// longest one with a port ("0.0.0.0:65535") fits well inside this.
+    static let openCandidateWindow = 32
+
+    private(set) var carry: [UInt8] = []
+
+    private static let colon = UInt8(ascii: ":")
+    private static let slash = UInt8(ascii: "/")
+
+    private static let urlExpression = try? NSRegularExpression(
+        pattern: #"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:/[^\s"'<>]*)?"#,
+        options: [.caseInsensitive]
+    )
+
+    /// Feeds one chunk of output and returns the addresses it completed.
+    mutating func scan(_ chunk: ArraySlice<UInt8>) -> [URL] {
+        guard !chunk.isEmpty else { return [] }
+
+        // The separator can be whole in the chunk, already in the carry (an
+        // address left open last time), or cut across the boundary between
+        // them. None of the three is the common case, and it costs a memchr.
+        guard Self.firstSeparator(in: carry[...]) != nil
+            || Self.separatorSpans(carry, chunk)
+            || Self.firstSeparator(in: chunk) != nil
+        else {
+            carry.append(contentsOf: chunk.suffix(Self.schemeCarry))
+            if carry.count > Self.schemeCarry {
+                carry.removeFirst(carry.count - Self.schemeCarry)
+            }
+            return []
         }
 
-        if lastMatchEnd > pendingText.startIndex {
-            pendingText = String(pendingText[lastMatchEnd...])
+        var buffer = carry
+        buffer.append(contentsOf: chunk)
+        carry.removeAll(keepingCapacity: true)
+        guard let expression = Self.urlExpression,
+              let separator = Self.firstSeparator(in: buffer[...])
+        else { return [] }
+
+        // Nothing before the first separator's scheme can belong to a match.
+        let text = String(decoding: buffer[max(0, separator - 5)...], as: UTF8.self)
+
+        var urls: [URL] = []
+        var resolved = text.startIndex
+        var openMatchStart: String.Index?
+        let range = NSRange(text.startIndex..., in: text)
+        for match in expression.matches(in: text, range: range) {
+            guard let matchRange = Range(match.range, in: text) else { continue }
+            // A match touching the end may be truncated — so may one that
+            // stops at a trailing ":" whose port hasn't arrived. Wait for more
+            // output.
+            let rest = text[matchRange.upperBound...]
+            if rest.isEmpty || rest == ":" {
+                openMatchStart = matchRange.lowerBound
+                break
+            }
+            if let url = URL(string: Self.stripped(String(text[matchRange]))) {
+                urls.append(url)
+            }
+            resolved = matchRange.upperBound
         }
+
+        let tail: Substring.UTF8View
+        if let openMatchStart {
+            tail = text.utf8[openMatchStart...]
+        } else if let candidate = text[resolved...].range(of: "://", options: .backwards),
+                  text.utf8.distance(from: candidate.lowerBound, to: text.endIndex)
+                    <= Self.openCandidateWindow {
+            // An address whose host hasn't fully arrived ("http://localh").
+            let schemeStart = text.utf8.index(candidate.lowerBound, offsetBy: -5, limitedBy: resolved)
+                ?? resolved
+            tail = text.utf8[schemeStart...]
+        } else {
+            tail = text.utf8[resolved...].suffix(Self.schemeCarry)
+        }
+        carry.append(contentsOf: tail.suffix(Self.carryLimit))
+        return urls
+    }
+
+    /// Offset of the first `://` in `bytes`, relative to the slice's start.
+    static func firstSeparator(in bytes: ArraySlice<UInt8>) -> Int? {
+        bytes.withUnsafeBufferPointer { buffer -> Int? in
+            guard buffer.count >= 3, let base = buffer.baseAddress else { return nil }
+            var offset = 0
+            while offset <= buffer.count - 3 {
+                guard let hit = memchr(base + offset, Int32(colon), buffer.count - 2 - offset)
+                else { return nil }
+                let index = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(hit))
+                if base[index + 1] == slash, base[index + 2] == slash { return index }
+                offset = index + 1
+            }
+            return nil
+        }
+    }
+
+    /// Whether a `://` starts at the end of `head` and finishes in `tail`.
+    static func separatorSpans(_ head: [UInt8], _ tail: ArraySlice<UInt8>) -> Bool {
+        guard let last = head.last, let first = tail.first else { return false }
+        if last == colon {
+            return first == slash && tail.dropFirst().first == slash
+        }
+        if last == slash, head.count >= 2, head[head.count - 2] == colon {
+            return first == slash
+        }
+        return false
     }
 
     /// Terminals wrap URLs in punctuation and escape sequences more often than
     /// not.
-    private func stripped(_ text: String) -> String {
+    static func stripped(_ text: String) -> String {
         var result = text
         while let last = result.last, ".,;:)]}\"'".contains(last) {
             result.removeLast()

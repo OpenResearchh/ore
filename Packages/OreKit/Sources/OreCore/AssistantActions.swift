@@ -387,7 +387,10 @@ extension InProcessCoreClient {
             return AssistantBridgeResponse(id: request.id, ok: true, result: result)
         } catch {
             await audit(request, summary: summary, decision: "failed")
-            let message = (error as CustomStringConvertible).description
+            // Not `error as CustomStringConvertible`: that coercion bridges
+            // through NSError, and on Linux NSError's description ignores the
+            // error's own one. String(describing:) finds it on every platform.
+            let message = String(describing: error)
             return AssistantBridgeResponse(id: request.id, ok: false, error: message)
         }
     }

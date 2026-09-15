@@ -52,18 +52,20 @@ All three are offline. Please add tests with your change. Some guidelines:
   explain decisions the code can't.
 - UI changes: include a screenshot. `ORE_SNAPSHOT=/tmp/shot.png` renders the
   window to a PNG and exits.
-- Make sure both suites pass locally. CI runs them on macOS and runs OreKit on
-  Linux.
+- Make sure both suites pass locally. They are the gate that counts today;
+  the [CI workflow](.github/workflows/orekit.yml) is not running yet.
 
 ## Releases
 
 `master` is always releasable, but merging doesn't cut a release. A maintainer
-runs the [release workflow](.github/workflows/release.yml), which bumps the
-version, runs both suites, builds and attests the artifacts, and publishes a
-GitHub Release. `Apps/OreMac/Scripts/certify-release.sh` does the same from a
-Mac, without attestations. Both produce `ORE-<version>.zip`,
-`ORE-<version>.dmg`, `SHA256SUMS`, and the `RELEASE` manifest that `install.sh`
-reads.
+runs `Apps/OreMac/Scripts/certify-release.sh` from a clean master checkout,
+which bumps the version, runs both suites, builds the artifacts, and publishes
+a GitHub Release and the Homebrew cask. That is the release path until GitHub
+Actions runs for this repository. The
+[release workflow](.github/workflows/release.yml) then takes over and adds
+build attestations, which a locally cut release can't have. Both produce
+`ORE-<version>.zip`, `ORE-<version>.dmg`, `SHA256SUMS`, and the `RELEASE`
+manifest that `install.sh` reads.
 
 ## License
 

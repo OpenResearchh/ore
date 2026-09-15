@@ -92,11 +92,22 @@ knowing:
   inheriting yours.
 - ORE never stores a GitHub token. All GitHub access goes through the `gh`
   CLI you authenticated yourself.
-- Everything ORE persists is local: under `~/ore/` (or `$ORE_HOME`) the
-  database `ore.sqlite`, the worktrees in `workspaces/`, the assistant's own
-  workspace in `assistant/`, the anonymous analytics queue `telemetry.sqlite`
-  and the `install-channel` marker; downloaded voice models under
-  `~/Library/Caches`; and preferences in the `dev.ore.OreMac` defaults domain.
+- Everything ORE persists is local. Under `~/ore/` (or `$ORE_HOME`):
+  - the database `ore.sqlite`
+  - the worktrees in `workspaces/`
+  - new and cloned projects in `repositories/`
+  - the assistant's own workspace in `assistant/`, including its bridge socket
+    `assistant/.bridge.sock` (in `$TMPDIR` when that path is too long for a
+    socket)
+  - cached scientist profiles and portraits in `scientists/`
+  - agent CLI discovery results in `harness-cache.json`
+  - the in-app updater's log, `update.log`
+  - the anonymous analytics queue `telemetry.sqlite` and the
+    `install-channel` marker
+
+  Outside it: neural voice model weights in `~/.cache/fluidaudio`, synthesized
+  narration phrases in `~/Library/Caches/dev.ore.OreMac`, and preferences in
+  the `dev.ore.OreMac` defaults domain.
 
 For what ORE reports about usage, see [PRIVACY.md](PRIVACY.md).
 

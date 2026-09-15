@@ -1,11 +1,12 @@
 name: Release
 
-# The attested release path, and now the preferred one.
+# The attested release path, for once GitHub Actions runs for this repository.
 #
-# Scripts/certify-release.sh can cut the same release from a Mac, but build
-# provenance attestations can only be produced where the artifact is actually
-# built. A locally-cut release cannot be attested, so certify-release.sh is the
-# fallback rather than the norm.
+# Until then, releases are cut with Apps/OreMac/Scripts/certify-release.sh from
+# a clean master checkout on a maintainer's Mac. It runs the same suites and
+# publishes the same four files. What it cannot do is attest them: build
+# provenance can only be produced where the artifact is built, so its releases
+# say "not attested" in their notes.
 #
 # Users verify a download with:
 #   gh attestation verify ORE-<version>.zip -R OpenResearchh/ore

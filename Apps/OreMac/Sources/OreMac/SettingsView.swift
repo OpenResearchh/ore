@@ -6,10 +6,45 @@ import OreTelemetry
 import ServiceManagement
 import SwiftUI
 
+/// The Settings scene's root: a shell with no inputs of its own.
+///
+/// AppKit keeps the Settings hosting view for the whole process once it has
+/// been opened, and re-runs its root body on display cycles to answer
+/// `NSHostingView.minSize()` (see `refreshLaunchAtLogin`). Keeping that root
+/// trivial means the re-run stops here: `SettingsPanes` takes no inputs, so
+/// SwiftUI has nothing new to hand it and skips its body.
+///
+/// With `ore.debug.unmountClosedSettings` set, the panes are also dropped
+/// while the window is closed — off by default, because it resets the pane's
+/// local state (the selected agent, an open license) between openings.
+struct SettingsView: View {
+    private static let unmountsWhileClosed =
+        UserDefaults.standard.bool(forKey: "ore.debug.unmountClosedSettings")
+
+    @State private var isOnScreen = true
+
+    var body: some View {
+        if Self.unmountsWhileClosed {
+            // A ZStack, not a Group: its appear/disappear belong to the
+            // container, so swapping the panes out can't re-trigger them.
+            ZStack {
+                if isOnScreen {
+                    SettingsPanes()
+                }
+            }
+            .frame(width: 950, height: 650)
+            .onAppear { isOnScreen = true }
+            .onDisappear { isOnScreen = false }
+        } else {
+            SettingsPanes()
+        }
+    }
+}
+
 /// Settings is an inspector, not a pile of unrelated forms. The left rail is
 /// stable navigation; the detail side explains the selected system and shows
 /// the real CLI probe/model data that the running core is using.
-struct SettingsView: View {
+private struct SettingsPanes: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage(AppModel.DefaultKey.newChatHarness) private var harnessRaw = ""
     @AppStorage(AppModel.DefaultKey.newChatModel) private var defaultModel = ""
@@ -67,6 +102,7 @@ struct SettingsView: View {
         case environment = "Environment"
         case dreams = "Dreams"
         case privacy = "Privacy"
+        case about = "About"
         var id: String { rawValue }
         var icon: String {
             switch self {
@@ -78,6 +114,7 @@ struct SettingsView: View {
             case .environment: "terminal"
             case .dreams: "moon.stars"
             case .privacy: "hand.raised"
+            case .about: "info.circle"
             }
         }
         var detail: String {
@@ -90,6 +127,7 @@ struct SettingsView: View {
             case .environment: "Understand where work lives and what every terminal and agent inherits."
             case .dreams: "Overnight research while this Mac is idle. Off by default, read-only, budgeted."
             case .privacy: "What ORE sends, what it never sends, and how to see or stop it."
+            case .about: "Who makes ORE, its license, and the open-source work it is built on."
             }
         }
     }
@@ -208,6 +246,7 @@ struct SettingsView: View {
         case .environment: environment
         case .dreams: dreams
         case .privacy: PrivacySettings()
+        case .about: AboutSettings()
         }
     }
 
@@ -1082,8 +1121,203 @@ private struct PrivacySettings: View {
         "API keys and agent CLI credentials",
     ]
 
+    /// The store is SQLite on disk; read it off the main actor.
     private func reload() {
-        pending = TelemetryInspection.pending(home: OreHome.directory)
+        Task {
+            pending = await Task.detached(priority: .userInitiated) {
+                TelemetryInspection.pending(home: OreHome.directory)
+            }.value
+        }
+    }
+}
+
+/// Who makes ORE, the license it is shared under, and the open-source work it
+/// ships — with every license text reproduced in the app, as those licenses ask.
+private struct AboutSettings: View {
+    @State private var openDocument: LegalDocument?
+    @State private var documentText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: "ORE", icon: "info.circle") {
+                HStack(spacing: 14) {
+                    OreAppIcon(size: 56)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("ORE")
+                            .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        Text("Version \(OreAbout.version)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        Text("Made by \(OreAbout.company)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                HStack(spacing: 8) {
+                    linkButton("Website", systemImage: "globe", url: OreAbout.website)
+                    linkButton("Source code", systemImage: "chevron.left.forwardslash.chevron.right", url: OreAbout.repository)
+                    linkButton("Release notes", systemImage: "doc.text", url: OreAbout.releaseNotes)
+                    linkButton("Privacy contact", systemImage: "envelope", url: OreAbout.privacyContact)
+                    Spacer(minLength: 0)
+                }
+            }
+
+            SettingsCard(title: "License", icon: "checkmark.seal") {
+                Text(OreAbout.copyright)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                Text("ORE is open source under the \(OreAbout.licenseName): you may use, change and share it on those terms, and it comes without warranty.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    documentButton(.license, show: "View license", hide: "Hide license")
+                    documentButton(.notice, show: "View notice", hide: "Hide notice")
+                    Spacer()
+                }
+                if openDocument == .license || openDocument == .notice {
+                    documentView
+                }
+            }
+
+            SettingsCard(title: "Acknowledgements", icon: "heart") {
+                Text("ORE is built on open-source work. Each project keeps its own license, and every one is reproduced in full inside the app.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(spacing: 0) {
+                    ForEach(ThirdPartyComponent.all) { component in
+                        componentRow(component)
+                        if component != ThirdPartyComponent.all.last { Divider() }
+                    }
+                }
+                HStack {
+                    documentButton(
+                        .thirdPartyLicenses,
+                        show: "View full license texts",
+                        hide: "Hide full license texts"
+                    )
+                    Spacer()
+                }
+                if openDocument == .thirdPartyLicenses {
+                    documentView
+                }
+            }
+
+            Text("Claude, Codex and Cursor are trademarks of their respective owners. ORE is not affiliated with or endorsed by them.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func linkButton(_ title: String, systemImage: String, url: URL) -> some View {
+        Button { NSWorkspace.shared.open(url) } label: {
+            Label(title, systemImage: systemImage)
+        }
+        .help(url.absoluteString.replacingOccurrences(of: "mailto:", with: ""))
+    }
+
+    /// Opens the text in place. Read from the bundle on the click, never in
+    /// `body`, which Settings re-runs every display cycle.
+    private func documentButton(_ document: LegalDocument, show: String, hide: String) -> some View {
+        Button(openDocument == document ? hide : show) {
+            if openDocument == document {
+                openDocument = nil
+            } else {
+                documentText = document.text
+                    ?? "This build doesn't include \(document.rawValue). It is at the root of the source repository."
+                openDocument = document
+            }
+        }
+    }
+
+    private var documentView: some View {
+        LegalTextView(text: documentText)
+            .frame(height: 280)
+            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func componentRow(_ component: ThirdPartyComponent) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(component.name)
+                    .font(.callout.weight(.medium))
+                Text("\(component.purpose) · \(component.credit)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Text(component.license)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Button { NSWorkspace.shared.open(component.url) } label: {
+                Image(systemName: "arrow.up.right.square")
+            }
+            .buttonStyle(.plain)
+            .help("Open \(component.name)")
+        }
+        .padding(.vertical, 7)
+    }
+}
+
+/// A license text, read-only and selectable.
+///
+/// Not a SwiftUI `Text` in a `ScrollView`: ThirdPartyLicenses is ~59 KB, and a
+/// selectable `Text` lays the whole of it out as one block inside a scroll
+/// view nested in the page's own. An NSTextView with non-contiguous layout
+/// only lays out what is on screen, and its overlay-only scroll view matches
+/// every other scroller in the app.
+private struct LegalTextView: NSViewRepresentable {
+    let text: String
+
+    final class Coordinator {
+        var lastApplied: String?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        // TextKit 1 from the start: non-contiguous layout is a layout-manager
+        // feature, and reaching for `layoutManager` on a TextKit 2 view swaps
+        // its whole text stack out after the fact.
+        let textView = NSTextView(usingTextLayoutManager: false)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.textContainer?.widthTracksTextView = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textColor = .labelColor
+        textView.layoutManager?.allowsNonContiguousLayout = true
+
+        let scroll = OreOverlayScrollView()
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = scroll.documentView as? NSTextView else { return }
+        // Compared against what was last applied, not `textView.string`,
+        // which would bridge the whole document on every update.
+        guard context.coordinator.lastApplied != text else { return }
+        context.coordinator.lastApplied = text
+        textView.textStorage?.setAttributedString(NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.labelColor,
+            ]
+        ))
+        textView.scroll(.zero)
     }
 }
 

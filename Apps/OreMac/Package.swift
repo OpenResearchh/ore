@@ -52,6 +52,9 @@ let package = Package(
             ],
             resources: [
                 .copy("Resources/HarnessIcons"),
+                // LICENSE, NOTICE and every dependency's license text, so the
+                // notices travel with the binary (Scripts/generate-legal-resources.sh).
+                .copy("Resources/Legal"),
             ],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])

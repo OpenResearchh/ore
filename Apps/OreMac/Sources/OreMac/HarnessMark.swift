@@ -56,38 +56,49 @@ struct HarnessMark: View {
 }
 
 @MainActor
-private enum HarnessBrandAssets {
+enum HarnessBrandAssets {
     static let claude = load("claude")
     static let codex = load("codex")
     static let cursor = load("cursor")
 
-    /// SwiftPM's generated `Bundle.module` resolves the resource bundle from
-    /// `Bundle.main.bundleURL` (the app *root*) and a build-time absolute path —
-    /// neither of which matches a packaged `.app`, where the bundle lands in
-    /// `Contents/Resources`. On a distributed build both lookups miss and
-    /// `Bundle.module` *traps*, so the first harness icon to render takes the
-    /// whole app down (the update prompt is one thing that triggers that first
-    /// render). Resolve the bundle ourselves across the real locations and fall
-    /// back to `nil` — an SF Symbol — rather than a fatal error.
-    private static let resourceBundle: Bundle = {
-        let name = "OreMac_OreMac.bundle"
-        let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent(name), // Contents/Resources — packaged app
-            Bundle.main.bundleURL.appendingPathComponent(name),    // app root — SwiftPM's expectation
-            Bundle(for: BundleToken.self).resourceURL?.appendingPathComponent(name),
-            Bundle(for: BundleToken.self).bundleURL.appendingPathComponent(name),
-        ]
-        for case let url? in candidates
-        where FileManager.default.fileExists(atPath: url.path) {
-            if let bundle = Bundle(url: url) { return bundle }
+    private static let inlineMarks: [HarnessKind: NSImage] = {
+        var marks: [HarnessKind: NSImage] = [:]
+        for harness in HarnessKind.allCases {
+            let source: NSImage?
+            switch harness {
+            case .claudeCode: source = claude
+            case .codex: source = codex
+            case .cursorAgent: source = cursor
+            }
+            guard let source else { continue }
+            let size: CGFloat = 14
+            let mark = NSImage(size: NSSize(width: size, height: size))
+            mark.lockFocus()
+            let rect = NSRect(x: 0, y: 0, width: size, height: size)
+            let shape = NSBezierPath(roundedRect: rect, xRadius: 3.3, yRadius: 3.3)
+            shape.addClip()
+            if harness != .claudeCode {
+                NSColor.black.setFill()
+                shape.fill()
+            }
+            let inset: CGFloat = harness == .claudeCode ? 0 : harness == .codex ? size * 0.13 : size * 0.2
+            source.draw(in: rect.insetBy(dx: inset, dy: inset))
+            mark.unlockFocus()
+            mark.accessibilityDescription = harness.displayName
+            marks[harness] = mark
         }
-        // Last resort: look in the main bundle directly (resources may have been
-        // flattened into Contents/Resources). Its lookups return nil when the
-        // icon is absent, so this still degrades gracefully instead of crashing.
-        return .main
+        return marks
     }()
 
-    private final class BundleToken {}
+    /// Cached small marks for AppKit text attachments, matching `HarnessMark`.
+    static func inlineMark(for harness: HarnessKind) -> NSImage? {
+        inlineMarks[harness]
+    }
+
+    /// Not `Bundle.module`, which traps in a packaged app: the first harness
+    /// icon to render took the whole app down. A missing icon falls back to
+    /// an SF Symbol instead. See `OreResourceBundle`.
+    private static var resourceBundle: Bundle { OreResourceBundle.bundle }
 
     private static func load(_ name: String) -> NSImage? {
         guard let url = resourceBundle.url(

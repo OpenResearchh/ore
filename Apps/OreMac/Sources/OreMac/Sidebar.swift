@@ -1,3 +1,5 @@
+import AppKit
+import ImageIO
 import OreGit
 import OreProtocol
 import SwiftUI
@@ -14,8 +16,25 @@ struct Sidebar: View {
     @State private var showArchived = false
     @State private var renameWorkspace: WorkspaceSummary?
     @State private var renameText = ""
+    /// The order on screen while the person is pointing at or scrolling the
+    /// list; nil while the list follows the live order. See `SidebarOrderHold`.
+    @State private var heldOrder: SidebarHeldOrder?
+    /// Pointer and scroll bookkeeping for the hold. A plain reference, not
+    /// view state: live scroll notifications arrive during the gesture, and
+    /// writing observed state from them would re-run this body mid-scroll —
+    /// the very thing the hold exists to prevent.
+    @State private var holdClock = SidebarHoldClock()
+    @Environment(\.controlActiveState) private var controlActiveState
     @AppStorage("ore.collapsedRepositories") private var collapsedRepositoriesRaw = ""
     @AppStorage("ore.sidebar.filter") private var filterRaw = SidebarFilter.all.rawValue
+
+    /// Debug: the pinned strip as fixed chrome under the filter tabs instead of
+    /// a row inside the List, so no horizontal scroll view ever sits in the
+    /// list's scroll content. Off by default: the strip then stays put while
+    /// the list scrolls, which is a visible change.
+    private static let pinnedStripOutsideList = UserDefaults.standard.bool(
+        forKey: "ore.debug.sidebarStripOutsideList"
+    )
 
     private var collapsedRepositories: Set<String> {
         Set(collapsedRepositoriesRaw.split(separator: "\n").map(String.init))
@@ -25,106 +44,50 @@ struct Sidebar: View {
         SidebarFilter(rawValue: filterRaw) ?? .all
     }
 
-    /// "Active" is the reference design's question — who is doing something or
-    /// waiting on me — not merely "exists": an agent working, blocked, failed,
-    /// or finished with unread output all count.
-    private static func isActive(_ workspace: WorkspaceSummary, chats: [ChatSummary]) -> Bool {
-        if workspace.hasUnread { return true }
-        switch sidebarEffectiveStatus(for: workspace, chats: chats) {
-        case .thinking, .requesting, .runningTool, .awaitingInput, .failed: return true
-        case .idle, .interrupted: return false
-        }
-    }
-
-    private struct RepositoryGroup: Identifiable {
-        var id: String { path }
-        var path: String
-        var name: String
-        var workspaces: [WorkspaceSummary]
-
-        /// The most recent activity across the group's workspaces, used to float
-        /// the last-worked-in project to the top of the sidebar.
-        var latestActivity: Date? {
-            workspaces.compactMap(\.lastActivity).max()
-        }
-    }
-
-    private static func repositoryGroups(_ listedWorkspaces: [WorkspaceSummary]) -> [RepositoryGroup] {
-        Dictionary(grouping: listedWorkspaces, by: \.repositoryPath)
-            .map { path, workspaces in
-                RepositoryGroup(
-                    path: path,
-                    name: (path as NSString).lastPathComponent,
-                    workspaces: workspaces
-                )
-            }
-            // Most recently worked-in project on top: the one you touched last is
-            // the one you're most likely coming back to. `sortedWorkspaces` is
-            // already recency-ordered, so a group's latest activity is its first
-            // workspace's.
-            .sorted { first, second in
-                let firstActivity = first.latestActivity ?? .distantPast
-                let secondActivity = second.latestActivity ?? .distantPast
-                if firstActivity != secondActivity { return firstActivity > secondActivity }
-
-                // Dictionary iteration order is deliberately unspecified. Most
-                // untouched repositories have no activity date, so without a
-                // tie-breaker every unrelated model update could swap those
-                // project sections even though neither project had changed.
-                return first.path < second.path
-            }
-    }
-
-    /// ⌘1–9 jumps to a workspace by its position in `sortedWorkspaces`. Mapping
-    /// each of the first nine to its number lets the sidebar show the shortcut
-    /// inline, so switching between parallel agents is discoverable, not hidden.
-    private static func workspaceShortcuts(_ sortedWorkspaces: [WorkspaceSummary]) -> [WorkspaceID: Int] {
+    /// ⌘1–9 jumps to a workspace by its position in the displayed order.
+    /// Mapping each of the first nine to its number lets the sidebar show the
+    /// shortcut inline, so switching between parallel agents is discoverable,
+    /// not hidden.
+    private static func workspaceShortcuts(_ ordered: [WorkspaceSummary]) -> [WorkspaceID: Int] {
         var result: [WorkspaceID: Int] = [:]
-        for (index, workspace) in sortedWorkspaces.prefix(9).enumerated() {
+        for (index, workspace) in ordered.prefix(9).enumerated() {
             result[workspace.id] = index + 1
         }
         return result
     }
 
-    var body: some View {
-        // Everything derived from the fleet is resolved once per pass and
-        // handed down. `sortedWorkspaces` sorts on every read and `chats(for:)`
-        // filters every summary; as computed properties they ran several times
-        // per workspace, plus once per row for the shortcut map.
-        let workspaces = model.sortedWorkspaces
-        let chatsByWorkspace = Dictionary(
-            workspaces.map { ($0.id, model.chats(for: $0.id)) },
-            uniquingKeysWith: { first, _ in first }
+    /// The layout as the model stands, under the current filter. Only the
+    /// Active tab reads the active set: under All, reading it would re-run the
+    /// whole list every time an agent started or stopped.
+    private func resolveLayout(held: SidebarHeldOrder?) -> SidebarLayout {
+        SidebarLayout(
+            workspaces: model.sortedWorkspaces,
+            activeIDs: filter == .active ? model.activeWorkspaceIDs : nil,
+            held: held
         )
-        let activeIDs = Set(workspaces.lazy
-            .filter { Self.isActive($0, chats: chatsByWorkspace[$0.id] ?? []) }
-            .map(\.id))
-        let pinnedWorkspaces = workspaces.filter(\.isPinned)
-        // What the main list shows: pinned rows live in their own strip, and the
-        // Active tab narrows to workspaces that are doing something or need you.
-        let listedWorkspaces = workspaces.filter {
-            !$0.isPinned && (filter != .active || activeIDs.contains($0.id))
-        }
-        let workingCount = workspaces.lazy.filter { workspace in
-            switch sidebarEffectiveStatus(for: workspace, chats: chatsByWorkspace[workspace.id] ?? []) {
-            case .thinking, .requesting, .runningTool: return true
-            default: return false
-            }
-        }.count
-        let shortcuts = Self.workspaceShortcuts(workspaces)
+    }
+
+    var body: some View {
+        // Resolved once per pass and handed down. The fleet-wide answers (who
+        // is active, how many are working) are stored on the model and change
+        // only when they do, and each row reads its own chats — so one tab's
+        // status flip re-runs that row, not this list.
+        let layout = resolveLayout(held: heldOrder)
+        let shortcuts = Self.workspaceShortcuts(layout.ordered)
+        let selectedID = model.selectedWorkspaceID
         List {
-            if workspaces.isEmpty {
+            if layout.ordered.isEmpty {
                 emptyState
-            } else if filter == .active, listedWorkspaces.isEmpty, pinnedWorkspaces.isEmpty {
+            } else if filter == .active, layout.listed.isEmpty, layout.pinned.isEmpty {
                 Text("All agents are idle")
                     .font(.system(size: OreTheme.Font.body))
                     .foregroundStyle(.secondary)
                     .padding(.vertical, OreTheme.Space.sm)
             }
 
-            if !pinnedWorkspaces.isEmpty {
+            if !Self.pinnedStripOutsideList, !layout.pinned.isEmpty {
                 Section {
-                    PinnedStrip(workspaces: pinnedWorkspaces, chatsFor: { chatsByWorkspace[$0] ?? [] })
+                    PinnedStrip(workspaces: layout.pinned)
                         .listRowSeparator(.hidden)
                         .listRowInsets(EdgeInsets(
                             top: 2, leading: OreTheme.Space.sm,
@@ -135,14 +98,13 @@ struct Sidebar: View {
                 }
             }
 
-            ForEach(Self.repositoryGroups(listedWorkspaces)) { repository in
+            ForEach(layout.groups) { repository in
                 DisclosureGroup(isExpanded: repositoryBinding(repository.path)) {
                     ForEach(repository.workspaces) { workspace in
                         WorkspaceRow(
                             workspace: workspace,
-                            chats: chatsByWorkspace[workspace.id] ?? [],
                             identity: model.researchIdentity(for: workspace),
-                            isSelected: model.selectedWorkspaceID == workspace.id,
+                            isSelected: selectedID == workspace.id,
                             shortcutIndex: shortcuts[workspace.id],
                             onRename: {
                                 renameText = workspace.name
@@ -153,24 +115,12 @@ struct Sidebar: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                             .onTapGesture { model.selectedWorkspaceID = workspace.id }
+                            // One concrete background faded in and out: swapping
+                            // between two type-erased views rebuilt the row
+                            // background on every selection change.
                             .listRowBackground(
-                                model.selectedWorkspaceID == workspace.id
-                                    ? AnyView(
-                                        RoundedRectangle(
-                                            cornerRadius: OreTheme.pillRadius,
-                                            style: .continuous
-                                        )
-                                        .fill(OreTheme.sidebarSelectedFill)
-                                        .overlay {
-                                            RoundedRectangle(
-                                                cornerRadius: OreTheme.pillRadius,
-                                                style: .continuous
-                                            )
-                                            .strokeBorder(OreTheme.selectedStroke, lineWidth: 0.75)
-                                        }
-                                        .padding(.vertical, 2)
-                                    )
-                                    : AnyView(Color.clear)
+                                SidebarSelectionBackground()
+                                    .opacity(selectedID == workspace.id ? 1 : 0)
                             )
                             .contextMenu { menu(for: workspace) }
                     }
@@ -222,7 +172,7 @@ struct Sidebar: View {
         }
         // Warm every row's portrait up front instead of on first render, so
         // faces appear with the list rather than popping in as you scroll.
-        .task(id: workspaces.count) {
+        .task(id: layout.ordered.count) {
             for workspace in model.sortedWorkspaces {
                 guard !Task.isCancelled else { return }
                 guard let identity = model.researchIdentity(for: workspace) else { continue }
@@ -240,34 +190,32 @@ struct Sidebar: View {
         // `.scrollIndicators` — the probe reaches the AppKit scroller directly.
         .scrollIndicators(.hidden)
         .background(OreListScrollerOverlay())
+        .background(SidebarScrollProbe(
+            onScrollStart: noteScrollStarted,
+            onScrollEnd: noteScrollEnded
+        ))
         .safeAreaInset(edge: .top, spacing: 0) {
-            if !workspaces.isEmpty {
-                filterTabs(allCount: workspaces.count, activeCount: activeIDs.count)
-                    .padding(.horizontal, OreTheme.Space.sm)
-                    .padding(.top, OreTheme.Space.xs)
-                    .padding(.bottom, OreTheme.Space.sm)
+            if !layout.ordered.isEmpty {
+                VStack(spacing: 0) {
+                    SidebarFilterTabs(filterRaw: $filterRaw, allCount: layout.ordered.count)
+                        .padding(.horizontal, OreTheme.Space.sm)
+                        .padding(.top, OreTheme.Space.xs)
+                        .padding(.bottom, OreTheme.Space.sm)
+                    if Self.pinnedStripOutsideList, !layout.pinned.isEmpty {
+                        PinnedStrip(workspaces: layout.pinned)
+                            .padding(.horizontal, OreTheme.Space.sm)
+                            .padding(.bottom, OreTheme.Space.sm)
+                    }
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack(spacing: OreTheme.Space.sm) {
-                connectedPill(working: workingCount, total: workspaces.count)
+                SidebarPresencePill(total: layout.ordered.count)
                 Spacer()
                 // The assistant's global mute sits with the app-wide controls,
                 // not in a tab: it silences every workspace at once.
-                Button {
-                    model.narration.setMuted(!model.narration.isMuted)
-                } label: {
-                    Image(systemName: model.narration.isMuted ? "speaker.slash" : "speaker.wave.2")
-                        .font(.system(size: OreTheme.Font.body))
-                        .contentTransition(.symbolEffect(.replace))
-                        .frame(width: 28, height: OreTheme.RowHeight.bar)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(model.narration.isMuted
-                    ? "Unmute the assistant (⇧⌥⌘S)"
-                    : "Mute the assistant (⇧⌥⌘S)")
-                .accessibilityLabel(model.narration.isMuted ? "Unmute assistant" : "Mute assistant")
+                SidebarMuteButton()
                 SettingsLink {
                     Image(systemName: "gearshape")
                         .font(.system(size: OreTheme.Font.body))
@@ -286,6 +234,28 @@ struct Sidebar: View {
             // pill carries its own glass; rows scrolling under pick up the
             // system's scroll-edge treatment.
         }
+        .onHover { pointerMoved(inside: $0) }
+        // A hold normally ends when the pointer leaves. Tracking areas are
+        // key-window-scoped, so a pointer parked over the sidebar while the
+        // user switches apps never reports an exit — and the order would stay
+        // frozen for as long as they were away. Treat losing the window as
+        // losing the pointer.
+        .onChange(of: controlActiveState) { _, state in
+            guard state == .inactive else { return }
+            holdClock.pointerInside = false
+            settleHold()
+        }
+        // ⌘1–9 lives in the app's commands, which cannot see this view's state.
+        // While the order is held the model is told what is on screen; nil
+        // hands the shortcuts back to the live order.
+        .onChange(of: heldOrder == nil ? nil : layout.shortcutOrder, initial: true) { _, order in
+            model.sidebarShortcutOrder = order
+        }
+        .onDisappear {
+            holdClock.reset()
+            heldOrder = nil
+            model.sidebarShortcutOrder = nil
+        }
         .alert("Rename Workspace", isPresented: Binding(
             get: { renameWorkspace != nil },
             set: { if !$0 { renameWorkspace = nil } }
@@ -299,62 +269,58 @@ struct Sidebar: View {
         }
     }
 
-    /// The reference design's segmented capsule: All | Active, each with its
-    /// count. Selection stays quiet (a primary wash, not accent) so the blue
-    /// pill remains reserved for the selected workspace row.
-    private func filterTabs(allCount: Int, activeCount: Int) -> some View {
-        HStack(spacing: 2) {
-            ForEach(SidebarFilter.allCases) { tab in
-                let isOn = filter == tab
-                Button {
-                    filterRaw = tab.rawValue
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(tab.title)
-                            .font(.system(size: OreTheme.Font.body, weight: isOn ? .semibold : .regular))
-                        Text("\(tab == .all ? allCount : activeCount)")
-                            .font(.system(size: OreTheme.Font.caption).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 24)
-                    .background(
-                        isOn ? Color.primary.opacity(0.1) : .clear,
-                        in: Capsule()
-                    )
-                    .contentShape(Capsule())
-                }
-                .buttonStyle(OrePressableButtonStyle())
-            }
-        }
-        .padding(3)
-        .modifier(SidebarGlassCapsule())
-        .animation(.easeOut(duration: 0.15), value: filterRaw)
+    // MARK: Order hold
+
+    private func pointerMoved(inside: Bool) {
+        holdClock.pointerInside = inside
+        if inside { beginHold() } else { settleHold() }
     }
 
-    /// The footer's presence pill: green while any agent is live, quiet gray
-    /// otherwise — the sidebar's own "Connected" light.
-    private func connectedPill(working: Int, total: Int) -> some View {
-        let isLive = working > 0
-        return HStack(spacing: 6) {
-            Circle()
-                .fill(isLive ? OreTheme.Presence.active : OreTheme.Presence.idle)
-                .frame(width: 7, height: 7)
-            // "Workspaces", not "active" — the filter tab above already uses
-            // "Active" to mean something narrower, and one word carrying two
-            // meanings on one surface reads as a bug.
-            Text(isLive
-                ? "\(working) working"
-                : "\(total) workspace\(total == 1 ? "" : "s")")
-                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+    private func noteScrollStarted() {
+        holdClock.isScrolling = true
+        beginHold()
+    }
+
+    private func noteScrollEnded() {
+        holdClock.isScrolling = false
+        holdClock.lastScrollEnd = Date()
+        settleHold()
+    }
+
+    /// Freezes what is on screen now. Only the first call writes view state;
+    /// every later one while holding just cancels a pending release.
+    private func beginHold() {
+        holdClock.cancelRelease()
+        guard heldOrder == nil else { return }
+        heldOrder = resolveLayout(held: nil).heldOrder
+    }
+
+    private func settleHold() {
+        holdClock.cancelRelease()
+        switch SidebarOrderHold.release(
+            pointerInside: holdClock.pointerInside,
+            isScrolling: holdClock.isScrolling,
+            lastScrollEnd: holdClock.lastScrollEnd,
+            now: Date()
+        ) {
+        case .hold:
+            return
+        case .now:
+            releaseHold()
+        case .after(let delay):
+            holdClock.releaseTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { return }
+                settleHold()
+            }
         }
-        .foregroundStyle(isLive ? OreTheme.Presence.active : Color.secondary)
-        .padding(.horizontal, 10)
-        .frame(height: 22)
-        .modifier(SidebarGlassCapsule(
-            tint: isLive ? OreTheme.Presence.active.opacity(0.12) : nil
-        ))
-        .animation(.easeOut(duration: 0.2), value: isLive)
+    }
+
+    private func releaseHold() {
+        guard heldOrder != nil else { return }
+        // Whatever re-sorted while the list held still moves now, visibly,
+        // instead of jumping out from under the pointer.
+        withAnimation(.snappy) { heldOrder = nil }
     }
 
     /// "Archived (3) · 1.2 GB freed" — the total makes the payoff of parking
@@ -401,6 +367,378 @@ struct Sidebar: View {
                 renameWorkspace = workspace
             }
         )
+    }
+}
+
+/// What the sidebar lists, in the order it lists it: the pinned strip, then
+/// repository groups. Pure so the order hold is testable without a window.
+/// Internal for tests.
+struct SidebarLayout {
+    struct RepositoryGroup: Identifiable {
+        var id: String { path }
+        var path: String
+        var name: String
+        var workspaces: [WorkspaceSummary]
+
+        /// The most recent activity across the group's workspaces, used to float
+        /// the last-worked-in project to the top of the sidebar.
+        var latestActivity: Date? {
+            workspaces.compactMap(\.lastActivity).max()
+        }
+    }
+
+    /// Every unarchived workspace in displayed order — `sortedWorkspaces`, or
+    /// the held order while the sidebar holds still. ⌘1–9 counts along this.
+    var ordered: [WorkspaceSummary]
+    var pinned: [WorkspaceSummary]
+    /// What the main list shows: pinned rows live in their own strip, and the
+    /// Active tab narrows to workspaces that are doing something or need you.
+    var listed: [WorkspaceSummary]
+    var groups: [RepositoryGroup]
+
+    /// `activeIDs` is nil under the All tab. `held` re-expresses the live data
+    /// in the order last shown; see `SidebarOrderHold.merge`.
+    init(workspaces live: [WorkspaceSummary], activeIDs: Set<WorkspaceID>?, held: SidebarHeldOrder?) {
+        if let held {
+            let byID = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            ordered = SidebarOrderHold.merge(held: held.workspaceIDs, live: live.map(\.id))
+                .compactMap { byID[$0] }
+        } else {
+            ordered = live
+        }
+        pinned = ordered.filter(\.isPinned)
+        listed = ordered.filter { !$0.isPinned && (activeIDs?.contains($0.id) ?? true) }
+        var groups = Self.repositoryGroups(listed)
+        if let held {
+            let order = SidebarOrderHold.merge(held: held.repositoryPaths, live: groups.map(\.path))
+            let position = Dictionary(
+                order.enumerated().map { ($1, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            groups.sort { (position[$0.path] ?? .max) < (position[$1.path] ?? .max) }
+        }
+        self.groups = groups
+    }
+
+    /// What to freeze when a hold begins: exactly this layout's order.
+    var heldOrder: SidebarHeldOrder {
+        SidebarHeldOrder(workspaceIDs: ordered.map(\.id), repositoryPaths: groups.map(\.path))
+    }
+
+    var shortcutOrder: [WorkspaceID] {
+        ordered.prefix(9).map(\.id)
+    }
+
+    private static func repositoryGroups(_ listedWorkspaces: [WorkspaceSummary]) -> [RepositoryGroup] {
+        Dictionary(grouping: listedWorkspaces, by: \.repositoryPath)
+            .map { path, workspaces in
+                RepositoryGroup(
+                    path: path,
+                    name: (path as NSString).lastPathComponent,
+                    workspaces: workspaces
+                )
+            }
+            // Most recently worked-in project on top: the one you touched last is
+            // the one you're most likely coming back to. `sortedWorkspaces` is
+            // already recency-ordered, so a group's latest activity is its first
+            // workspace's.
+            .sorted { first, second in
+                let firstActivity = first.latestActivity ?? .distantPast
+                let secondActivity = second.latestActivity ?? .distantPast
+                if firstActivity != secondActivity { return firstActivity > secondActivity }
+
+                // Dictionary iteration order is deliberately unspecified. Most
+                // untouched repositories have no activity date, so without a
+                // tie-breaker every unrelated model update could swap those
+                // project sections even though neither project had changed.
+                return first.path < second.path
+            }
+    }
+}
+
+/// The sidebar's order at the moment a hold began.
+struct SidebarHeldOrder: Equatable {
+    var workspaceIDs: [WorkspaceID]
+    var repositoryPaths: [String]
+}
+
+/// Keeps rows from moving under the person using them.
+///
+/// The live order re-sorts on attention and recency, so with agents running
+/// rows and whole project sections jumped mid-scroll, and a click could land
+/// on whatever slid into place. While the pointer is over the sidebar — or a
+/// flick's momentum is still settling — the displayed order holds; status,
+/// names, and counts keep updating in place, and the queued order is applied
+/// with an animation once the hold ends.
+enum SidebarOrderHold {
+    /// How long after a scroll gesture ends the order still holds, so a flick
+    /// that carries the pointer out of the sidebar doesn't reorder under the
+    /// last rows it showed.
+    static let scrollGrace: TimeInterval = 1.5
+
+    enum Release: Equatable {
+        case hold
+        case now
+        case after(TimeInterval)
+    }
+
+    static func release(
+        pointerInside: Bool,
+        isScrolling: Bool,
+        lastScrollEnd: Date?,
+        now: Date
+    ) -> Release {
+        if pointerInside || isScrolling { return .hold }
+        guard let lastScrollEnd else { return .now }
+        let remaining = scrollGrace - now.timeIntervalSince(lastScrollEnd)
+        return remaining > 0 ? .after(remaining) : .now
+    }
+
+    /// `live` in `held`'s order. Anything gone is dropped at once — a row for
+    /// a removed workspace can't stay — and anything new takes its live
+    /// position, since a new row is almost always one the person just made.
+    static func merge<ID: Hashable>(held: [ID], live: [ID]) -> [ID] {
+        let liveSet = Set(live)
+        var result = held.filter { liveSet.contains($0) }
+        let kept = Set(result)
+        for (index, id) in live.enumerated() where !kept.contains(id) {
+            result.insert(id, at: min(index, result.count))
+        }
+        return result
+    }
+
+    /// The workspace ⌘(index+1) selects: the held order when the sidebar is
+    /// holding, the live order otherwise, and never one that has since gone.
+    static func shortcutTarget(at index: Int, held: [WorkspaceID]?, live: [WorkspaceID]) -> WorkspaceID? {
+        let order = held ?? live
+        guard order.indices.contains(index) else { return nil }
+        let id = order[index]
+        return held == nil || live.contains(id) ? id : nil
+    }
+}
+
+/// Mutable, unobserved companion to the hold. See `Sidebar.holdClock`.
+@MainActor
+final class SidebarHoldClock {
+    var pointerInside = false
+    var isScrolling = false
+    var lastScrollEnd: Date?
+    var releaseTask: Task<Void, Never>?
+
+    func cancelRelease() {
+        releaseTask?.cancel()
+        releaseTask = nil
+    }
+
+    func reset() {
+        cancelRelease()
+        pointerInside = false
+        isScrolling = false
+        lastScrollEnd = nil
+    }
+}
+
+/// Reports the sidebar List's live scroll gestures — a trackpad flick and its
+/// momentum — so the order hold can outlast a pointer that leaves mid-flick.
+/// The List's scroll view is a sibling of this background probe, found the
+/// way `OreScrollerOverlay` finds it: climb a few levels, search down.
+private struct SidebarScrollProbe: NSViewRepresentable {
+    var onScrollStart: () -> Void
+    var onScrollEnd: () -> Void
+
+    final class Probe: NSView {
+        var onScrollStart: (() -> Void)?
+        var onScrollEnd: (() -> Void)?
+        private weak var observed: NSScrollView?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            // The sibling scroll view may not be installed on this pass.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.attachIfNeeded() }
+            }
+        }
+
+        /// Cheap once attached, so `updateNSView` can call it on every pass:
+        /// the List's scroll view can be installed several passes after the
+        /// probe lands, and a single async retry would miss it.
+        func attachIfNeeded() {
+            if let observed, observed.window != nil { return }
+            guard let scroll = findScrollView() else { return }
+            let center = NotificationCenter.default
+            if let observed {
+                center.removeObserver(self, name: nil, object: observed)
+            }
+            // Selector-based, so the center drops them when the probe goes.
+            center.addObserver(
+                self, selector: #selector(liveScrollStarted),
+                name: NSScrollView.willStartLiveScrollNotification, object: scroll
+            )
+            center.addObserver(
+                self, selector: #selector(liveScrollEnded),
+                name: NSScrollView.didEndLiveScrollNotification, object: scroll
+            )
+            observed = scroll
+        }
+
+        @objc private func liveScrollStarted(_ note: Notification) { onScrollStart?() }
+        @objc private func liveScrollEnded(_ note: Notification) { onScrollEnd?() }
+
+        /// The List's own scroll view: table-backed and holding the probe's
+        /// centre. A pinned strip's horizontal scroll view never qualifies.
+        private func findScrollView() -> NSScrollView? {
+            guard let window else { return nil }
+            let centre = convert(NSPoint(x: bounds.midX, y: bounds.midY), to: nil)
+            var root: NSView? = superview
+            for _ in 0..<5 {
+                guard let candidate = root else { break }
+                if let found = Self.tableScrollView(in: candidate, window: window, containing: centre) {
+                    return found
+                }
+                root = candidate.superview
+            }
+            return nil
+        }
+
+        private static func tableScrollView(
+            in view: NSView, window: NSWindow, containing point: NSPoint
+        ) -> NSScrollView? {
+            if let scroll = view as? NSScrollView,
+               scroll.window === window,
+               scroll.documentView is NSTableView,
+               scroll.convert(scroll.bounds, to: nil).contains(point) {
+                return scroll
+            }
+            for subview in view.subviews {
+                if let found = tableScrollView(in: subview, window: window, containing: point) {
+                    return found
+                }
+            }
+            return nil
+        }
+    }
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.onScrollStart = onScrollStart
+        probe.onScrollEnd = onScrollEnd
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.onScrollStart = onScrollStart
+        probe.onScrollEnd = onScrollEnd
+        probe.attachIfNeeded()
+    }
+}
+
+/// The selected row's pill.
+private struct SidebarSelectionBackground: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: OreTheme.pillRadius, style: .continuous)
+            .fill(OreTheme.sidebarSelectedFill)
+            .overlay {
+                RoundedRectangle(cornerRadius: OreTheme.pillRadius, style: .continuous)
+                    .strokeBorder(OreTheme.selectedStroke, lineWidth: 0.75)
+            }
+            .padding(.vertical, 2)
+    }
+}
+
+/// The reference design's segmented capsule: All | Active, each with its
+/// count. Selection stays quiet (a primary wash, not accent) so the blue
+/// pill remains reserved for the selected workspace row. Its own view so the
+/// Active count's changes redraw the capsule, not the list.
+private struct SidebarFilterTabs: View {
+    @Environment(AppModel.self) private var model
+    @Binding var filterRaw: String
+    let allCount: Int
+
+    var body: some View {
+        let filter = SidebarFilter(rawValue: filterRaw) ?? .all
+        let activeCount = model.activeWorkspaceIDs.count
+        HStack(spacing: 2) {
+            ForEach(SidebarFilter.allCases) { tab in
+                let isOn = filter == tab
+                Button {
+                    filterRaw = tab.rawValue
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(tab.title)
+                            .font(.system(size: OreTheme.Font.body, weight: isOn ? .semibold : .regular))
+                        Text("\(tab == .all ? allCount : activeCount)")
+                            .font(.system(size: OreTheme.Font.caption).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 24)
+                    .background(
+                        isOn ? Color.primary.opacity(0.1) : .clear,
+                        in: Capsule()
+                    )
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(OrePressableButtonStyle())
+            }
+        }
+        .padding(3)
+        .modifier(SidebarGlassCapsule())
+        .animation(.easeOut(duration: 0.15), value: filterRaw)
+    }
+}
+
+/// The footer's presence pill: green while any agent is live, quiet gray
+/// otherwise — the sidebar's own "Connected" light. Reads the working count
+/// itself, so agents starting and stopping redraw only the pill.
+private struct SidebarPresencePill: View {
+    @Environment(AppModel.self) private var model
+    let total: Int
+
+    var body: some View {
+        let working = model.workingCount
+        let isLive = working > 0
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isLive ? OreTheme.Presence.active : OreTheme.Presence.idle)
+                .frame(width: 7, height: 7)
+            // "Workspaces", not "active" — the filter tab above already uses
+            // "Active" to mean something narrower, and one word carrying two
+            // meanings on one surface reads as a bug.
+            Text(isLive
+                ? "\(working) working"
+                : "\(total) workspace\(total == 1 ? "" : "s")")
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+        }
+        .foregroundStyle(isLive ? OreTheme.Presence.active : Color.secondary)
+        .padding(.horizontal, 10)
+        .frame(height: 22)
+        .modifier(SidebarGlassCapsule(
+            tint: isLive ? OreTheme.Presence.active.opacity(0.12) : nil
+        ))
+        .animation(.easeOut(duration: 0.2), value: isLive)
+    }
+}
+
+private struct SidebarMuteButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let isMuted = model.narration.isMuted
+        Button {
+            model.narration.setMuted(!isMuted)
+        } label: {
+            Image(systemName: isMuted ? "speaker.slash" : "speaker.wave.2")
+                .font(.system(size: OreTheme.Font.body))
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 28, height: OreTheme.RowHeight.bar)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isMuted
+            ? "Unmute the assistant (⇧⌥⌘S)"
+            : "Mute the assistant (⇧⌥⌘S)")
+        .accessibilityLabel(isMuted ? "Unmute assistant" : "Mute assistant")
     }
 }
 
@@ -458,6 +796,50 @@ func sidebarEffectiveStatus(
     return latest?.status ?? workspace.status
 }
 
+/// The fleet-wide answers the sidebar shows — which workspaces are active, how
+/// many are working — in one pass. `AppModel` runs it when the fleet or a chat
+/// changes and stores the result, so no view recomputes it per render.
+/// Internal for tests.
+enum SidebarFleetActivity {
+    struct Summary: Equatable {
+        var activeIDs: Set<WorkspaceID> = []
+        var workingCount = 0
+    }
+
+    /// "Active" is the reference design's question — who is doing something or
+    /// waiting on me — not merely "exists": an agent working, blocked, failed,
+    /// or finished with unread output all count.
+    static func isActive(_ workspace: WorkspaceSummary, status: AgentStatus) -> Bool {
+        if workspace.hasUnread { return true }
+        switch status {
+        case .thinking, .requesting, .runningTool, .awaitingInput, .failed: return true
+        case .idle, .interrupted: return false
+        }
+    }
+
+    static func isWorking(_ status: AgentStatus) -> Bool {
+        switch status {
+        case .thinking, .requesting, .runningTool: return true
+        default: return false
+        }
+    }
+
+    /// `workspaces` are the unarchived ones; `chats` returns a workspace's
+    /// open tabs.
+    static func resolve(
+        _ workspaces: [WorkspaceSummary],
+        chats: (WorkspaceID) -> [ChatSummary]
+    ) -> Summary {
+        var summary = Summary()
+        for workspace in workspaces {
+            let status = sidebarEffectiveStatus(for: workspace, chats: chats(workspace.id))
+            if isActive(workspace, status: status) { summary.activeIDs.insert(workspace.id) }
+            if isWorking(status) { summary.workingCount += 1 }
+        }
+        return summary
+    }
+}
+
 /// "3h", "5d" — the reference design's timestamp column. A full relative
 /// sentence ("5 days ago") is the row's widest element for its least important
 /// fact; the compact form keeps the name in charge. Internal for tests.
@@ -479,41 +861,60 @@ func sidebarCompactAge(_ date: Date, now: Date = Date()) -> String {
 /// list, one tap from anywhere. Pinned workspaces live here instead of in the
 /// repository groups so pinning visibly promotes them.
 private struct PinnedStrip: View {
-    @Environment(AppModel.self) private var model
     let workspaces: [WorkspaceSummary]
-    let chatsFor: (WorkspaceID) -> [ChatSummary]
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(alignment: .top, spacing: OreTheme.Space.md) {
-                ForEach(workspaces) { workspace in
-                    let isSelected = model.selectedWorkspaceID == workspace.id
-                    VStack(spacing: 4) {
-                        WorkspaceAvatar(
-                            workspace: workspace,
-                            chats: chatsFor(workspace.id),
-                            size: 36,
-                            identity: model.researchIdentity(for: workspace)
-                        )
-                        Text(workspace.name)
-                            .font(.system(
-                                size: OreTheme.Font.caption,
-                                weight: isSelected ? .semibold : .regular
-                            ))
-                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
-                            .lineLimit(1)
-                            .frame(maxWidth: 56)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture { model.selectedWorkspaceID = workspace.id }
-                    .contextMenu {
-                        WorkspaceActionsMenu(workspace: workspace, onRename: {})
-                    }
-                    .help(workspace.name)
-                }
+        // A horizontal scroll view inside the List can catch the vertical
+        // gesture meant for the list. Only use one when the avatars actually
+        // overflow; when they fit, the same row is laid out plainly.
+        ViewThatFits(in: .horizontal) {
+            avatars
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollView(.horizontal, showsIndicators: false) {
+                avatars
             }
-            .padding(.horizontal, OreTheme.Space.xs)
         }
+    }
+
+    private var avatars: some View {
+        HStack(alignment: .top, spacing: OreTheme.Space.md) {
+            ForEach(workspaces) { workspace in
+                PinnedWorkspace(workspace: workspace)
+            }
+        }
+        .padding(.horizontal, OreTheme.Space.xs)
+    }
+}
+
+/// One pinned avatar. Reads selection and identity itself, so selecting a
+/// workspace redraws the strip's items rather than the list around them.
+private struct PinnedWorkspace: View {
+    @Environment(AppModel.self) private var model
+    let workspace: WorkspaceSummary
+
+    var body: some View {
+        let isSelected = model.selectedWorkspaceID == workspace.id
+        VStack(spacing: 4) {
+            WorkspaceAvatar(
+                workspace: workspace,
+                size: 36,
+                identity: model.researchIdentity(for: workspace)
+            )
+            Text(workspace.name)
+                .font(.system(
+                    size: OreTheme.Font.caption,
+                    weight: isSelected ? .semibold : .regular
+                ))
+                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                .lineLimit(1)
+                .frame(maxWidth: 56)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedWorkspaceID = workspace.id }
+        .contextMenu {
+            WorkspaceActionsMenu(workspace: workspace, onRename: {})
+        }
+        .help(workspace.name)
     }
 }
 
@@ -524,18 +925,60 @@ private struct PinnedStrip: View {
 private enum ScientistPortraitCache {
     private static var images: [String: NSImage] = [:]
     private static var misses: Set<String> = []
+    /// One decode per portrait even when the warm-up pass and a row ask at once.
+    private static var loads: [String: Task<NSImage?, Never>] = [:]
+    /// The largest avatar is 36 pt; three pixels a point covers Retina with
+    /// room. The corpus portraits are far larger than any avatar needs.
+    private nonisolated static let maxPixelSize = 108
+
+    /// `@unchecked`: the image is created in the detached task and only read
+    /// on the main actor after it is handed over.
+    private struct Decoded: @unchecked Sendable {
+        var image: NSImage?
+    }
 
     static func load(for identity: ResearchIdentity) async -> NSImage? {
-        if let image = images[identity.slug] { return image }
-        if misses.contains(identity.slug) { return nil }
-        guard let profile = await ScientistCorpus.shared.profile(for: identity),
-              let url = ScientistCorpus.shared.imageURL(for: profile),
-              let image = NSImage(contentsOf: url) else {
-            misses.insert(identity.slug)
-            return nil
+        let slug = identity.slug
+        if let image = images[slug] { return image }
+        if misses.contains(slug) { return nil }
+        if let pending = loads[slug] { return await pending.value }
+        let load = Task<NSImage?, Never> { @MainActor in
+            guard let profile = await ScientistCorpus.shared.profile(for: identity),
+                  let url = ScientistCorpus.shared.imageURL(for: profile) else { return nil }
+            // Decoded at avatar size off the main actor. `NSImage(contentsOf:)`
+            // here decoded the full portrait on main for a 28 pt circle.
+            return await Task.detached(priority: .utility) {
+                Self.decodeThumbnail(at: url)
+            }.value.image
         }
-        images[identity.slug] = image
+        loads[slug] = load
+        let image = await load.value
+        loads[slug] = nil
+        if let image {
+            images[slug] = image
+        } else {
+            misses.insert(slug)
+        }
         return image
+    }
+
+    nonisolated private static func decodeThumbnail(at url: URL) -> Decoded {
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            // Decode here, in this task, rather than when SwiftUI draws it.
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else {
+            return Decoded(image: NSImage(contentsOf: url))
+        }
+        return Decoded(image: NSImage(
+            cgImage: thumbnail,
+            size: NSSize(width: thumbnail.width, height: thumbnail.height)
+        ))
     }
 }
 
@@ -544,8 +987,8 @@ private enum ScientistPortraitCache {
 /// that spins while the agent works, and the harness mark tucked in the
 /// corner so you can tell which agent lives here without reading anything.
 private struct WorkspaceAvatar: View {
+    @Environment(AppModel.self) private var model
     let workspace: WorkspaceSummary
-    let chats: [ChatSummary]
     var size: CGFloat = 28
     /// The scientist this workspace is named for, when it is.
     var identity: ResearchIdentity?
@@ -555,11 +998,13 @@ private struct WorkspaceAvatar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var portrait: NSImage?
 
+    /// Read here, by id, so a tab's status change redraws this avatar only.
     private var status: AgentStatus {
-        sidebarEffectiveStatus(for: workspace, chats: chats)
+        sidebarEffectiveStatus(for: workspace, chats: model.chats(for: workspace.id))
     }
 
     var body: some View {
+        let status = self.status
         Group {
             if let portrait {
                 Image(nsImage: portrait)
@@ -579,16 +1024,16 @@ private struct WorkspaceAvatar: View {
             }
             portrait = await ScientistPortraitCache.load(for: identity)
         }
-        .overlay { statusRing }
+        .overlay { statusRing(status) }
         .overlay(alignment: .bottomTrailing) {
             HarnessMark(harness: workspace.harness, size: size * 0.42)
                 .offset(x: 2, y: 2)
         }
-        .help(statusHelp)
+        .help(statusHelp(status))
     }
 
     @ViewBuilder
-    private var statusRing: some View {
+    private func statusRing(_ status: AgentStatus) -> some View {
         switch status {
         case .thinking, .requesting, .runningTool:
             if reduceMotion {
@@ -614,7 +1059,7 @@ private struct WorkspaceAvatar: View {
             .padding(-2.5)
     }
 
-    private var statusHelp: String {
+    private func statusHelp(_ status: AgentStatus) -> String {
         switch status {
         case .thinking, .requesting, .runningTool: "Agent working"
         case .awaitingInput: "Needs your attention"
@@ -752,7 +1197,6 @@ private struct RepositoryRow: View {
 private struct WorkspaceRow: View {
     @Environment(AppModel.self) private var model
     let workspace: WorkspaceSummary
-    let chats: [ChatSummary]
     /// The scientist this workspace is named for — drives the portrait avatar.
     var identity: ResearchIdentity?
     let isSelected: Bool
@@ -766,11 +1210,16 @@ private struct WorkspaceRow: View {
     /// outranks it — a row that needs you says so, not what was said last.
     @State private var digest: String?
 
+    /// This workspace's open tabs, read by id: the row observes its own list,
+    /// so a chat changing elsewhere in the fleet never redraws it.
+    private var chats: [ChatSummary] {
+        model.chats(for: workspace.id)
+    }
+
     var body: some View {
         HStack(spacing: OreTheme.Space.sm) {
             WorkspaceAvatar(
                 workspace: workspace,
-                chats: chats,
                 size: 28,
                 identity: identity,
                 onProminentFill: false
@@ -849,36 +1298,54 @@ private struct WorkspaceRow: View {
                     .help("Finished with unread activity")
             }
 
-            if isHovering || isSelected {
-                Menu {
-                    WorkspaceActionsMenu(workspace: workspace, onRename: onRename)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Color.primary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .buttonStyle(.plain)
-                .help("Workspace actions")
-            } else if let shortcutIndex {
-                Text("⌘\(shortcutIndex)")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(.tertiary)
-                    .frame(minWidth: 24)
-                    .help("Jump here with ⌘\(shortcutIndex)")
-            }
+            trailingSlot
         }
         .frame(minHeight: 44)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         // Re-fetched only when the workspace actually has new activity, so the
-        // sidebar never polls; a quiet row costs one query per turn completed.
+        // sidebar never polls; a quiet row costs one query per turn completed,
+        // and the model's cache means scrolling back to a row costs none.
         .task(id: digestKey) {
-            digest = await model.lastTurnDigest(for: workspace.id)
+            let fetched = await model.lastTurnDigest(
+                for: workspace.id, lastActivity: workspace.lastActivity
+            )
+            if fetched != digest { digest = fetched }
         }
+    }
+
+    /// The ⋯ menu and the ⌘-number share one fixed slot. The menu stays
+    /// mounted and only fades in: it is an NSPopUpButton underneath, and
+    /// mounting one whenever a row slid under a resting pointer was real work
+    /// mid-scroll, and relaid out the row around it.
+    private var trailingSlot: some View {
+        let showsActions = isHovering || isSelected
+        return ZStack {
+            if let shortcutIndex {
+                Text("⌘\(shortcutIndex)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .help("Jump here with ⌘\(shortcutIndex)")
+                    .opacity(showsActions ? 0 : 1)
+            }
+            Menu {
+                WorkspaceActionsMenu(workspace: workspace, onRename: onRename)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .buttonStyle(.plain)
+            .help("Workspace actions")
+            .opacity(showsActions ? 1 : 0)
+            .allowsHitTesting(showsActions)
+            .accessibilityHidden(!showsActions)
+        }
+        .frame(width: 24, height: 24)
     }
 
     /// Identity for the snippet load: a new turn moves `lastActivity`, which
@@ -891,7 +1358,17 @@ private struct WorkspaceRow: View {
     /// of the time, which is what makes the list read like the mock's chat
     /// list instead of a table of idle machines.
     private var secondLineText: String? {
-        statusLine ?? digest
+        statusLine ?? shownDigest
+    }
+
+    /// The model's snippet for this exact activity stamp when it has one, so
+    /// a row that scrolls back into view is two lines tall from its first
+    /// frame instead of growing once its read lands.
+    private var shownDigest: String? {
+        if let cached = model.cachedTurnDigest(for: workspace.id, lastActivity: workspace.lastActivity) {
+            return cached
+        }
+        return digest
     }
 
     private var effectiveStatus: AgentStatus {

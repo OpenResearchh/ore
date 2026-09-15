@@ -15,6 +15,16 @@ enum FleetSuggestionResolver {
     }
 
     static func resolve(_ workspaces: [WorkspaceSummary]) -> Suggestion? {
+        resolve(workspaces) { $0.gitStatus.hasUncommittedChanges }
+    }
+
+    /// `hasUncommittedChanges` is asked only of idle workspaces that reach the
+    /// last rung, so a caller reading live git state reads (and observes) it
+    /// only when status alone didn't decide the suggestion.
+    static func resolve(
+        _ workspaces: [WorkspaceSummary],
+        hasUncommittedChanges: (WorkspaceSummary) -> Bool
+    ) -> Suggestion? {
         let active = workspaces.filter { !$0.isArchived }
         if let workspace = active.first(where: { $0.status == .awaitingInput }) {
             return Suggestion(
@@ -38,7 +48,7 @@ enum FleetSuggestionResolver {
             )
         }
         if let workspace = active.first(where: {
-            $0.status == .idle && $0.gitStatus.hasUncommittedChanges
+            $0.status == .idle && hasUncommittedChanges($0)
         }) {
             return Suggestion(
                 id: "commit", icon: "tray.and.arrow.down",
@@ -66,14 +76,11 @@ struct MenuBarDashboard: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if let suggestion = FleetSuggestionResolver.resolve(model.sortedWorkspaces.map { workspace in
-                var copy = workspace
-                copy.gitStatus = model.gitChrome(for: workspace.id)
-                return copy
-            }) {
-                fleetSuggestionRow(suggestion)
-                Divider()
-            }
+            // Its own view: resolving the suggestion reads live git state, and
+            // doing it here subscribed the whole dashboard to every workspace's
+            // dirt — an agent writing a file anywhere re-ran the cards, the
+            // workspace list and the footer, menu closed or not.
+            MenuBarSuggestionRow(onReveal: reveal)
             if !model.assistantConfirmations.isEmpty {
                 confirmations
                 Divider()
@@ -398,39 +405,6 @@ struct MenuBarDashboard: View {
         .padding(OreTheme.Space.sm)
     }
 
-    /// The fleet's one suggested next step, right under the header — the menu
-    /// bar's version of the composer's suggestion ladder. Clicking acts:
-    /// reveal the workspace, and for commit suggestions also ask its current
-    /// tab's agent to commit.
-    private func fleetSuggestionRow(_ suggestion: FleetSuggestionResolver.Suggestion) -> some View {
-        Button {
-            if let workspace = model.sortedWorkspaces.first(where: { $0.id == suggestion.workspaceID }) {
-                if suggestion.startsCommitAgent {
-                    model.commitWithAgent(in: workspace.id)
-                }
-                reveal(workspace)
-            }
-        } label: {
-            HStack(spacing: OreTheme.Space.sm) {
-                Image(systemName: suggestion.icon)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 16)
-                Text(suggestion.title)
-                    .font(.system(size: OreTheme.Font.body, weight: .medium))
-                    .lineLimit(1)
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, OreTheme.Space.md)
-        .frame(height: 30)
-    }
-
     private func reveal(_ workspace: WorkspaceSummary) {
         model.selectedWorkspaceID = workspace.id
         openMain()
@@ -461,6 +435,66 @@ struct MenuBarDashboard: View {
         case .failed: return "failed"
         case .interrupted: return "stopped"
         case .idle: return "finished"
+        }
+    }
+}
+
+/// The fleet's one suggested next step, right under the header — the menu
+/// bar's version of the composer's suggestion ladder. Clicking acts: reveal
+/// the workspace, and for commit suggestions also ask its current tab's agent
+/// to commit.
+///
+/// Split out of `MenuBarDashboard` so the git state the last rung needs is
+/// observed by this 30 pt row alone. It also asks for that state only when
+/// the menu is in use: while the extra's window is closed a summary's own
+/// `gitStatus` decides the rung, which costs no per-workspace subscription.
+/// The difference is invisible — nobody is reading the row then — and opening
+/// the menu flips `controlActiveState` and resolves it again from live dirt.
+private struct MenuBarSuggestionRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.controlActiveState) private var controlActiveState
+    let onReveal: (WorkspaceSummary) -> Void
+
+    var body: some View {
+        if let suggestion {
+            Button {
+                if let workspace = model.sortedWorkspaces.first(where: {
+                    $0.id == suggestion.workspaceID
+                }) {
+                    if suggestion.startsCommitAgent {
+                        model.commitWithAgent(in: workspace.id)
+                    }
+                    onReveal(workspace)
+                }
+            } label: {
+                HStack(spacing: OreTheme.Space.sm) {
+                    Image(systemName: suggestion.icon)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 16)
+                    Text(suggestion.title)
+                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                        .lineLimit(1)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, OreTheme.Space.md)
+            .frame(height: 30)
+            Divider()
+        }
+    }
+
+    private var suggestion: FleetSuggestionResolver.Suggestion? {
+        let isInUse = controlActiveState != .inactive
+        return FleetSuggestionResolver.resolve(model.sortedWorkspaces) { workspace in
+            isInUse
+                ? model.gitChrome(for: workspace.id).hasUncommittedChanges
+                : workspace.gitStatus.hasUncommittedChanges
         }
     }
 }

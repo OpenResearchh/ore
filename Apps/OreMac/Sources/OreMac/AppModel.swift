@@ -74,6 +74,32 @@ final class AppModel {
     /// render, and it only moves when `workspaces` does. See
     /// `recomputeSortedWorkspaces` for the ordering.
     private(set) var sortedWorkspaces: [WorkspaceSummary] = []
+
+    // Fleet-wide answers, stored and reassigned only when they actually move.
+    // As computed properties each read subscribed a view to the whole
+    // `workspaces` array (or every workspace's chat list), so any agent's
+    // status flip re-ran the sidebar, the app's menu commands, and RootView
+    // mid-scroll even when the answer they showed was the same.
+
+    /// The workspace on screen. A lookup into `workspaces` from a view made
+    /// that view depend on every workspace; this changes only with the
+    /// selection or the selected workspace's own summary.
+    private(set) var selectedWorkspace: WorkspaceSummary?
+    private(set) var archivedWorkspaces: [WorkspaceSummary] = []
+    /// Workspaces needing attention plus new dream findings — the dock badge.
+    private(set) var attentionCount = 0
+    private(set) var hasNeedsYouStops = false
+    /// Unarchived workspaces doing something or waiting on the person — the
+    /// sidebar's Active tab. See `SidebarFleetActivity`.
+    private(set) var activeWorkspaceIDs: Set<WorkspaceID> = []
+    /// How many unarchived workspaces have an agent working right now.
+    private(set) var workingCount = 0
+    /// The first nine workspaces in the order the sidebar is *showing*, while
+    /// it holds its order still under the pointer; nil when it shows the live
+    /// order. ⌘1–9 reads this so a shortcut always lands on the row whose
+    /// badge it matches. Only read by actions, so not observed.
+    @ObservationIgnored
+    var sidebarShortcutOrder: [WorkspaceID]?
     /// The product-owned assistant workspace, routed out of `workspaces` at
     /// event intake. This is the single point that keeps it off the sidebar,
     /// out of ⌘1–9, and away from every picker — the Assistant window is the
@@ -82,7 +108,9 @@ final class AppModel {
     /// Hidden overnight-research worktrees. The Dreams window is the only
     /// surface that should mention them.
     private(set) var dreamWorkspaces: [WorkspaceSummary] = []
-    private(set) var dreamInbox = DreamInboxSnapshot()
+    private(set) var dreamInbox = DreamInboxSnapshot() {
+        didSet { recomputeAttentionCount() }
+    }
     private(set) var dreamSleepStatus: DreamSleepStatus = .disabled
     @ObservationIgnored
     private var dreamMonitor: DreamEnvironmentMonitor?
@@ -127,6 +155,7 @@ final class AppModel {
 
     var selectedWorkspaceID: WorkspaceID? {
         didSet {
+            recomputeSelectedWorkspace()
             guard selectedWorkspaceID != oldValue else { return }
             focusChanged(from: oldValue, to: selectedWorkspaceID)
         }
@@ -542,10 +571,6 @@ final class AppModel {
 
     // MARK: - Reading
 
-    var selectedWorkspace: WorkspaceSummary? {
-        workspaces.first { $0.id == selectedWorkspaceID }
-    }
-
     /// The assistant's current conversation, once the snapshot has arrived.
     var assistantChatID: ChatID? {
         guard let assistant = assistantWorkspace else { return nil }
@@ -871,7 +896,12 @@ final class AppModel {
         NeedsYouCycle.stops(needsYou: tabNeedsYou, workspaces: sortedWorkspaces)
     }
 
-    var hasNeedsYouStops: Bool { !needsYouStops.isEmpty }
+    /// Kept current from `tabNeedsYou` and `sortedWorkspaces`, the two inputs
+    /// to `needsYouStops`; the ⇧⌘U menu item reads it.
+    private func recomputeNeedsYouStops() {
+        let next = !needsYouStops.isEmpty
+        if next != hasNeedsYouStops { hasNeedsYouStops = next }
+    }
 
     /// Jumps to the next thing waiting on the user, anywhere in the fleet.
     /// Returns false when nothing is — the caller keeps the menu item disabled,
@@ -1147,15 +1177,44 @@ final class AppModel {
                 return (first.lastActivity ?? .distantPast) > (second.lastActivity ?? .distantPast)
             }
         if sorted != sortedWorkspaces { sortedWorkspaces = sorted }
+
+        let archived = workspaces.filter(\.isArchived)
+        if archived != archivedWorkspaces { archivedWorkspaces = archived }
+        recomputeSelectedWorkspace()
+        recomputeAttentionCount()
+        recomputeNeedsYouStops()
+        recomputeFleetActivity()
     }
 
-    var archivedWorkspaces: [WorkspaceSummary] {
-        workspaces.filter(\.isArchived)
+    private func recomputeSelectedWorkspace() {
+        let next = selectedWorkspaceID.flatMap { id in workspaces.first { $0.id == id } }
+        if next != selectedWorkspace { selectedWorkspace = next }
     }
 
-    var attentionCount: Int {
-        workspaces.filter { !$0.isArchived && $0.needsAttention }.count
+    private func recomputeAttentionCount() {
+        let next = sortedWorkspaces.lazy.filter(\.needsAttention).count
             + dreamInbox.newFindingCount
+        if next != attentionCount { attentionCount = next }
+    }
+
+    /// Chat statuses feed the Active tab and the working count, so this runs
+    /// after every write to `chatIndex` as well as every fleet change. It is a
+    /// pass over each workspace's open tabs — cheap at write time, and far
+    /// cheaper than the sidebar doing it on every render.
+    private func recomputeFleetActivity() {
+        let next = SidebarFleetActivity.resolve(sortedWorkspaces) { chats(for: $0) }
+        if next.activeIDs != activeWorkspaceIDs { activeWorkspaceIDs = next.activeIDs }
+        if next.workingCount != workingCount { workingCount = next.workingCount }
+    }
+
+    /// ⌘1–9's target: the sidebar's displayed order while it is holding still,
+    /// the live order otherwise. See `sidebarShortcutOrder`.
+    func shortcutWorkspaceID(at index: Int) -> WorkspaceID? {
+        SidebarOrderHold.shortcutTarget(
+            at: index,
+            held: sidebarShortcutOrder,
+            live: sortedWorkspaces.map(\.id)
+        )
     }
 
     // MARK: - Commands
@@ -2881,23 +2940,51 @@ final class AppModel {
         return (try? await client.turnCheckpoints(workspaceID: id, chatID: chatID)) ?? []
     }
 
+    /// Sidebar snippets by workspace, stamped with the `lastActivity` they were
+    /// read at. A List row that scrolls out and back in is a fresh view with
+    /// empty state; without this every return restarted the IPC read, and the
+    /// row grew its second line a beat after it appeared.
+    private struct TurnDigestEntry {
+        var lastActivity: Date?
+        var digest: String?
+    }
+    @ObservationIgnored
+    private var turnDigests: [WorkspaceID: TurnDigestEntry] = [:]
+
+    /// The snippet already read for this activity stamp, if there is one.
+    /// `.some(nil)` means "read, and there was nothing to show".
+    func cachedTurnDigest(for id: WorkspaceID, lastActivity: Date?) -> String?? {
+        guard let entry = turnDigests[id], entry.lastActivity == lastActivity else { return nil }
+        return .some(entry.digest)
+    }
+
     /// The sidebar row's snippet: the last thing said in the workspace's most
     /// recently active conversation, flattened to one line. Nil when nothing
     /// has been said yet, so a fresh workspace's row stays one line tall.
-    func lastTurnDigest(for id: WorkspaceID) async -> String? {
+    ///
+    /// Only goes to the core when `lastActivity` moved since the last read —
+    /// i.e. once per completed turn, not once per appearance.
+    func lastTurnDigest(for id: WorkspaceID, lastActivity: Date?) async -> String? {
+        if let cached = cachedTurnDigest(for: id, lastActivity: lastActivity) { return cached }
         let recent = chats(for: id).max {
             ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast)
         }
         guard let chatID = recent?.id else { return nil }
-        let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID)
-        guard let digest else { return nil }
+        guard let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID) else {
+            // A failed read is not cached: the next appearance tries again.
+            return nil
+        }
         let flattened = digest
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        guard !flattened.isEmpty else { return nil }
-        return String(flattened.prefix(160))
+        let result = flattened.isEmpty ? nil : String(flattened.prefix(160))
+        // A workspace removed while the read was in flight stays forgotten.
+        if workspaces.contains(where: { $0.id == id }) {
+            turnDigests[id] = TurnDigestEntry(lastActivity: lastActivity, digest: result)
+        }
+        return result
     }
 
     func loadDiffFromCheckpoint(_ commit: String, for id: WorkspaceID) async throws -> [FileDiff] {
@@ -3368,7 +3455,34 @@ final class AppModel {
         return ResearchIdentity.next(excluding: used)
     }
 
+    /// Resolved identities, keyed by the inputs that decide them. The sidebar
+    /// asks once per row per pass, and each answer was a defaults read plus a
+    /// scan of the catalog. Entries are dropped wherever the saved slug is
+    /// written, and a rename or moved worktree misses on its own.
+    private struct ResolvedResearchIdentity {
+        var name: String
+        var worktreePath: String
+        var identity: ResearchIdentity?
+    }
+    @ObservationIgnored
+    private var researchIdentityCache: [WorkspaceID: ResolvedResearchIdentity] = [:]
+
     func researchIdentity(for workspace: WorkspaceSummary) -> ResearchIdentity? {
+        if let cached = researchIdentityCache[workspace.id],
+           cached.name == workspace.name,
+           cached.worktreePath == workspace.worktreePath {
+            return cached.identity
+        }
+        let identity = resolveResearchIdentity(for: workspace)
+        researchIdentityCache[workspace.id] = ResolvedResearchIdentity(
+            name: workspace.name,
+            worktreePath: workspace.worktreePath,
+            identity: identity
+        )
+        return identity
+    }
+
+    private func resolveResearchIdentity(for workspace: WorkspaceSummary) -> ResearchIdentity? {
         let key = "ore.researchIdentity.\(workspace.id.rawValue)"
         if let saved = UserDefaults.standard.string(forKey: key),
            let identity = ResearchIdentity.matching(nameOrSlug: saved) {
@@ -3500,6 +3614,8 @@ final class AppModel {
             }
             chatSummaries = snapshot.chats
             chatIndex.replaceAll(snapshot.chats)
+            // `workspaces` was assigned above, against the old chat lists.
+            recomputeFleetActivity()
             chatOwners = Dictionary(
                 snapshot.chats.map { ($0.id, $0.workspaceID) },
                 uniquingKeysWith: { _, last in last }
@@ -3584,6 +3700,8 @@ final class AppModel {
             for key in ["ore.activeChat", "ore.researchIdentity"] {
                 UserDefaults.standard.removeObject(forKey: "\(key).\(id.rawValue)")
             }
+            researchIdentityCache.removeValue(forKey: id)
+            turnDigests.removeValue(forKey: id)
             if selectedWorkspaceID == id { selectedWorkspaceID = sortedWorkspaces.first?.id }
             dreamWorkspaces.removeAll { $0.id == id }
 
@@ -4556,6 +4674,7 @@ final class AppModel {
             chatSummaries.append(summary)
         }
         chatIndex.upsert(summary)
+        recomputeFleetActivity()
         // The engine's queue gate, brought over as-is. The composer decides
         // "send or queue" from this, so a guess derived from `status` would put
         // the button and the engine back out of step. Loaded states only — a
@@ -4614,6 +4733,7 @@ final class AppModel {
                     identity.slug,
                     forKey: "ore.researchIdentity.\(workspace.id.rawValue)"
                 )
+                researchIdentityCache.removeValue(forKey: workspace.id)
                 identityRenamesInFlight.insert(workspace.id)
                 rename(workspace.id, to: identity.name, userInitiated: false)
             }
@@ -4650,6 +4770,7 @@ final class AppModel {
         guard UserDefaults.standard.string(forKey: key) == nil,
               let identity = ResearchIdentity.matching(nameOrSlug: workspace.name) else { return }
         UserDefaults.standard.set(identity.slug, forKey: key)
+        researchIdentityCache.removeValue(forKey: workspace.id)
     }
 
     /// A name that is actually a failure the auto-namer captured. The naming

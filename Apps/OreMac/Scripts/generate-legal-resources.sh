@@ -64,6 +64,23 @@ for pin in pins:
     with open(os.path.join(path, licenses[0]), encoding="utf-8") as handle:
         print(handle.read().rstrip())
 
+    # A license alone isn't always the whole obligation: Apache 4(d) asks for a
+    # package's NOTICE to travel too, and some packages vendor code under its
+    # own license in a ThirdPartyLicenses directory.
+    extras = sorted(name for name in os.listdir(path) if name.lower().startswith("notice"))
+    bundled = os.path.join(path, "ThirdPartyLicenses")
+    if os.path.isdir(bundled):
+        extras += sorted(
+            os.path.join("ThirdPartyLicenses", name) for name in os.listdir(bundled)
+            if os.path.isfile(os.path.join(bundled, name))
+        )
+    for extra in extras:
+        print()
+        print(f"{directory}: {extra}")
+        print()
+        with open(os.path.join(path, extra), encoding="utf-8") as handle:
+            print(handle.read().rstrip())
+
 print()
 print(rule)
 print("Pocket TTS (neural narration voice model)")

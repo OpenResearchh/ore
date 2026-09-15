@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// What the app talks to. Everything is fire-and-forget: telemetry must never
 /// be able to slow down, block, or fail a user action.

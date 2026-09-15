@@ -40,6 +40,11 @@ public final class ChildProcess: @unchecked Sendable {
     public let executablePath: String
     public let arguments: [String]
 
+    /// Every pipe end this process was given, as created. A test can check
+    /// each one is closed afterwards without counting descriptors the rest of
+    /// the process opened in the meantime.
+    let pipeDescriptors: [DescriptorIdentity]
+
     private let process: Process
     private let stdinHandle: FileHandle
     private let writeQueue: DispatchQueue
@@ -97,6 +102,7 @@ public final class ChildProcess: @unchecked Sendable {
         let stdoutPipe = Pipe()
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
+        var pipes = [stdinPipe, stdoutPipe]
 
         self.process = process
         self.stdinHandle = stdinPipe.fileHandleForWriting
@@ -116,12 +122,18 @@ public final class ChildProcess: @unchecked Sendable {
         } else {
             let stderrPipe = Pipe()
             process.standardError = stderrPipe
+            pipes.append(stderrPipe)
             self.stderrChunks = ChildProcess.chunkStream(
                 from: stderrPipe.fileHandleForReading,
                 label: "stderr",
                 bufferingPolicy: .bufferingNewest(ChildProcess.stderrBufferLimit)
             )
         }
+        // Recorded now, while every end is certainly open and still this
+        // process's own.
+        self.pipeDescriptors = pipes
+            .flatMap { [$0.fileHandleForReading.fileDescriptor, $0.fileHandleForWriting.fileDescriptor] }
+            .compactMap(DescriptorIdentity.init)
 
         // Installed before launch, exactly once. Installing it after launch
         // raced the exit, and when the process had already gone Foundation
@@ -267,8 +279,13 @@ public final class ChildProcess: @unchecked Sendable {
                     // Thread's own pool only drains when its body returns — at
                     // EOF. Without a pool per read, every 16 KB chunk a
                     // harness ever wrote stayed resident for as long as the
-                    // session ran: hundreds of MB after a few hours.
+                    // session ran: hundreds of MB after a few hours. Linux has
+                    // no autorelease pools, and nothing there to drain.
+                    #if canImport(Darwin)
                     let chunk = autoreleasepool { handle.availableData }
+                    #else
+                    let chunk = handle.availableData
+                    #endif
                     if chunk.isEmpty { break }  // EOF
                     continuation.yield(chunk)
                 }

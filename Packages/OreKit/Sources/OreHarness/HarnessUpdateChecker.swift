@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OreProtocol
 
 /// Asks each agent CLI's install channel what version it is publishing.

@@ -38,26 +38,26 @@ struct ChildProcessLifecycleTests {
         #expect(await process.waitForExit() == 0)
     }
 
-    @Test func sequentialShortProcessesDoNotAccumulateFileDescriptors() async throws {
-        // Warm up once so lazily-opened descriptors (dispatch, /dev/null)
-        // don't count as growth.
-        try await runToCompletion()
-        let before = try openDescriptorCount()
-
+    @Test func sequentialShortProcessesCloseEveryPipeTheyWereGiven() async throws {
+        // Counting /dev/fd can't answer this. Every other suite runs in this
+        // same process, and on Linux, where launches are serialized, over two
+        // hundred pipes from their git calls can be open at the moment of the
+        // second count. So the test follows the exact pipe ends these
+        // processes were given, by inode, and checks none of them is left.
+        var pipeEnds: [DescriptorIdentity] = []
         for _ in 0..<60 {
-            try await runToCompletion()
+            pipeEnds += try await runToCompletion()
         }
         // Stdin closes on the write queue; give it a beat.
         try await Task.sleep(for: .milliseconds(200))
 
-        // A leaked process holds at least two pipe ends (120+ here). Other
-        // suites run in parallel and open files too, so allow slack rather
-        // than demanding an exact count.
-        let growth = try openDescriptorCount() - before
-        #expect(growth < 40, "open descriptors grew by \(growth)")
+        // Three pipes, two ends each, per process.
+        #expect(pipeEnds.count == 60 * 6)
+        let leaked = pipeEnds.filter(\.isStillOpen)
+        #expect(leaked.count == 0, "\(leaked.count) pipe ends are still open")
     }
 
-    private func runToCompletion() async throws {
+    private func runToCompletion() async throws -> [DescriptorIdentity] {
         let process = try shell("echo out; echo err >&2")
         process.closeStandardInput()
         async let stdout = process.stdoutChunks.collectText()
@@ -65,10 +65,7 @@ struct ChildProcessLifecycleTests {
         _ = await stdout
         _ = await stderr
         #expect(await process.waitForExit() == 0)
-    }
-
-    private func openDescriptorCount() throws -> Int {
-        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+        return process.pipeDescriptors
     }
 
     private func shell(_ script: String, discardStandardError: Bool = false) throws -> ChildProcess {

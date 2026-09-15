@@ -50,11 +50,20 @@ public actor StatusWatcher {
         gitState: [Date?]
     )?
 
+    /// The backstop poll. Where FSEvents reports changes it only has to catch
+    /// what they miss, so it can be slow. Without them, as on Linux, it is the
+    /// only way a change is ever noticed.
+    #if canImport(CoreServices)
+    public static let defaultPollInterval: Duration = .seconds(60)
+    #else
+    public static let defaultPollInterval: Duration = .seconds(10)
+    #endif
+
     public init(
         git: GitClient,
         worktreeURL: URL,
         debounce: Duration = .milliseconds(300),
-        pollInterval: Duration = .seconds(60),
+        pollInterval: Duration = StatusWatcher.defaultPollInterval,
         backgroundPollingEnabled: Bool = true
     ) {
         self.git = git

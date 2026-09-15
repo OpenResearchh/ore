@@ -1069,6 +1069,40 @@ struct AssistantBridgeTests {
         }
     }
 
+    @Test func aNewBypassTabAsksForConfirmation() async throws {
+        // Opening a tab with every permission check off is the same grant as
+        // switching one to it, and its prompt would start running at once.
+        try await BridgeHarness.run { harness in
+
+            let workspaceID = try await harness.makeWorkspace(named: "bypass-chat-test")
+            let before = try await harness.store.chats(workspaceID: workspaceID).count
+
+            async let call = harness.callBridgeAsync(
+                tool: "CreateChat",
+                arguments: [
+                    "workspaceID": .string(workspaceID.rawValue),
+                    "permissionMode": .string("bypassPermissions"),
+                    "prompt": .string("clean up the repository"),
+                ]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("a bypass tab must ask before it opens")
+                return
+            }
+            #expect(confirmation.actionClass == .autoAllowTab)
+            await harness.client.send(.resolveAssistantConfirmation(confirmation.id, .deny))
+            let response = try await call
+            #expect(!response.ok)
+            let after = try await harness.store.chats(workspaceID: workspaceID).count
+            #expect(after == before)
+        }
+    }
+
     @Test func acceptEditsModeDoesNotAsk() async throws {
         try await BridgeHarness.run { harness in
 

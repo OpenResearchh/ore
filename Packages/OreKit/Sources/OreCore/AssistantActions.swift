@@ -23,7 +23,7 @@ enum AssistantActionPolicy {
         // asked for. Prompting on these is how an assistant becomes paperwork.
         // Fleet/state tools are pure reads that happen to need the
         // app process. Memory writes stay in the MCP process.
-        case "CreateWorkspace", "CreateChat", "SendPromptToProject", "OpenWorkspace",
+        case "CreateWorkspace", "SendPromptToProject", "OpenWorkspace",
              "ListHarnesses", "GetExecutionOptions", "CheckHarnessUpdates",
              "GetAppState", "RouteTask", "ListGitHubRepositories",
              "SetChatModel", "SwitchChatHarness", "SetChatEffort",
@@ -43,6 +43,15 @@ enum AssistantActionPolicy {
              // anything that already exists — the same tier as the
              // CreateWorkspace it usually ends in.
              "RetryLastTurn", "AddRepository", "CreateProject":
+            return .auto
+
+        // A new tab is as contained as any other, unless it opens with every
+        // permission check off: that is the grant SetChatPermissionMode asks
+        // for, and here the prompt starts running the moment the tab exists.
+        case "CreateChat":
+            if arguments["permissionMode"]?.stringValue == PermissionMode.bypassPermissions.rawValue {
+                return .confirm(.autoAllowTab)
+            }
             return .auto
 
         case "SetChatPermissionMode":
@@ -1968,7 +1977,11 @@ extension InProcessCoreClient {
         case "CreateWorkspace":
             let repository = request.arguments["repository"]?.stringValue ?? "the repository"
             return "Create a workspace in \(repository)"
-        case "CreateChat": return "Open a new chat tab\(place)"
+        case "CreateChat":
+            if request.arguments["permissionMode"]?.stringValue == PermissionMode.bypassPermissions.rawValue {
+                return "Open a new chat tab\(place) with every permission check off"
+            }
+            return "Open a new chat tab\(place)"
         case "SendPromptToProject": return "Send a prompt to the agent\(place)"
         case "OpenWorkspace": return "Show\(place.isEmpty ? " a workspace" : place) on screen"
         case "GetAppState": return "Read the live app state"

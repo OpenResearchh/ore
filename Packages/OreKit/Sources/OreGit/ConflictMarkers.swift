@@ -96,14 +96,6 @@ public enum ConflictMarkers {
         return replacing(hunk, in: text, with: side == .ours ? hunk.ours : hunk.theirs)
     }
 
-    public static func resolvingAll(_ text: String, side: ConflictSide) -> String {
-        var current = text
-        while let hunk = hunks(in: current).first {
-            current = replacing(hunk, in: current, with: side == .ours ? hunk.ours : hunk.theirs)
-        }
-        return current
-    }
-
     private static func replacing(_ hunk: ConflictHunk, in text: String, with body: String) -> String {
         let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             .map(String.init)

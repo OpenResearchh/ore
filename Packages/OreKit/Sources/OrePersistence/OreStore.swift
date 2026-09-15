@@ -20,13 +20,6 @@ public enum OreHome {
     public static var worktreeRoot: URL {
         directory.appendingPathComponent("workspaces", isDirectory: true)
     }
-
-    /// The product-owned assistant workspace's home. Deliberately outside
-    /// `worktreeRoot`: it is not a worktree of any user repository, it's the
-    /// assistant's own memory and scratch space.
-    public static var assistantDirectory: URL {
-        directory.appendingPathComponent("assistant", isDirectory: true)
-    }
 }
 
 /// The database.
@@ -36,6 +29,10 @@ public enum OreHome {
 /// text, git status generations — deliberately does not; it lives in the engine
 /// and is only written at boundaries. A transcript that survives a crash is
 /// worth a write; a token counter updating at 60Hz is not.
+///
+/// Reads are `nonisolated`: the actor holds no state of its own, and WAL lets
+/// readers run beside the writer, so a sidebar query has no reason to queue
+/// behind every agent's transcript write. Writes stay on the actor.
 public actor OreStore {
     private let writer: any DatabaseWriter
 
@@ -52,6 +49,9 @@ public actor OreStore {
         configuration.busyMode = .timeout(5)
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
+            // Under WAL, NORMAL only risks the last commits on power loss, never
+            // corruption, and drops an fsync from every transcript write.
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
         }
 
         try FileManager.default.createDirectory(
@@ -98,8 +98,8 @@ public actor OreStore {
         try writer.write(body)
     }
 
-    public func read<T: Sendable>(_ body: @Sendable (Database) throws -> T) throws -> T {
-        try writer.read(body)
+    public nonisolated func read<T: Sendable>(_ body: @Sendable (Database) throws -> T) async throws -> T {
+        try await writer.read(body)
     }
 
     // MARK: - Repositories
@@ -114,8 +114,8 @@ public actor OreStore {
     /// registered as a repository too (workspaces have a foreign key to one),
     /// but it is the product's, not the user's, so it never appears here — no
     /// picker should offer to create a workspace in it.
-    public func repositories() throws -> [RepositoryRecord] {
-        try writer.read { db in
+    public nonisolated func repositories() async throws -> [RepositoryRecord] {
+        try await writer.read { db in
             try RepositoryRecord.fetchAll(db, sql: """
                 SELECT repository.* FROM repository
                 WHERE NOT EXISTS (
@@ -134,8 +134,8 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func workspace(_ id: WorkspaceID) throws -> WorkspaceRecord? {
-        try writer.read { db in try WorkspaceRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func workspace(_ id: WorkspaceID) async throws -> WorkspaceRecord? {
+        try await writer.read { db in try WorkspaceRecord.fetchOne(db, key: id.rawValue) }
     }
 
     /// Sidebar order: pinned first, then most recently active. A workspace the
@@ -144,11 +144,11 @@ public actor OreStore {
     /// Product-owned workspaces (assistant, dream) are excluded by default so
     /// every existing caller — the sidebar, name uniqueness, engine startup —
     /// keeps seeing only the user's own workspaces.
-    public func workspaces(
+    public nonisolated func workspaces(
         includeArchived: Bool = false,
         includeAssistant: Bool = false
-    ) throws -> [WorkspaceRecord] {
-        try writer.read { db in
+    ) async throws -> [WorkspaceRecord] {
+        try await writer.read { db in
             var request = WorkspaceRecord.all()
             if !includeArchived {
                 request = request.filter(Column("isArchived") == false)
@@ -167,8 +167,8 @@ public actor OreStore {
     }
 
     /// The product-owned assistant workspace, if it has been created.
-    public func assistantWorkspace() throws -> WorkspaceRecord? {
-        try writer.read { db in
+    public nonisolated func assistantWorkspace() async throws -> WorkspaceRecord? {
+        try await writer.read { db in
             try WorkspaceRecord
                 .filter(Column("kind") == WorkspaceKind.assistant.rawValue)
                 .fetchOne(db)
@@ -196,8 +196,8 @@ public actor OreStore {
     }
 
     /// Workspaces stacked directly on this one.
-    public func children(of id: WorkspaceID) throws -> [WorkspaceRecord] {
-        try writer.read { db in
+    public nonisolated func children(of id: WorkspaceID) async throws -> [WorkspaceRecord] {
+        try await writer.read { db in
             try WorkspaceRecord
                 .filter(Column("stackedOnWorkspaceID") == id.rawValue)
                 .fetchAll(db)
@@ -212,12 +212,14 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func chat(_ id: ChatID) throws -> ChatRecord? {
-        try writer.read { db in try ChatRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func chat(_ id: ChatID) async throws -> ChatRecord? {
+        try await writer.read { db in try ChatRecord.fetchOne(db, key: id.rawValue) }
     }
 
-    public func chats(workspaceID: WorkspaceID, includeClosed: Bool = true) throws -> [ChatRecord] {
-        try writer.read { db in
+    public nonisolated func chats(
+        workspaceID: WorkspaceID, includeClosed: Bool = true
+    ) async throws -> [ChatRecord] {
+        try await writer.read { db in
             var request = ChatRecord.filter(Column("workspaceID") == workspaceID.rawValue)
             if !includeClosed {
                 request = request.filter(Column("isClosed") == false)
@@ -251,8 +253,8 @@ public actor OreStore {
         }
     }
 
-    public func nextChatSortIndex(workspaceID: WorkspaceID) throws -> Int {
-        try writer.read { db in
+    public nonisolated func nextChatSortIndex(workspaceID: WorkspaceID) async throws -> Int {
+        try await writer.read { db in
             let maximum = try Int.fetchOne(
                 db,
                 sql: "SELECT MAX(sortIndex) FROM chat WHERE workspaceID = ?",
@@ -262,28 +264,12 @@ public actor OreStore {
         }
     }
 
-    public func updateChat(
-        _ id: ChatID,
-        _ mutate: @Sendable @escaping (inout ChatRecord) -> Void
-    ) throws -> ChatRecord? {
-        try writer.write { db in
-            guard var record = try ChatRecord.fetchOne(db, key: id.rawValue) else { return nil }
-            mutate(&record)
-            try record.update(db)
-            return record
-        }
-    }
-
-    public func deleteChat(_ id: ChatID) throws {
-        _ = try writer.write { db in try ChatRecord.deleteOne(db, key: id.rawValue) }
-    }
-
     public func saveChatTransition(_ transition: ChatTransition) throws {
         try writer.write { db in try ChatTransitionRecord(transition).save(db) }
     }
 
-    public func chatTransitions(chatID: ChatID) throws -> [ChatTransition] {
-        try writer.read { db in
+    public nonisolated func chatTransitions(chatID: ChatID) async throws -> [ChatTransition] {
+        try await writer.read { db in
             try ChatTransitionRecord
                 .filter(Column("chatID") == chatID.rawValue)
                 .order(Column("createdAt"), Column("id"))
@@ -298,8 +284,8 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func latestSession(for workspaceID: WorkspaceID) throws -> SessionRecord? {
-        try writer.read { db in
+    public nonisolated func latestSession(for workspaceID: WorkspaceID) async throws -> SessionRecord? {
+        try await writer.read { db in
             try SessionRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
                 .order(Column("startedAt").desc)
@@ -307,8 +293,8 @@ public actor OreStore {
         }
     }
 
-    public func latestSession(for chatID: ChatID) throws -> SessionRecord? {
-        try writer.read { db in
+    public nonisolated func latestSession(for chatID: ChatID) async throws -> SessionRecord? {
+        try await writer.read { db in
             try SessionRecord
                 .filter(Column("chatID") == chatID.rawValue)
                 .order(Column("startedAt").desc)
@@ -316,16 +302,16 @@ public actor OreStore {
         }
     }
 
-    public func session(_ id: SessionID) throws -> SessionRecord? {
-        try writer.read { db in try SessionRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func session(_ id: SessionID) async throws -> SessionRecord? {
+        try await writer.read { db in try SessionRecord.fetchOne(db, key: id.rawValue) }
     }
 
     public func saveTurn(_ record: TurnRecord) throws {
         try writer.write { db in try record.save(db) }
     }
 
-    public func nextTurnOrdinal(sessionID: SessionID) throws -> Int {
-        try writer.read { db in
+    public nonisolated func nextTurnOrdinal(sessionID: SessionID) async throws -> Int {
+        try await writer.read { db in
             let maximum = try Int.fetchOne(
                 db,
                 sql: "SELECT MAX(ordinal) FROM turn WHERE sessionID = ?",
@@ -335,8 +321,8 @@ public actor OreStore {
         }
     }
 
-    public func turns(sessionID: SessionID) throws -> [TurnRecord] {
-        try writer.read { db in
+    public nonisolated func turns(sessionID: SessionID) async throws -> [TurnRecord] {
+        try await writer.read { db in
             try TurnRecord
                 .filter(Column("sessionID") == sessionID.rawValue)
                 .order(Column("ordinal"))
@@ -347,8 +333,8 @@ public actor OreStore {
     /// The newest turn of a conversation without materialising the transcript:
     /// one row, ordered the same way `turns(chatID:)` is, cheap enough for
     /// every sidebar row to ask for its snippet line.
-    public func latestTurn(chatID: ChatID) throws -> TurnRecord? {
-        try writer.read { db in
+    public nonisolated func latestTurn(chatID: ChatID) async throws -> TurnRecord? {
+        try await writer.read { db in
             try TurnRecord.fetchOne(
                 db,
                 sql: """
@@ -367,8 +353,8 @@ public actor OreStore {
     /// The visible transcript belongs to the chat, not to any one provider
     /// incarnation. Sessions are ordered first so ordinals can restart at zero
     /// after a cross-harness handoff without scrambling history.
-    public func turns(chatID: ChatID) throws -> [TurnRecord] {
-        try writer.read { db in
+    public nonisolated func turns(chatID: ChatID) async throws -> [TurnRecord] {
+        try await writer.read { db in
             try TurnRecord.fetchAll(
                 db,
                 sql: """
@@ -390,8 +376,10 @@ public actor OreStore {
     /// `excludingOrigins` is what makes the number mean "turns the person
     /// had". The assistant's chat also carries ORE's own fleet digests, and a
     /// conversation length that counts those describes the fleet, not the user.
-    public func turnCount(chatID: ChatID, excludingOrigins: Set<MessageOrigin> = []) throws -> Int {
-        try writer.read { db in
+    public nonisolated func turnCount(
+        chatID: ChatID, excludingOrigins: Set<MessageOrigin> = []
+    ) async throws -> Int {
+        try await writer.read { db in
             var sql = """
                 SELECT COUNT(*)
                 FROM turn
@@ -416,25 +404,26 @@ public actor OreStore {
     /// turn hard — breadth matters more than fidelity when the next step is a
     /// summary, and an unbounded transcript is exactly what compaction exists
     /// to escape.
-    public func conversationTranscript(
+    public nonisolated func conversationTranscript(
         chatID: ChatID,
         excludingOrigins: Set<MessageOrigin> = [],
         turnLimit: Int = 60,
         charactersPerTurn: Int = 700
-    ) throws -> String? {
-        let turns = try turns(chatID: chatID)
+    ) async throws -> String? {
+        let turns = try await turns(chatID: chatID)
             .filter { !excludingOrigins.contains(MessageOrigin(rawValue: $0.promptOrigin) ?? .user) }
             .suffix(turnLimit)
         guard !turns.isEmpty else { return nil }
 
-        let exchanges = turns.compactMap { turn -> String? in
+        var exchanges: [String] = []
+        for turn in turns {
             var parts: [String] = []
             if let prompt = turn.prompt, !prompt.isEmpty {
                 parts.append("User: \(String(prompt.prefix(charactersPerTurn)))")
             }
             // The stored summary is the reply's own text, so it saves loading
             // every block for turns whose blocks would only be re-clipped.
-            let blocks = (try? blocks(turnID: turn.turnID)) ?? []
+            let blocks = (try? await blocks(turnID: turn.turnID)) ?? []
             let reply = turn.summary ?? blocks
                 .filter { $0.blockKind == .text }
                 .map(\.text)
@@ -445,13 +434,15 @@ public actor OreStore {
             if let plan = Self.planTranscriptLine(in: blocks) {
                 parts.append(String(plan.prefix(charactersPerTurn)))
             }
-            return parts.isEmpty ? nil : parts.joined(separator: "\n")
+            if !parts.isEmpty { exchanges.append(parts.joined(separator: "\n")) }
         }
         return exchanges.isEmpty ? nil : exchanges.joined(separator: "\n\n")
     }
 
-    public func handoffContext(chatID: ChatID, transcriptTailLimit: Int = 8) throws -> String? {
-        let turns = try turns(chatID: chatID)
+    public nonisolated func handoffContext(
+        chatID: ChatID, transcriptTailLimit: Int = 8
+    ) async throws -> String? {
+        let turns = try await turns(chatID: chatID)
         guard !turns.isEmpty else { return nil }
 
         var sections: [String] = []
@@ -460,11 +451,11 @@ public actor OreStore {
             sections.append("Prior turn summaries:\n" + summaries.suffix(12).map { "- \($0)" }.joined(separator: "\n"))
         }
 
-        let tail = turns.suffix(transcriptTailLimit)
-        let transcript = tail.compactMap { turn -> String? in
+        var transcript: [String] = []
+        for turn in turns.suffix(transcriptTailLimit) {
             var parts: [String] = []
             if let prompt = turn.prompt, !prompt.isEmpty { parts.append("User: \(prompt)") }
-            let blocks = (try? blocks(turnID: turn.turnID)) ?? []
+            let blocks = (try? await blocks(turnID: turn.turnID)) ?? []
             let text = blocks
                 .filter { $0.blockKind == .text }
                 .map(\.text)
@@ -473,7 +464,7 @@ public actor OreStore {
             if let plan = Self.planTranscriptLine(in: blocks) {
                 parts.append(plan)
             }
-            return parts.isEmpty ? nil : parts.joined(separator: "\n")
+            if !parts.isEmpty { transcript.append(parts.joined(separator: "\n")) }
         }
         if !transcript.isEmpty {
             sections.append("Recent transcript:\n" + transcript.joined(separator: "\n\n"))
@@ -498,8 +489,8 @@ public actor OreStore {
         return "\(label):\n\(block.text)"
     }
 
-    public func turn(_ id: TurnID) throws -> TurnRecord? {
-        try writer.read { db in try TurnRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func turn(_ id: TurnID) async throws -> TurnRecord? {
+        try await writer.read { db in try TurnRecord.fetchOne(db, key: id.rawValue) }
     }
 
     /// Drops a turn and everything after it. This is the transcript half of a
@@ -551,8 +542,8 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func block(_ id: String) throws -> BlockRecord? {
-        try writer.read { db in try BlockRecord.fetchOne(db, key: id) }
+    public nonisolated func block(_ id: String) async throws -> BlockRecord? {
+        try await writer.read { db in try BlockRecord.fetchOne(db, key: id) }
     }
 
     public func appendBlocks(_ records: [BlockRecord]) throws {
@@ -562,8 +553,8 @@ public actor OreStore {
         }
     }
 
-    public func blocks(turnID: TurnID) throws -> [BlockRecord] {
-        try writer.read { db in
+    public nonisolated func blocks(turnID: TurnID) async throws -> [BlockRecord] {
+        try await writer.read { db in
             try BlockRecord
                 .filter(Column("turnID") == turnID.rawValue)
                 .order(Column("ordinal"))
@@ -571,8 +562,43 @@ public actor OreStore {
         }
     }
 
-    public func nextBlockOrdinal(turnID: TurnID) throws -> Int {
-        try writer.read { db in
+    /// Every block of a conversation in one read, for loading its history
+    /// without a query per turn.
+    ///
+    /// Shape: one entry per turn that has blocks, in `turns(chatID:)` order,
+    /// each holding that turn's blocks by ordinal. Turns without blocks are
+    /// absent, so pair the result with `turns(chatID:)` by `turnID`.
+    public nonisolated func blocks(
+        chatID: ChatID
+    ) async throws -> [(turnID: TurnID, blocks: [BlockRecord])] {
+        let records = try await writer.read { db in
+            try BlockRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT block.*
+                    FROM block
+                    JOIN turn ON turn.id = block.turnID
+                    JOIN session ON session.id = turn.sessionID
+                    WHERE session.chatID = ?
+                    ORDER BY session.startedAt, turn.ordinal, turn.startedAt, block.turnID,
+                             block.ordinal
+                    """,
+                arguments: [chatID.rawValue]
+            )
+        }
+        var grouped: [(turnID: TurnID, blocks: [BlockRecord])] = []
+        for record in records {
+            if grouped.last?.turnID.rawValue == record.turnID {
+                grouped[grouped.count - 1].blocks.append(record)
+            } else {
+                grouped.append((TurnID(rawValue: record.turnID), [record]))
+            }
+        }
+        return grouped
+    }
+
+    public nonisolated func nextBlockOrdinal(turnID: TurnID) async throws -> Int {
+        try await writer.read { db in
             let maximum = try Int.fetchOne(
                 db,
                 sql: "SELECT MAX(ordinal) FROM block WHERE turnID = ?",
@@ -628,24 +654,24 @@ public actor OreStore {
     /// memory stops being a reliable index. Hits name the *tab*, not just the
     /// workspace: the answer to "where was I doing X" is only useful if the
     /// follow-up can be sent to the conversation that was already carrying it.
-    public func search(
+    public nonisolated func search(
         _ query: String,
         scope: SearchScope = .projects,
         workspaceID: WorkspaceID? = nil,
         limit: Int = 50
-    ) throws -> [SearchHit] {
+    ) async throws -> [SearchHit] {
         let pattern = FTS5Pattern(matchingAllPrefixesIn: query)
         guard let pattern else { return [] }
 
-        var arguments: [any DatabaseValueConvertible] = [pattern]
-        var workspaceClause = ""
+        var values: [any DatabaseValueConvertible] = [pattern]
+        let workspaceClause = workspaceID == nil ? "" : "AND workspace.id = ?"
         if let workspaceID {
-            workspaceClause = "AND workspace.id = ?"
-            arguments.append(workspaceID.rawValue)
+            values.append(workspaceID.rawValue)
         }
-        arguments.append(limit)
+        values.append(limit)
+        let arguments: StatementArguments = StatementArguments(values)
 
-        return try writer.read { db in
+        return try await writer.read { db in
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -669,7 +695,7 @@ public actor OreStore {
                 ORDER BY block.createdAt DESC
                 LIMIT ?
                 """,
-                arguments: StatementArguments(arguments)
+                arguments: arguments
             )
             return rows.map { row in
                 SearchHit(
@@ -697,8 +723,8 @@ public actor OreStore {
         }
     }
 
-    public func pendingDiffComments(workspaceID: WorkspaceID) throws -> [DiffCommentRecord] {
-        try writer.read { db in
+    public nonisolated func pendingDiffComments(workspaceID: WorkspaceID) async throws -> [DiffCommentRecord] {
+        try await writer.read { db in
             try DiffCommentRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
                 .filter(Column("isSent") == false)
@@ -714,10 +740,6 @@ public actor OreStore {
                 .filter(Column("isSent") == false)
                 .updateAll(db, Column("isSent").set(to: true))
         }
-    }
-
-    public func deleteDiffComment(id: Int64) throws {
-        _ = try writer.write { db in try DiffCommentRecord.deleteOne(db, key: id) }
     }
 
     public func deletePendingDiffComments(
@@ -743,8 +765,8 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func viewedFiles(workspaceID: WorkspaceID) throws -> [String: String] {
-        try writer.read { db in
+    public nonisolated func viewedFiles(workspaceID: WorkspaceID) async throws -> [String: String] {
+        try await writer.read { db in
             let records = try ViewedFileRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
                 .fetchAll(db)
@@ -764,8 +786,8 @@ public actor OreStore {
         }
     }
 
-    public func assistantActions(limit: Int = 200) throws -> [AssistantActionRecord] {
-        try writer.read { db in
+    public nonisolated func assistantActions(limit: Int = 200) async throws -> [AssistantActionRecord] {
+        try await writer.read { db in
             try AssistantActionRecord
                 .order(Column("createdAt").desc, Column("id").desc)
                 .limit(limit)
@@ -779,8 +801,8 @@ public actor OreStore {
         }
     }
 
-    public func assistantGrants() throws -> [String] {
-        try writer.read { db in
+    public nonisolated func assistantGrants() async throws -> [String] {
+        try await writer.read { db in
             try AssistantGrantRecord.fetchAll(db).map(\.actionClass)
         }
     }
@@ -797,14 +819,14 @@ public actor OreStore {
         }
     }
 
-    public func assistantTabGrants() throws -> [ChatID] {
-        try writer.read { db in
+    public nonisolated func assistantTabGrants() async throws -> [ChatID] {
+        try await writer.read { db in
             try AssistantTabGrantRecord.fetchAll(db).map(\.id)
         }
     }
 
-    public func hasAssistantTabGrant(_ chatID: ChatID) throws -> Bool {
-        try writer.read { db in
+    public nonisolated func hasAssistantTabGrant(_ chatID: ChatID) async throws -> Bool {
+        try await writer.read { db in
             try AssistantTabGrantRecord.fetchOne(db, key: chatID.rawValue) != nil
         }
     }
@@ -819,20 +841,24 @@ public actor OreStore {
 
     /// `ore.toml` scripts run as the user, so they run only after the user has
     /// seen them. The approval covers this exact text; an edit asks again.
-    public func approveRepositoryScripts(repositoryPath: String, setup: String?, archive: String?) throws {
+    public func approveRepositoryScripts(
+        repositoryPath: String, setup: String?, run: String?, archive: String?
+    ) throws {
         try writer.write { db in
             try RepositoryScriptApprovalRecord(
-                repositoryPath: repositoryPath, setup: setup, archive: archive
+                repositoryPath: repositoryPath, setup: setup, run: run, archive: archive
             ).save(db)
         }
     }
 
-    public func repositoryScriptsApproved(repositoryPath: String, setup: String?, archive: String?) throws -> Bool {
-        try writer.read { db in
+    public nonisolated func repositoryScriptsApproved(
+        repositoryPath: String, setup: String?, run: String?, archive: String?
+    ) async throws -> Bool {
+        try await writer.read { db in
             guard let record = try RepositoryScriptApprovalRecord.fetchOne(db, key: repositoryPath) else {
                 return false
             }
-            return record.setup == setup && record.archive == archive
+            return record.setup == setup && record.run == run && record.archive == archive
         }
     }
 
@@ -841,35 +867,36 @@ public actor OreStore {
     public func enqueueMessage(_ record: QueuedMessageRecord) throws {
         try writer.write { db in
             var record = record
+            record.sortIndex = (try Int64.fetchOne(db, sql: "SELECT MAX(sortIndex) FROM queuedMessage") ?? 0) + 1
             try record.insert(db)
         }
     }
 
-    public func queuedMessages(workspaceID: WorkspaceID) throws -> [QueuedMessageRecord] {
-        try writer.read { db in
+    public nonisolated func queuedMessages(workspaceID: WorkspaceID) async throws -> [QueuedMessageRecord] {
+        try await writer.read { db in
             try QueuedMessageRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchAll(db)
         }
     }
 
-    public func queuedMessages(chatID: ChatID) throws -> [QueuedMessageRecord] {
-        try writer.read { db in
+    public nonisolated func queuedMessages(chatID: ChatID) async throws -> [QueuedMessageRecord] {
+        try await writer.read { db in
             try QueuedMessageRecord
                 .filter(Column("chatID") == chatID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchAll(db)
         }
     }
 
-    /// Takes the oldest queued message, removing it in the same transaction so
+    /// Takes the first queued message in the user's order, removing it in the same transaction so
     /// two drains can't deliver the same message twice.
     public func dequeueMessage(workspaceID: WorkspaceID) throws -> QueuedMessageRecord? {
         try writer.write { db in
             guard let record = try QueuedMessageRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchOne(db)
             else { return nil }
             try record.delete(db)
@@ -881,7 +908,7 @@ public actor OreStore {
         try writer.write { db in
             guard let record = try QueuedMessageRecord
                 .filter(Column("chatID") == chatID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchOne(db)
             else { return nil }
             try record.delete(db)
@@ -919,6 +946,27 @@ public actor OreStore {
         }
     }
 
+    /// Move within the current queue in one transaction. A message that has
+    /// already drained is ignored; identity, attachments and timestamps stay intact.
+    public func moveQueuedMessage(id: Int64, direction: Int) throws {
+        guard direction == -1 || direction == 1 else { return }
+        try writer.write { db in
+            guard let record = try QueuedMessageRecord.fetchOne(db, key: id) else { return }
+            let records = try QueuedMessageRecord
+                .filter(Column("workspaceID") == record.workspaceID)
+                .filter(Column("chatID") == record.chatID)
+                .order(Column("sortIndex"), Column("id"))
+                .fetchAll(db)
+            guard let index = records.firstIndex(where: { $0.id == id }),
+                  records.indices.contains(index + direction) else { return }
+            let neighbor = records[index + direction]
+            try QueuedMessageRecord.filter(Column("id") == id)
+                .updateAll(db, Column("sortIndex").set(to: neighbor.sortIndex))
+            try QueuedMessageRecord.filter(Column("id") == neighbor.id)
+                .updateAll(db, Column("sortIndex").set(to: record.sortIndex))
+        }
+    }
+
     public func unmarkViewed(workspaceID: WorkspaceID, filePath: String) throws {
         _ = try writer.write { db in
             try ViewedFileRecord
@@ -934,20 +982,20 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func dreamRun(_ id: DreamRunID) throws -> DreamRunRecord? {
-        try writer.read { db in try DreamRunRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func dreamRun(_ id: DreamRunID) async throws -> DreamRunRecord? {
+        try await writer.read { db in try DreamRunRecord.fetchOne(db, key: id.rawValue) }
     }
 
-    public func latestDreamRun() throws -> DreamRunRecord? {
-        try writer.read { db in
+    public nonisolated func latestDreamRun() async throws -> DreamRunRecord? {
+        try await writer.read { db in
             try DreamRunRecord
                 .order(Column("createdAt").desc)
                 .fetchOne(db)
         }
     }
 
-    public func activeDreamRun() throws -> DreamRunRecord? {
-        try writer.read { db in
+    public nonisolated func activeDreamRun() async throws -> DreamRunRecord? {
+        try await writer.read { db in
             try DreamRunRecord.fetchOne(
                 db,
                 sql: """
@@ -964,12 +1012,12 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func dreamTask(_ id: DreamTaskID) throws -> DreamTaskRecord? {
-        try writer.read { db in try DreamTaskRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func dreamTask(_ id: DreamTaskID) async throws -> DreamTaskRecord? {
+        try await writer.read { db in try DreamTaskRecord.fetchOne(db, key: id.rawValue) }
     }
 
-    public func dreamTasks(runID: DreamRunID) throws -> [DreamTaskRecord] {
-        try writer.read { db in
+    public nonisolated func dreamTasks(runID: DreamRunID) async throws -> [DreamTaskRecord] {
+        try await writer.read { db in
             try DreamTaskRecord
                 .filter(Column("runID") == runID.rawValue)
                 .order(Column("createdAt").asc)
@@ -981,12 +1029,12 @@ public actor OreStore {
         try writer.write { db in try record.save(db) }
     }
 
-    public func dreamFinding(_ id: DreamFindingID) throws -> DreamFindingRecord? {
-        try writer.read { db in try DreamFindingRecord.fetchOne(db, key: id.rawValue) }
+    public nonisolated func dreamFinding(_ id: DreamFindingID) async throws -> DreamFindingRecord? {
+        try await writer.read { db in try DreamFindingRecord.fetchOne(db, key: id.rawValue) }
     }
 
-    public func dreamFinding(dedupeKey: String) throws -> DreamFindingRecord? {
-        try writer.read { db in
+    public nonisolated func dreamFinding(dedupeKey: String) async throws -> DreamFindingRecord? {
+        try await writer.read { db in
             try DreamFindingRecord
                 .filter(Column("dedupeKey") == dedupeKey)
                 .order(Column("lastSeenAt").desc)
@@ -994,8 +1042,10 @@ public actor OreStore {
         }
     }
 
-    public func dreamFindings(statuses: [DreamFindingStatus] = DreamFindingStatus.allCases) throws -> [DreamFindingRecord] {
-        try writer.read { db in
+    public nonisolated func dreamFindings(
+        statuses: [DreamFindingStatus] = DreamFindingStatus.allCases
+    ) async throws -> [DreamFindingRecord] {
+        try await writer.read { db in
             let placeholders = statuses.map { _ in "?" }.joined(separator: ", ")
             return try DreamFindingRecord.fetchAll(
                 db,
@@ -1016,8 +1066,8 @@ public actor OreStore {
         }
     }
 
-    public func dreamLedgerTokens(runID: DreamRunID) throws -> Int {
-        try writer.read { db in
+    public nonisolated func dreamLedgerTokens(runID: DreamRunID) async throws -> Int {
+        try await writer.read { db in
             try Int.fetchOne(
                 db,
                 sql: "SELECT COALESCE(SUM(tokens), 0) FROM dreamLedger WHERE runID = ?",
@@ -1026,8 +1076,8 @@ public actor OreStore {
         }
     }
 
-    public func dreamLedgerTokens(since: Date) throws -> Int {
-        try writer.read { db in
+    public nonisolated func dreamLedgerTokens(since: Date) async throws -> Int {
+        try await writer.read { db in
             try Int.fetchOne(
                 db,
                 sql: "SELECT COALESCE(SUM(tokens), 0) FROM dreamLedger WHERE createdAt >= ?",
@@ -1036,8 +1086,8 @@ public actor OreStore {
         }
     }
 
-    public func dreamFindings(runID: DreamRunID) throws -> [DreamFindingRecord] {
-        try writer.read { db in
+    public nonisolated func dreamFindings(runID: DreamRunID) async throws -> [DreamFindingRecord] {
+        try await writer.read { db in
             try DreamFindingRecord
                 .filter(Column("runID") == runID.rawValue)
                 .order(Column("createdAt").asc)
@@ -1045,8 +1095,8 @@ public actor OreStore {
         }
     }
 
-    public func dreamKindAcceptance() throws -> [DreamKindAcceptance] {
-        try writer.read { db in
+    public nonisolated func dreamKindAcceptance() async throws -> [DreamKindAcceptance] {
+        try await writer.read { db in
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -1108,8 +1158,8 @@ public actor OreStore {
 
     /// 14-day turn activity per user repository, plus whether any pinned
     /// workspace on that repo is sitting untouched.
-    public func dreamRepositoryActivity(since: Date) throws -> [DreamRepositoryActivity] {
-        try writer.read { db in
+    public nonisolated func dreamRepositoryActivity(since: Date) async throws -> [DreamRepositoryActivity] {
+        try await writer.read { db in
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -1161,9 +1211,9 @@ public actor OreStore {
 
     /// Hour-of-day histogram of the user's own turns, used to recommend quiet
     /// hours. Computed off the render loop on purpose.
-    public func quietHoursRecommendation(now: Date = Date()) throws -> QuietHoursRecommendation? {
+    public nonisolated func quietHoursRecommendation(now: Date = Date()) async throws -> QuietHoursRecommendation? {
         let since = now.addingTimeInterval(-14 * 24 * 3600)
-        let hours: [Int] = try writer.read { db in
+        let hours: [Int] = try await writer.read { db in
             try Int.fetchAll(
                 db,
                 sql: """

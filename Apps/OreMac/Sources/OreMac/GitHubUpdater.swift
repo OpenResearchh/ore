@@ -28,10 +28,9 @@ private enum GitHubUpdateError: LocalizedError, Sendable {
 /// today. This fills that gap: it asks GitHub for the latest release, and if
 /// this build is behind, offers to install it and restart.
 ///
-/// Auth is the trick that makes it work *now*, while the repo is private: it
-/// shells out to `gh` when the CLI is signed in (which it is, since ORE
-/// drives it), and falls back to the public REST endpoint so the same code
-/// keeps working once the repo is public or for a user without `gh`.
+/// It asks through `gh` when the CLI is signed in, so the check is not subject
+/// to the anonymous API rate limit, and falls back to the public REST endpoint
+/// for a user without `gh`.
 @MainActor
 @Observable
 final class GitHubUpdater {
@@ -402,7 +401,7 @@ final class GitHubUpdater {
         return (name, url, intValue(chosen["id"]))
     }
 
-    /// Uses the signed-in `gh` CLI so the check works against a private repo.
+    /// Uses the signed-in `gh` CLI, which is not subject to the anonymous rate limit.
     private nonisolated static func ghAPI(path: String) async -> Data? {
         guard let gh = executable(named: "gh") else { return nil }
         return await run(gh, ["api", path, "-H", "Accept: application/vnd.github+json"])
@@ -750,7 +749,14 @@ final class GitHubUpdater {
         of process: Process,
         timeout: Duration
     ) async -> Int32? {
-        await withTaskCancellationHandler {
+        // Cancelled on the way out so a child that exits promptly doesn't
+        // leave a task (and the Process) sleeping out the full deadline.
+        let deadline = Task {
+            do { try await Task.sleep(for: timeout) } catch { return }
+            if process.isRunning { process.terminate() }
+        }
+        defer { deadline.cancel() }
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
                 do {
@@ -759,10 +765,6 @@ final class GitHubUpdater {
                     process.terminationHandler = nil
                     continuation.resume(returning: nil)
                     return
-                }
-                Task {
-                    try? await Task.sleep(for: timeout)
-                    if process.isRunning { process.terminate() }
                 }
             }
         } onCancel: {

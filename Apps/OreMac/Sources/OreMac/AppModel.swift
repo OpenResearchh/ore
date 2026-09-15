@@ -67,7 +67,39 @@ final class AppModel {
             automaticRoutinePermissionsKey: automaticRoutinePermissionsDefault,
         ])
     }
-    private(set) var workspaces: [WorkspaceSummary] = []
+    private(set) var workspaces: [WorkspaceSummary] = [] {
+        didSet { recomputeSortedWorkspaces() }
+    }
+    /// Sidebar order, stored rather than computed: views read it many times a
+    /// render, and it only moves when `workspaces` does. See
+    /// `recomputeSortedWorkspaces` for the ordering.
+    private(set) var sortedWorkspaces: [WorkspaceSummary] = []
+
+    // Fleet-wide answers, stored and reassigned only when they actually move.
+    // As computed properties each read subscribed a view to the whole
+    // `workspaces` array (or every workspace's chat list), so any agent's
+    // status flip re-ran the sidebar, the app's menu commands, and RootView
+    // mid-scroll even when the answer they showed was the same.
+
+    /// The workspace on screen. A lookup into `workspaces` from a view made
+    /// that view depend on every workspace; this changes only with the
+    /// selection or the selected workspace's own summary.
+    private(set) var selectedWorkspace: WorkspaceSummary?
+    private(set) var archivedWorkspaces: [WorkspaceSummary] = []
+    /// Workspaces needing attention plus new dream findings — the dock badge.
+    private(set) var attentionCount = 0
+    private(set) var hasNeedsYouStops = false
+    /// Unarchived workspaces doing something or waiting on the person — the
+    /// sidebar's Active tab. See `SidebarFleetActivity`.
+    private(set) var activeWorkspaceIDs: Set<WorkspaceID> = []
+    /// How many unarchived workspaces have an agent working right now.
+    private(set) var workingCount = 0
+    /// The first nine workspaces in the order the sidebar is *showing*, while
+    /// it holds its order still under the pointer; nil when it shows the live
+    /// order. ⌘1–9 reads this so a shortcut always lands on the row whose
+    /// badge it matches. Only read by actions, so not observed.
+    @ObservationIgnored
+    var sidebarShortcutOrder: [WorkspaceID]?
     /// The product-owned assistant workspace, routed out of `workspaces` at
     /// event intake. This is the single point that keeps it off the sidebar,
     /// out of ⌘1–9, and away from every picker — the Assistant window is the
@@ -76,7 +108,9 @@ final class AppModel {
     /// Hidden overnight-research worktrees. The Dreams window is the only
     /// surface that should mention them.
     private(set) var dreamWorkspaces: [WorkspaceSummary] = []
-    private(set) var dreamInbox = DreamInboxSnapshot()
+    private(set) var dreamInbox = DreamInboxSnapshot() {
+        didSet { recomputeAttentionCount() }
+    }
     private(set) var dreamSleepStatus: DreamSleepStatus = .disabled
     @ObservationIgnored
     private var dreamMonitor: DreamEnvironmentMonitor?
@@ -86,7 +120,9 @@ final class AppModel {
     private(set) var assistantConfirmations: [AssistantConfirmation] = []
     /// Project tabs blocked on a permission or question, for the HUD / menu bar
     /// when the user is in another app.
-    private(set) var tabNeedsYou: [TabNeedsYou] = []
+    private(set) var tabNeedsYou: [TabNeedsYou] = [] {
+        didSet { recomputeNeedsYouStops() }
+    }
     private(set) var harnesses: [HarnessProbeResult] = []
     /// Whether the probe has reported at least once. Distinct from
     /// `harnesses.isEmpty`: "we have not looked yet" and "we looked and found
@@ -119,15 +155,21 @@ final class AppModel {
 
     var selectedWorkspaceID: WorkspaceID? {
         didSet {
+            recomputeSelectedWorkspace()
             guard selectedWorkspaceID != oldValue else { return }
             focusChanged(from: oldValue, to: selectedWorkspaceID)
         }
     }
 
     private(set) var chatSummaries: [ChatSummary] = []
+    /// `chatSummaries` grouped by workspace and kept sorted, so `chats(for:)`
+    /// is a lookup. Updated alongside every write to `chatSummaries`.
+    @ObservationIgnored
+    let chatIndex = ChatIndex()
     /// Live transcript state is keyed by durable chat identity, never by
     /// workspace: several tabs in one worktree can stream concurrently.
     private(set) var chatStates: [ChatID: ChatState] = [:]
+    private(set) var workspaceAutoApprovals: [WorkspaceID: WorkspaceAutoApproval] = [:]
     /// Git dirt lives off the `workspaces` array so a file write does not
     /// invalidate every chrome view that read the fleet list.
     @ObservationIgnored
@@ -147,13 +189,26 @@ final class AppModel {
     /// waiting on a cold `git diff`. Keyed by workspace and stamped with the
     /// git-status generation it was computed against, so a stale entry is shown
     /// immediately while a fresh one loads in the background.
-    struct DiffSnapshot {
+    struct DiffSnapshot: Equatable {
         var generation: UInt64
         var diffs: [FileDiff]
         var gitAction: SuggestedGitAction
         var pullRequest: GitHubClient.PullRequest?
     }
-    private(set) var diffCache: [WorkspaceID: DiffSnapshot] = [:]
+    /// One observable per workspace, like `workspaceLive`: a refresh in one
+    /// worktree used to rewrite a shared dictionary and invalidate every
+    /// reader of every workspace's diff.
+    @ObservationIgnored
+    let diffCache = WorkspaceDiffRegistry()
+    @ObservationIgnored
+    private var diffPrefetches = RefreshGate<WorkspaceID>()
+    /// A trailing refresh waits this long, so a burst of file writes costs one
+    /// more `git diff` rather than one per write.
+    private static let diffPrefetchDebounce: Duration = .milliseconds(1500)
+    @ObservationIgnored
+    private var didWarmWorkspaces = false
+    @ObservationIgnored
+    private var historyLoadsInFlight: Set<ChatID> = []
 
     /// Speaks agent activity aloud for tabs whose speaker toggle is on.
     let narration = NarrationEngine()
@@ -162,20 +217,35 @@ final class AppModel {
 
     private let client: InProcessCoreClient
     private var eventTask: Task<Void, Never>?
+    // Pure bookkeeping below is `@ObservationIgnored`: no view reads it, and
+    // several are written on every agent event, which would otherwise count
+    // as a change to the whole model.
     /// Batches streaming deltas so a fast model can't drive the transcript's
     /// layout at the rate the tokens arrive.
+    @ObservationIgnored
     private var coalescers: [ChatID: TextDeltaCoalescer] = [:]
+    @ObservationIgnored
     private var chatOwners: [ChatID: WorkspaceID] = [:]
+    @ObservationIgnored
     private var pendingNewChatMessages: [WorkspaceID: [String]] = [:]
     /// Draft text to drop into a chat that hasn't been published yet, so Commit
     /// / Create PR can open a tab without sending until the user hits return.
+    @ObservationIgnored
     private var pendingNewChatDrafts: [WorkspaceID: [String]] = [:]
     /// The Review button's next chat claims incoming PostDiffComment findings.
+    @ObservationIgnored
     private var pendingReviewCommentInbox: Set<WorkspaceID> = []
-    /// Workspace → the tab whose composer owns Review-posted comments.
+    /// Workspace → the tab whose composer owns Review-posted comments. Observed,
+    /// because tab strips label the Review tab from it; only written when the
+    /// inbox actually moves.
     private var reviewCommentInbox: [WorkspaceID: ChatID] = [:]
+    /// The same mapping as read back from `UserDefaults`, cached apart from the
+    /// observed one so the getter that views call never writes observed state.
+    @ObservationIgnored
+    private var storedReviewInbox: [WorkspaceID: ChatID?] = [:]
     /// Comments the user dismissed from a tab. Kept so the Review poll cannot
     /// put them back while the store delete is still in flight.
+    @ObservationIgnored
     private var dismissedCommentKeys: [ChatID: Set<String>] = [:]
     /// Signals the visible composer to pick up a draft written from outside
     /// (toolbar Commit / Create PR) without waiting for a tab switch.
@@ -201,6 +271,7 @@ final class AppModel {
     private(set) var gitOpsInFlight: [WorkspaceID: GitOperation] = [:]
     private var flushTask: Task<Void, Never>?
     /// Composer text waiting to be written back, keyed by chat. See `setDraft`.
+    @ObservationIgnored
     private var pendingDrafts: [ChatID: (workspaceID: WorkspaceID, text: String)] = [:]
     private var draftFlushTask: Task<Void, Never>?
 
@@ -230,12 +301,19 @@ final class AppModel {
     static func running() -> AppModel? { shared }
 
     private var started = false
+    private(set) var isBackgroundPollingEnabled = true
 
     func start() {
         // Idempotent: called from app init (so intents and the menu bar work
         // before any window exists) and again from the window's task.
         guard !started else { return }
         started = true
+        updateBackgroundPolling()
+        for name in [NSApplication.didHideNotification, NSApplication.didUnhideNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.updateBackgroundPolling() }
+            }
+        }
         AppModel.shared = self
         voiceAssistant.model = self
         // The pill follows tabNeedsYou + the voice phase from here on, so a
@@ -296,12 +374,27 @@ final class AppModel {
         }
     }
 
+    private func updateBackgroundPolling() {
+        // `start()` runs from the App's init, before NSApplication exists; a
+        // launching app isn't hidden, and the hide/unhide observers take over.
+        let enabled = !(NSApp?.isHidden ?? false)
+        isBackgroundPollingEnabled = enabled
+        Task { [weak self] in
+            guard let self else { return }
+            await client.setBackgroundPollingEnabled(enabled)
+            guard enabled, isBackgroundPollingEnabled, let workspace = selectedWorkspace else { return }
+            prefetchDiff(for: workspace)
+            await refreshGitAction(for: workspace.id)
+        }
+    }
+
     /// Flushes coalesced deltas at ~40Hz, but only while something is pending.
     ///
     /// The transcript is the app's hottest surface, and every delta that
     /// reaches it costs a layout pass. Batching at a fixed cadence decouples
     /// rendering cost from token rate. A timer that ran forever still woke the
     /// main actor 40 times a second while the app sat idle.
+    @ObservationIgnored
     private var lastBackgroundFlush: [ChatID: ContinuousClock.Instant] = [:]
 
     private func scheduleFlush() {
@@ -478,10 +571,6 @@ final class AppModel {
 
     // MARK: - Reading
 
-    var selectedWorkspace: WorkspaceSummary? {
-        workspaces.first { $0.id == selectedWorkspaceID }
-    }
-
     /// The assistant's current conversation, once the snapshot has arrived.
     var assistantChatID: ChatID? {
         guard let assistant = assistantWorkspace else { return nil }
@@ -520,7 +609,9 @@ final class AppModel {
 
     /// Biometrics or the login password — whichever the Mac has. A machine
     /// with neither (or a denied prompt) simply doesn't mint standing grants.
-    private static func authenticateStandingGrant() async -> Bool {
+    private static func authenticateStandingGrant(
+        reason: String = "let the ORE assistant always perform this kind of action"
+    ) async -> Bool {
         let context = LAContext()
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
@@ -528,7 +619,7 @@ final class AppModel {
         }
         return (try? await context.evaluatePolicy(
             .deviceOwnerAuthentication,
-            localizedReason: "let the ORE assistant always perform this kind of action"
+            localizedReason: reason
         )) ?? false
     }
 
@@ -611,10 +702,16 @@ final class AppModel {
         workspaceID: WorkspaceID,
         chatID: ChatID
     ) {
+        // Most events are deltas and tool calls that never make a line; decide
+        // that before paying for any lookups.
+        switch event {
+        case .turnCompleted, .question, .sessionError: break
+        default: return
+        }
         guard proactiveWatchEnabled, assistantWorkspace != nil else { return }
         if dreamWorkspaces.contains(where: { $0.id == workspaceID }) { return }
         let place = "\(workspaceName(workspaceID))"
-            + (chatSummaries.first { $0.id == chatID }.map { " / \($0.title)" } ?? "")
+            + (chatIndex.summary(for: chatID).map { " / \($0.title)" } ?? "")
 
         let line: String?
         switch event {
@@ -731,7 +828,9 @@ final class AppModel {
         guard fleetTickTask == nil else { return }
         fleetTickTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: Self.fleetTick)
+                // Nothing here is second-accurate, so let the system batch this
+                // wake-up with others instead of waking the CPU just for it.
+                try? await Task.sleep(for: Self.fleetTick, tolerance: .seconds(10))
                 guard let self, !Task.isCancelled else { return }
                 self.tickFleetAwareness()
             }
@@ -797,7 +896,12 @@ final class AppModel {
         NeedsYouCycle.stops(needsYou: tabNeedsYou, workspaces: sortedWorkspaces)
     }
 
-    var hasNeedsYouStops: Bool { !needsYouStops.isEmpty }
+    /// Kept current from `tabNeedsYou` and `sortedWorkspaces`, the two inputs
+    /// to `needsYouStops`; the ⇧⌘U menu item reads it.
+    private func recomputeNeedsYouStops() {
+        let next = !needsYouStops.isEmpty
+        if next != hasNeedsYouStops { hasNeedsYouStops = next }
+    }
 
     /// Jumps to the next thing waiting on the user, anywhere in the fleet.
     /// Returns false when nothing is — the caller keeps the menu item disabled,
@@ -832,9 +936,7 @@ final class AppModel {
     }
 
     func chats(for workspaceID: WorkspaceID, includeClosed: Bool = false) -> [ChatSummary] {
-        chatSummaries
-            .filter { $0.workspaceID == workspaceID && (includeClosed || !$0.isClosed) }
-            .sorted { $0.createdAt < $1.createdAt }
+        chatIndex.chats(for: workspaceID, includeClosed: includeClosed)
     }
 
     func activeChat(for workspaceID: WorkspaceID) -> ChatSummary? {
@@ -855,11 +957,23 @@ final class AppModel {
 
     func chat(for id: ChatID) -> ChatState {
         if let existing = chatStates[id] { return existing }
+        let state = makeChatState(for: id)
+        Task { await loadHistory(for: id) }
+        return state
+    }
+
+    /// Creates a chat's state without starting its history load, for callers
+    /// that await the load themselves. State is released when a chat closes,
+    /// so this is also the path a reopened chat comes back through.
+    private func makeChatState(for id: ChatID) -> ChatState {
         let state = ChatState()
         state.draftAttachments = Self.loadDraftAttachments(for: id)
         state.replaceDraftComments(Self.loadDraftComments(for: id))
+        // `upsertChat` only reconciles states that already exist.
+        if let summary = chatIndex.summary(for: id) {
+            state.reconcileTurnActive(summary.isTurnActive)
+        }
         chatStates[id] = state
-        Task { await loadHistory(for: id) }
         return state
     }
 
@@ -874,10 +988,43 @@ final class AppModel {
     /// rows. Doing the conversion here — rather than storing rows — keeps the
     /// database shaped like the domain rather than like this particular view.
     private func loadHistory(for id: ChatID) async {
-        let state = chat(for: id)
+        guard historyLoadsInFlight.insert(id).inserted else { return }
+        defer { historyLoadsInFlight.remove(id) }
+        let state = chatStates[id] ?? makeChatState(for: id)
         guard !state.hasLoadedHistory else { return }
         guard let turns = try? await client.transcript(chatID: id) else { return }
+        // One query for the whole chat; a long chat used to cost one round
+        // trip per turn, each resuming on the main actor.
+        let grouped = (try? await client.blocks(chatID: id)) ?? []
+        let transitions = (try? await client.chatTransitions(chatID: id)) ?? []
+        // Folding results into calls and sorting is linear in the transcript's
+        // length; a long chat is not a reason to hold the main thread.
+        let rows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
+            let blocks = Dictionary(
+                grouped.map { ($0.turnID, $0.blocks) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            return Self.historyRows(turns: turns, blocks: blocks, transitions: transitions)
+        }.value
+        // The chat may have closed (state released) or closed and reopened
+        // (a new state) while this read ran. Load into whatever is current, and
+        // never resurrect state for a chat nobody holds any more.
+        // `ChatState.loadHistory` ignores a second load.
+        guard let current = chatStates[id] else { return }
+        current.loadHistory(rows)
+    }
 
+    /// A chat's state only if something already loaded it. For polls and
+    /// passive reads that must not start a full history load as a side effect.
+    func existingChat(for id: ChatID) -> ChatState? {
+        chatStates[id]
+    }
+
+    private nonisolated static func historyRows(
+        turns: [TurnRecord],
+        blocks: [TurnID: [BlockRecord]],
+        transitions: [ChatTransition]
+    ) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
         for turn in turns {
             let turnID = turn.turnID
@@ -894,8 +1041,7 @@ final class AppModel {
                 ))
             }
 
-            guard let blocks = try? await client.blocks(turnID: turnID) else { continue }
-            for block in blocks {
+            for block in blocks[turnID] ?? [] {
                 if block.blockKind == .toolResult,
                    let rawID = block.toolCallID,
                    let index = rows.lastIndex(where: { $0.toolCallID?.rawValue == rawID }) {
@@ -908,53 +1054,64 @@ final class AppModel {
                 rows.append(row)
             }
         }
-        if let transitions = try? await client.chatTransitions(chatID: id) {
-            for transition in transitions {
-                rows.append(TranscriptRow(
-                    id: "transition-\(transition.id)",
-                    turnID: TurnID(rawValue: "transition"),
-                    kind: .divider,
-                    text: transition.displayText,
-                    isComplete: true,
-                    createdAt: transition.createdAt
-                ))
-            }
+        for transition in transitions {
+            rows.append(TranscriptRow(
+                id: "transition-\(transition.id)",
+                turnID: TurnID(rawValue: "transition"),
+                kind: .divider,
+                text: transition.displayText,
+                isComplete: true,
+                createdAt: transition.createdAt
+            ))
         }
         rows.sort { $0.createdAt < $1.createdAt }
-        state.loadHistory(rows)
+        return rows
     }
 
     /// Merge newly posted review comments onto the Review tab that produced
     /// them — never onto every chat, and never onto whichever tab is selected.
+    ///
+    /// Polled, so it reads loaded state where it exists and stored drafts where
+    /// it doesn't: creating a `ChatState` here loaded the full history of every
+    /// open tab once a second.
     func pullDraftComments(for workspaceID: WorkspaceID) async {
         guard let comments = try? await client.pendingDiffComments(workspaceID: workspaceID) else {
             return
         }
+        guard !comments.isEmpty else { return }
         let open = chats(for: workspaceID)
         guard let ownerID = ReviewCommentInbox.owner(
             reviewInbox: reviewInboxChatID(for: workspaceID),
-            busyChats: open.filter { chat(for: $0.id).isBusy }.map(\.id)
+            busyChats: open.filter { chatStates[$0.id]?.isBusy == true }.map(\.id)
         ) else { return }
-        let owner = chat(for: ownerID)
         let others = open.compactMap { summary -> [DiffCommentReference]? in
             guard summary.id != ownerID else { return nil }
-            return chat(for: summary.id).draftComments
+            return draftComments(for: summary.id)
         }
         let dismissed = dismissedKeys(for: ownerID)
-        var added = false
+        var ownerComments = draftComments(for: ownerID)
+        var attaching: [DiffCommentReference] = []
         for comment in comments
         where ReviewCommentInbox.shouldAttach(
             comment,
-            ownerComments: owner.draftComments,
+            ownerComments: ownerComments,
             otherChatsComments: others
         ) && !dismissed.contains(comment.identityKey) {
-            owner.addDraftComment(comment)
-            added = true
+            ownerComments.append(comment)
+            attaching.append(comment)
         }
-        if added { persistDraftComments(owner.draftComments, for: ownerID) }
+        guard !attaching.isEmpty else { return }
+        let owner = chat(for: ownerID)
+        for comment in attaching { owner.addDraftComment(comment) }
+        persistDraftComments(owner.draftComments, for: ownerID)
     }
 
-    private static func row(
+    /// A chat's draft comments without creating its state.
+    private func draftComments(for chatID: ChatID) -> [DiffCommentReference] {
+        chatStates[chatID]?.draftComments ?? Self.loadDraftComments(for: chatID)
+    }
+
+    private nonisolated static func row(
         from block: BlockRecord,
         turnID: TurnID
     ) -> TranscriptRow? {
@@ -1011,23 +1168,53 @@ final class AppModel {
     /// Sidebar order: pinned first, then anything that needs attention, then
     /// by recency. "Needs me" outranks "was recent" because that is the
     /// question the sidebar exists to answer.
-    var sortedWorkspaces: [WorkspaceSummary] {
-        workspaces
+    private func recomputeSortedWorkspaces() {
+        let sorted = workspaces
             .filter { !$0.isArchived }
             .sorted { first, second in
                 if first.isPinned != second.isPinned { return first.isPinned }
                 if first.needsAttention != second.needsAttention { return first.needsAttention }
                 return (first.lastActivity ?? .distantPast) > (second.lastActivity ?? .distantPast)
             }
+        if sorted != sortedWorkspaces { sortedWorkspaces = sorted }
+
+        let archived = workspaces.filter(\.isArchived)
+        if archived != archivedWorkspaces { archivedWorkspaces = archived }
+        recomputeSelectedWorkspace()
+        recomputeAttentionCount()
+        recomputeNeedsYouStops()
+        recomputeFleetActivity()
     }
 
-    var archivedWorkspaces: [WorkspaceSummary] {
-        workspaces.filter(\.isArchived)
+    private func recomputeSelectedWorkspace() {
+        let next = selectedWorkspaceID.flatMap { id in workspaces.first { $0.id == id } }
+        if next != selectedWorkspace { selectedWorkspace = next }
     }
 
-    var attentionCount: Int {
-        workspaces.filter { !$0.isArchived && $0.needsAttention }.count
+    private func recomputeAttentionCount() {
+        let next = sortedWorkspaces.lazy.filter(\.needsAttention).count
             + dreamInbox.newFindingCount
+        if next != attentionCount { attentionCount = next }
+    }
+
+    /// Chat statuses feed the Active tab and the working count, so this runs
+    /// after every write to `chatIndex` as well as every fleet change. It is a
+    /// pass over each workspace's open tabs — cheap at write time, and far
+    /// cheaper than the sidebar doing it on every render.
+    private func recomputeFleetActivity() {
+        let next = SidebarFleetActivity.resolve(sortedWorkspaces) { chats(for: $0) }
+        if next.activeIDs != activeWorkspaceIDs { activeWorkspaceIDs = next.activeIDs }
+        if next.workingCount != workingCount { workingCount = next.workingCount }
+    }
+
+    /// ⌘1–9's target: the sidebar's displayed order while it is holding still,
+    /// the live order otherwise. See `sidebarShortcutOrder`.
+    func shortcutWorkspaceID(at index: Int) -> WorkspaceID? {
+        SidebarOrderHold.shortcutTarget(
+            at: index,
+            held: sidebarShortcutOrder,
+            live: sortedWorkspaces.map(\.id)
+        )
     }
 
     // MARK: - Commands
@@ -1127,21 +1314,33 @@ final class AppModel {
     }
 
     private func syncDreamMonitor() {
-        dreamMonitor?.isDreaming = dreamInbox.run?.state == .dreaming
+        let isDreaming = dreamInbox.run?.state == .dreaming
+        // The monitor polls idle time and power every 30 seconds. That is only
+        // worth doing while Dream Mode can act on it: when it is switched on,
+        // or while a run (a manual one included) is going.
+        if DreamSettingsStore.load().enabled || isDreaming {
+            if dreamMonitor == nil {
+                let monitor = DreamEnvironmentMonitor(client: client)
+                dreamMonitor = monitor
+                monitor.start()
+            }
+        } else if let monitor = dreamMonitor {
+            monitor.stop()
+            dreamMonitor = nil
+        }
+        dreamMonitor?.isDreaming = isDreaming
         dreamMonitor?.refreshAssertion()
         refreshDreamSleepStatus()
     }
 
     private func startDreamMode() {
-        let monitor = DreamEnvironmentMonitor(client: client)
-        dreamMonitor = monitor
-        monitor.start()
         pushDreamSettings()
         Task { await client.send(.listDreamFindings) }
     }
 
     private func upsertDream(_ summary: WorkspaceSummary) {
         if let index = dreamWorkspaces.firstIndex(where: { $0.id == summary.id }) {
+            guard dreamWorkspaces[index] != summary else { return }
             dreamWorkspaces[index] = summary
         } else {
             dreamWorkspaces.append(summary)
@@ -1151,6 +1350,7 @@ final class AppModel {
     private func upsertDreamFinding(_ finding: DreamFindingSummary) {
         var findings = dreamInbox.findings
         if let index = findings.firstIndex(where: { $0.id == finding.id }) {
+            guard findings[index] != finding else { return }
             findings[index] = finding
         } else {
             findings.insert(finding, at: 0)
@@ -1159,7 +1359,7 @@ final class AppModel {
     }
 
     func refreshDreamSleepStatus() {
-        dreamSleepStatus = dreamMonitor?.currentSleepStatus
+        let status = dreamMonitor?.currentSleepStatus
             ?? DreamScheduler.sleepStatus(
                 settings: DreamSettingsStore.load(),
                 environment: DreamEnvironmentSnapshot(
@@ -1168,6 +1368,7 @@ final class AppModel {
                 ),
                 isDreaming: dreamInbox.run?.state == .dreaming
             )
+        if status != dreamSleepStatus { dreamSleepStatus = status }
     }
 
     private var notifiedDreamRunIDs: Set<String> = []
@@ -1226,21 +1427,26 @@ final class AppModel {
         serviceTier: String? = nil,
         origin: MessageOrigin = .user,
         to id: WorkspaceID,
-        chatID: ChatID
+        chatID: ChatID,
+        fromComposer: Bool = true
     ) {
         let state = chat(for: chatID)
-        let comments = state.takeDraftComments()
-        persistDraftComments([], for: chatID)
         cancelScheduledContinuation(for: chatID)
-        persistDraftAttachments([], for: chatID)
-        // The text just left the composer, so any buffered copy of it is stale.
-        // Clearing the summary here rather than waiting out the debounce is what
-        // keeps the tab bar's unsent-draft pencil from lingering after a send.
-        discardPendingDraft(for: chatID)
-        if composerInjection?.chatID == chatID { composerInjection = nil }
-        if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
-            summary.draftText = ""
-            upsertChat(summary)
+        // A button's prompt isn't the composer's text: whatever the user has
+        // half-typed, attached or commented stays put for their own send.
+        let comments = fromComposer ? state.takeDraftComments() : []
+        if fromComposer {
+            persistDraftComments([], for: chatID)
+            persistDraftAttachments([], for: chatID)
+            // The text just left the composer, so any buffered copy of it is stale.
+            // Clearing the summary here rather than waiting out the debounce is what
+            // keeps the tab bar's unsent-draft pencil from lingering after a send.
+            discardPendingDraft(for: chatID)
+            if composerInjection?.chatID == chatID { composerInjection = nil }
+            if var summary = chatSummaries.first(where: { $0.id == chatID }), !summary.draftText.isEmpty {
+                summary.draftText = ""
+                upsertChat(summary)
+            }
         }
         // One id for the row drawn now and the engine's echo of the same send,
         // so this message is not drawn a second time when the echo arrives.
@@ -1347,18 +1553,99 @@ final class AppModel {
         }
     }
 
+    struct WorkspacePermissionGroup: Identifiable {
+        let chat: ChatSummary
+        let requests: [PermissionRequest]
+        let questions: [AgentQuestion]
+        let hasPlan: Bool
+        var id: ChatID { chat.id }
+        var pendingCount: Int { requests.count + questions.count + (hasPlan ? 1 : 0) }
+    }
+
+    func workspacePermissionGroups(for workspaceID: WorkspaceID) -> [WorkspacePermissionGroup] {
+        chats(for: workspaceID, includeClosed: true).compactMap { summary in
+            guard let state = chatStates[summary.id] else { return nil }
+            let hasPlan: Bool
+            if case .proposal = state.plan { hasPlan = true } else { hasPlan = false }
+            let questions = state.pendingQuestions
+            let requests = state.pendingPermissions.filter { permission in
+                // A dedicated question or plan owns its backing permission;
+                // show one item rather than two ways to answer the same gate.
+                if permission.toolName == "AskUserQuestion",
+                   questions.contains(where: { $0.toolCallID == permission.toolCallID }) { return false }
+                if permission.toolName == "ExitPlanMode", hasPlan { return false }
+                return true
+            }
+            guard !requests.isEmpty || !questions.isEmpty || hasPlan else { return nil }
+            return WorkspacePermissionGroup(chat: summary, requests: requests, questions: questions, hasPlan: hasPlan)
+        }
+    }
+
+    func approveWorkspaceRequests(for workspaceID: WorkspaceID) {
+        // Snapshot the set the user approved. Requests arriving later need a
+        // separate click or an explicitly enabled timed grant.
+        let groups = workspacePermissionGroups(for: workspaceID)
+        for group in groups {
+            for request in group.requests where WorkspacePermissionPolicy.isToolRequest(request) {
+                resolvePermission(request.id, decision: .allow, for: workspaceID, chatID: group.chat.id)
+            }
+        }
+    }
+
+    func enableWorkspaceAutoApproval(for workspaceID: WorkspaceID, minutes: Int) async -> Bool {
+        guard [5, 15, 30, 60].contains(minutes) else { return false }
+        guard await Self.authenticateStandingGrant(
+            reason: "automatically approve tool requests in this ORE workspace for \(minutes) minutes"
+        ) else { return false }
+        let grant = WorkspaceAutoApproval(
+            workspaceID: workspaceID,
+            expiresAt: Date().addingTimeInterval(Double(minutes) * 60)
+        )
+        workspaceAutoApprovals[workspaceID] = grant
+        for group in workspacePermissionGroups(for: workspaceID) {
+            for request in group.requests where grant.allows(request, in: workspaceID) {
+                approveTimedWorkspaceRequest(request, workspaceID: workspaceID, chatID: group.chat.id, grant: grant)
+            }
+        }
+        return true
+    }
+
+    func disableWorkspaceAutoApproval(for workspaceID: WorkspaceID) {
+        workspaceAutoApprovals.removeValue(forKey: workspaceID)
+    }
+
+    private func approveTimedWorkspaceRequest(
+        _ request: PermissionRequest, workspaceID: WorkspaceID, chatID: ChatID,
+        grant: WorkspaceAutoApproval
+    ) {
+        let content = PermissionPresentation(request: request)
+        resolvePermission(
+            request.id, decision: .allow, for: workspaceID, chatID: chatID,
+            automatic: AutomaticApproval(
+                toolCallID: request.toolCallID,
+                command: content.target ?? WorkspacePermissionPolicy.inputText(request.input),
+                reason: "is covered by your workspace auto-approval until \(grant.expiresAt.formatted(date: .omitted, time: .shortened))"
+            )
+        )
+    }
+
     /// Drop every ask this permission was the gate for — see `NeedsYouPairing`.
     private func retireNeedsYou(resolving requestID: PermissionRequestID) {
-        tabNeedsYou = NeedsYouPairing.remaining(tabNeedsYou, resolving: requestID)
+        let remaining = NeedsYouPairing.remaining(tabNeedsYou, resolving: requestID)
+        if remaining != tabNeedsYou { tabNeedsYou = remaining }
     }
 
     /// The Allow/Deny card currently on screen, if the generic buttons own it.
     /// AskUserQuestion and ExitPlanMode keep their dedicated cards instead.
     var actionablePermission: PermissionRequest? {
-        guard let chat = selectedChat, let permission = chat.pendingPermission else { return nil }
-        if permission.toolName == "AskUserQuestion" { return nil }
-        if permission.toolName == "ExitPlanMode", case .proposal = chat.plan { return nil }
-        return permission
+        guard let chat = selectedChat else { return nil }
+        // The same request the card shows: the oldest one the generic
+        // buttons own.
+        return chat.pendingPermissions.first { permission in
+            if permission.toolName == "AskUserQuestion" { return false }
+            if permission.toolName == "ExitPlanMode", case .proposal = chat.plan { return false }
+            return true
+        }
     }
 
     /// ⇧⌘A from the composer, which approves without the card being focused.
@@ -1414,7 +1701,7 @@ final class AppModel {
         }
         let gate = NeedsYouPairing.gate(
             forToolCall: question.toolCallID,
-            pendingPermission: state.pendingPermission
+            pendingPermissions: state.pendingPermissions
         )
         // Captured in ask order before the answer retires this one, so the
         // reply reads back in the order the agent asked.
@@ -1530,25 +1817,12 @@ final class AppModel {
         ))) }
     }
 
-    /// The temporary "commit clerk" tab: forked from the active chat — so it
-    /// already knows what the work was about and can write honest messages —
-    /// named Commit, and immediately prompted to stage and commit everything.
-    /// The composer's suggestion chip offers closing the tab once the tree is
-    /// clean (see `composerSuggestion` in ChatPane).
-    func startCommitAgent(in workspaceID: WorkspaceID) {
-        guard let source = activeChat(for: workspaceID),
-              chatCreationsInFlight.insert(workspaceID).inserted else { return }
-        pendingNewChatMessages[workspaceID, default: []].append(Self.commitAgentPrompt)
-        showChatInCenter(workspaceID)
-        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
-        Task { await client.send(.createChat(CreateChatRequest(
-            workspaceID: workspaceID,
-            title: ResearchIdentity.unique("Commit", excluding: used),
-            harness: source.harness,
-            model: source.model,
-            permissionMode: source.permissionMode,
-            forkFrom: source.id
-        ))) }
+    /// Asks the tab the user is in to stage and commit everything. That tab's
+    /// agent already knows what the work was about, so it writes honest
+    /// messages, and the result lands where the user is looking rather than
+    /// in a tab spun up beside it. A busy turn queues it like any message.
+    func commitWithAgent(in workspaceID: WorkspaceID) {
+        sendToCurrentTab(Self.commitAgentPrompt, in: workspaceID)
     }
 
     static let commitAgentPrompt = """
@@ -1560,33 +1834,36 @@ final class AppModel {
         without asking for confirmation.
         """
 
-    /// The "ship it" sibling of `startCommitAgent`: a temporary tab that
-    /// commits whatever is outstanding, pushes, and opens the pull request —
-    /// the whole default flow, no sheets, no questions.
-    func startShipAgent(in workspaceID: WorkspaceID, base: String? = nil) {
-        guard let source = activeChat(for: workspaceID),
-              chatCreationsInFlight.insert(workspaceID).inserted else { return }
+    /// The "ship it" sibling of `commitWithAgent`: the current tab commits
+    /// whatever is outstanding, pushes, and opens the pull request — the
+    /// whole default flow, no sheets, no questions.
+    func shipWithAgent(in workspaceID: WorkspaceID, base: String? = nil) {
         let baseBranch = base
             ?? workspaces.first { $0.id == workspaceID }?.baseBranch
             ?? "main"
-        pendingNewChatMessages[workspaceID, default: []].append("""
-            Ship this branch. Commit any outstanding staged and unstaged work \
-            with clear, conventional commit messages, push the branch, and \
-            open a pull request against \(baseBranch) with a concise title \
-            and a description that covers what changed and why. Never force \
-            push. Proceed without asking for confirmation, and finish by \
-            reporting the pull request URL.
-            """)
+        sendToCurrentTab(Self.shipAgentPrompt(base: baseBranch), in: workspaceID)
+    }
+
+    static func shipAgentPrompt(base: String) -> String {
+        """
+        Ship this branch. Commit any outstanding staged and unstaged work \
+        with clear, conventional commit messages, push the branch, and \
+        open a pull request against \(base) with a concise title \
+        and a description that covers what changed and why. Never force \
+        push. Proceed without asking for confirmation, and finish by \
+        reporting the pull request URL.
+        """
+    }
+
+    /// A button's prompt goes to the tab on screen, leaving its composer
+    /// alone. Only a workspace with no tab open gets a new one.
+    private func sendToCurrentTab(_ prompt: String, in workspaceID: WorkspaceID) {
         showChatInCenter(workspaceID)
-        let used = Set(chats(for: workspaceID, includeClosed: true).map(\.title))
-        Task { await client.send(.createChat(CreateChatRequest(
-            workspaceID: workspaceID,
-            title: ResearchIdentity.unique("Ship", excluding: used),
-            harness: source.harness,
-            model: source.model,
-            permissionMode: source.permissionMode,
-            forkFrom: source.id
-        ))) }
+        guard let chatID = activeChat(for: workspaceID)?.id else {
+            createChat(in: workspaceID, initialMessage: prompt)
+            return
+        }
+        send(prompt, to: workspaceID, chatID: chatID, fromComposer: false)
     }
 
     /// Marks a chat as ephemeral: hidden from the tab strip, never focused,
@@ -2000,11 +2277,11 @@ final class AppModel {
     }
 
     func reviewInboxChatID(for workspaceID: WorkspaceID) -> ChatID? {
-        if let cached = reviewCommentInbox[workspaceID] { return cached }
-        guard let raw = UserDefaults.standard.string(forKey: Self.reviewInboxKey(for: workspaceID))
-        else { return nil }
-        let id = ChatID(rawValue: raw)
-        reviewCommentInbox[workspaceID] = id
+        if let remembered = reviewCommentInbox[workspaceID] { return remembered }
+        if let stored = storedReviewInbox[workspaceID] { return stored }
+        let id = UserDefaults.standard.string(forKey: Self.reviewInboxKey(for: workspaceID))
+            .map(ChatID.init(rawValue:))
+        storedReviewInbox[workspaceID] = .some(id)
         return id
     }
 
@@ -2013,7 +2290,8 @@ final class AppModel {
     }
 
     private func rememberReviewInbox(_ chatID: ChatID, for workspaceID: WorkspaceID) {
-        reviewCommentInbox[workspaceID] = chatID
+        if reviewCommentInbox[workspaceID] != chatID { reviewCommentInbox[workspaceID] = chatID }
+        storedReviewInbox[workspaceID] = .some(chatID)
         UserDefaults.standard.set(chatID.rawValue, forKey: Self.reviewInboxKey(for: workspaceID))
     }
 
@@ -2202,6 +2480,13 @@ final class AppModel {
     /// `ore.toml` scripts waiting for the user to read and allow them, oldest
     /// first. The main window asks about the first one.
     var pendingScriptApprovals: [RepositoryScriptsApproval] = []
+
+    /// Ask about a workspace's scripts, replacing any older question about the
+    /// same workspace.
+    func requestScriptApproval(_ approval: RepositoryScriptsApproval) {
+        pendingScriptApprovals.removeAll { $0.workspaceID == approval.workspaceID }
+        pendingScriptApprovals.append(approval)
+    }
 
     func approveRepositoryScripts(_ approval: RepositoryScriptsApproval) {
         pendingScriptApprovals.removeAll { $0 == approval }
@@ -2488,7 +2773,9 @@ final class AppModel {
     private func composerIsOccupied(_ chat: ChatSummary) -> Bool {
         chat.status.occupiesComposer
             || chat.queuedMessageCount > 0
-            || self.chat(for: chat.id).isBusy
+            // Loaded state only: a tab with none has no local turn running, and
+            // creating one here loaded every open tab's history.
+            || chatStates[chat.id]?.isBusy == true
     }
 
     /// Marks an injection as taken by the composer it was meant for.
@@ -2635,10 +2922,6 @@ final class AppModel {
         try await client.diff(workspaceID: id, againstBase: true)
     }
 
-    func loadGitAction(for id: WorkspaceID) async throws -> SuggestedGitAction {
-        try await client.suggestedGitAction(workspaceID: id)
-    }
-
     func loadGitStatus(for id: WorkspaceID) async throws -> SuggestedGitStatus {
         try await client.suggestedGitStatus(workspaceID: id)
     }
@@ -2664,23 +2947,51 @@ final class AppModel {
         return (try? await client.turnCheckpoints(workspaceID: id, chatID: chatID)) ?? []
     }
 
+    /// Sidebar snippets by workspace, stamped with the `lastActivity` they were
+    /// read at. A List row that scrolls out and back in is a fresh view with
+    /// empty state; without this every return restarted the IPC read, and the
+    /// row grew its second line a beat after it appeared.
+    private struct TurnDigestEntry {
+        var lastActivity: Date?
+        var digest: String?
+    }
+    @ObservationIgnored
+    private var turnDigests: [WorkspaceID: TurnDigestEntry] = [:]
+
+    /// The snippet already read for this activity stamp, if there is one.
+    /// `.some(nil)` means "read, and there was nothing to show".
+    func cachedTurnDigest(for id: WorkspaceID, lastActivity: Date?) -> String?? {
+        guard let entry = turnDigests[id], entry.lastActivity == lastActivity else { return nil }
+        return .some(entry.digest)
+    }
+
     /// The sidebar row's snippet: the last thing said in the workspace's most
     /// recently active conversation, flattened to one line. Nil when nothing
     /// has been said yet, so a fresh workspace's row stays one line tall.
-    func lastTurnDigest(for id: WorkspaceID) async -> String? {
+    ///
+    /// Only goes to the core when `lastActivity` moved since the last read —
+    /// i.e. once per completed turn, not once per appearance.
+    func lastTurnDigest(for id: WorkspaceID, lastActivity: Date?) async -> String? {
+        if let cached = cachedTurnDigest(for: id, lastActivity: lastActivity) { return cached }
         let recent = chats(for: id).max {
             ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast)
         }
         guard let chatID = recent?.id else { return nil }
-        let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID)
-        guard let digest else { return nil }
+        guard let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID) else {
+            // A failed read is not cached: the next appearance tries again.
+            return nil
+        }
         let flattened = digest
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        guard !flattened.isEmpty else { return nil }
-        return String(flattened.prefix(160))
+        let result = flattened.isEmpty ? nil : String(flattened.prefix(160))
+        // A workspace removed while the read was in flight stays forgotten.
+        if workspaces.contains(where: { $0.id == id }) {
+            turnDigests[id] = TurnDigestEntry(lastActivity: lastActivity, digest: result)
+        }
+        return result
     }
 
     func loadDiffFromCheckpoint(_ commit: String, for id: WorkspaceID) async throws -> [FileDiff] {
@@ -2721,18 +3032,22 @@ final class AppModel {
 
     /// The last cached diff for a workspace, if any — used to paint the review
     /// pane instantly on switch before a fresh read completes.
-    func cachedDiff(for id: WorkspaceID) -> DiffSnapshot? { diffCache[id] }
+    func cachedDiff(for id: WorkspaceID) -> DiffSnapshot? { diffCache.state(for: id).snapshot }
 
     /// Loads a workspace's diff and suggested git action together, caches the
     /// result, and returns it. The concurrent reads mean the review pane waits
     /// on the slower of the two rather than their sum.
     @discardableResult
     func refreshDiff(for workspace: WorkspaceSummary) async throws -> DiffSnapshot {
+        // A write during either read belongs to the next refresh, not this
+        // one. Otherwise the trailing prefetch mistakes old data for current.
+        let generation = gitGeneration(for: workspace.id)
+        let state = diffCache.state(for: workspace.id)
         async let diffs = loadDiff(for: workspace.id)
         async let gitStatus = loadGitStatus(for: workspace.id)
         let status = try await gitStatus
         let snapshot = DiffSnapshot(
-            generation: gitGeneration(for: workspace.id),
+            generation: generation,
             diffs: try await diffs,
             gitAction: status.action,
             pullRequest: status.pullRequest
@@ -2744,11 +3059,11 @@ final class AppModel {
         // agent wrote anything — the "Changes 0 even though files are
         // modified" that only showed up sometimes. The newest generation wins,
         // and a stale caller is handed the newer snapshot rather than its own.
-        if let cached = diffCache[workspace.id], cached.generation > snapshot.generation {
-            return cached
-        }
-        diffCache[workspace.id] = snapshot
-        return snapshot
+        // Archive/removal may have released the cache during the reads. Do
+        // not recreate it (or fill a state still held by an outgoing pane).
+        guard diffCache.contains(state, for: workspace.id) else { return snapshot }
+        state.store(snapshot)
+        return state.snapshot ?? snapshot
     }
 
     /// Recomputes just the suggested git action, leaving the cached diff alone.
@@ -2764,8 +3079,9 @@ final class AppModel {
     /// Cheap enough to call on turn boundaries and workspace switches: it is one
     /// `gh pr view` and a `git status`, and it never refetches the diff.
     func refreshGitAction(for workspaceID: WorkspaceID) async {
+        guard isBackgroundPollingEnabled else { return }
         guard let status = try? await loadGitStatus(for: workspaceID) else { return }
-        guard var snapshot = diffCache[workspaceID] else { return }
+        guard var snapshot = cachedDiff(for: workspaceID) else { return }
         guard snapshot.gitAction != status.action
             || snapshot.pullRequest != status.pullRequest else { return }
 
@@ -2784,21 +3100,47 @@ final class AppModel {
 
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
-        diffCache[workspaceID] = snapshot
+        diffCache.state(for: workspaceID).store(snapshot)
     }
 
     /// Best-effort background warm-up of a workspace's diff so a later switch is
     /// instant. Skips work when the cache already matches the current git-status
     /// generation; failures are swallowed since the real refresh reports them.
+    ///
+    /// At most one read per workspace runs at a time. Requests landing while it
+    /// does collapse into a single trailing read after a short debounce, so an
+    /// agent writing files does not queue a `git diff` per write.
     func prefetchDiff(for workspace: WorkspaceSummary) {
-        let generation = gitGeneration(for: workspace.id)
-        if let cached = diffCache[workspace.id],
-           cached.generation == generation { return }
-        var stamped = workspace
-        stamped.gitStatus.generation = generation
+        guard isBackgroundPollingEnabled, !workspace.isArchived else { return }
+        if cachedDiff(for: workspace.id)?.generation == gitGeneration(for: workspace.id) { return }
+        guard diffPrefetches.request(workspace.id) else { return }
         Task(priority: .utility) { [weak self] in
-            _ = try? await self?.refreshDiff(for: stamped)
+            await self?.runDiffPrefetch(for: workspace.id)
         }
+    }
+
+    /// Only call after `diffPrefetches.request` returned true.
+    private func runDiffPrefetch(for id: WorkspaceID) async {
+        repeat {
+            guard isBackgroundPollingEnabled else {
+                diffPrefetches.cancel(id)
+                return
+            }
+            let generation = gitGeneration(for: id)
+            if cachedDiff(for: id)?.generation != generation,
+               var stamped = workspaces.first(where: { $0.id == id })
+                ?? (assistantWorkspace?.id == id ? assistantWorkspace : nil),
+               !stamped.isArchived {
+                stamped.gitStatus.generation = generation
+                _ = try? await refreshDiff(for: stamped)
+            }
+        } while await shouldRunTrailingDiffPrefetch(for: id)
+    }
+
+    private func shouldRunTrailingDiffPrefetch(for id: WorkspaceID) async -> Bool {
+        guard diffPrefetches.finish(id) else { return false }
+        try? await Task.sleep(for: Self.diffPrefetchDebounce)
+        return true
     }
 
     /// Warms the transcript for a workspace's active chat so its centre column
@@ -2810,13 +3152,37 @@ final class AppModel {
         _ = chat(for: chatID)
     }
 
-    /// Warms diffs and transcripts for every workspace shortly after they load,
-    /// so navigating between worktrees feels instant rather than cold.
+    /// Warms diffs and transcripts shortly after the fleet loads, so navigating
+    /// between worktrees feels instant rather than cold.
+    ///
+    /// Once per launch, the selected workspace first, then the rest one at a
+    /// time: warming everything at once put a `git diff`, a PR lookup and a
+    /// full history load per workspace on the machine in the same second, and
+    /// did it again on every snapshot.
     private func warmWorkspaces() {
-        for workspace in workspaces {
-            prefetchDiff(for: workspace)
-            prefetchHistory(for: workspace.id)
+        // A snapshot with no workspaces yet does not use up the one warm-up.
+        guard !didWarmWorkspaces, !workspaces.isEmpty else { return }
+        didWarmWorkspaces = true
+        if let selected = selectedWorkspace {
+            prefetchDiff(for: selected)
+            prefetchHistory(for: selected.id)
         }
+        let others = sortedWorkspaces.map(\.id).filter { $0 != selectedWorkspaceID }
+        guard !others.isEmpty else { return }
+        Task(priority: .utility) { [weak self] in
+            for id in others {
+                guard let self else { return }
+                await self.warmHistory(for: id)
+                guard self.diffPrefetches.request(id) else { continue }
+                await self.runDiffPrefetch(for: id)
+            }
+        }
+    }
+
+    private func warmHistory(for workspaceID: WorkspaceID) async {
+        guard let chatID = activeChatIDs[workspaceID] else { return }
+        if let state = chatStates[chatID], state.hasLoadedHistory { return }
+        await loadHistory(for: chatID)
     }
 
     func addDiffComment(_ reference: DiffCommentReference, for id: WorkspaceID) {
@@ -2850,28 +3216,34 @@ final class AppModel {
     /// The row is the same message — it was drawn the moment the user pressed
     /// send — so leaving it on the original text means the transcript shows
     /// one thing and the agent is handed another.
-    func updateQueuedMessage(_ record: QueuedMessageRecord, text: String) async {
+    func updateQueuedMessage(_ record: QueuedMessageRecord, text: String) async throws {
         guard let id = record.id else { return }
-        try? await client.updateQueuedMessage(id: id, text: text)
+        try await client.updateQueuedMessage(id: id, text: text)
         guard !record.submissionID.isEmpty, let chatID = record.chatID else { return }
         chat(for: ChatID(rawValue: chatID))
             .updateQueuedRow(submissionID: record.submissionID, text: text)
     }
 
-    func deleteQueuedMessage(_ record: QueuedMessageRecord) async {
+    func deleteQueuedMessage(_ record: QueuedMessageRecord) async throws {
         guard let id = record.id else { return }
-        try? await client.deleteQueuedMessage(id: id)
+        try await client.deleteQueuedMessage(id: id)
         // Retire the row too. A deleted message that stays in the transcript
         // marked "queued" is not just cosmetic: it is what the next turn to
         // start would otherwise claim as the message that was sent.
         if !record.submissionID.isEmpty, let chatID = record.chatID {
             chat(for: ChatID(rawValue: chatID)).removeQueuedRow(submissionID: record.submissionID)
         }
-        if let chat = selectedChatSummary {
+        if let chat = chats(for: WorkspaceID(rawValue: record.workspaceID), includeClosed: true)
+            .first(where: { $0.id.rawValue == record.chatID }) {
             var updated = chat
             updated.queuedMessageCount = max(0, updated.queuedMessageCount - 1)
             upsertChat(updated)
         }
+    }
+
+    func moveQueuedMessage(_ record: QueuedMessageRecord, direction: Int) async throws {
+        guard let id = record.id else { return }
+        try await client.moveQueuedMessage(id: id, direction: direction)
     }
 
     func search(_ query: String) async -> [SearchResult] {
@@ -3090,7 +3462,34 @@ final class AppModel {
         return ResearchIdentity.next(excluding: used)
     }
 
+    /// Resolved identities, keyed by the inputs that decide them. The sidebar
+    /// asks once per row per pass, and each answer was a defaults read plus a
+    /// scan of the catalog. Entries are dropped wherever the saved slug is
+    /// written, and a rename or moved worktree misses on its own.
+    private struct ResolvedResearchIdentity {
+        var name: String
+        var worktreePath: String
+        var identity: ResearchIdentity?
+    }
+    @ObservationIgnored
+    private var researchIdentityCache: [WorkspaceID: ResolvedResearchIdentity] = [:]
+
     func researchIdentity(for workspace: WorkspaceSummary) -> ResearchIdentity? {
+        if let cached = researchIdentityCache[workspace.id],
+           cached.name == workspace.name,
+           cached.worktreePath == workspace.worktreePath {
+            return cached.identity
+        }
+        let identity = resolveResearchIdentity(for: workspace)
+        researchIdentityCache[workspace.id] = ResolvedResearchIdentity(
+            name: workspace.name,
+            worktreePath: workspace.worktreePath,
+            identity: identity
+        )
+        return identity
+    }
+
+    private func resolveResearchIdentity(for workspace: WorkspaceSummary) -> ResearchIdentity? {
         let key = "ore.researchIdentity.\(workspace.id.rawValue)"
         if let saved = UserDefaults.standard.string(forKey: key),
            let identity = ResearchIdentity.matching(nameOrSlug: saved) {
@@ -3127,6 +3526,12 @@ final class AppModel {
             }
             return value
         }.value
+    }
+
+    /// A file as it was at the workspace's merge base: how the review pane
+    /// shows a deleted image, or the "before" of a replaced one.
+    func baseFileData(path: String, in workspaceID: WorkspaceID) async -> Data? {
+        try? await client.baseFileData(workspaceID: workspaceID, path: path)
     }
 
     func saveFileContents(_ contents: String, path: String, in workspace: WorkspaceSummary) async throws {
@@ -3199,11 +3604,7 @@ final class AppModel {
     // MARK: - Events
 
     private func apply(_ event: CoreEvent) {
-        #if DEBUG
-        UIFanoutProbe.record(event)
-        #endif
-        // One funnel for analytics, in the same place and for the same reason
-        // as the probe above: every core event passes through here exactly
+        // One funnel for analytics: every core event passes through here exactly
         // once, so nothing has to be instrumented twice or kept in sync with
         // a second dispatch path. The translator decides what, if anything,
         // is worth reporting; most events produce nothing.
@@ -3219,6 +3620,9 @@ final class AppModel {
                 workspaceLive.seed(workspace)
             }
             chatSummaries = snapshot.chats
+            chatIndex.replaceAll(snapshot.chats)
+            // `workspaces` was assigned above, against the old chat lists.
+            recomputeFleetActivity()
             chatOwners = Dictionary(
                 snapshot.chats.map { ($0.id, $0.workspaceID) },
                 uniquingKeysWith: { _, last in last }
@@ -3267,16 +3671,23 @@ final class AppModel {
                 upsertDream(summary)
                 break
             }
+            let wasArchived = workspaces.first { $0.id == summary.id }?.isArchived ?? false
             upsert(summary)
             identityRenamesInFlight.remove(summary.id)
             rememberIdentityIfPresent(for: summary)
-            if summary.isArchived { repairWorkspaceSelection() }
+            if summary.isArchived {
+                if !wasArchived { releaseArchived(summary.id) }
+                repairWorkspaceSelection()
+            }
 
         case .workspaceRemoved(let id):
             workspaces.removeAll { $0.id == id }
             workspaceLive.remove(id)
+            diffCache.remove(id)
+            diffPrefetches.cancel(id)
             fleetWatcher.forget(id)
-            let removed = chatSummaries.filter { $0.workspaceID == id }.map(\.id)
+            let removed = Set(chatIndex.removeWorkspace(id))
+                .union(chatSummaries.filter { $0.workspaceID == id }.map(\.id))
             chatSummaries.removeAll { $0.workspaceID == id }
             for chatID in removed { forget(chatID) }
             activeChatIDs.removeValue(forKey: id)
@@ -3296,13 +3707,17 @@ final class AppModel {
             for key in ["ore.activeChat", "ore.researchIdentity"] {
                 UserDefaults.standard.removeObject(forKey: "\(key).\(id.rawValue)")
             }
+            researchIdentityCache.removeValue(forKey: id)
+            turnDigests.removeValue(forKey: id)
             if selectedWorkspaceID == id { selectedWorkspaceID = sortedWorkspaces.first?.id }
             dreamWorkspaces.removeAll { $0.id == id }
 
         case .dreamRunStateChanged(let run):
-            var inbox = dreamInbox
-            inbox.run = run
-            dreamInbox = inbox
+            if dreamInbox.run != run {
+                var inbox = dreamInbox
+                inbox.run = run
+                dreamInbox = inbox
+            }
             syncDreamMonitor()
             maybeNotifyDreamFinished(run)
 
@@ -3316,7 +3731,7 @@ final class AppModel {
             upsertDreamFinding(finding)
 
         case .dreamInboxUpdated(let inbox):
-            dreamInbox = inbox
+            if dreamInbox != inbox { dreamInbox = inbox }
             syncDreamMonitor()
 
         case .assistantConfirmationRequested(let confirmation):
@@ -3368,11 +3783,11 @@ final class AppModel {
             }
 
         case .promptSubmitted(let id, let chatID, let submission):
-            chatOwners[chatID] = id
+            noteOwner(id, of: chatID)
             chat(for: chatID).applyPromptSubmission(submission)
 
         case .agent(let id, let chatID, let agentEvent):
-            chatOwners[chatID] = id
+            noteOwner(id, of: chatID)
             // Deltas are buffered; everything else flushes them first so a
             // tool call can never appear above the text that introduced it.
             var coalescer = coalescers[chatID] ?? TextDeltaCoalescer()
@@ -3390,7 +3805,7 @@ final class AppModel {
 
         case .chatAdded(let chat):
             chatCreationsInFlight.remove(chat.workspaceID)
-            chatOwners[chat.id] = chat.workspaceID
+            noteOwner(chat.workspaceID, of: chat.id)
             upsertChat(chat)
             if pendingReviewCommentInbox.remove(chat.workspaceID) != nil {
                 rememberReviewInbox(chat.id, for: chat.workspaceID)
@@ -3433,8 +3848,9 @@ final class AppModel {
             }
 
         case .chatUpdated(let chat):
-            chatOwners[chat.id] = chat.workspaceID
+            noteOwner(chat.workspaceID, of: chat.id)
             chatRenamesInFlight.remove(chat.id)
+            let wasOpen = chatIndex.summary(for: chat.id).map { !$0.isClosed } ?? false
             // Neighbor is computed while the closed chat is still in the open
             // list. After `upsertChat` it is filtered out, and `.first` would
             // jump to the oldest remaining tab.
@@ -3450,6 +3866,9 @@ final class AppModel {
             if let replacement {
                 selectChat(replacement, in: chat.workspaceID)
             }
+            // A closed tab's transcript, buffers and asks are held until it is
+            // reopened, which may be never; `chat(for:)` reloads them if it is.
+            if chat.isClosed, wasOpen { release(chat.id) }
 
         case .assistantConversationCompacted(let id, _, let successor):
             // ORE retired the conversation the user was in, so following it is
@@ -3457,30 +3876,18 @@ final class AppModel {
             // for a seam ORE made itself.
             selectChat(successor, in: id)
 
-        case .chatRemoved(_, let chatID):
-            forget(chatID)
-            chatSummaries.removeAll { $0.id == chatID }
-
-        case .chatsListed(let workspaceID, let chats):
-            for chat in chats {
-                chatOwners[chat.id] = workspaceID
-                upsertChat(chat)
-            }
-            adoptResearchChatTitles(in: workspaceID)
-
         case .gitStatusChanged(let id, let status):
             let live = workspaceLive.state(for: id)
             guard status.generation >= live.gitGeneration else { return }
             live.apply(status)
-            // The tree changed, so any cached diff is now stale — warm a fresh
-            // one in the background so the review pane stays instant. Stamp
-            // generation on a copy rather than writing `workspaces[i].gitStatus`,
-            // which would invalidate every reader of the fleet array.
-            if let workspace = workspaces.first(where: { $0.id == id })
-                ?? (assistantWorkspace?.id == id ? assistantWorkspace : nil) {
-                var stamped = workspace
-                stamped.gitStatus.generation = status.generation
-                prefetchDiff(for: stamped)
+            // The tree changed, so the cached diff is now stale. Only the
+            // workspace on screen warms a fresh one here: every other worktree
+            // an agent is writing to would otherwise run `git diff` on every
+            // write, for a pane nobody is looking at. The rest refresh when
+            // they are selected (`focusChanged`). `prefetchDiff` stamps the
+            // generation on a copy, never on `workspaces[i].gitStatus`.
+            if id == selectedWorkspaceID, let workspace = selectedWorkspace {
+                prefetchDiff(for: workspace)
             }
 
         case .harnessProbeCompleted(let probes):
@@ -3502,8 +3909,7 @@ final class AppModel {
             banners.append(Banner(message: failure.message, detail: failure.detail))
 
         case .repositoryScriptsNeedApproval(let approval):
-            pendingScriptApprovals.removeAll { $0.workspaceID == approval.workspaceID }
-            pendingScriptApprovals.append(approval)
+            requestScriptApproval(approval)
         }
     }
 
@@ -3667,6 +4073,12 @@ final class AppModel {
     private func applyToChat(workspaceID: WorkspaceID, chatID: ChatID, event: AgentEvent) {
         chat(for: chatID).apply(event)
         if case .permissionRequest(let request) = event,
+           let grant = workspaceAutoApprovals[workspaceID],
+           grant.allows(request, in: workspaceID) {
+            approveTimedWorkspaceRequest(request, workspaceID: workspaceID, chatID: chatID, grant: grant)
+            return
+        }
+        if case .permissionRequest(let request) = event,
            UserDefaults.standard.bool(forKey: Self.automaticRoutinePermissionsKey),
            let workspace = workspaces.first(where: { $0.id == workspaceID })
                 ?? (assistantWorkspace?.id == workspaceID ? assistantWorkspace : nil)
@@ -3712,7 +4124,7 @@ final class AppModel {
             }
             if let reason = AssistantFailoverPolicy.reason(for: event),
                !assistantRateLimitHandled,
-               let current = chatSummaries.first(where: { $0.id == chatID })?.harness
+               let current = chatIndex.summary(for: chatID)?.harness
                 ?? assistantWorkspace?.harness,
                harnesses.contains(where: { $0.isReady && $0.kind != current }) {
                 // Core performs the switch; this is only the spoken cue, and
@@ -3770,19 +4182,19 @@ final class AppModel {
             retireNeedsYou(resolving: resolution.id)
         case .toolCall(let call)
             where PlanProposalPolicy.proceedsPastProposal(call.name):
-            tabNeedsYou.removeAll {
+            removeNeedsYou {
                 if case .plan(let item) = $0, item.chatID == chatID { return true }
                 return false
             }
         case .turnStarted:
-            tabNeedsYou.removeAll {
+            removeNeedsYou {
                 if case .plan(let item) = $0, item.chatID == chatID { return true }
                 return false
             }
         case .turnCompleted:
             // Cursor's CreatePlan turn is already over when the plan is ready.
             // Dropping plan needs-you here would hide the ask.
-            tabNeedsYou.removeAll {
+            removeNeedsYou {
                 switch $0 {
                 case .permission(let item): return item.chatID == chatID
                 case .question(let item): return item.chatID == chatID
@@ -3860,6 +4272,13 @@ final class AppModel {
     /// with what they said. Nothing may offer it as an Allow/Deny of its own.
     static func isQuestionGate(_ request: PermissionRequest) -> Bool {
         request.toolName == "AskUserQuestion"
+    }
+
+    /// `removeAll` on an observed array notifies even when nothing matched, and
+    /// the per-event callers above match nothing almost every time.
+    private func removeNeedsYou(where shouldRemove: (TabNeedsYou) -> Bool) {
+        guard tabNeedsYou.contains(where: shouldRemove) else { return }
+        tabNeedsYou.removeAll(where: shouldRemove)
     }
 
     @discardableResult
@@ -3992,19 +4411,30 @@ final class AppModel {
             if case .permission(let item) = $0, item.chatID == chatID { return true }
             return false
         }
-        if let permissionID {
+        // Every ordinary request the tab has open, not only the one clicked:
+        // parallel tool calls ask at once, and a grant that answered one left
+        // the harness blocked on the rest. Question and plan gates keep their
+        // own cards — allowing those blindly would send back an empty answer.
+        let state = chat(for: chatID)
+        var allowed = state.pendingPermissions
+            .filter { $0.toolName != "AskUserQuestion" && $0.toolName != "ExitPlanMode" }
+            .map(\.id)
+        if let permissionID, !allowed.contains(permissionID) {
+            allowed.insert(permissionID, at: 0)
+        }
+        for id in allowed {
             // Authentication may take a moment; the user's click has already
-            // answered this prompt, so silence it and retire the local card
-            // before proving the standing grant.
-            voiceAssistant.permissionResolved(permissionID)
-            narration.cancelPermissionPrompt(permissionID)
-            chat(for: chatID).resolvePermission(permissionID)
+            // answered these prompts, so silence them and retire the local
+            // cards before proving the standing grant.
+            voiceAssistant.permissionResolved(id)
+            narration.cancelPermissionPrompt(id)
+            state.resolvePermission(id)
         }
         Task { @MainActor in
             let proven = await Self.authenticateStandingGrant()
-            if let permissionID {
+            for id in allowed {
                 await client.send(.resolveChatPermission(
-                    workspaceID, chatID, permissionID, .allow
+                    workspaceID, chatID, id, .allow
                 ))
             }
             if proven {
@@ -4033,7 +4463,7 @@ final class AppModel {
         workspaceID: WorkspaceID,
         chatID: ChatID
     ) -> NarrationOrigin {
-        let title = chatSummaries.first { $0.id == chatID }?.title
+        let title = chatIndex.summary(for: chatID)?.title
         guard selectedWorkspaceID == workspaceID else {
             let name = workspaceName(workspaceID)
             // The title earns its place only when it says something the
@@ -4063,12 +4493,11 @@ final class AppModel {
     /// continuation would still fire against a deleted conversation, and the
     /// per-chat defaults accumulated one set of orphans per chat ever created.
     private func forget(_ chatID: ChatID) {
+        release(chatID)
         narration.forget(chatID)
-        chatOwners.removeValue(forKey: chatID)
-        coalescers.removeValue(forKey: chatID)
-        lastBackgroundFlush.removeValue(forKey: chatID)
-        chatStates.removeValue(forKey: chatID)
-        dismissedCommentKeys.removeValue(forKey: chatID)
+        translator.forget(chatID)
+        // Observed: a removal that finds nothing would still notify readers.
+        if ephemeralChatIDs.contains(chatID) { ephemeralChatIDs.remove(chatID) }
         chatRenamesInFlight.remove(chatID)
         continuationTasks.removeValue(forKey: chatID)?.cancel()
         scheduledContinuations.removeValue(forKey: chatID)
@@ -4087,6 +4516,45 @@ final class AppModel {
             reviewCommentInbox[workspaceID] = nil
             UserDefaults.standard.removeObject(forKey: Self.reviewInboxKey(for: workspaceID))
         }
+        for (workspaceID, stored) in storedReviewInbox where stored == chatID {
+            storedReviewInbox[workspaceID] = nil
+            UserDefaults.standard.removeObject(forKey: Self.reviewInboxKey(for: workspaceID))
+        }
+    }
+
+    /// Drops a chat's in-memory state while keeping everything it needs to come
+    /// back: a closed chat can be reopened, so drafts, scheduled continuations
+    /// and its narration toggle stay, and `chat(for:)` reloads the transcript.
+    private func release(_ chatID: ChatID) {
+        // `narration.release` frees the chat's buffers but, unlike `forget`,
+        // keeps the tab's speaker on, which a reopened tab should keep.
+        narration.release(chatID)
+        chatOwners.removeValue(forKey: chatID)
+        coalescers.removeValue(forKey: chatID)
+        lastBackgroundFlush.removeValue(forKey: chatID)
+        if let state = chatStates[chatID] {
+            // Rendered rows are cached by turn; a reopened chat re-renders.
+            TranscriptCell.dropRenderCache(turnIDs: state.rows.map(\.turnID))
+            chatStates.removeValue(forKey: chatID)
+        }
+        dismissedCommentKeys.removeValue(forKey: chatID)
+        // A closed tab can no longer be answered, so its asks leave the HUD.
+        removeNeedsYou { $0.chatID == chatID }
+    }
+
+    /// An archived workspace keeps its record but loses its checkout, so what
+    /// was held in memory for it is dead weight until it is unarchived — and
+    /// its terminal is a shell running in a directory that no longer exists.
+    private func releaseArchived(_ workspaceID: WorkspaceID) {
+        for chat in chats(for: workspaceID, includeClosed: true) { release(chat.id) }
+        diffCache.remove(workspaceID)
+        diffPrefetches.cancel(workspaceID)
+        TerminalRegistry.shared.closeTerminal(for: workspaceID)
+    }
+
+    /// `chatOwners` is written on every agent event; only a real move is a write.
+    private func noteOwner(_ workspaceID: WorkspaceID, of chatID: ChatID) {
+        if chatOwners[chatID] != workspaceID { chatOwners[chatID] = workspaceID }
     }
 
     private func workspaceName(_ id: WorkspaceID) -> String {
@@ -4205,20 +4673,20 @@ final class AppModel {
 
     private func upsertChat(_ summary: ChatSummary) {
         if let index = chatSummaries.firstIndex(where: { $0.id == summary.id }) {
-            if chatSummaries[index] == summary {
-                #if DEBUG
-                UIFanoutProbe.equalChatSummariesSkipped += 1
-                #endif
-            } else {
+            if chatSummaries[index] != summary {
                 chatSummaries[index] = summary
             }
         } else {
             chatSummaries.append(summary)
         }
+        chatIndex.upsert(summary)
+        recomputeFleetActivity()
         // The engine's queue gate, brought over as-is. The composer decides
         // "send or queue" from this, so a guess derived from `status` would put
-        // the button and the engine back out of step.
-        chat(for: summary.id).reconcileTurnActive(summary.isTurnActive)
+        // the button and the engine back out of step. Loaded states only — a
+        // state created later reads it from the summary (`makeChatState`), and
+        // creating one here loaded full history for every chat that changed.
+        chatStates[summary.id]?.reconcileTurnActive(summary.isTurnActive)
         if activeChatIDs[summary.workspaceID] == nil, !summary.isClosed {
             let saved = UserDefaults.standard.string(
                 forKey: "ore.activeChat.\(summary.workspaceID.rawValue)"
@@ -4271,6 +4739,7 @@ final class AppModel {
                     identity.slug,
                     forKey: "ore.researchIdentity.\(workspace.id.rawValue)"
                 )
+                researchIdentityCache.removeValue(forKey: workspace.id)
                 identityRenamesInFlight.insert(workspace.id)
                 rename(workspace.id, to: identity.name, userInitiated: false)
             }
@@ -4307,6 +4776,7 @@ final class AppModel {
         guard UserDefaults.standard.string(forKey: key) == nil,
               let identity = ResearchIdentity.matching(nameOrSlug: workspace.name) else { return }
         UserDefaults.standard.set(identity.slug, forKey: key)
+        researchIdentityCache.removeValue(forKey: workspace.id)
     }
 
     /// A name that is actually a failure the auto-namer captured. The naming
@@ -4352,6 +4822,8 @@ final class AppModel {
         // Looking at a workspace again is the other moment its remote state may
         // have moved without us — a PR reviewed or merged in a browser tab.
         if let next { Task { [weak self] in await self?.refreshGitAction(for: next) } }
+        // Background worktrees skip diff refreshes while unseen; catch up now.
+        if let workspace = selectedWorkspace { prefetchDiff(for: workspace) }
     }
 
     func dismissBanner(_ id: UUID) {
@@ -4405,18 +4877,39 @@ private enum GitHubRepositoryInputError: LocalizedError, Sendable {
 enum FilePresentationMode: String, Sendable {
     case source
     case diff
-    /// Rendered markdown. Only offered for markdown files — a plan the agent
-    /// wrote should read as a document, not as raw markup.
+    /// The file rendered: markdown as a document, HTML as a page, an image as
+    /// an image. A plan the agent wrote should read as a document, and an icon
+    /// it drew should be looked at, not decoded.
     case preview
+
+    enum PreviewKind: Sendable, Equatable {
+        case markdown
+        case html
+        case image
+    }
+
+    /// What a preview of this path renders, or nil when there isn't one.
+    static func previewKind(path: String) -> PreviewKind? {
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ["md", "markdown", "mdown", "mdx"].contains(ext) { return .markdown }
+        if ["html", "htm", "xhtml"].contains(ext) { return .html }
+        if BinaryFileKind(path: path).isPreviewable { return .image }
+        return nil
+    }
 
     /// Whether this path can render as a document at all.
     static func supportsPreview(path: String) -> Bool {
-        ["md", "markdown", "mdown", "mdx"]
-            .contains((path as NSString).pathExtension.lowercased())
+        previewKind(path: path) != nil
     }
 
-    /// What a plain "open this file" means for this path: markdown reads as a
-    /// document by default, everything else as source.
+    /// Whether the file has a text form to open in the editor. A PNG does
+    /// not, and offering Source for one only led to "Can't open this file".
+    static func hasSource(path: String) -> Bool {
+        !BinaryFileKind(path: path).isKnownBinary
+    }
+
+    /// What a plain "open this file" means for this path: documents, pages
+    /// and images open as previews by default, everything else as source.
     static func preferred(forPath path: String) -> FilePresentationMode {
         supportsPreview(path: path) ? .preview : .source
     }
@@ -4474,5 +4967,40 @@ final class WorkspaceLiveRegistry {
 
     func remove(_ id: WorkspaceID) {
         states.removeValue(forKey: id)
+    }
+}
+
+/// One workspace's cached diff, observable on its own for the same reason as
+/// `WorkspaceLiveState`.
+@MainActor
+@Observable
+final class WorkspaceDiffState {
+    private(set) var snapshot: AppModel.DiffSnapshot?
+
+    /// Equal re-reads — the common case for a refresh — do not notify.
+    func store(_ next: AppModel.DiffSnapshot?) {
+        if let next, let snapshot, snapshot.generation > next.generation { return }
+        if snapshot != next { snapshot = next }
+    }
+}
+
+@MainActor
+final class WorkspaceDiffRegistry {
+    private var states: [WorkspaceID: WorkspaceDiffState] = [:]
+
+    func state(for id: WorkspaceID) -> WorkspaceDiffState {
+        if let existing = states[id] { return existing }
+        let created = WorkspaceDiffState()
+        states[id] = created
+        return created
+    }
+
+    func contains(_ state: WorkspaceDiffState, for id: WorkspaceID) -> Bool {
+        states[id] === state
+    }
+
+    /// Cleared before it is dropped, so a pane still showing it redraws.
+    func remove(_ id: WorkspaceID) {
+        states.removeValue(forKey: id)?.store(nil)
     }
 }

@@ -80,6 +80,37 @@ struct WorkspaceEngineTests {
         )
     }
 
+    @Test func stoppingAnEngineFlushesCoalescedTranscriptRevisions() async throws {
+        let harness = try await makeEngine()
+        _ = try await harness.engine.ensureSession()
+        let session = try #require(harness.harness.latestSession)
+        let turnID = TurnID.generate()
+        let callID = ToolCallID.generate()
+        let markerID = BlockID.generate()
+        session.emit(.turnStarted(TurnStarted(turnID: turnID)))
+        session.emit(.toolCall(ToolCall(
+            turnID: turnID, id: callID, name: "Read", input: ["revision": "first"]
+        )))
+        session.emit(.toolCall(ToolCall(
+            turnID: turnID, id: callID, name: "Read", input: ["revision": "last"]
+        )))
+        // A later persisted event establishes that both revisions reached the
+        // writer, without delivering the turn/session boundary that flushes it.
+        session.emit(.blockCompleted(BlockCompleted(
+            turnID: turnID, blockID: markerID, kind: .text, text: "marker"
+        )))
+        #expect(try await waitUntil {
+            try await harness.store.block(markerID.rawValue) != nil
+        })
+        #expect(try await harness.store.block("tool-\(callID.rawValue)")?
+            .decodedPayload?["revision"]?.stringValue == "first")
+
+        await harness.engine.stop()
+
+        #expect(try await harness.store.block("tool-\(callID.rawValue)")?
+            .decodedPayload?["revision"]?.stringValue == "last")
+    }
+
     @Test func sessionsCanWriteTheLinkedWorktreeGitMetadata() async throws {
         let harness = try await makeEngine()
         let expected = harness.fixture.repository

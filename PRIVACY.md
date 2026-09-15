@@ -102,6 +102,30 @@ servers. ORE never receives, stores, or forwards the audio either way.
 Everything else is local: agent output, narration summaries, the assistant,
 and your whole workspace history live in `~/ore/` on this Mac.
 
+## Other network requests
+
+ORE makes a few requests of its own. None of them carries your code, your
+prompts, or anything that identifies you:
+
+- **App updates.** ORE asks GitHub's Releases API for the latest version —
+  through your signed-in `gh` CLI when there is one, anonymously otherwise.
+- **Agent CLI updates.** To tell you when Claude Code, Codex or cursor-agent is
+  out of date, ORE looks up the latest version of that package on the npm
+  registry or Homebrew's formulae API, depending on how it was installed, or,
+  for cursor-agent, reads Cursor's install script at `cursor.com/install`.
+- **Scientist profiles.** Workspaces are named after scientists. ORE fetches
+  that person's Wikipedia summary and the portrait it links to
+  (`upload.wikimedia.org`) to show alongside the name, and caches both in
+  `~/ore/scientists`; the requests contain only the scientist's name and that
+  image's address.
+- **HTML previews.** A page you open in the review pane's Preview loads only
+  files from its own worktree. Its scripts don't run, and nothing it
+  references on the internet is fetched. Links you click open in your browser.
+- **Voice models.** When ORE uses its neural narration voice, the FluidAudio
+  library downloads the model weights from Hugging Face once and caches them
+  in `~/.cache/fluidaudio`. The phrases ORE synthesizes with it are cached in
+  `~/Library/Caches/dev.ore.OreMac`.
+
 ## Where it goes
 
 [PostHog](https://posthog.com) (US region), which is open source and processes

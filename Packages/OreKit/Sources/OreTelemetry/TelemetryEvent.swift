@@ -297,7 +297,7 @@ extension TelemetryEvent {
     /// The exhaustive `switch` in `TelemetryPayloadTests` means a new event
     /// cannot be added without being added here and consciously audited.
     public static var auditCatalogue: [TelemetryEvent] {
-        let hostileModel = ModelTag(rawModel: "/Users/tushar/code/secret-startup feature/fix-the-thing")
+        let hostileModel = ModelTag(rawModel: "/Users/ada/code/secret-startup feature/fix-the-thing")
         return [
             .appInstalled(channel: .installScript),
             .appLaunched(reason: .cold, daysSinceInstall: .firstWeek),

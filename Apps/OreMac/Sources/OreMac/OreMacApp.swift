@@ -7,11 +7,119 @@ import OreTelemetry
 import SwiftUI
 import UserNotifications
 
+/// Launch work that must not hold up the first frame. Runs once: shortly after
+/// the first window appears, or from a fallback timer when no window does.
+@MainActor
+enum DeferredLaunchWork {
+    private static var pending: (@MainActor () -> Void)?
+
+    static func schedule(_ work: @escaping @MainActor () -> Void) {
+        pending = work
+    }
+
+    static func runIfNeeded() {
+        guard let work = pending else { return }
+        pending = nil
+        work()
+    }
+}
+
+/// Stands in for the telemetry client until `TelemetryClient.make` has run
+/// after the first frame. Events recorded before then are held and handed
+/// over in order; an opt-out before then drops them and is passed on.
+final class DeferredTelemetryRecorder: TelemetryRecorder, @unchecked Sendable {
+    private let lock = NSLock()
+    private var target: (any TelemetryRecorder)?
+    private var buffered: [TelemetryEvent] = []
+    private var optedOutEarly = false
+    /// Launch-window events are a handful; the cap only guards a runaway.
+    static let bufferLimit = 256
+
+    init() {}
+
+    func install(_ recorder: any TelemetryRecorder) {
+        guard let forwardOptOut = attach(recorder) else { return }
+        if forwardOptOut {
+            Task { await recorder.optOut() }
+        }
+    }
+
+    /// `nil` when a recorder is already installed; otherwise whether an early
+    /// opt-out still has to reach the real one.
+    private func attach(_ recorder: any TelemetryRecorder) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard target == nil else { return nil }
+        target = recorder
+        if !optedOutEarly {
+            for event in buffered { recorder.record(event) }
+        }
+        buffered = []
+        return optedOutEarly
+    }
+
+    func record(_ event: TelemetryEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let target {
+            target.record(event)
+        } else if !optedOutEarly, buffered.count < Self.bufferLimit {
+            buffered.append(event)
+        }
+    }
+
+    func recordBlocking(_ event: TelemetryEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let target {
+            target.recordBlocking(event)
+        } else if !optedOutEarly, buffered.count < Self.bufferLimit {
+            // Lost if the process dies first — a quit within a second of
+            // launch, before there is a store to write to.
+            buffered.append(event)
+        }
+    }
+
+    func optOut() async {
+        await currentTarget(optingOut: true)?.optOut()
+    }
+
+    func optIn() async {
+        await currentTarget(optingIn: true)?.optIn()
+    }
+
+    func flush() async {
+        await currentTarget()?.flush()
+    }
+
+    func pendingDescriptions() async -> [String] {
+        await currentTarget()?.pendingDescriptions() ?? []
+    }
+
+    /// Synchronous so the lock is never held across a suspension.
+    private func currentTarget(
+        optingOut: Bool = false,
+        optingIn: Bool = false
+    ) -> (any TelemetryRecorder)? {
+        lock.lock()
+        defer { lock.unlock() }
+        if target == nil {
+            if optingOut {
+                optedOutEarly = true
+                buffered = []
+            } else if optingIn {
+                optedOutEarly = false
+            }
+        }
+        return target
+    }
+}
+
 @main
 struct OreMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
-    @State private var updater = Updater()
+    @State private var updater: Updater
     @State private var githubUpdater = GitHubUpdater()
     @State private var launchFailure: String?
     @State private var isShowingNewWorkspace = false
@@ -29,25 +137,13 @@ struct OreMacApp: App {
         AppModel.registerDefaults()
         TelemetryConsent.registerDefaults()
 
-        // Anonymous usage analytics, built first so a launch is still counted
-        // when the store below fails to open — that failure is exactly the
-        // thing worth knowing about.
-        //
-        // `make` returns a no-op for debug builds, for any build with no key
-        // stamped into Info.plist (every contributor's, and every fork's),
-        // when ORE_TELEMETRY=0, and when the user has opted out — which it
-        // checks itself, synchronously, before returning a recording client,
-        // so the two calls below cannot beat consent to the queue. Silence is
-        // the default, and nothing downstream needs to know it might be off.
-        // See PRIVACY.md.
-        let telemetry = TelemetryClient.make(home: OreHome.directory)
-        let recorder = telemetry.recorder
-        if let facts = telemetry.launch {
-            if facts.isNewInstall {
-                recorder.record(.appInstalled(channel: facts.channel))
-            }
-            recorder.record(.appLaunched(reason: .cold, daysSinceInstall: facts.daysSinceInstall))
-        }
+        // Anonymous usage analytics. The client itself is built after the
+        // first frame (see `DeferredLaunchWork` below) — `make` opens its own
+        // SQLite store, which has no business delaying the window. Until then
+        // this stand-in buffers, so a launch is still counted when the store
+        // below fails to open — that failure is exactly the thing worth
+        // knowing about.
+        let recorder = DeferredTelemetryRecorder()
 
         // The store and the core are created before the first window exists, so
         // a broken database surfaces as a message rather than a blank window.
@@ -81,6 +177,39 @@ struct OreMacApp: App {
         // any window existing. `start()` is idempotent, so the window calling
         // it again is harmless.
         created.start()
+
+        // Created stopped; started with the rest of the deferred work.
+        let updater = Updater()
+        _updater = State(initialValue: updater)
+        DeferredLaunchWork.schedule {
+            updater.startIfNeeded()
+            Task.detached(priority: .utility) {
+                // `make` returns a no-op for debug builds, for any build with
+                // no key stamped into Info.plist (every contributor's, and
+                // every fork's), when ORE_TELEMETRY=0, and when the user has
+                // opted out — which it checks itself, synchronously, before
+                // returning a recording client, so the launch events below
+                // cannot beat consent to the queue. Silence is the default,
+                // and nothing downstream needs to know it might be off.
+                // See PRIVACY.md.
+                let telemetry = TelemetryClient.make(home: OreHome.directory)
+                if let facts = telemetry.launch {
+                    if facts.isNewInstall {
+                        telemetry.recorder.record(.appInstalled(channel: facts.channel))
+                    }
+                    telemetry.recorder.record(
+                        .appLaunched(reason: .cold, daysSinceInstall: facts.daysSinceInstall)
+                    )
+                }
+                recorder.install(telemetry.recorder)
+            }
+        }
+        // A launch can show no window at all (the menu bar keeps ORE alive),
+        // and the window's task is what normally runs this.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            DeferredLaunchWork.runIfNeeded()
+        }
     }
 
     var body: some Scene {
@@ -108,6 +237,11 @@ struct OreMacApp: App {
                 // already sat through.
                 githubUpdater.reconcilePendingRestart()
                 model.start()
+                // Sparkle and telemetry setup, a beat after the window is up.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    DeferredLaunchWork.runIfNeeded()
+                }
                 // Tap ⌥⌘ anywhere to dictate. Without Accessibility this still
                 // works while ORE is frontmost, so it is never dead.
                 VoiceHotkeyMonitor.shared.start()
@@ -135,23 +269,18 @@ struct OreMacApp: App {
 
                 Divider()
 
-                // ⌃⌘A — Mail's archive chord. Stages a confirmation; archiving
-                // stops the agent and removes the checkout from disk.
-                Button("Archive Workspace") {
-                    if let id = model.selectedWorkspaceID { model.requestArchive(id) }
-                }
-                .keyboardShortcut("a", modifiers: [.control, .command])
-                .disabled(model.selectedWorkspace == nil)
+                // Each item that reads the model is its own view: a command
+                // read here is a read by the whole `Scene`, so one agent's
+                // status flip re-evaluated every window group, every command
+                // and the menu bar label — mid-scroll, sixty times a second
+                // while a fleet was busy. See `FleetCommand`.
+                ArchiveWorkspaceCommand().environment(model)
 
                 Button("Mark All Notifications Read") {
                     model.markAllNotificationsRead()
                 }
 
-                Button("Next Git Step") {
-                    model.performSuggestedGitAction()
-                }
-                .keyboardShortcut("g", modifiers: [.command, .option])
-                .disabled(!model.canPerformSuggestedGitAction)
+                NextGitStepCommand().environment(model)
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand().environment(updater)
@@ -161,6 +290,8 @@ struct OreMacApp: App {
                 // ⌥⌘A opens the assistant's activity window from anywhere.
                 OpenAssistantCommand()
                 OpenDreamsCommand().environment(model)
+
+                MuteAssistantCommand().environment(model)
 
                 Button("Command Palette") { isShowingPalette = true }
                     .keyboardShortcut("k", modifiers: .command)
@@ -225,20 +356,12 @@ struct OreMacApp: App {
 
                 Divider()
 
-                Button("Allow Tool") { model.allowPendingPermission() }
-                    .keyboardShortcut("a", modifiers: [.command, .shift])
-                    .disabled(model.actionablePermission == nil)
-
-                Button("Deny Tool") { model.denyPendingPermission() }
-                    .keyboardShortcut("d", modifiers: [.command, .shift])
-                    .disabled(model.actionablePermission == nil)
+                PendingPermissionCommands().environment(model)
 
                 // ⇧⌘U walks everything in the fleet that is waiting on the
                 // user — blocked tabs first, then failed turns — so the
                 // sidebar's attention badge has a keyboard that answers it.
-                Button("Next Needs You") { model.focusNextNeedsYou() }
-                    .keyboardShortcut("u", modifiers: [.command, .shift])
-                    .disabled(!model.hasNeedsYouStops)
+                NextNeedsYouCommand().environment(model)
 
                 Divider()
 
@@ -275,20 +398,105 @@ struct OreMacApp: App {
             MenuBarDashboard()
                 .environment(model)
         } label: {
-            Image(systemName: model.attentionCount > 0 ? "sparkles.square.filled.on.square" : "sparkles")
+            MenuBarStatusIcon().environment(model)
         }
         .menuBarExtraStyle(.window)
     }
 
+    /// Through the model, not `sortedWorkspaces`: while the sidebar is holding
+    /// its order still under the pointer, ⌘3 has to land on the row *showing*
+    /// a ⌘3 badge, not on whatever the live sort has since promoted to third.
+    /// Reading a function rather than a property also keeps the scene from
+    /// observing the fleet list. See `SidebarOrderHold`.
     private func selectWorkspace(at index: Int) {
-        let workspaces = model.sortedWorkspaces
-        guard workspaces.indices.contains(index) else { return }
-        model.selectedWorkspaceID = workspaces[index].id
+        guard let id = model.shortcutWorkspaceID(at: index) else { return }
+        model.selectedWorkspaceID = id
     }
 
     private func requestNotificationPermission() async {
         _ = try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound, .badge])
+    }
+}
+
+/// ⌃⌘A — Mail's archive chord. Stages a confirmation; archiving stops the
+/// agent and removes the checkout from disk.
+private struct ArchiveWorkspaceCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Archive Workspace") {
+            if let id = model.selectedWorkspaceID { model.requestArchive(id) }
+        }
+        .keyboardShortcut("a", modifiers: [.control, .command])
+        .disabled(model.selectedWorkspace == nil)
+    }
+}
+
+/// ⌥⌘G runs whatever the review pane is offering: open a PR, continue after a
+/// merge, and so on. Its enablement reads the selected workspace's cached diff
+/// and in-flight git ops, which move on every agent write.
+private struct NextGitStepCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Next Git Step") {
+            model.performSuggestedGitAction()
+        }
+        .keyboardShortcut("g", modifiers: [.command, .option])
+        .disabled(!model.canPerformSuggestedGitAction)
+    }
+}
+
+private struct MuteAssistantCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button(model.narration.isMuted ? "Unmute Assistant" : "Mute Assistant") {
+            model.narration.setMuted(!model.narration.isMuted)
+        }
+        .keyboardShortcut("s", modifiers: [.shift, .option, .command])
+    }
+}
+
+/// ⇧⌘A / ⇧⌘D answer the selected tab's oldest generic permission. Both read
+/// `actionablePermission`, which walks the selected chat's pending requests —
+/// so it lands here, where a permission arriving only re-evaluates two menu
+/// items.
+private struct PendingPermissionCommands: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let isActionable = model.actionablePermission != nil
+        Button("Allow Tool") { model.allowPendingPermission() }
+            .keyboardShortcut("a", modifiers: [.command, .shift])
+            .disabled(!isActionable)
+
+        Button("Deny Tool") { model.denyPendingPermission() }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+            .disabled(!isActionable)
+    }
+}
+
+private struct NextNeedsYouCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Next Needs You") { model.focusNextNeedsYou() }
+            .keyboardShortcut("u", modifiers: [.command, .shift])
+            .disabled(!model.hasNeedsYouStops)
+    }
+}
+
+/// The status item's glyph. Its own view so the stored attention count is
+/// observed here and not by the whole `Scene`.
+private struct MenuBarStatusIcon: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Image(systemName: model.attentionCount > 0
+            ? "sparkles.square.filled.on.square"
+            : "sparkles")
     }
 }
 
@@ -340,9 +548,7 @@ struct RootView: View {
     @AppStorage("ore.showsReview") private var showsReview = true
     @AppStorage("ore.showsSidebar") private var showsSidebar = true
     @AppStorage("ore.bottomPane") private var bottomPaneRaw = BottomPane.none.rawValue
-    @AppStorage("ore.terminalHeight") private var terminalHeight = 240.0
     @AppStorage("ore.reviewWidth") private var reviewWidth = 340.0
-    @State private var terminalDragStart: CGFloat?
     @State private var reviewDragStart: CGFloat?
     /// The presence strip's usage card (limits, tokens, spend).
     @State private var showsUsagePopover = false
@@ -504,7 +710,18 @@ struct RootView: View {
         .toolbar {
             if let workspace = model.selectedWorkspace {
                 ToolbarItem(placement: .primaryAction) {
-                    GitActionToolbar(workspace: workspace)
+                    HStack(spacing: 8) {
+                        WorkspaceReviewButton(workspace: workspace)
+                            // The toolbar packs this group hard against
+                            // whatever ends the title area, and two rounded
+                            // edges meeting with nothing between them read as
+                            // an overlap rather than as two controls. Wider
+                            // than the 8 pt between siblings on purpose: this
+                            // gap separates the group from the chrome, not one
+                            // button from the next.
+                            .padding(.leading, 12)
+                        GitActionToolbar(workspace: workspace)
+                    }
                 }
             }
             ToolbarItem(placement: .primaryAction) {
@@ -540,39 +757,17 @@ struct RootView: View {
                 description: Text(failure)
             )
         } else if let workspace = model.selectedWorkspace {
-            Group {
-                if bottomPane == .terminal {
-                    GeometryReader { geometry in
-                        let resolvedTerminalHeight = min(
-                            min(max(terminalHeight, 150), 420),
-                            max(150, geometry.size.height - 365)
-                        )
-                        VStack(spacing: 0) {
-                            workspaceMain(workspace)
-                                .frame(
-                                    width: geometry.size.width,
-                                    height: max(360, geometry.size.height - resolvedTerminalHeight - 5)
-                                )
-                                .clipped()
-                            terminalResizeHandle
-                            TerminalPane(workspace: workspace) { bottomPane = .none }
-                                .frame(height: resolvedTerminalHeight)
-                        }
-                        .frame(
-                            width: geometry.size.width,
-                            height: geometry.size.height,
-                            alignment: .top
-                        )
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    VStack(spacing: 0) {
-                        workspaceMain(workspace)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .layoutPriority(1)
-                        bottomDock(workspace)
-                    }
-                }
+            // One structural path whether or not the terminal is open: only the
+            // bottom slot changes identity. The terminal branch used to wrap
+            // `workspaceMain` in a GeometryReader the dock branch didn't have,
+            // so ⌥⌘T rebuilt ChatPane, the transcript table, the review pane
+            // and the source editor — and every one lost its scroll position.
+            WorkspaceBottomSplit(showsTerminal: bottomPane == .terminal) {
+                workspaceMain(workspace)
+            } dock: {
+                bottomDock(workspace)
+            } terminal: {
+                TerminalPane(workspace: workspace) { bottomPane = .none }
             }
             .id(workspace.id)
             .background {
@@ -581,32 +776,6 @@ struct RootView: View {
         } else {
             welcome
         }
-    }
-
-    private var terminalResizeHandle: some View {
-        Rectangle()
-            .fill(OreTheme.hairline)
-            .frame(height: 5)
-            .overlay {
-                Capsule()
-                    .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 34, height: 2)
-            }
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering { NSCursor.resizeUpDown.push() }
-                else { NSCursor.pop() }
-            }
-            .gesture(DragGesture(minimumDistance: 1)
-                .onChanged { value in
-                    if terminalDragStart == nil { terminalDragStart = terminalHeight }
-                    terminalHeight = min(
-                        max((terminalDragStart ?? terminalHeight) - value.translation.height, 150),
-                        420
-                    )
-                }
-                .onEnded { _ in terminalDragStart = nil })
-            .help("Drag to resize the terminal")
     }
 
     private func workspaceMain(_ workspace: WorkspaceSummary) -> some View {
@@ -911,6 +1080,120 @@ struct RootView: View {
     }
 }
 
+/// The terminal pane's height rules, pulled out of the view so they can be
+/// tested without a window.
+enum TerminalSplitLayout {
+    static let minimumHeight: CGFloat = 150
+    static let maximumHeight: CGFloat = 420
+    /// What the workspace above keeps however far the terminal is dragged:
+    /// the chat's tab strip, a few rows, and the composer.
+    static let workspaceReserve: CGFloat = 365
+
+    /// A dragged or persisted height, held to the pane's own bounds.
+    static func clamped(_ requested: CGFloat) -> CGFloat {
+        min(max(requested, minimumHeight), maximumHeight)
+    }
+
+    /// The height actually laid out. `containerHeight` is zero until the
+    /// column has been measured once; the request alone decides until then,
+    /// rather than flashing the minimum for a frame.
+    static func resolvedHeight(requested: CGFloat, containerHeight: CGFloat) -> CGFloat {
+        let height = clamped(requested)
+        guard containerHeight > 0 else { return height }
+        return min(height, max(minimumHeight, containerHeight - workspaceReserve))
+    }
+}
+
+/// The workspace column over its bottom slot: the collapsed dock bar, or the
+/// terminal under a drag handle.
+///
+/// `main` sits at the same structural position in both states, so toggling the
+/// terminal only swaps the slot beneath it. The column height and the live drag
+/// are this view's own state, so a window resize or a divider drag re-runs this
+/// small body instead of `RootView`'s.
+private struct WorkspaceBottomSplit<Main: View, Dock: View, Terminal: View>: View {
+    let showsTerminal: Bool
+    @ViewBuilder var main: Main
+    @ViewBuilder var dock: Dock
+    @ViewBuilder var terminal: Terminal
+
+    @AppStorage("ore.terminalHeight") private var terminalHeight = 240.0
+    /// Whole points, so sub-point layout jitter doesn't write state.
+    @State private var containerHeight: CGFloat = 0
+    /// The height while the divider is held. Persisted only when the drag ends:
+    /// writing `@AppStorage` per mouse event re-laid out the transcript and
+    /// round-tripped UserDefaults on every one.
+    @State private var dragHeight: CGFloat?
+    @State private var dragStart: CGFloat?
+
+    private var resolvedTerminalHeight: CGFloat {
+        TerminalSplitLayout.resolvedHeight(
+            requested: dragHeight ?? terminalHeight,
+            containerHeight: containerHeight
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            main
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+            if showsTerminal {
+                resizeHandle
+                terminal
+                    .frame(height: resolvedTerminalHeight)
+            } else {
+                dock
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { noteContainerHeight(proxy.size.height) }
+                    .onChange(of: proxy.size.height) { _, height in
+                        noteContainerHeight(height)
+                    }
+            }
+        }
+    }
+
+    private func noteContainerHeight(_ height: CGFloat) {
+        let rounded = height.rounded()
+        if rounded != containerHeight { containerHeight = rounded }
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(OreTheme.hairline)
+            .frame(height: 5)
+            .overlay {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 34, height: 2)
+            }
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeUpDown.push() }
+                else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = dragHeight ?? terminalHeight }
+                    let next = TerminalSplitLayout.clamped(
+                        (dragStart ?? terminalHeight) - value.translation.height
+                    )
+                    if next != dragHeight { dragHeight = next }
+                }
+                .onEnded { _ in
+                    if let dragHeight { terminalHeight = dragHeight }
+                    dragHeight = nil
+                    dragStart = nil
+                })
+            .help("Drag to resize the terminal")
+    }
+}
+
 /// Prefetch lives in its own view so a git-generation bump does not rebuild
 /// the window chrome — only this task identity changes.
 private struct GitDiffPrefetch: View {
@@ -1068,43 +1351,6 @@ private struct FilePalette: View {
     }
 }
 
-/// The onboarding doctor's result, shown until the user has a workspace.
-struct HarnessStatusList: View {
-    let harnesses: [HarnessProbeResult]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(harnesses, id: \.kind) { harness in
-                HStack(spacing: 6) {
-                    Image(systemName: harness.isReady
-                        ? "checkmark.circle.fill"
-                        : (harness.isInstalled ? "exclamationmark.circle.fill" : "xmark.circle"))
-                        .foregroundStyle(harness.isReady
-                            ? Color.green
-                            : (harness.isInstalled ? .orange : .secondary))
-
-                    Text(harness.kind.displayName).fontWeight(.medium)
-
-                    if let version = harness.version {
-                        Text(version).font(.caption).foregroundStyle(.secondary)
-                    }
-
-                    if !harness.isInstalled {
-                        Text("not installed").font(.caption).foregroundStyle(.secondary)
-                    } else if harness.authState == .notAuthenticated {
-                        // The fix is a specific command; saying so beats
-                        // "authentication failed".
-                        Text(harness.kind == .claudeCode ? "run `claude /login`" : "run `codex login`")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.orange)
-                    }
-                }
-            }
-        }
-        .oreCard(padding: 12, radius: 14)
-    }
-}
-
 /// The `ore.toml` approval prompt. Kept out of `RootView`'s modifier chain,
 /// which is already longer than the type checker will solve in one piece.
 private struct ScriptApprovalDialog: ViewModifier {
@@ -1133,6 +1379,7 @@ private struct ScriptApprovalDialog: ViewModifier {
         let repository = URL(fileURLWithPath: approval.repositoryPath).lastPathComponent
         let commands = [
             approval.setup.map { "Setup, on every new workspace:\n\($0)" },
+            approval.run.map { "Run, with \u{2318}R in the terminal:\n\($0)" },
             approval.archive.map { "Archive, when a workspace is archived:\n\($0)" },
         ].compactMap { $0 }.joined(separator: "\n\n")
         return "The ore.toml in \(repository) wants to run these commands as you. "

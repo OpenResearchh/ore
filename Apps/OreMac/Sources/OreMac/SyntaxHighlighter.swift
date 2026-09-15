@@ -3,17 +3,24 @@ import SwiftTreeSitter
 import TreeSitterJSON
 import TreeSitterSwift
 
-/// Syntax highlighting for code blocks and diffs.
+/// Syntax highlighting for code blocks, the source editor and diffs.
 ///
-/// tree-sitter parses rather than pattern-matches, which is what makes it
-/// correct on the things a regex highlighter gets wrong — a keyword inside a
-/// string, a comment containing code, a generic parameter list. It is also
-/// incremental, though ORE re-parses whole snippets: they are small, and the
-/// diff viewer's unit of work is a hunk, not a file.
+/// Two engines, one theme. tree-sitter parses rather than pattern-matches,
+/// which makes it the most accurate option, but only Swift and JSON have
+/// grammars ORE can bundle (see below). Everything else — and every diff
+/// line, and any snippet tree-sitter fails on — goes through `SyntaxLexer`, a
+/// single-pass scanner driven by declarative `LanguageDefinition`s.
 ///
-/// Any language without a bundled grammar falls back to a regex pass rather
-/// than to nothing. Unhighlighted code in an app whose whole job is reading
-/// code is a worse outcome than approximate highlighting.
+/// The lexer is deliberately a lexer, not a parser: it knows where comments,
+/// strings, numbers and words start and end in each language, and colours by
+/// what a token is rather than where it sits. That is enough to never colour a
+/// `//` inside a string as a comment or a keyword inside a comment, and it runs
+/// in one linear pass with no regular expressions, so a 2 MB file in the
+/// editor costs about as much as copying it.
+///
+/// Unhighlighted code in an app whose whole job is reading code is a worse
+/// outcome than approximate highlighting, so unknown languages get a generic
+/// C-like definition rather than nothing. Plain text (`text`, `log`) opts out.
 final class SyntaxHighlighter: @unchecked Sendable {
     static let shared = SyntaxHighlighter()
 
@@ -25,8 +32,7 @@ final class SyntaxHighlighter: @unchecked Sendable {
         var query: Query?
     }
 
-    /// Grammars bundled with the app, and the names people actually write in a
-    /// fenced code block.
+    /// Grammars bundled with the app.
     ///
     /// Each grammar's C entry point returns an opaque `TSLanguage *`.
     private static func grammar(named name: String) -> OpaquePointer? {
@@ -37,18 +43,6 @@ final class SyntaxHighlighter: @unchecked Sendable {
         }
     }
 
-    private static let aliases: [String: String] = [
-        "py": "python",
-        "jsonc": "json",
-        "js": "javascript",
-        "jsx": "javascript",
-        "mjs": "javascript",
-        "cjs": "javascript",
-        "ts": "javascript",
-        "tsx": "javascript",
-        "node": "javascript",
-    ]
-
     // Only grammars whose SwiftPM manifest actually builds are bundled.
     //
     // Several official tree-sitter grammars (JavaScript, Python among them)
@@ -58,11 +52,10 @@ final class SyntaxHighlighter: @unchecked Sendable {
     // itself. Consumed from another directory the test fails, the scanner is
     // skipped, and the link dies on undefined symbols. Vendoring a copy of a
     // generated parser to work around that is a maintenance burden that
-    // outweighs the benefit, so those languages take the regex path — the same
-    // degradation any unbundled language gets.
+    // outweighs the benefit, so those languages take the lexer path.
 
-    /// Highlights a snippet. Returns plain attributed text when the language is
-    /// unknown, so a caller never has to check.
+    /// Highlights a snippet or a whole file. Returns plain attributed text when
+    /// the language opts out of colour, so a caller never has to check.
     func highlight(
         _ code: String,
         language rawLanguage: String?,
@@ -70,54 +63,102 @@ final class SyntaxHighlighter: @unchecked Sendable {
         baseColor: NSColor = .labelColor,
         cache: Bool = true
     ) -> NSAttributedString {
+        guard cache else {
+            return renderHighlight(code, language: rawLanguage, font: font, baseColor: baseColor)
+        }
         let cacheKey = HighlightCacheKey(
             language: Self.canonicalName(rawLanguage) ?? "",
-            code: code,
+            codeHash: code.hashValue,
+            codeLength: code.utf8.count,
             fontSize: font.pointSize,
             appearance: NSAppearance.currentDrawing().name.rawValue
         )
-        if cache {
-            lock.lock()
-            let cached = highlightCache[cacheKey]
-            lock.unlock()
-            if let cached { return cached }
-        }
+        if let cached = cachedHighlight(for: cacheKey, code: code) { return cached }
 
         let rendered = renderHighlight(
             code, language: rawLanguage, font: font, baseColor: baseColor
         )
-        if cache {
-            storeHighlight(rendered, for: cacheKey)
-        }
+        storeHighlight(rendered, code: code, for: cacheKey)
         return rendered
     }
 
+    init(highlightCacheBudget: Int = 8 << 20, highlightCacheCapacity: Int = 48) {
+        self.highlightCacheBudget = highlightCacheBudget
+        self.highlightCacheCapacity = highlightCacheCapacity
+    }
+
+    /// Keyed by a hash of the code rather than the code itself, with the
+    /// code kept on the entry for a full comparison on a hit — a collision
+    /// must never hand back another snippet's colours.
     private struct HighlightCacheKey: Hashable {
         var language: String
-        var code: String
+        var codeHash: Int
+        var codeLength: Int
         var fontSize: CGFloat
         var appearance: String
     }
 
-    private var highlightCache: [HighlightCacheKey: NSAttributedString] = [:]
-    private var highlightRecency: [HighlightCacheKey: UInt64] = [:]
-    private var highlightTick: UInt64 = 0
-    private static let highlightCacheCapacity = 48
+    private struct HighlightCacheEntry {
+        var code: String
+        var value: NSAttributedString
+        var cost: Int
+        var lastUsed: UInt64
+    }
 
-    private func storeHighlight(_ value: NSAttributedString, for key: HighlightCacheKey) {
+    private var highlightCache: [HighlightCacheKey: HighlightCacheEntry] = [:]
+    private var highlightTick: UInt64 = 0
+    private var highlightCacheCost = 0
+    /// Bounded by size as well as count. Forty-eight whole files was the old
+    /// bound, and the editor added one per keystroke.
+    private let highlightCacheBudget: Int
+    private let highlightCacheCapacity: Int
+
+    /// Approximate bytes: the attributed copy (UTF-16 plus attribute runs)
+    /// and the code string kept for the equality check.
+    static func highlightCost(of value: NSAttributedString, code: String) -> Int {
+        value.length * 4 + code.utf8.count + 64
+    }
+
+    /// Entry count and approximate bytes held, for tests.
+    var highlightCacheUsage: (count: Int, cost: Int) {
         lock.lock()
         defer { lock.unlock() }
-        if highlightCache.count >= Self.highlightCacheCapacity {
-            let survivors = highlightRecency.sorted { $0.value > $1.value }
-                .prefix(Self.highlightCacheCapacity / 2)
-                .map(\.key)
-            let keep = Set(survivors)
-            highlightCache = highlightCache.filter { keep.contains($0.key) }
-            highlightRecency = highlightRecency.filter { keep.contains($0.key) }
-        }
+        return (highlightCache.count, highlightCacheCost)
+    }
+
+    private func cachedHighlight(for key: HighlightCacheKey, code: String) -> NSAttributedString? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = highlightCache[key], entry.code == code else { return nil }
         highlightTick += 1
-        highlightRecency[key] = highlightTick
-        highlightCache[key] = value
+        highlightCache[key]?.lastUsed = highlightTick
+        return entry.value
+    }
+
+    private func storeHighlight(_ value: NSAttributedString, code: String, for key: HighlightCacheKey) {
+        let cost = Self.highlightCost(of: value, code: code)
+        lock.lock()
+        defer { lock.unlock() }
+        if let replaced = highlightCache.removeValue(forKey: key) {
+            highlightCacheCost -= replaced.cost
+        }
+        // One snippet worth a large share of the budget would evict everything
+        // else to make room, then be the next thing evicted.
+        guard cost <= highlightCacheBudget / 4 else { return }
+        highlightTick += 1
+        highlightCache[key] = HighlightCacheEntry(code: code, value: value, cost: cost, lastUsed: highlightTick)
+        highlightCacheCost += cost
+        guard highlightCache.count > highlightCacheCapacity || highlightCacheCost > highlightCacheBudget
+        else { return }
+        // Least recently used first, down to three quarters so the next few
+        // stores don't each pay for a sort.
+        let targetCount = highlightCacheCapacity * 3 / 4
+        let targetCost = highlightCacheBudget * 3 / 4
+        for (staleKey, entry) in highlightCache.sorted(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            guard highlightCache.count > targetCount || highlightCacheCost > targetCost else { break }
+            highlightCache.removeValue(forKey: staleKey)
+            highlightCacheCost -= entry.cost
+        }
     }
 
     private func renderHighlight(
@@ -132,46 +173,43 @@ final class SyntaxHighlighter: @unchecked Sendable {
         )
         guard !code.isEmpty else { return result }
 
-        guard let name = Self.canonicalName(rawLanguage) else {
-            RegexHighlighter.apply(to: result, language: nil)
+        let name = Self.canonicalName(rawLanguage)
+        if let name, applyTreeSitter(to: result, code: code, language: name) {
             return result
         }
-        guard let loaded = loadLanguage(name), let query = loaded.query else {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
-
-        let parser = Parser()
-        do {
-            try parser.setLanguage(loaded.language)
-        } catch {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
-
-        guard let tree = parser.parse(code) else {
-            RegexHighlighter.apply(to: result, language: name)
-            return result
-        }
-
-        let cursor = query.execute(in: tree)
-        let utf16Length = code.utf16.count
-
-        while let match = cursor.next() {
-            for capture in match.captures {
-                guard let captureName = capture.name,
-                      let color = SyntaxTheme.color(forCapture: captureName)
-                else { continue }
-                guard let range = Self.attributedRange(
-                    for: capture.node.byteRange, utf16Length: utf16Length
-                ) else { continue }
-                result.addAttribute(.foregroundColor, value: color, range: range)
-            }
-        }
+        SyntaxPainter.paint(SyntaxLexer.tokens(for: code, language: name), into: result, font: font)
         return result
     }
 
+    /// Colours `result` with a bundled grammar. False when there is no grammar
+    /// for the language or it couldn't parse, so the caller can fall back.
+    private func applyTreeSitter(to result: NSMutableAttributedString, code: String, language name: String) -> Bool {
+        guard let loaded = loadLanguage(name), let query = loaded.query else { return false }
+        let parser = Parser()
+        guard (try? parser.setLanguage(loaded.language)) != nil, let tree = parser.parse(code) else { return false }
+
+        let cursor = query.execute(in: tree)
+        let utf16Length = code.utf16.count
+        result.beginEditing()
+        defer { result.endEditing() }
+        while let match = cursor.next() {
+            for capture in match.captures {
+                guard let captureName = capture.name,
+                      let color = SyntaxTheme.color(forCapture: captureName),
+                      let range = Self.attributedRange(for: capture.node.byteRange, utf16Length: utf16Length)
+                else { continue }
+                result.addAttribute(.foregroundColor, value: color, range: range)
+            }
+        }
+        return true
+    }
+
     /// Highlights one line, for the diff viewer.
+    ///
+    /// Safe off the main actor, which is where the diff viewer calls it: no
+    /// cache, no tree-sitter, and the lexer and theme are immutable statics.
+    /// Keep it that way — a diff is highlighted in one detached pass per load
+    /// rather than per row inside SwiftUI's `body`.
     func highlightLine(
         _ line: String,
         language: String?,
@@ -179,27 +217,32 @@ final class SyntaxHighlighter: @unchecked Sendable {
         baseColor: NSColor = .labelColor
     ) -> NSAttributedString {
         // A single diff line is rarely a complete parse unit, so tree-sitter
-        // would produce errors more often than colour. The regex pass is the
-        // honest tool at this granularity.
+        // would produce errors more often than colour. The lexer needs no
+        // context beyond the line, which is the honest tool at this granularity.
         let result = NSMutableAttributedString(
             string: line,
             attributes: [.font: font, .foregroundColor: baseColor]
         )
-        RegexHighlighter.apply(to: result, language: Self.canonicalName(language))
+        guard !line.isEmpty else { return result }
+        SyntaxPainter.paint(
+            SyntaxLexer.tokens(for: line, language: Self.canonicalName(language)), into: result, font: font
+        )
         return result
     }
 
-    /// The grammar name for a fenced block's info string or a file extension.
+    /// The language name for a fenced block's info string or a file extension.
     static func canonicalName(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        // A fence can carry more than a language: ```swift title=foo.swift
-        let first = raw.split(separator: " ").first.map(String.init) ?? raw
-        let lowered = first.lowercased()
-        return aliases[lowered] ?? lowered
+        LanguageRegistry.canonicalName(raw)
     }
 
+    /// The language for a file, by well-known name (`Dockerfile`, `.zshrc`)
+    /// and then by extension.
     static func language(forPath path: String) -> String? {
-        canonicalName((path as NSString).pathExtension)
+        LanguageRegistry.language(forPath: path)
+    }
+
+    static func language(forPath path: String, contents: String) -> String? {
+        LanguageRegistry.language(forPath: path, contents: contents)
     }
 
     // MARK: - Loading
@@ -242,11 +285,61 @@ final class SyntaxHighlighter: @unchecked Sendable {
     }
 }
 
+/// Applies lexer tokens to attributed text.
+enum SyntaxPainter {
+    static func paint(_ tokens: [SyntaxToken], into result: NSMutableAttributedString, font: NSFont) {
+        guard !tokens.isEmpty else { return }
+        let colors = SyntaxTheme.tokenColors
+        let length = result.length
+        var bold: NSFont?
+        var italic: NSFont?
+
+        // One editing session: without it every attribute change notifies
+        // layout, which on a large file costs more than the lexing.
+        result.beginEditing()
+        defer { result.endEditing() }
+        for token in tokens {
+            let end = min(token.end, length)
+            guard token.start < end else { continue }
+            let range = NSRange(location: token.start, length: end - token.start)
+            if let color = colors[Int(token.kind.rawValue)] {
+                result.addAttribute(.foregroundColor, value: color, range: range)
+            }
+            switch token.kind {
+            case .heading, .bold:
+                if bold == nil { bold = converting(font, to: .boldFontMask) }
+                result.addAttribute(.font, value: bold ?? font, range: range)
+            case .italic:
+                if italic == nil { italic = converting(font, to: .italicFontMask) }
+                result.addAttribute(.font, value: italic ?? font, range: range)
+            default:
+                break
+            }
+        }
+    }
+
+    /// `NSFontManager` is AppKit's shared, main-thread object, and the diff
+    /// viewer now paints its lines off the main actor. Off main the trait comes
+    /// from the font descriptor instead, which is immutable and safe on any
+    /// thread; on main the result stays exactly what it always was.
+    static func converting(_ font: NSFont, to trait: NSFontTraitMask) -> NSFont {
+        if Thread.isMainThread {
+            return NSFontManager.shared.convert(font, toHaveTrait: trait)
+        }
+        let symbolic: NSFontDescriptor.SymbolicTraits = trait == .italicFontMask ? .italic : .bold
+        let descriptor = font.fontDescriptor.withSymbolicTraits(
+            font.fontDescriptor.symbolicTraits.union(symbolic)
+        )
+        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+    }
+}
+
 /// Colours by capture name.
 ///
 /// Capture names are tree-sitter's shared vocabulary (`@keyword`, `@string`,
-/// `@function`), so one theme covers every grammar. System colours are used so
-/// the theme follows light and dark mode without a second palette.
+/// `@function`), so one theme covers every grammar and the lexer. System
+/// colours are used so the theme follows light and dark mode without a second
+/// palette.
 enum SyntaxTheme {
     static func color(forCapture capture: String) -> NSColor? {
         // Captures are dotted and specific-to-general: `keyword.function`
@@ -259,6 +352,9 @@ enum SyntaxTheme {
         }
     }
 
+    /// The lexer's colours, resolved once per token kind rather than per token.
+    static let tokenColors: [NSColor?] = SyntaxTokenKind.allCases.map { color(forCapture: $0.capture) }
+
     private static let table: [String: NSColor] = [
         "keyword": .systemPink,
         "conditional": .systemPink,
@@ -266,6 +362,9 @@ enum SyntaxTheme {
         "include": .systemPink,
         "operator": .labelColor,
         "string": .systemRed,
+        "string.escape": .systemOrange,
+        // Regular expressions, heredoc markers, LaTeX math.
+        "string.special": .systemBrown,
         "number": .systemPurple,
         "boolean": .systemPurple,
         "constant": .systemPurple,
@@ -275,11 +374,27 @@ enum SyntaxTheme {
         "type": .systemTeal,
         "constructor": .systemTeal,
         "variable": .labelColor,
+        // `self`/`this` read as keywords, as in Xcode.
+        "variable.builtin": .systemPink,
+        // Sigil variables: `$HOME`, `@name`, `--custom-property`.
+        "variable.special": .systemIndigo,
         "property": .systemIndigo,
         "parameter": .labelColor,
         "punctuation": .tertiaryLabelColor,
+        // Interpolation delimiters, list markers, fences.
+        "punctuation.special": .systemOrange,
         "attribute": .systemOrange,
         "label": .systemOrange,
+        "tag": .systemBlue,
+        "markup.heading": .systemBlue,
+        "markup.link": .systemIndigo,
+        "markup.link.url": .systemTeal,
+        "markup.raw": .systemRed,
+        "markup.quote": .secondaryLabelColor,
+        "diff.plus": .systemGreen,
+        "diff.minus": .systemRed,
+        "diff.hunk": .systemTeal,
+        "diff.header": .systemPurple,
     ]
 }
 
@@ -305,7 +420,7 @@ enum HighlightQueries {
         // Where the grammar bundles live depends on how the code was launched:
         // inside `Contents/Resources` for the app, beside the test binary when
         // running tests. Searching both means highlighting behaves the same in
-        // both, rather than silently degrading to the regex pass in one.
+        // both, rather than silently degrading to the lexer in one.
         let ownBundle = Bundle(for: SyntaxHighlighter.self)
         let searchRoots = [
             Bundle.main.resourceURL,
@@ -341,8 +456,6 @@ enum HighlightQueries {
     static func source(for language: String) -> String? {
         switch language {
         case "swift": return swift
-        case "python": return python
-        case "javascript": return javascript
         case "json": return json
         default: return nil
         }
@@ -369,114 +482,10 @@ enum HighlightQueries {
     (function_declaration (simple_identifier) @function)
     """
 
-    private static let python = """
-    (comment) @comment
-    (string) @string
-    (integer) @number
-    (float) @number
-    [(true) (false) (none)] @boolean
-    (identifier) @variable
-    (call function: (identifier) @function)
-    (function_definition name: (identifier) @function)
-    (class_definition name: (identifier) @type)
-    [
-      "def" "class" "if" "elif" "else" "for" "while" "return" "import" "from"
-      "as" "try" "except" "finally" "raise" "with" "lambda" "yield" "async"
-      "await" "pass" "break" "continue" "in" "is" "not" "and" "or" "global"
-    ] @keyword
-    """
-
-    private static let javascript = """
-    (comment) @comment
-    (string) @string
-    (template_string) @string
-    (number) @number
-    [(true) (false) (null) (undefined)] @boolean
-    (identifier) @variable
-    (call_expression function: (identifier) @function)
-    (function_declaration name: (identifier) @function)
-    (class_declaration name: (identifier) @type)
-    (property_identifier) @property
-    [
-      "function" "const" "let" "var" "if" "else" "for" "while" "return"
-      "class" "extends" "new" "import" "from" "export" "default" "try"
-      "catch" "finally" "throw" "async" "await" "yield" "typeof" "instanceof"
-    ] @keyword
-    """
-
     private static let json = """
     (string) @string
     (number) @number
     [(true) (false) (null)] @boolean
     (pair key: (string) @property)
     """
-}
-
-/// Fallback highlighting for languages without a bundled grammar.
-///
-/// Deliberately crude: strings, comments and a common keyword set. It exists so
-/// that an unfamiliar language still reads as code rather than as a wall of
-/// uniform text.
-enum RegexHighlighter {
-    private static let keywords: Set<String> = [
-        "func", "function", "def", "class", "struct", "enum", "interface", "trait",
-        "let", "var", "const", "val", "if", "else", "elif", "for", "while", "loop",
-        "return", "import", "from", "package", "use", "using", "include", "require",
-        "public", "private", "protected", "internal", "static", "final", "async",
-        "await", "try", "catch", "except", "finally", "throw", "throws", "raise",
-        "new", "delete", "null", "nil", "none", "true", "false", "self", "this",
-        "match", "case", "switch", "break", "continue", "yield", "type", "impl",
-    ]
-
-    static func apply(to string: NSMutableAttributedString, language: String?) {
-        let text = string.string
-        guard !text.isEmpty else { return }
-
-        applyPattern(#"(?m)(//|#).*$"#, color: .secondaryLabelColor, to: string, in: text)
-        applyPattern(#"/\*[\s\S]*?\*/"#, color: .secondaryLabelColor, to: string, in: text)
-        applyPattern(#""(?:[^"\\\n]|\\.)*""#, color: .systemRed, to: string, in: text)
-        applyPattern(#"'(?:[^'\\\n]|\\.)*'"#, color: .systemRed, to: string, in: text)
-        applyPattern(#"\b\d+(\.\d+)?\b"#, color: .systemPurple, to: string, in: text)
-
-        guard let wordExpression = try? NSRegularExpression(pattern: #"\b[A-Za-z_]\w*\b"#)
-        else { return }
-        let whole = NSRange(text.startIndex..., in: text)
-
-        for match in wordExpression.matches(in: text, range: whole) {
-            guard let range = Range(match.range, in: text),
-                  keywords.contains(String(text[range]))
-            else { continue }
-            // Comments and strings already claimed their ranges; a keyword
-            // inside one must not be recoloured.
-            guard !isClaimed(match.range, in: string) else { continue }
-            string.addAttribute(.foregroundColor, value: NSColor.systemPink, range: match.range)
-        }
-    }
-
-    private static func applyPattern(
-        _ pattern: String,
-        color: NSColor,
-        to string: NSMutableAttributedString,
-        in text: String
-    ) {
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return }
-        let whole = NSRange(text.startIndex..., in: text)
-        for match in expression.matches(in: text, range: whole) {
-            guard !isClaimed(match.range, in: string) else { continue }
-            string.addAttribute(.foregroundColor, value: color, range: match.range)
-        }
-    }
-
-    private static func isClaimed(_ range: NSRange, in string: NSMutableAttributedString) -> Bool {
-        guard range.location < string.length else { return true }
-        var claimed = false
-        string.enumerateAttribute(.foregroundColor, in: range) { value, _, stop in
-            guard let color = value as? NSColor else { return }
-            if color != .labelColor {
-                claimed = true
-                stop.pointee = true
-            }
-        }
-        return claimed
-    }
 }

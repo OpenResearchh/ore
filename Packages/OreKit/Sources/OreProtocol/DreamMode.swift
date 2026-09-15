@@ -13,13 +13,6 @@ public enum DreamKind: String, Sendable, Codable, CaseIterable, Hashable {
     case fix
     case appExplore
 
-    public var isResearch: Bool {
-        switch self {
-        case .review, .bugHunt, .dependencyAudit, .featureIdeas: true
-        case .testRun, .fix, .appExplore: false
-        }
-    }
-
     /// Research kinds the planner may schedule. Action kinds stay in the enum
     /// so findings do not need a migration when they turn on.
     public var isMVP: Bool {

@@ -20,13 +20,14 @@ struct AssistantActivityView: View {
     }
 
     @State private var tab: Tab = .activity
-    @State private var draft = ""
+    /// Held here so a half-typed question survives tab switches and
+    /// compactions, but read only by `AssistantComposer` — see `AssistantDraft`.
+    @State private var draft = AssistantDraft()
     @State private var expandedActivityGroups: Set<String> = []
     /// Owns the transcript's "jump to latest" affordance. Held here, like the
     /// chat pane's, so its identity survives every body pass — `TranscriptHost`
     /// compares it by reference.
     @State private var scrollAnchor = TranscriptScrollAnchor()
-    @FocusState private var composerFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -100,12 +101,34 @@ struct AssistantActivityView: View {
     ) -> some View {
         HStack(spacing: OreTheme.Space.md) {
             OreAppIcon(size: 22)
-            conversationMenu(assistant: assistant, chatID: chatID, current: summary)
+            ConversationMenu(
+                assistantID: assistant.id,
+                chatID: chatID,
+                title: summary?.title ?? "Assistant"
+            )
+            HeaderStatus(harness: summary?.harness ?? .claudeCode, state: state)
+            Spacer(minLength: OreTheme.Space.sm)
+            TabPicker(tab: $tab)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .frame(height: OreTheme.RowHeight.bar)
+        // Every other bar in the app floats on the toolbar material; without it
+        // this header fused into the content below it.
+        .background(.bar)
+    }
+
+    /// The agent's live status beside the title. Its own view so a status or
+    /// tool change redraws this label, not the whole window body above it.
+    private struct HeaderStatus: View {
+        let harness: HarnessKind
+        let state: ChatState
+
+        var body: some View {
             if state.status != .idle {
                 // Humanized, like the chat pane's composer status. This used to
                 // print the raw enum — the user was shown "runningTool".
                 Text(ComposerBusyCopy.label(
-                    harness: summary?.harness ?? .claudeCode,
+                    harness: harness,
                     status: state.status,
                     runningToolLabel: state.runningToolLabel,
                     isStarting: false,
@@ -116,7 +139,15 @@ struct AssistantActivityView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
-            Spacer(minLength: OreTheme.Space.sm)
+        }
+    }
+
+    /// The segmented tab switcher, isolated behind its binding. Rebuilt inline,
+    /// every status or chat change re-created its tagged segments.
+    private struct TabPicker: View {
+        @Binding var tab: Tab
+
+        var body: some View {
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
@@ -124,11 +155,6 @@ struct AssistantActivityView: View {
             .labelsHidden()
             .frame(width: 190)
         }
-        .padding(.horizontal, OreTheme.Space.md)
-        .frame(height: OreTheme.RowHeight.bar)
-        // Every other bar in the app floats on the toolbar material; without it
-        // this header fused into the content below it.
-        .background(.bar)
     }
 
     /// The title doubles as the conversation switcher. A window this narrow has
@@ -139,101 +165,189 @@ struct AssistantActivityView: View {
     /// keep count: there is no turn counter, and the list holds only what a
     /// person would call a conversation (see `AssistantConversationList`). A
     /// retired conversation is picked like any other — choosing it reopens it.
-    private func conversationMenu(
-        assistant: WorkspaceSummary,
-        chatID: ChatID,
-        current: ChatSummary?
-    ) -> some View {
-        let list = AssistantConversationList(
-            model.chats(for: assistant.id, includeClosed: true), current: chatID
-        )
-        return Menu {
-            Button("New Conversation") { model.createAssistantConversation() }
-            if !list.recent.isEmpty {
-                Divider()
-                ForEach(list.recent) {
-                    conversationButton($0, assistant: assistant, current: chatID)
+    ///
+    /// Its own view so the full list, closed conversations included, is read
+    /// here rather than in the window body: every summary change anywhere in
+    /// the assistant's history used to re-run the whole window.
+    private struct ConversationMenu: View {
+        @Environment(AppModel.self) private var model
+        let assistantID: WorkspaceID
+        let chatID: ChatID
+        let title: String
+
+        var body: some View {
+            let list = AssistantConversationList(
+                model.chats(for: assistantID, includeClosed: true), current: chatID
+            )
+            Menu {
+                Button("New Conversation") { model.createAssistantConversation() }
+                if !list.recent.isEmpty {
+                    Divider()
+                    ForEach(list.recent) { conversationButton($0) }
                 }
-            }
-            if !list.earlier.isEmpty {
-                Menu("Earlier") {
-                    ForEach(list.earlier) {
-                        conversationButton($0, assistant: assistant, current: chatID)
+                if !list.earlier.isEmpty {
+                    Menu("Earlier") {
+                        ForEach(list.earlier) { conversationButton($0) }
                     }
                 }
+            } label: {
+                Text(title)
+                    .font(.system(size: OreTheme.Font.body, weight: .semibold))
             }
-        } label: {
-            Text(current?.title ?? "Assistant")
-                .font(.system(size: OreTheme.Font.body, weight: .semibold))
+            .menuStyle(.borderlessButton)
+            .fixedSize()
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-    }
 
-    private func conversationButton(
-        _ conversation: ChatSummary,
-        assistant: WorkspaceSummary,
-        current: ChatID
-    ) -> some View {
-        Button {
-            if conversation.isClosed { model.reopenChat(conversation.id, in: assistant.id) }
-            model.selectChat(conversation.id, in: assistant.id)
-        } label: {
-            Label(
-                conversation.title,
-                systemImage: conversation.id == current ? "checkmark" : "bubble.left"
-            )
+        private func conversationButton(_ conversation: ChatSummary) -> some View {
+            Button {
+                if conversation.isClosed { model.reopenChat(conversation.id, in: assistantID) }
+                model.selectChat(conversation.id, in: assistantID)
+            } label: {
+                Label(
+                    conversation.title,
+                    systemImage: conversation.id == chatID ? "checkmark" : "bubble.left"
+                )
+            }
         }
     }
 
+    /// How the decision cards, the needs-you strip and the composer sit
+    /// against the transcript.
+    ///
+    /// Stacked (the default) they take their height out of the transcript's
+    /// frame, so every card that arrives or resolves resizes the transcript
+    /// and moves what the reader is looking at. Floating, they ride over its
+    /// foot on their own glass — exactly what the main chat pane does — and a
+    /// card only re-insets the scroll view. That is the better shape, but it
+    /// is a look change (rows slide under the glass) and nothing has measured
+    /// what the resize actually costs, so it waits behind a switch.
+    private static let floatsBottomChrome =
+        UserDefaults.standard.bool(forKey: "ore.debug.assistantFloatingChrome")
+
+    /// Measured height of the floating chrome; unused when stacked.
+    @State private var bottomChromeHeight: CGFloat = 0
+
+    @ViewBuilder
     private func activity(
         assistant: WorkspaceSummary,
         chatID: ChatID,
         summary: ChatSummary?,
         state: ChatState
     ) -> some View {
-        VStack(spacing: 0) {
-            Group {
-                if state.hasRows {
-                    // The same `Equatable` host the main chat pane uses. Read
-                    // its `==` before touching this: `state.rows` must not be
-                    // read here, or every keystroke in the composer below
-                    // re-derives and re-diffs the whole transcript.
-                    TranscriptHost(
-                        chat: state,
-                        worktreePath: assistant.worktreePath,
-                        agentName: summary?.harness.displayName ?? "ORE",
-                        searchQuery: "",
-                        persistenceKey: "assistant-\(chatID.rawValue)",
-                        expandedActivityGroups: expandedActivityGroups,
-                        canFork: false,
-                        onRevert: { _ in },
-                        onToggleActivity: { group in
-                            if !expandedActivityGroups.insert(group).inserted {
-                                expandedActivityGroups.remove(group)
-                            }
-                        },
-                        onOpenFile: { _ in },
-                        onTurnAction: { _, _ in },
-                        scrollAnchor: scrollAnchor
-                    )
-                    .equatable()
-                } else {
-                    ContentUnavailableView(
-                        "Ask about your work",
-                        systemImage: "sparkles",
-                        description: Text(
-                            "Try “what's happening across my workspaces?” — everything "
-                            + "the assistant does and remembers is auditable here."
-                        )
-                    )
-                    .frame(maxHeight: .infinity)
+        if Self.floatsBottomChrome {
+            ZStack(alignment: .bottom) {
+                transcript(
+                    assistant: assistant,
+                    chatID: chatID,
+                    summary: summary,
+                    state: state,
+                    // A hair of air between the newest row and the glass.
+                    bottomInset: bottomChromeHeight + OreTheme.Space.sm
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .bottomLeading) {
+                    jumpToLatest(bottom: bottomChromeHeight + OreTheme.Space.sm)
                 }
-            }
-            // The transcript rides the window's glass directly, exactly as the
-            // main chat column does now.
-            .layoutPriority(1)
 
+                bottomChrome(assistant: assistant, chatID: chatID, state: state)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: AssistantChromeHeightKey.self,
+                                value: proxy.size.height
+                            )
+                        }
+                    }
+            }
+            .onPreferenceChange(AssistantChromeHeightKey.self) { height in
+                // Whole points, and only on a real change: sub-point layout
+                // noise would otherwise re-inset the transcript every pass.
+                let rounded = height.rounded()
+                if rounded != bottomChromeHeight { bottomChromeHeight = rounded }
+            }
+        } else {
+            VStack(spacing: 0) {
+                transcript(
+                    assistant: assistant,
+                    chatID: chatID,
+                    summary: summary,
+                    state: state,
+                    bottomInset: nil
+                )
+                // The transcript rides the window's glass directly, exactly as
+                // the main chat column does now.
+                .layoutPriority(1)
+
+                bottomChrome(assistant: assistant, chatID: chatID, state: state)
+            }
+            .overlay(alignment: .bottomLeading) { jumpToLatest(bottom: 76) }
+        }
+    }
+
+    /// `bottomInset: nil` leaves `TranscriptHost`'s resting foot clearance in
+    /// place, which is what a stacked composer wants.
+    @ViewBuilder
+    private func transcript(
+        assistant: WorkspaceSummary,
+        chatID: ChatID,
+        summary: ChatSummary?,
+        state: ChatState,
+        bottomInset: CGFloat?
+    ) -> some View {
+        Group {
+            if state.hasRows {
+                // The same `Equatable` host the main chat pane uses. Read
+                // its `==` before touching this: `state.rows` must not be
+                // read here, or every keystroke in the composer below
+                // re-derives and re-diffs the whole transcript.
+                TranscriptHost(
+                    chat: state,
+                    worktreePath: assistant.worktreePath,
+                    agentName: summary?.harness.displayName ?? "ORE",
+                    agentHarness: summary?.harness,
+                    searchQuery: "",
+                    persistenceKey: "assistant-\(chatID.rawValue)",
+                    expandedActivityGroups: expandedActivityGroups,
+                    canFork: false,
+                    onRevert: { _ in },
+                    onToggleActivity: { group in
+                        if !expandedActivityGroups.insert(group).inserted {
+                            expandedActivityGroups.remove(group)
+                        }
+                    },
+                    onOpenFile: { _ in },
+                    onTurnAction: { _, _ in },
+                    scrollAnchor: scrollAnchor,
+                    bottomInset: bottomInset ?? Self.restingBottomInset
+                )
+                .equatable()
+            } else {
+                ContentUnavailableView(
+                    "Ask about your work",
+                    systemImage: "sparkles",
+                    description: Text(
+                        "Try “what's happening across my workspaces?” — everything "
+                        + "the assistant does and remembers is auditable here."
+                    )
+                )
+                .frame(maxHeight: .infinity)
+            }
+        }
+    }
+
+    /// `TranscriptHost`'s own default, restated so the stacked path passes the
+    /// value it has always had rather than depending on the default staying put.
+    private static let restingBottomInset: CGFloat = 12
+
+    /// The decision cards, the needs-you strip and the composer: everything
+    /// below the conversation.
+    @ViewBuilder
+    private func bottomChrome(
+        assistant: WorkspaceSummary,
+        chatID: ChatID,
+        state: ChatState
+    ) -> some View {
+        VStack(spacing: 0) {
             ForEach(model.assistantConfirmations) { confirmation in
                 confirmationCard(confirmation)
                     .id(confirmation.id)
@@ -248,17 +362,19 @@ struct AssistantActivityView: View {
             }
             needsYouStrip
 
-            composer(assistant: assistant, chatID: chatID, state: state)
+            AssistantComposer(draft: draft, chatID: chatID, state: state)
         }
-        .overlay(alignment: .bottomLeading) { jumpToLatestOverlay }
     }
 
+    /// Takes its clearance as a value: the stacked path has to guess at the
+    /// chrome's height (76 pt clears a resting composer), the floating path
+    /// knows it.
     @ViewBuilder
-    private var jumpToLatestOverlay: some View {
+    private func jumpToLatest(bottom: CGFloat) -> some View {
         if scrollAnchor.isAwayFromBottom {
             JumpToLatestButton { scrollAnchor.jumpToBottom() }
                 .padding(.leading, OreTheme.Space.md)
-                .padding(.bottom, 76)
+                .padding(.bottom, bottom)
                 .transition(.opacity)
         }
     }
@@ -422,7 +538,7 @@ struct AssistantActivityView: View {
     private func placeLabel(_ item: TabNeedsYou) -> String {
         item.placeLabel(
             workspace: model.workspaces.first { $0.id == item.workspaceID }?.name,
-            tab: model.chatSummaries.first { $0.id == item.chatID }?.title
+            tab: model.chatIndex.summary(for: item.chatID)?.title
         )
     }
 
@@ -526,12 +642,36 @@ struct AssistantActivityView: View {
         .cardLayout()
     }
 
-    private func composer(
-        assistant: WorkspaceSummary,
-        chatID: ChatID,
-        state: ChatState
-    ) -> some View {
-        let isEmpty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
+/// Height of the floating bottom chrome, so the transcript can inset itself
+/// by exactly as much as the glass covers.
+private struct AssistantChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The Assistant window's draft, boxed. As a plain `@State` string on the
+/// window, every keystroke re-ran the window body — header, decision cards,
+/// the needs-you strip — around a transcript that then had to prove itself
+/// equal. Only `AssistantComposer` reads `text`, so only it redraws.
+@MainActor
+@Observable
+private final class AssistantDraft {
+    var text = ""
+}
+
+private struct AssistantComposer: View {
+    @Environment(AppModel.self) private var model
+    @Bindable var draft: AssistantDraft
+    let chatID: ChatID
+    let state: ChatState
+    @FocusState private var composerFocused: Bool
+
+    var body: some View {
+        let isEmpty = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return VStack(alignment: .leading, spacing: 6) {
             if state.isBusy {
                 Button {
@@ -546,7 +686,7 @@ struct AssistantActivityView: View {
                 .help("Stop the assistant (⌘.)")
             }
             HStack(alignment: .bottom, spacing: OreTheme.Space.sm) {
-                TextField("Ask across all your projects…", text: $draft, axis: .vertical)
+                TextField("Ask across all your projects…", text: $draft.text, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: OreTheme.Font.prose))
                     // Up to eight lines, and Return inserts one. `onSubmit` used
@@ -574,9 +714,9 @@ struct AssistantActivityView: View {
 
     private func sendDraft() {
         guard let assistant = model.assistantWorkspace else { return }
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draft = ""
+        draft.text = ""
         model.send(text, to: assistant.id)
     }
 }
@@ -678,8 +818,7 @@ private struct AssistantAuditView: View {
                 }
                 .listStyle(.inset)
                 .scrollContentBackground(.hidden)
-                .scrollIndicators(.hidden)
-                .background(OreListScrollerOverlay())
+                .oreOverlayScrollers()
             }
         }
     }
@@ -691,7 +830,7 @@ private struct AssistantAuditView: View {
     }
 
     private func tabGrantLabel(_ chatID: ChatID) -> String {
-        if let chat = model.chatSummaries.first(where: { $0.id == chatID }) {
+        if let chat = model.chatIndex.summary(for: chatID) {
             return "Auto-allow “\(chat.title)”"
         }
         return "Auto-allow a tab"
@@ -750,8 +889,7 @@ private struct AssistantMemoryView: View {
                     .tag(file.id)
             }
             .scrollContentBackground(.hidden)
-            .scrollIndicators(.hidden)
-            .background(OreListScrollerOverlay())
+            .oreOverlayScrollers()
             .frame(minWidth: 150, idealWidth: 180, maxWidth: 240)
 
             ScrollView {
@@ -764,7 +902,9 @@ private struct AssistantMemoryView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(OreTheme.Space.md)
             }
-            .scrollIndicators(.hidden)
+            // A long memory file needs a position cue; hiding the indicators
+            // was only ever a workaround for the legacy track.
+            .oreOverlayScrollers()
             // Raw memory files are a reading surface: mostly paper, the same
             // bargain the diff documents strike over the glass.
             .background(OreTheme.Surface.content.opacity(0.85))

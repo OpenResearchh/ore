@@ -61,10 +61,8 @@ public enum CoreCommand: Sendable, Codable {
     case switchChatHarness(WorkspaceID, ChatID, harness: HarnessKind, model: String?)
     case setChatModel(WorkspaceID, ChatID, model: String?)
     case setChatDraft(WorkspaceID, ChatID, text: String)
-    case listChats(WorkspaceID)
     case sendMessage(SendMessageRequest)
     /// Cancel the in-flight turn. Distinct from stopping the session.
-    case interruptTurn(WorkspaceID)
     case interruptChatTurn(WorkspaceID, ChatID)
     case setPermissionMode(WorkspaceID, PermissionMode)
     case setChatPermissionMode(WorkspaceID, ChatID, PermissionMode)
@@ -86,8 +84,6 @@ public enum CoreCommand: Sendable, Codable {
     case revertChatToCheckpoint(WorkspaceID, ChatID, TurnID)
 
     // Session control
-    case startSession(WorkspaceID, SessionRequest)
-    case startChatSession(WorkspaceID, ChatID, SessionRequest)
     case stopSession(WorkspaceID)
     case stopChatSession(WorkspaceID, ChatID)
 

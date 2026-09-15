@@ -21,18 +21,18 @@ enum NeedsYouPairing {
     /// the agent must never receive an answer to a question it did not ask.
     static func gate(
         forToolCall toolCallID: ToolCallID?,
-        pendingPermission: PermissionRequest?
+        pendingPermissions: [PermissionRequest]
     ) -> PermissionRequestID? {
-        guard let permission = pendingPermission,
-              permission.toolName == "AskUserQuestion"
-        else { return nil }
-        if let toolCallID, let gated = permission.toolCallID {
-            return toolCallID == gated ? permission.id : nil
+        // Searched, not the head of the queue: a Bash request from a parallel
+        // tool call can be open ahead of the question's gate.
+        let gates = pendingPermissions.filter { $0.toolName == "AskUserQuestion" }
+        if let toolCallID, let exact = gates.first(where: { $0.toolCallID == toolCallID }) {
+            return exact.id
         }
         // One side did not report a tool call id, so there is nothing to
         // contradict the pairing. A chat only ever has one AskUserQuestion
         // gate open at a time, so the tool name is the best evidence left.
-        return permission.id
+        return gates.first { toolCallID == nil || $0.toolCallID == nil }?.id
     }
 
     /// The reply to send back through the gate once a tool call's questions

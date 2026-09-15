@@ -13,8 +13,6 @@ public enum CoreEvent: Sendable, Codable {
     case workspaceRemoved(WorkspaceID)
     case chatAdded(ChatSummary)
     case chatUpdated(ChatSummary)
-    case chatRemoved(WorkspaceID, ChatID)
-    case chatsListed(WorkspaceID, [ChatSummary])
     /// A prompt reached a chat. Emitted for every send, including the ones a
     /// client never saw: the assistant's, and the opening prompt of a freshly
     /// created workspace. Without it those prompts stay invisible until the
@@ -376,15 +374,30 @@ public struct RepositoryScriptsApproval: Sendable, Codable, Hashable, Identifiab
     public var workspaceID: WorkspaceID
     public var repositoryPath: String
     public var setup: String?
+    public var run: String?
     public var archive: String?
+    /// Whether allowing these also runs `setup` in the workspace. True when
+    /// the prompt comes from creating it. False when it comes from ⌘R later:
+    /// setup was offered when the workspace was made, and installing again
+    /// because the user wanted to start a dev server would be a surprise.
+    public var runsSetup: Bool
 
     public var id: WorkspaceID { workspaceID }
 
-    public init(workspaceID: WorkspaceID, repositoryPath: String, setup: String?, archive: String?) {
+    public init(
+        workspaceID: WorkspaceID,
+        repositoryPath: String,
+        setup: String?,
+        run: String?,
+        archive: String?,
+        runsSetup: Bool = true
+    ) {
         self.workspaceID = workspaceID
         self.repositoryPath = repositoryPath
         self.setup = setup
+        self.run = run
         self.archive = archive
+        self.runsSetup = runsSetup
     }
 }
 

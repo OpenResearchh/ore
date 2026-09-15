@@ -216,50 +216,65 @@ public actor DiffEngine {
             ["ls-files", "--others", "--exclude-standard", "-z"],
             in: worktree
         )
-        var results: [FileDiff] = []
-        for path in output.nulSeparatedFields {
-            // `--no-index` diffs an untracked file against nothing, giving the
-            // same unified format as everything else. It exits 1 on difference,
-            // which is success here.
-            let arguments = [
-                "diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", path,
-            ]
-            guard let text = try? await git.run(
-                arguments, in: worktree, allowedExitCodes: [0, 1]
-            ).standardOutput else {
-                if let fallback = try? failedUntrackedDiff(path: path, worktree: worktree) {
-                    results.append(fallback)
-                }
-                continue
-            }
-            results += UnifiedDiffParser.parse(text).map { diff in
-                var diff = diff
-                diff.path = path
-                diff.status = .untracked
-                return diff
-            }
+        // Read directly rather than spawning `git diff --no-index` per file:
+        // an agent that generates a directory of files made every review
+        // refresh a sequential process per file, for a diff that is all
+        // additions anyway.
+        return output.nulSeparatedFields.map {
+            Self.untrackedFileDiff(path: $0, worktree: worktree, maximumBytes: maximumDiffBytes)
         }
-        return results
     }
 
-    private func failedUntrackedDiff(path: String, worktree: URL) throws -> FileDiff {
-        // `git diff --no-index` exits non-zero when files differ, which
-        // GitClient reports as a failure. Read the file directly instead.
+    /// What `git diff --no-index /dev/null <path>` parses to, built from the
+    /// file itself: one all-added hunk, git's binary test (a NUL in the first
+    /// 8000 bytes), a symlink diffed as its target path, and the same size cap
+    /// as tracked diffs.
+    static func untrackedFileDiff(path: String, worktree: URL, maximumBytes: Int) -> FileDiff {
         let url = worktree.appendingPathComponent(path)
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else {
-            return FileDiff(path: path, status: .untracked, isBinary: true)
+        let fileManager = FileManager.default
+        let unreadable = FileDiff(path: path, status: .untracked, isBinary: true)
+        let contents: Data
+        if let destination = try? fileManager.destinationOfSymbolicLink(atPath: url.path) {
+            contents = Data(destination.utf8)
+        } else {
+            // Nested repositories are listed as directories; like git, there
+            // is no text to show for them.
+            guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular
+            else { return unreadable }
+            if let size = (attributes[.size] as? NSNumber)?.intValue, size > maximumBytes {
+                return FileDiff(path: path, status: .untracked, isTruncated: true)
+            }
+            guard let data = try? Data(contentsOf: url) else { return unreadable }
+            contents = data
         }
-        var rawLines = contents.split(separator: "\n", omittingEmptySubsequences: false)
-        // A trailing newline produces an empty final component that isn't a line.
-        if rawLines.last?.isEmpty == true { rawLines.removeLast() }
-        let lines = rawLines.enumerated()
-            .map { DiffLine(kind: .added, text: String($0.element), newLineNumber: $0.offset + 1) }
+        if contents.prefix(8000).contains(0) { return unreadable }
+        // git prints no hunk for an empty file.
+        guard !contents.isEmpty else { return FileDiff(path: path, status: .untracked) }
+
+        // Split bytes, not Characters: Swift treats "\r\n" as one Character,
+        // which would fuse every line of a CRLF file into one.
+        var rawLines = contents.split(separator: 0x0A, omittingEmptySubsequences: false)
+        let endsWithNewline = contents.last == 0x0A
+        if endsWithNewline { rawLines.removeLast() }
+        var lines = rawLines.enumerated().map {
+            DiffLine(
+                kind: .added,
+                text: String(decoding: $0.element, as: UTF8.self),
+                newLineNumber: $0.offset + 1
+            )
+        }
+        let lineCount = lines.count
+        if !endsWithNewline {
+            // Same text the parser keeps from git's "\ No newline at end of file".
+            lines.append(DiffLine(kind: .noNewline, text: " No newline at end of file"))
+        }
         return FileDiff(
             path: path,
             status: .untracked,
             hunks: [DiffHunk(
                 oldStart: 0, oldCount: 0,
-                newStart: 1, newCount: lines.count,
+                newStart: 1, newCount: lineCount,
                 lines: lines
             )]
         )

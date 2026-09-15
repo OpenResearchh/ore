@@ -80,19 +80,31 @@ struct ClaudeCodeTranslator {
 
     mutating func translate(line: String) -> Output {
         guard let data = line.data(using: .utf8) else { return Output() }
-        guard let envelope = try? decoder.decode(ClaudeWire.Envelope.self, from: data) else {
-            // Not our protocol: a CLI that printed a warning to stdout, or a
-            // version emitting something we can't parse. Never fatal.
-            return Output()
+        // The envelope is a second full parse of the line, so it is skipped on
+        // the hot path: once the provider session is known and the type can be
+        // peeked, only the payload is decoded. `system` still needs it for the
+        // subtype, but those lines are rare next to token deltas.
+        let peeked = ClaudeWire.peekType(in: line)
+        var subtype: String?
+        let type: Substring
+        if let peeked, peeked != "system", providerSessionID != nil {
+            type = peeked
+        } else {
+            guard let envelope = try? decoder.decode(ClaudeWire.Envelope.self, from: data) else {
+                // Not our protocol: a CLI that printed a warning to stdout, or a
+                // version emitting something we can't parse. Never fatal.
+                return Output()
+            }
+            if let providerSessionID = envelope.sessionID, self.providerSessionID == nil {
+                self.providerSessionID = providerSessionID
+            }
+            type = Substring(envelope.type)
+            subtype = envelope.subtype
         }
 
-        if let providerSessionID = envelope.sessionID, self.providerSessionID == nil {
-            self.providerSessionID = providerSessionID
-        }
-
-        switch envelope.type {
+        switch type {
         case "system":
-            return handleSystem(subtype: envelope.subtype, data: data)
+            return handleSystem(subtype: subtype, data: data)
         case "stream_event":
             return handleStreamEvent(data: data)
         case "assistant":

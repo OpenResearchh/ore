@@ -10,9 +10,9 @@ struct LaunchBriefingTests {
     @Test func greetingUsesFirstNameAndDaypart() {
         let morning = date(hour: 9)
         let briefing = LaunchBriefing.compose(
-            workspaces: [], lastSeenAt: nil, now: morning, userName: "Tushar"
+            workspaces: [], lastSeenAt: nil, now: morning, userName: "Ada"
         )
-        #expect(briefing.greeting == "Good morning, Tushar.")
+        #expect(briefing.greeting == "Good morning, Ada.")
         #expect(briefing.lines.map(\.id) == ["quiet"])
         #expect(briefing.lines[0].text == "Ready when you are")
     }
@@ -131,7 +131,7 @@ struct LaunchBriefingTests {
     }
 
     @Test func firstNameExtraction() {
-        #expect(LaunchBriefing.firstName(from: "Tushar Ojha") == "Tushar")
+        #expect(LaunchBriefing.firstName(from: "Ada Lovelace") == "Ada")
         #expect(LaunchBriefing.firstName(from: "") == nil)
     }
 

@@ -18,3 +18,28 @@ changelog/
 
 # Python bytecode
 __pycache__/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local secrets and signing material — never commit these
+.env
+.env.*
+*.p12
+*.cer
+*.key
+*.mobileprovision
+*.provisionprofile
+*.p8
+*.pem
+sparkle_private_key*
+*_ed25519*
+
+# Release archives — published to GitHub Releases, never committed
+*.dmg
+*.xcarchive
+
+# Local agent settings
+.claude/settings.local.json

@@ -24,6 +24,9 @@
 #   ORE_MANIFEST       URL (file:// works) of the release manifest to use
 #   ORE_VERSION        install this version instead of the published latest
 #   ORE_INSTALL_DIR    install here instead of /Applications or ~/Applications
+#   ORE_REPO           GitHub owner/name to install from
+#   ORE_DOWNLOAD_BASE  base URL release assets are downloaded from
+#   ORE_HOME           where the install channel marker is written (~/ore)
 set -eu
 
 main() {
@@ -34,7 +37,10 @@ main() {
 
   TMP=""
   STAGED=""
-  trap cleanup EXIT INT TERM
+  # An interrupt has to stop the script, not just run cleanup and carry on
+  # with a staged app that cleanup has already deleted. Exiting fires EXIT.
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM
 
   check_platform
   resolve_release
@@ -118,7 +124,7 @@ manifest_value() {
 
 download() {
   say "==> Downloading"
-  curl -fsSL --progress-bar "$zip_url" -o "$TMP/$zip_name" \
+  curl -fSL --progress-bar "$zip_url" -o "$TMP/$zip_name" \
     || die "could not download $zip_name from $zip_url"
 
   # Fail closed. The checksum only proves the transfer wasn't corrupted — TLS

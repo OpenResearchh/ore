@@ -138,6 +138,53 @@ struct CoreClientTests {
         await client.shutdown()
     }
 
+    @Test func hidingTheHostReachesEveryEngineAndTheOnesMadeMeanwhile() async throws {
+        let fixture = try await GitFixture.initialized()
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "first"
+        )))
+        guard case .workspaceAdded(let first)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no workspaceAdded event")
+            return
+        }
+        let firstEngine = try await client.engine(for: first.id)
+        #expect(await firstEngine.backgroundPollingEnabled)
+
+        await client.setBackgroundPollingEnabled(false)
+        #expect(await !firstEngine.backgroundPollingEnabled)
+
+        // An engine created while hidden must not start polling on its own.
+        let checkpoint = await recorder.checkpoint()
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "second"
+        )))
+        guard case .workspaceAdded(let second)? = await recorder.waitFor(
+            after: checkpoint,
+            matching: {
+                if case .workspaceAdded = $0 { return true }
+                return false
+            }
+        ) else {
+            Issue.record("no second workspaceAdded event")
+            return
+        }
+        let secondEngine = try await client.engine(for: second.id)
+        #expect(await !secondEngine.backgroundPollingEnabled)
+
+        await client.setBackgroundPollingEnabled(true)
+        #expect(await firstEngine.backgroundPollingEnabled)
+        #expect(await secondEngine.backgroundPollingEnabled)
+
+        await client.shutdown()
+    }
+
     @Test func oreTomlDrivesBranchPrefixAndCopiedFiles() async throws {
         // The config is checked in so a teammate gets the project's setup
         // without being told; that only works if the core actually reads it.
@@ -245,6 +292,52 @@ struct CoreClientTests {
         }
         #expect(again.setup == "echo second > marker.txt")
         #expect(!fixture.exists("marker.txt", in: worktree))
+
+        await client.shutdown()
+    }
+
+    @Test func aRunScriptWaitsForApprovalBeforeCommandR() async throws {
+        // ⌘R runs ore.toml's run script as the user, so it is approved like
+        // setup and archive. Allowing it from the terminal doesn't run setup.
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo setup > setup-marker.txt"
+        run = "echo serving"
+        """)
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "runner"
+        )))
+
+        guard case .workspaceAdded(let summary)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }), case .repositoryScriptsNeedApproval(let shown)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("expected the workspace and an approval request")
+            return
+        }
+        #expect(shown.run == "echo serving")
+
+        let unapproved = try await client.workspaceEnvironment(workspaceID: summary.id)
+        #expect(unapproved.runScript == "echo serving")
+        let request = try #require(unapproved.runScriptApproval)
+        #expect(!request.runsSetup)
+
+        await client.send(.approveRepositoryScripts(request))
+        var environment = unapproved
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < deadline, environment.runScriptApproval != nil {
+            try? await Task.sleep(for: .milliseconds(100))
+            environment = try await client.workspaceEnvironment(workspaceID: summary.id)
+        }
+        #expect(environment.runScriptApproval == nil)
+        #expect(!fixture.exists("setup-marker.txt", in: URL(fileURLWithPath: summary.worktreePath)))
 
         await client.shutdown()
     }
@@ -500,7 +593,7 @@ struct CoreClientTests {
         let client = try makeClient(fixture)
         let recorder = CoreEventRecorder(client)
 
-        await client.send(.interruptTurn(WorkspaceID(rawValue: "does-not-exist")))
+        await client.send(.interruptChatTurn(WorkspaceID(rawValue: "does-not-exist"), ChatID(rawValue: "missing")))
 
         guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
                 if case .commandFailed = $0 { return true }

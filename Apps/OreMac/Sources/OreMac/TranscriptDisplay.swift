@@ -39,6 +39,13 @@ enum TranscriptDisplay {
 
         fileprivate var lastKey: CacheKey?
         fileprivate var lastOutput: [TranscriptRow] = []
+        fileprivate var lastStructuralRevision: Int?
+        fileprivate var lastSourceRowID: String?
+
+        /// Changes whenever the output may differ from the last one by more
+        /// than the last row's content. Hand it to `TranscriptView` so the
+        /// table can skip its own whole-transcript diff while text streams.
+        fileprivate(set) var structureToken = 0
     }
 
     /// - Parameter revision: `ChatState.rowsRevision`, or `nil` to opt out of the
@@ -49,13 +56,18 @@ enum TranscriptDisplay {
     ///   `isBusy` — a turn blocked on a permission is not "busy" for the
     ///   composer, but collapsing its thinking behind a permission card is what
     ///   made the transcript jump.
+    /// - Parameter structuralRevision: `ChatState.structuralRevision`, alongside
+    ///   `revision`. When it has not moved since the last call, only the last
+    ///   row's text changed, and that one row is replaced instead of
+    ///   re-deriving the transcript. `nil` always takes the full path.
     static func rows(
         from source: [TranscriptRow],
         keepLiveTurnExpanded: Bool,
         expanded: Set<String>,
         memo: Memo,
         hidingPlanTurnID: TurnID? = nil,
-        revision: Int? = nil
+        revision: Int? = nil,
+        structuralRevision: Int? = nil
     ) -> [TranscriptRow] {
         // The per-turn memo below still walks and hashes every row, which is
         // O(transcript) — fine per stream flush, but this function also runs on
@@ -72,6 +84,11 @@ enum TranscriptDisplay {
             )
         }
         if let key, key == memo.lastKey { return memo.lastOutput }
+        if let key, let structuralRevision,
+           replaceStreamingRow(from: source, key: key, structuralRevision: structuralRevision,
+                               expanded: expanded, hidingPlanTurnID: hidingPlanTurnID, memo: memo) {
+            return memo.lastOutput
+        }
 
         let visible = source.compactMap { prepared($0, expanded: expanded, hidingPlanTurnID: hidingPlanTurnID) }
         let activeTurn: TurnID? = keepLiveTurnExpanded ? visible.last?.turnID : nil
@@ -149,7 +166,45 @@ enum TranscriptDisplay {
         memo.subjects = subjects
         memo.lastKey = key
         memo.lastOutput = result
+        memo.lastStructuralRevision = structuralRevision
+        memo.lastSourceRowID = source.last?.id
+        memo.structureToken &+= 1
         return result
+    }
+
+    /// The streaming fast path: nothing but the last source row's text changed
+    /// since the memo's output, and that row is the last one drawn, top-level
+    /// prose in the live turn. Such a row passes through turn layout untouched
+    /// (the live turn is not grouped, and only rows with a parent or a tool
+    /// call id are nested), so replacing it is exactly what re-deriving gives.
+    /// Returns false, changing nothing, whenever that can't be shown cheaply.
+    private static func replaceStreamingRow(
+        from source: [TranscriptRow],
+        key: Memo.CacheKey,
+        structuralRevision: Int,
+        expanded: Set<String>,
+        hidingPlanTurnID: TurnID?,
+        memo: Memo
+    ) -> Bool {
+        guard let previousKey = memo.lastKey,
+              key.keepLiveTurnExpanded,
+              previousKey.keepLiveTurnExpanded,
+              previousKey.sourceCount == key.sourceCount,
+              previousKey.expanded == key.expanded,
+              previousKey.hidingPlanTurnID == key.hidingPlanTurnID,
+              memo.lastStructuralRevision == structuralRevision,
+              let last = source.last,
+              last.id == memo.lastSourceRowID,
+              last.kind == .assistantText || last.kind == .thinking,
+              last.parentToolCallID == nil,
+              memo.lastOutput.last?.id == last.id,
+              var replacement = prepared(last, expanded: expanded, hidingPlanTurnID: hidingPlanTurnID)
+        else { return false }
+        // `annotated` writes this for every live-turn row; prose never has one.
+        replacement.resolvedSubject = nil
+        memo.lastOutput[memo.lastOutput.count - 1] = replacement
+        memo.lastKey = key
+        return true
     }
 
     /// Cheap identity of a source slice: ids and per-row revisions, never text.
@@ -272,16 +327,12 @@ enum TranscriptDisplay {
     }
 
     static func activitySummary(for rows: [TranscriptRow]) -> String {
-        let tools = rows.filter { $0.kind == .toolCall }.count
-        let thoughts = rows.filter { $0.kind == .thinking }.count
-        let notes = rows.filter { $0.kind == .assistantText }.count
-        let errors = rows.filter { $0.kind == .error || $0.isError }.count
-        var parts: [String] = []
-        if tools > 0 { parts.append("\(tools) tool call\(tools == 1 ? "" : "s")") }
-        if thoughts > 0 { parts.append("\(thoughts) thought\(thoughts == 1 ? "" : "s")") }
-        if notes > 0 { parts.append("\(notes) note\(notes == 1 ? "" : "s")") }
-        if errors > 0 { parts.append("\(errors) issue\(errors == 1 ? "" : "s")") }
-        return parts.isEmpty ? "Activity" : parts.joined(separator: ", ")
+        // One count for the fold — not tool calls vs thoughts vs notes, which
+        // is harness jargon. Issues are drawn separately on the row so they
+        // don't hide in a comma list.
+        let steps = rows.count
+        guard steps > 0 else { return "Activity" }
+        return "\(steps) step\(steps == 1 ? "" : "s")"
     }
 
     // MARK: - Source prep
@@ -333,6 +384,13 @@ enum TranscriptDisplay {
     /// at most trailing punctuation — so a reply that merely *mentions* skipping
     /// something is still shown.
     static func isSkipVerdict(_ text: String) -> Bool {
+        // Every streaming flush of a reply passes through here. Anything that
+        // doesn't open with the token is rejected before trimming the whole text.
+        var head = String.UnicodeScalarView()
+        head.append(contentsOf: text.unicodeScalars.lazy.drop {
+            CharacterSet.whitespacesAndNewlines.contains($0) || $0 == "." || $0 == "!"
+        }.prefix(4))
+        guard String(head).caseInsensitiveCompare("SKIP") == .orderedSame else { return false }
         let value = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: ".!"))

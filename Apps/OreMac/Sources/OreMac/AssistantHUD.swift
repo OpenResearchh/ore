@@ -38,8 +38,25 @@ final class AssistantVoiceHUD {
     /// the app's own card and the menu bar); only this surface goes quiet.
     private var dismissedNeedsYouIDs: Set<String> = []
 
-    private static let pillSize = NSSize(width: 380, height: 56)
-    private static let actionWidth: CGFloat = 460
+    private nonisolated static let pillSize = NSSize(width: 380, height: 56)
+    private nonisolated static let actionWidth: CGFloat = 460
+
+    /// Whether the panel is up (or fading up), and the size it was last given.
+    /// `evaluate()` runs for every word of a narration line; when neither has
+    /// changed there is nothing to resize, re-shadow or fade in.
+    private var isShown = false
+    private var shownSize: NSSize?
+
+    /// The panel's size for what it has to show. Questions carry a full
+    /// prompt plus an options row and need the taller card; permissions stay
+    /// one line.
+    nonisolated static func panelSize(voiceActive: Bool, actions: Bool, isQuestion: Bool) -> NSSize {
+        let actionHeight: CGFloat = isQuestion ? 128 : 76
+        if voiceActive && actions {
+            return NSSize(width: actionWidth, height: 64 + actionHeight)
+        }
+        return actions ? NSSize(width: actionWidth, height: actionHeight) : pillSize
+    }
 
     func dismissNeedsYouCard(_ id: String) {
         dismissedNeedsYouIDs.insert(id)
@@ -125,24 +142,22 @@ final class AssistantVoiceHUD {
         hideTask?.cancel()
         hideTask = nil
         let panel = panel ?? makePanel()
-        // Questions carry a full prompt plus an options row and need the
-        // taller card; permissions stay one line.
         let isQuestion = if case .question = actionable { true } else { false }
-        let actionHeight: CGFloat = isQuestion ? 128 : 76
-        let size = voiceActive && actions
-            ? NSSize(width: Self.actionWidth, height: 64 + actionHeight)
-            : actions
-            ? NSSize(width: Self.actionWidth, height: actionHeight)
-            : Self.pillSize
-        panel.setContentSize(size)
+        let size = Self.panelSize(voiceActive: voiceActive, actions: actions, isQuestion: isQuestion)
+        let sizeChanged = size != shownSize
+        if sizeChanged { panel.setContentSize(size) }
         // Buttons need the mouse; the voice-only pill must stay a ghost so
         // it never blocks clicks in the app underneath it.
-        panel.ignoresMouseEvents = !actions
+        if panel.ignoresMouseEvents != !actions { panel.ignoresMouseEvents = !actions }
         position(panel, size: size)
-        panel.orderFrontRegardless()
+        let wasShown = isShown && panel.isVisible
+        isShown = true
+        shownSize = size
+        if !wasShown { panel.orderFrontRegardless() }
         // The shadow is derived from the rendered shape; recompute it when the
         // pill grows into the card layout (or back) so it hugs the new outline.
-        panel.invalidateShadow()
+        if sizeChanged || !wasShown { panel.invalidateShadow() }
+        guard !wasShown else { return }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             panel.animator().alphaValue = 1
@@ -150,7 +165,9 @@ final class AssistantVoiceHUD {
     }
 
     private func hide() {
-        guard let panel else { return }
+        // Already fading or gone: another fade would only restart the timer.
+        guard let panel, isShown else { return }
+        isShown = false
         hideTask?.cancel()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.25
@@ -207,10 +224,8 @@ final class AssistantVoiceHUD {
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
             ?? NSScreen.main
         guard let frame = screen?.visibleFrame else { return }
-        panel.setFrameOrigin(NSPoint(
-            x: frame.midX - size.width / 2,
-            y: frame.minY + 84
-        ))
+        let origin = NSPoint(x: frame.midX - size.width / 2, y: frame.minY + 84)
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
     }
 }
 
@@ -350,10 +365,13 @@ private struct AssistantHUDView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
 
-            WaveformBars(mode: waveform)
+            WaveformBars(mode: waveform, level: { controller.audioLevel })
                 .frame(width: 34, height: 20)
 
-            StreamingTranscript(text: transcript, placeholder: placeholder)
+            // A closure, read in the transcript's own body: partial results
+            // arrive many times a second, and reading them here re-ran the
+            // whole pill — and the action card under it — for each one.
+            StreamingTranscript(text: { transcript }, placeholder: placeholder)
                 .foregroundStyle(micIsOpen ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -395,7 +413,7 @@ private struct AssistantHUDView: View {
     /// The tab whose narration is playing, by the name its tab shows.
     private var narratingPlace: String? {
         guard let model, let id = model.narration.speakingChatID else { return nil }
-        return model.chatSummaries.first { $0.id == id }?.title
+        return model.chatIndex.summary(for: id)?.title
     }
 
     /// A tab or the fleet is speaking while the assistant itself is idle.
@@ -426,7 +444,7 @@ private struct AssistantHUDView: View {
 
     private var waveform: WaveformBars.Mode {
         switch controller.phase {
-        case .listening, .answering: .listening(controller.audioLevel)
+        case .listening, .answering: .listening
         case .speaking: .speaking
         case .armed, .thinking: .thinking
         case .idle: isNarrating ? .speaking : .thinking
@@ -748,7 +766,7 @@ private struct HUDActionButtonStyle: ButtonStyle {
 /// mid-word or done. The scroll is programmatic only — the panel ignores mouse
 /// events while voice-only, so there is nothing for a user to drag.
 private struct StreamingTranscript: View {
-    var text: String
+    var text: @MainActor () -> String
     var placeholder: String
 
     /// A trailing anchor rather than the last word: scrolling to the word
@@ -756,7 +774,7 @@ private struct StreamingTranscript: View {
     /// edge mid-animation.
     private static let tailID = "tail"
 
-    private var words: [(id: Int, text: String)] {
+    private static func words(in text: String) -> [(id: Int, text: String)] {
         // Any whitespace, not just spaces: a recognizer's partial results and a
         // narration line can both carry a newline, and one long "word" the
         // width of the pill would freeze the scroll.
@@ -765,33 +783,48 @@ private struct StreamingTranscript: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    if words.isEmpty {
-                        Text(placeholder)
-                    } else {
-                        ForEach(words, id: \.id) { word in
-                            Text(word.text).transition(.opacity)
+        let text = text()
+        if #available(macOS 15.0, *) {
+            // The scroll view holds the tail against the trailing edge as the
+            // line grows, in the same pass as the growth. The fallback below
+            // started a fresh 0.25 s scroll animation for every partial result,
+            // each one cutting off the last mid-flight.
+            strip(text)
+                .defaultScrollAnchor(.trailing, for: .sizeChanges)
+        } else {
+            ScrollViewReader { proxy in
+                strip(text)
+                    .onChange(of: text) { _, _ in
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(Self.tailID, anchor: .trailing)
                         }
                     }
-                    Color.clear.frame(width: 1, height: 1).id(Self.tailID)
-                }
-                .font(.system(size: 13, weight: .medium))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .animation(.easeOut(duration: 0.18), value: text)
-            }
-            // No `scrollDisabled`: the voice-only panel already ignores mouse
-            // events, so there is no gesture to suppress — and the modifier
-            // has a habit of taking `scrollTo` down with it.
-            .frame(height: 18)
-            .onChange(of: text) { _, _ in
-                withAnimation(.easeOut(duration: 0.25)) {
-                    proxy.scrollTo(Self.tailID, anchor: .trailing)
-                }
             }
         }
+    }
+
+    private func strip(_ text: String) -> some View {
+        let words = Self.words(in: text)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                if words.isEmpty {
+                    Text(placeholder)
+                } else {
+                    ForEach(words, id: \.id) { word in
+                        Text(word.text).transition(.opacity)
+                    }
+                }
+                Color.clear.frame(width: 1, height: 1).id(Self.tailID)
+            }
+            .font(.system(size: 13, weight: .medium))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .animation(.easeOut(duration: 0.18), value: text)
+        }
+        // No `scrollDisabled`: the voice-only panel already ignores mouse
+        // events, so there is no gesture to suppress — and the modifier
+        // has a habit of taking `scrollTo` down with it.
+        .frame(height: 18)
     }
 }
 
@@ -817,46 +850,24 @@ private struct InterruptHint: View {
 /// Shared with the new-workspace composer, which listens the same way the
 /// assistant pill does and should look like it.
 struct WaveformBars: View {
-    enum Mode: Equatable {
-        /// 0…1 microphone loudness.
-        case listening(Double)
-        case thinking
-        case speaking
-    }
+    /// Listening swings wide and scales with loudness; speaking is a steady
+    /// mid-tempo wave (there is no output meter to ride); thinking is one
+    /// slow, gentle swell — alive, but clearly not hearing.
+    typealias Mode = WaveformBarsView.Style
 
     var mode: Mode
+    /// Microphone loudness, 0…1. A closure read in this body rather than a
+    /// value the caller reads: otherwise the whole pill re-renders on every
+    /// mic tick just to hand the bars a number.
+    var level: (@MainActor () -> Double)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval)) { context in
-            let time = context.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 3) {
-                ForEach(0..<5, id: \.self) { index in
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: 3.5, height: height(bar: index, time: time))
-                }
-            }
-            .frame(height: 20, alignment: .center)
-        }
-    }
-
-    private func height(bar index: Int, time: TimeInterval) -> CGFloat {
-        switch mode {
-        case .listening(let level):
-            // Each bar rides its own phase of the same wave; loudness scales
-            // the whole figure so silence reads as a flat quiet line.
-            let wave = sin(time * 9 + Double(index) * 1.7) * 0.5 + 0.5
-            let energy = 0.15 + min(max(level, 0), 1) * 0.85
-            return 4 + CGFloat(wave * energy) * 16
-        case .speaking:
-            // No output meter to ride, so a steady mid-tempo wave stands in:
-            // busier than thinking, calmer than a voice hitting the mic.
-            let wave = sin(time * 6 + Double(index) * 1.3) * 0.5 + 0.5
-            return 4 + CGFloat(wave) * 11
-        case .thinking:
-            // One slow, gentle swell — alive, but clearly not hearing.
-            let swell = sin(time * 2.4 + Double(index) * 0.35) * 0.5 + 0.5
-            return 4 + CGFloat(swell) * 5
-        }
+        // The motion itself runs on the render server (`WaveformBarsView`).
+        WaveformBarsLayer(
+            style: mode,
+            level: mode == .listening ? (level?() ?? 0) : 0,
+            isAnimated: !reduceMotion
+        )
     }
 }

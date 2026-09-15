@@ -153,7 +153,7 @@ struct LaunchBriefing: Equatable {
         return "\(daypart), \(userName)."
     }
 
-    /// First name only — "Good morning, Tushar", not a passport check.
+    /// First name only — "Good morning, Ada", not a passport check.
     static func firstName(from fullName: String) -> String? {
         let first = fullName.split(separator: " ").first.map(String.init)
         return first?.isEmpty == false ? first : nil

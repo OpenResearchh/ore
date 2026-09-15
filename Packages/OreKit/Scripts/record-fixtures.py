@@ -117,6 +117,7 @@ def record(name, prompt, mode="default", permission="allow", interrupt_after=Non
     time.sleep(0.5)
     process.kill()
 
+    lines = [scrub(line) for line in lines]
     path = os.path.abspath(os.path.join(FIXTURES, name + ".jsonl"))
     with open(path, "w") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -151,6 +152,38 @@ def seed_workspace():
     """Files some scenarios need to exist before the agent looks."""
     with open(os.path.join(WORKSPACE, "notes.txt"), "w") as handle:
         handle.write("hello\n")
+
+
+# Recordings are committed to a public repository, so anything that describes
+# the recording account or machine is replaced before the file is written.
+# Tests assert on none of these fields.
+HOME = os.path.expanduser("~")
+
+
+def scrub_value(value, key=None):
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k == "account" and isinstance(v, dict):
+                v = dict(v, email="user@example.com", organization="Example Organization")
+            elif k == "mcp_servers":
+                v = []
+            elif k == "tools" and isinstance(v, list):
+                v = [t for t in v if not (isinstance(t, str) and t.startswith("mcp__"))]
+            out[k] = scrub_value(v, k)
+        return out
+    if isinstance(value, list):
+        return [scrub_value(v) for v in value]
+    if isinstance(value, str):
+        return value.replace(HOME, "/Users/user")
+    return value
+
+
+def scrub(line):
+    try:
+        return json.dumps(scrub_value(json.loads(line)), separators=(",", ":"), ensure_ascii=False)
+    except ValueError:
+        return line.replace(HOME, "/Users/user")
 
 
 def main():

@@ -57,4 +57,13 @@ struct TranscriptScrollPolicy {
     /// The row still has its height corrected; only the draw is held back until
     /// the view settles, which is also when the reader could first notice it.
     var deferOffscreenRedraws: Bool { isUserScrolling || !isFollowingBottom }
+
+    /// Stronger than `deferOffscreenRedraws`, and only while a gesture is
+    /// actually in flight somewhere other than the foot: even *measuring* a row
+    /// below the viewport is held back. Measuring means laying the row's text
+    /// out with TextKit, and a long streaming reply re-measured ten times a
+    /// second is the one piece of transcript work big enough to be felt between
+    /// the frames of a flick. The document is briefly the wrong length — the
+    /// knob lags — which is the trade: correct length, or a smooth gesture.
+    var defersOffscreenHeights: Bool { isUserScrolling && !isFollowingBottom }
 }

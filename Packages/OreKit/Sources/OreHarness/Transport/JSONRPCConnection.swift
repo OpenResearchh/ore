@@ -34,6 +34,9 @@ public actor JSONRPCConnection {
     private let process: ChildProcess
     private var nextRequestID = 0
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
+    /// Cancelled when the reply lands: a Codex `turn/start` waits up to a day,
+    /// and a sleeping task per answered request adds up.
+    private var timeouts: [Int: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var isClosed = false
 
@@ -87,8 +90,8 @@ public actor JSONRPCConnection {
 
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
-            Task { [weak self] in
-                try? await Task.sleep(for: timeout)
+            timeouts[id] = Task { [weak self] in
+                do { try await Task.sleep(for: timeout) } catch { return }
                 await self?.timeOut(id: id, method: method)
             }
         }
@@ -144,6 +147,7 @@ public actor JSONRPCConnection {
         guard let id = message["id"]?.intValue,
               let waiting = pending.removeValue(forKey: id)
         else { return }
+        timeouts.removeValue(forKey: id)?.cancel()
 
         if let error = message["error"] {
             let text = ProviderErrorCopy.unwrap(
@@ -164,6 +168,7 @@ public actor JSONRPCConnection {
     }
 
     private func timeOut(id: Int, method: String) {
+        timeouts.removeValue(forKey: id)
         guard let waiting = pending.removeValue(forKey: id) else { return }
         waiting.resume(throwing: HarnessError.transportFailure("`\(method)` timed out"))
     }
@@ -171,6 +176,8 @@ public actor JSONRPCConnection {
     private func failAllPending(reason: String) {
         let waiting = pending
         pending.removeAll()
+        for (_, timeout) in timeouts { timeout.cancel() }
+        timeouts.removeAll()
         for (_, continuation) in waiting {
             continuation.resume(throwing: HarnessError.transportFailure(reason))
         }

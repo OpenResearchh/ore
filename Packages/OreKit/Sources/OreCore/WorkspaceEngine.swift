@@ -34,6 +34,9 @@ public actor WorkspaceEngine {
     private var statusWatcher: StatusWatcher?
     private var statusTask: Task<Void, Never>?
     private var baseSyncTask: Task<Void, Never>?
+    private(set) var backgroundPollingEnabled: Bool
+    private var hasStarted = false
+    private var isStopped = false
     private var gitStatus: GitStatusSummary = GitStatusSummary()
     private var baseSync: BaseSyncStatus?
     private var chats: [ChatID: ChatRuntime] = [:]
@@ -101,7 +104,8 @@ public actor WorkspaceEngine {
         store: OreStore,
         git: GitClient,
         harnessRegistry: HarnessRegistry,
-        allowAPIKeyFallback: Bool = false
+        allowAPIKeyFallback: Bool = false,
+        backgroundPollingEnabled: Bool = true
     ) {
         self.workspaceID = record.workspaceID
         self.isAssistantWorkspace = record.workspaceKind == .assistant
@@ -111,6 +115,7 @@ public actor WorkspaceEngine {
         self.git = git
         self.harnessRegistry = harnessRegistry
         self.allowAPIKeyFallback = allowAPIKeyFallback
+        self.backgroundPollingEnabled = backgroundPollingEnabled
         self.worktreeURL = URL(fileURLWithPath: record.worktreePath)
         self.gitHub = GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
         self.diffEngine = DiffEngine(git: git)
@@ -198,18 +203,23 @@ public actor WorkspaceEngine {
         )
     }
 
-    public func currentRecord() -> WorkspaceRecord { record }
-
-    public func pendingPermissionRequests() -> [PermissionRequest] {
-        chats.values.flatMap { $0.pendingPermissions.values }
-    }
-
     // MARK: - Lifecycle
 
     public func start() async {
+        guard !isStopped else { return }
         _ = try? await loadChats()
         await startStatusWatching()
-        await startBaseSyncWatching()
+        hasStarted = true
+        startBaseSyncWatching()
+    }
+
+    public func setBackgroundPollingEnabled(_ enabled: Bool) async {
+        guard backgroundPollingEnabled != enabled else { return }
+        backgroundPollingEnabled = enabled
+        baseSyncTask?.cancel()
+        baseSyncTask = nil
+        if enabled, hasStarted { startBaseSyncWatching() }
+        await statusWatcher?.setBackgroundPollingEnabled(enabled)
     }
 
     /// Marks the workspace read. Notification hygiene is capped at one unread
@@ -230,12 +240,17 @@ public actor WorkspaceEngine {
     }
 
     public func stop() async {
+        isStopped = true
         statusTask?.cancel()
         baseSyncTask?.cancel()
+        baseSyncTask = nil
         await statusWatcher?.stop()
         for runtime in chats.values {
             runtime.sessionTask?.cancel()
             await runtime.session?.stop()
+            // Shutdown and archive cancel the event loop too, so no session
+            // boundary remains to persist the last coalesced revisions.
+            await runtime.transcript?.flush()
             runtime.session = nil
         }
         continuation.finish()
@@ -736,6 +751,9 @@ public actor WorkspaceEngine {
         await runtime.session?.stop()
         runtime.session = nil
         runtime.sessionEffort = nil
+        // The cancelled loop won't deliver `sessionEnded`, so coalesced tool
+        // and plan revisions are written here or not at all.
+        await runtime.transcript?.flush()
         runtime.transcript = nil
         runtime.isTurnActive = false
         setStatus(.idle, runtime: runtime)
@@ -1576,6 +1594,13 @@ public actor WorkspaceEngine {
             : try await diffEngine.workingTreeDiff(worktree: worktreeURL)
     }
 
+    /// A file as it was at the merge base — the "before" of the review diff.
+    public func baseFileData(path: String) async -> Data? {
+        let mergeBase = await git.mergeBase(with: record.baseBranch, in: worktreeURL)
+            ?? record.baseBranch
+        return await git.fileData(atRevision: mergeBase, path: path, in: worktreeURL)
+    }
+
     public func addDiffComment(_ reference: DiffCommentReference) async throws {
         try await ingestPostedComments()
         _ = try await store.addDiffComment(DiffCommentRecord(
@@ -1735,8 +1760,13 @@ public actor WorkspaceEngine {
     /// the decision itself is a pure function.
     public func gitActionContext() async -> GitActionContext {
         let gitHubStatus = await gitHub.status()
+        // This runs on every status change of every workspace. A PR a minute
+        // old is fine for choosing the next action; ORE's own PR operations
+        // forget the cached answer, so they show at once.
         let pullRequest = gitHubStatus.isAuthenticated
-            ? await gitHub.pullRequest(forBranch: record.branch)
+            ? await gitHub.pullRequest(
+                forBranch: record.branch, maxAge: Self.pullRequestCacheLifetime
+            )
             : nil
 
         var parentBranch: String?
@@ -1745,15 +1775,19 @@ public actor WorkspaceEngine {
            let parent = try? await store.workspace(WorkspaceID(rawValue: parentID)) {
             parentBranch = parent.branch
             if gitHubStatus.isAuthenticated {
-                parentPullRequest = await gitHub.pullRequest(forBranch: parent.branch)
+                parentPullRequest = await gitHub.pullRequest(
+                    forBranch: parent.branch, maxAge: Self.pullRequestCacheLifetime
+                )
             }
         }
 
-        // Read the working tree live so the suggested action agrees with the
-        // diff, which is always computed live against the base. The cached
-        // `gitStatus` can lag the tree by a debounce/poll interval, and that gap
-        // showed up as a "No changes" action sitting next to a real diff.
-        let liveStatus = await statusWatcher?.currentSnapshot()?.summary() ?? gitStatus
+        // The suggested action must agree with the diff, which is always
+        // computed live against the base. The published `gitStatus` can lag
+        // the tree by a debounce/poll interval, and that gap showed up as a
+        // "No changes" action sitting next to a real diff. The watcher's last
+        // read is reused only while no filesystem event has arrived since it
+        // began, which is exactly when it can't disagree.
+        let liveStatus = await statusWatcher?.recentSnapshot()?.summary() ?? gitStatus
 
         return GitActionContext(
             hasUncommittedChanges: liveStatus.hasUncommittedChanges,
@@ -1957,8 +1991,11 @@ public actor WorkspaceEngine {
     // MARK: - Status watching
 
     private func startStatusWatching() async {
-        guard statusWatcher == nil else { return }
-        let watcher = StatusWatcher(git: git, worktreeURL: worktreeURL)
+        guard !isStopped, statusWatcher == nil else { return }
+        let watcher = StatusWatcher(
+            git: git, worktreeURL: worktreeURL,
+            backgroundPollingEnabled: backgroundPollingEnabled
+        )
         statusWatcher = watcher
 
         statusTask = Task { [weak self] in
@@ -1982,12 +2019,23 @@ public actor WorkspaceEngine {
         publishGitStatusChange()
     }
 
-    private func startBaseSyncWatching() async {
-        guard baseSyncTask == nil else { return }
-        await refreshBaseSync(forceFetch: true)
+    /// Base sync is a banner, not a live feed: minutes of lag cost nothing,
+    /// while a 45-second tick was a steady stream of git processes per
+    /// workspace. Matches `GitClient.remoteFetchCooldown`, so a tick fetches.
+    static let baseSyncInterval: Duration = .seconds(300)
+    /// How old a PR may be when choosing the next git action.
+    static let pullRequestCacheLifetime: Duration = .seconds(60)
+
+    /// Not awaited by `start`: the first reading needs the network, and every
+    /// engine starts at once at launch. The fetch is not forced either, so
+    /// sibling worktrees of one repository share a single fetch.
+    private func startBaseSyncWatching() {
+        guard backgroundPollingEnabled, !isStopped, baseSyncTask == nil else { return }
         baseSyncTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await self?.refreshBaseSync(forceFetch: false, isLaunch: true)
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(45))
+                try? await Task.sleep(for: WorkspaceEngine.baseSyncInterval)
                 guard !Task.isCancelled else { return }
                 await self?.refreshBaseSync(forceFetch: false)
             }
@@ -1997,7 +2045,7 @@ public actor WorkspaceEngine {
     /// Fetch origin's default branch and compare it to the local default ref
     /// and to this worktree. Cheap when the fetch is coalesced; the comparison
     /// is local rev-list / merge-tree.
-    private func refreshBaseSync(forceFetch: Bool) async {
+    private func refreshBaseSync(forceFetch: Bool, isLaunch: Bool = false) async {
         guard await git.hasRemote() else {
             if baseSync != nil {
                 baseSync = nil
@@ -2015,7 +2063,7 @@ public actor WorkspaceEngine {
             measuredBehind,
             defaultBranch: defaultBranch,
             origin: origin,
-            forceFetch: forceFetch
+            allowed: !forceFetch && !isLaunch
         )
         let workspaceBehind = await git.commitCount(
             from: "HEAD", to: origin, in: worktreeURL
@@ -2046,10 +2094,10 @@ public actor WorkspaceEngine {
     ///
     /// Guarded twice: never move a branch some checkout is sitting on, and
     /// `fastForwardLocalBranch` itself refuses a diverged (non-ancestor)
-    /// local default. Periodic refreshes only (`!forceFetch`): every engine's
-    /// initial refresh fires at once at startup, and piling more spawns onto
-    /// that burst buys nothing — the first periodic tick lands 45 seconds
-    /// later.
+    /// local default. Periodic refreshes only (`allowed`): not a forced
+    /// fetch, and not the launch reading — every engine's first refresh fires
+    /// at once at startup, and piling more spawns onto that burst buys
+    /// nothing; the first periodic tick follows `baseSyncInterval` later.
     ///
     /// Deliberately a separate function of sequential `guard`s, NOT a
     /// multi-clause `if` with `try? await` in `refreshBaseSync`'s condition
@@ -2062,9 +2110,9 @@ public actor WorkspaceEngine {
         _ measured: Int,
         defaultBranch: String,
         origin: String,
-        forceFetch: Bool
+        allowed: Bool
     ) async -> Int {
-        guard !forceFetch, measured > 0 else { return measured }
+        guard allowed, measured > 0 else { return measured }
         guard await git.branchExists(defaultBranch) else { return measured }
         let checkedOut = await git.isBranchCheckedOut(defaultBranch)
         guard !checkedOut else { return measured }
@@ -2093,7 +2141,9 @@ public actor WorkspaceEngine {
     private func handle(_ rawEvent: AgentEvent, chatID: ChatID) async {
         guard let runtime = chats[chatID] else { return }
         let event = enriched(rawEvent, runtime: runtime)
-        await runtime.transcript?.handle(event)
+        if TranscriptWriter.persists(event) {
+            await runtime.transcript?.handle(event)
+        }
 
         switch event {
         case .statusChanged(let newStatus):
@@ -2176,8 +2226,16 @@ public actor WorkspaceEngine {
             // which contends with every other worktree on a loaded runner.
             await drainQueue(runtime: runtime)
             // The agent has stopped writing, so this is the moment the diff is
-            // both interesting and stable.
-            await statusWatcher?.refreshNow()
+            // both interesting and stable. Not awaited: `git status` plus two
+            // numstats under load held the turn-end event — and with it the
+            // composer — until they finished. The result arrives on its own
+            // stream moments later.
+            if let statusWatcher {
+                Task { await statusWatcher.refreshNow() }
+            }
+            // The agent may have opened or merged a PR with `gh` itself; the
+            // turn-end action refresh must not offer to create it again.
+            await gitHub.forgetCachedPullRequests()
             await compactAssistantIfOutgrown(runtime)
             publishChatChange(runtime)
 

@@ -37,22 +37,32 @@ public actor GitHubClient {
         }
     }
 
+    /// Remembered across every client in the process: this ran two `gh`
+    /// processes on each git-action refresh of each workspace. Signed in holds
+    /// until a command fails on auth (`run` forgets it then); signed out is
+    /// re-checked after a short while, so a `gh auth login` in a terminal
+    /// shows up without a restart.
     public func status() async -> Status {
-        guard executablePath != nil else {
+        guard let executablePath else {
             return Status(
                 isInstalled: false,
                 isAuthenticated: false,
                 diagnostic: "The GitHub CLI (`gh`) is not installed."
             )
         }
+        if let cached = GitHubStateCache.shared.status(for: executablePath) {
+            return cached
+        }
         let version = try? await run(["--version"]).lines.first
         let authenticated = (try? await run(["auth", "status"])) != nil
-        return Status(
+        let status = Status(
             isInstalled: true,
             isAuthenticated: authenticated,
             version: version,
             diagnostic: authenticated ? nil : "Run `gh auth login` to connect GitHub."
         )
+        GitHubStateCache.shared.store(status, for: executablePath)
+        return status
     }
 
     // MARK: - Account and repositories
@@ -86,6 +96,8 @@ public actor GitHubClient {
     /// GitHub's own browser page and credential store.
     public func authenticate() async throws {
         guard let executablePath else { throw GitHubError.ghNotInstalled }
+        // Whatever happens, the remembered signed-out status is now suspect.
+        defer { GitHubStateCache.shared.invalidateStatus(for: executablePath) }
         _ = try await GitProcess.run(
             executablePath: executablePath,
             arguments: [
@@ -219,10 +231,6 @@ public actor GitHubClient {
         }
 
         public var hasRunningChecks: Bool { checks.contains { !$0.isComplete } }
-
-        public var allChecksPassed: Bool {
-            !checks.isEmpty && checks.allSatisfy { $0.isComplete && $0.isSuccess }
-        }
     }
 
     public struct CheckRun: Sendable, Hashable, Codable {
@@ -267,17 +275,57 @@ public actor GitHubClient {
     }
 
     /// The open PR for a branch, if there is one.
-    public func pullRequest(forBranch branch: String) async -> PullRequest? {
+    ///
+    /// `maxAge` accepts an answer that old from any client in the process —
+    /// for polling refreshes, where a network round trip per workspace per
+    /// status change bought nothing. The default always asks GitHub. Every
+    /// answer is remembered, and this client's own PR changes forget them.
+    public func pullRequest(
+        forBranch branch: String, maxAge: Duration = .zero
+    ) async -> PullRequest? {
+        let key = pullRequestCacheKey(branch)
+        if maxAge > .zero, let cached = GitHubStateCache.shared.pullRequest(for: key, maxAge: maxAge) {
+            return cached.pullRequest
+        }
         let fields = [
             "number", "title", "url", "state", "isDraft",
             "baseRefName", "headRefName", "mergeable", "reviewDecision", "statusCheckRollup",
         ].joined(separator: ",")
 
-        guard let output = try? await run(
-            ["pr", "view", branch, "--json", fields]
-        ) else { return nil }
+        let output: GitOutput
+        do {
+            output = try await run(["pr", "view", branch, "--json", fields])
+        } catch {
+            // "No PR" is an answer worth keeping; a network or auth failure is
+            // not, or one blip would hide the PR for the whole window.
+            if Self.isNoPullRequest(error) {
+                GitHubStateCache.shared.store(nil, for: key)
+            }
+            return nil
+        }
 
-        return decodePullRequest(output.standardOutput)
+        let pullRequest = decodePullRequest(output.standardOutput)
+        GitHubStateCache.shared.store(pullRequest, for: key)
+        return pullRequest
+    }
+
+    /// Drops remembered PRs for this repository — after a push, say, which
+    /// moves checks without going through `gh`.
+    public func forgetCachedPullRequests() {
+        GitHubStateCache.shared.invalidatePullRequests(withPrefix: pullRequestCachePrefix)
+    }
+
+    private var pullRequestCachePrefix: String { "\(repositoryURL.path)\u{0}" }
+
+    private func pullRequestCacheKey(_ branch: String) -> String {
+        pullRequestCachePrefix + branch
+    }
+
+    static func isNoPullRequest(_ error: any Error) -> Bool {
+        guard let gitError = error as? GitError,
+              case .commandFailed(_, _, let message) = gitError
+        else { return false }
+        return message.lowercased().contains("no pull requests found")
     }
 
     public func createPullRequest(
@@ -295,6 +343,7 @@ public actor GitHubClient {
             "--body", body,
         ]
         if draft { arguments.append("--draft") }
+        defer { forgetCachedPullRequests() }
         let output = try await run(arguments)
         // `gh pr create` prints the PR URL on success.
         return output.lines.last(where: { $0.hasPrefix("http") }) ?? output.trimmedStandardOutput
@@ -304,12 +353,14 @@ public actor GitHubClient {
     /// children were branched from it, so they must point at the base branch
     /// instead of a branch that no longer exists.
     public func retargetPullRequest(number: Int, to base: String) async throws {
+        defer { forgetCachedPullRequests() }
         try await run(["pr", "edit", String(number), "--base", base])
     }
 
     public func merge(number: Int, method: MergeMethod = .squash, deleteBranch: Bool = true) async throws {
         var arguments = ["pr", "merge", String(number), method.flag]
         if deleteBranch { arguments.append("--delete-branch") }
+        defer { forgetCachedPullRequests() }
         try await run(arguments)
     }
 
@@ -564,13 +615,92 @@ public actor GitHubClient {
     @discardableResult
     private func run(_ arguments: [String]) async throws -> GitOutput {
         guard let executablePath else { throw GitHubError.ghNotInstalled }
-        return try await GitProcess.run(
-            executablePath: executablePath,
-            arguments: arguments,
-            workingDirectory: repositoryURL,
-            stdin: nil,
-            environmentOverrides: ["GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat"]
-        )
+        do {
+            return try await GitProcess.run(
+                executablePath: executablePath,
+                arguments: arguments,
+                workingDirectory: repositoryURL,
+                stdin: nil,
+                environmentOverrides: ["GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat"]
+            )
+        } catch {
+            if Self.invalidatesStatus(error) {
+                GitHubStateCache.shared.invalidateStatus(for: executablePath)
+            }
+            throw error
+        }
+    }
+
+    /// A failure that means the remembered `status()` may be wrong: `gh` could
+    /// not be launched, or it said the credentials are missing or rejected.
+    /// "No pull requests found" and friends are answers, not auth changes.
+    static func invalidatesStatus(_ error: any Error) -> Bool {
+        guard let gitError = error as? GitError,
+              case .commandFailed(_, _, let message) = gitError
+        else { return true }
+        let lowered = message.lowercased()
+        return lowered.contains("gh auth login")
+            || lowered.contains("http 401")
+            || lowered.contains("bad credentials")
+    }
+}
+
+/// What `GitHubClient` remembers between calls, shared by every instance in
+/// the process — each engine's, and the throwaway clients the core creates
+/// per action — so a merge through one is seen by the others.
+final class GitHubStateCache: Sendable {
+    static let shared = GitHubStateCache()
+
+    /// How long "not signed in" is believed before `gh auth status` runs again.
+    static let signedOutStatusLifetime: Duration = .seconds(30)
+
+    struct CachedPullRequest: Sendable {
+        var pullRequest: GitHubClient.PullRequest?
+        var at: ContinuousClock.Instant
+    }
+
+    private struct CachedStatus: Sendable {
+        var status: GitHubClient.Status
+        var at: ContinuousClock.Instant
+    }
+
+    private let statuses = Lockbox<[String: CachedStatus]>([:])
+    private let pullRequests = Lockbox<[String: CachedPullRequest]>([:])
+
+    func status(for executablePath: String) -> GitHubClient.Status? {
+        guard let entry = statuses.get()[executablePath] else { return nil }
+        if entry.status.isAuthenticated { return entry.status }
+        return entry.at.duration(to: .now) < Self.signedOutStatusLifetime ? entry.status : nil
+    }
+
+    func store(_ status: GitHubClient.Status, for executablePath: String) {
+        statuses.withLock { $0[executablePath] = CachedStatus(status: status, at: .now) }
+    }
+
+    func invalidateStatus(for executablePath: String) {
+        statuses.withLock { $0[executablePath] = nil }
+    }
+
+    func pullRequest(for key: String, maxAge: Duration) -> CachedPullRequest? {
+        guard let entry = pullRequests.get()[key], entry.at.duration(to: .now) <= maxAge else {
+            return nil
+        }
+        return entry
+    }
+
+    func store(_ pullRequest: GitHubClient.PullRequest?, for key: String) {
+        pullRequests.withLock { entries in
+            // One entry per branch looked at; drop the lot rather than let a
+            // very long session accumulate them.
+            if entries.count > 512 { entries.removeAll() }
+            entries[key] = CachedPullRequest(pullRequest: pullRequest, at: .now)
+        }
+    }
+
+    func invalidatePullRequests(withPrefix prefix: String) {
+        pullRequests.withLock { entries in
+            entries = entries.filter { !$0.key.hasPrefix(prefix) }
+        }
     }
 }
 

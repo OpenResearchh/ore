@@ -27,22 +27,48 @@ public enum ShellEnvironment {
 
     private static let cache = Cache()
 
-    private final class Cache: @unchecked Sendable {
-        private let lock = NSLock()
+    /// Computes a value once, without holding its lock while computing.
+    ///
+    /// The login-shell probe can take seconds; holding a lock across it made
+    /// every concurrent `childEnvironment()` contend on that lock (and made
+    /// `invalidateCache()` block behind a probe). Now one caller computes with
+    /// the lock released and the others sleep on the condition until it
+    /// publishes — they still get the single computed value.
+    final class Cache: @unchecked Sendable {
+        private let condition = NSCondition()
         private var value: [String: String]?
+        private var isComputing = false
+        private var generation: UInt64 = 0
 
         func resolve(_ compute: () -> [String: String]) -> [String: String] {
-            lock.lock()
-            defer { lock.unlock() }
-            if let value { return value }
+            condition.lock()
+            while value == nil, isComputing {
+                condition.wait()
+            }
+            if let value {
+                condition.unlock()
+                return value
+            }
+            isComputing = true
+            let startedGeneration = generation
+            condition.unlock()
+
             let computed = compute()
-            value = computed
+
+            condition.lock()
+            isComputing = false
+            // An invalidation mid-probe means this reading may predate the
+            // change; hand it to this caller but let the next one re-probe.
+            if generation == startedGeneration { value = computed }
+            condition.broadcast()
+            condition.unlock()
             return computed
         }
 
         func invalidate() {
-            lock.lock()
-            defer { lock.unlock() }
+            condition.lock()
+            defer { condition.unlock() }
+            generation += 1
             value = nil
         }
     }
@@ -62,10 +88,6 @@ public enum ShellEnvironment {
         Thread.detachNewThread {
             _ = loginShellEnvironment()
         }
-    }
-
-    public static func invalidateCache() {
-        cache.invalidate()
     }
 
     /// The environment to hand a harness child process: login-shell values,

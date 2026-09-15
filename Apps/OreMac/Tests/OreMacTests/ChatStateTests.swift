@@ -330,6 +330,44 @@ struct TranscriptDisplayTests {
         #expect(footer.activitySignature != first)
     }
 
+    @Test func activitySummaryIsASingleStepCount() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "th", turnID: turn, kind: .thinking, text: "hmm"),
+            TranscriptRow(id: "tool", turnID: turn, kind: .toolCall, text: "Read"),
+            TranscriptRow(id: "note", turnID: turn, kind: .assistantText, text: "working"),
+            TranscriptRow(id: "err", turnID: turn, kind: .error, text: "boom"),
+        ]
+        let summary = TranscriptDisplay.activitySummary(for: rows)
+        #expect(summary == "4 steps")
+        #expect(!summary.contains("tool call"))
+        #expect(!summary.contains("thought"))
+        #expect(!summary.contains("note"))
+        #expect(!summary.contains("issue"))
+    }
+
+    @Test func aSingleItemIsOneStep() {
+        let row = TranscriptRow(
+            id: "th", turnID: TurnID(rawValue: "t1"), kind: .thinking, text: "hmm"
+        )
+        #expect(TranscriptDisplay.activitySummary(for: [row]) == "1 step")
+    }
+
+    @Test func collapsedActivityReadsAsStepsNotACategoryList() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "go"),
+            TranscriptRow(id: "th", turnID: turn, kind: .thinking, text: "hmm", isComplete: true),
+            TranscriptRow(id: "tool", turnID: turn, kind: .toolCall, text: "Read", isComplete: true),
+            TranscriptRow(id: "a1", turnID: turn, kind: .assistantText, text: "done", isComplete: true),
+        ]
+        let displayed = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        let group = displayed.first { $0.kind == .activityGroup }
+        #expect(group?.text == "2 steps")
+    }
+
     @Test func streamingALaterTurnReusesCompletedTurnOutput() {
         let turn1 = TurnID(rawValue: "t1")
         let turn2 = TurnID(rawValue: "t2")

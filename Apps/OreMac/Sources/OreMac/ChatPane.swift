@@ -52,6 +52,10 @@ struct ChatPane: View {
     @State private var renameChatTarget: ChatSummary?
     @State private var renameChatText = ""
     @State private var workspaceFileIndex: [WorkspaceFileNode] = []
+    /// `workspaceFileIndex` prepared for @-mentions: rebuilt with the index,
+    /// memoized per query, so a ChatPane pass mid-mention doesn't re-sort
+    /// every file.
+    @State private var mentionIndex = MentionSuggestionIndex(files: [])
     /// Owns the transcript's "jump to latest" affordance. Held here rather than
     /// in `TranscriptHost` so its identity survives every body pass.
     @State private var scrollAnchor = TranscriptScrollAnchor()
@@ -82,9 +86,19 @@ struct ChatPane: View {
     @State private var voiceCanceledFilePaths: Set<String> = []
     /// The floating dock's measured height, fed into the transcript's bottom
     /// content inset so rows can scroll clear of the glass above them.
-    @State private var dockHeight: CGFloat = 0
+    ///
+    /// Held by reference rather than in `@State` on purpose: a card entering or
+    /// leaving the dock sweeps this height for the 0.18 s the transition runs,
+    /// and as plain state every intermediate value re-ran `chatBody` — which
+    /// re-resolves the active chat (a filter and sort over every chat in the
+    /// app), the nudge, and rebuilds every dock card. Only `ComposerDockInset`
+    /// reads the property, so only that small subtree invalidates.
+    @State private var dock = ComposerDockMetrics()
     private var hotkey: VoiceHotkeyMonitor { .shared }
 
+    /// Fresh lookups, for event handlers. Each access filters and sorts every
+    /// chat summary, so render paths resolve both once in `chatBody` and take
+    /// them as parameters (named the same, shadowing these) instead.
     private var chat: ChatState { model.chat(for: workspace.id) }
     private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
 
@@ -125,6 +139,11 @@ struct ChatPane: View {
                     Group {
                         if let filePath = model.activeFilePath[workspace.id] {
                             DiffDocumentView(workspace: workspace, path: filePath)
+                                // A fresh document per file tab. Without it
+                                // SwiftUI reused the previous file's view, so
+                                // the new diff opened at the old one's scroll
+                                // offset and briefly showed its state.
+                                .id("\(workspace.id.rawValue)|\(filePath)")
                                 .padding(.top, OreTheme.RowHeight.bar)
                         } else {
                             // Own view identity so transcript/composer observation
@@ -134,7 +153,10 @@ struct ChatPane: View {
                             }
                         }
                     }
-                    .frame(maxWidth: .infinity)
+                    // The column always owns the pane's full height. A short
+                    // document state ("Can't open this file") otherwise sized
+                    // the column to itself and floated mid-window.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                     if let splitID = resolvedSplitChatID {
                         // The reference design's seam: a live accent line, not a
@@ -144,10 +166,11 @@ struct ChatPane: View {
                             .frame(width: 2)
                         SplitChatColumn(workspace: workspace, chatID: splitID)
                             .padding(.top, OreTheme.RowHeight.bar)
-                            .frame(maxWidth: .infinity)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                             .id(splitID)
                     }
                 }
+                .frame(maxHeight: .infinity, alignment: .top)
 
                 ChatTabBar(
                     workspace: workspace,
@@ -165,7 +188,9 @@ struct ChatPane: View {
                 // `OreNavigationSelection`), which is also how the system's
                 // floating tab groups solve this.
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            // Top, not the default centre: a stack shorter than the pane was
+            // centred whole, carrying the tab strip down to the middle.
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // No opaque fill. The transcript scrolls directly over the window's
@@ -183,7 +208,7 @@ struct ChatPane: View {
         enum Action {
             /// Send this prompt to the current chat.
             case send(String)
-            /// Spin up the temporary commit tab (`AppModel.startCommitAgent`).
+            /// Ask this tab's agent to commit (`AppModel.commitWithAgent`).
             case commitAgent
             /// Close this tab — offered on a finished commit tab.
             case closeTab
@@ -201,7 +226,7 @@ struct ChatPane: View {
     /// tab offers to close itself, a failure offers a diagnosis, a stale base
     /// offers a sync, uncommitted work offers the commit clerk, a diff offers
     /// a summary, and only then the generic recap.
-    private var composerSuggestion: ComposerSuggestion? {
+    private func composerSuggestion(chat: ChatState, chatSummary: ChatSummary?) -> ComposerSuggestion? {
         guard chat.hasRows, !chat.isBusy else { return nil }
         guard chat.pendingPermission == nil, chat.pendingQuestion == nil,
               chat.prominentError == nil, chat.draftComments.isEmpty,
@@ -290,7 +315,7 @@ struct ChatPane: View {
     /// A ready plan is its own response surface. Keeping the ordinary composer
     /// beneath it produces two competing places to type and, under vertical
     /// compression, lets the transcript squeeze the plan body to zero height.
-    private var isReviewingPlan: Bool {
+    private func isReviewingPlan(_ chat: ChatState) -> Bool {
         if case .proposal = chat.plan { return true }
         return false
     }
@@ -310,7 +335,7 @@ struct ChatPane: View {
         case .send(let prompt):
             model.send(prompt, to: workspace.id)
         case .commitAgent:
-            model.startCommitAgent(in: workspace.id)
+            model.commitWithAgent(in: workspace.id)
         case .closeTab:
             guard let id = chatSummary?.id else { return }
             model.closeChat(id, in: workspace.id)
@@ -318,7 +343,7 @@ struct ChatPane: View {
     }
 
     /// Reloads the queued-message strip when the tab changes or its queue does.
-    private var queuedMessagesTaskID: String {
+    private func queuedMessagesTaskID(_ chatSummary: ChatSummary?) -> String {
         let id = chatSummary?.id.rawValue ?? ""
         let count = chatSummary?.queuedMessageCount ?? 0
         return "\(id)-\(count)"
@@ -338,116 +363,94 @@ struct ChatPane: View {
         }
     }
 
-    /// Bottom-trailing, in the band the turn rail deliberately leaves clear (it
-    /// stops 50pt short of the foot), so the button sits on neither the rail nor
-    /// the centred prose.
-    @ViewBuilder
-    private var jumpToLatestOverlay: some View {
-        let away = scrollAnchor.isAwayFromBottom
-        ZStack {
-            if away {
-                JumpToLatestButton { scrollAnchor.jumpToBottom() }
-                    .transition(
-                        reduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity)
-                    )
-            }
-        }
-        .padding(.trailing, OreTheme.Space.md)
-        .padding(.bottom, OreTheme.Space.sm)
-        .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.8), value: away)
-    }
-
     /// The transcript itself, or the empty state before a chat has any rows.
     ///
     /// Split out of `chatBody` because that one expression had grown past what
     /// the type checker will solve in reasonable time.
     @ViewBuilder
-    private var transcriptViewport: some View {
-        ZStack(alignment: .bottomLeading) {
-            if !chat.hasRows && !chat.isBusy {
-                ResearchEmptyState(
-                    identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
-                        ?? model.researchIdentity(for: workspace),
-                    title: chatSummary?.title,
-                    seed: chatSummary?.id.rawValue ?? workspace.id.rawValue,
-                    onSuggestion: { suggestion in
-                        draft = suggestion
-                        composerFocused = true
-                    }
-                )
-                // Centered in the part of the pane the floating dock leaves
-                // uncovered, so its suggestion chips never hide behind glass.
-                .padding(.bottom, dockHeight)
-            } else {
-                TranscriptHost(
-                    chat: chat,
-                    worktreePath: workspace.worktreePath,
-                    agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "",
-                    searchQuery: isSearching ? effectiveSearchQuery : "",
-                    persistenceKey: transcriptScrollKey,
-                    expandedActivityGroups: expandedActivityGroups,
-                    canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
-                    onRevert: { revertTarget = $0 },
-                    onToggleActivity: { toggleActivity($0) },
-                    onOpenFile: { openAgentFile($0) },
-                    onTurnAction: { turn, action in handleTurnAction(turn, action) },
-                    scrollAnchor: scrollAnchor,
-                    // A hair of air between the newest row and the dock's glass.
-                    bottomInset: dockHeight + OreTheme.Space.sm,
-                    // …and head room under the floating tab strip, so the top
-                    // row rests below the pills while scrolled rows slide
-                    // underneath them.
-                    topInset: OreTheme.RowHeight.bar + OreTheme.Space.sm
-                )
-                .equatable()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // The scroll-edge treatment, done on the content instead of
-                // the chrome: rows dissolve as they slide up toward the tab
-                // pills. A mask is clipped to this pane by construction, so —
-                // unlike the scrim rectangle it replaces — it cannot print an
-                // edge against the inspector, and full-contrast text can never
-                // sit level with the pills or the window title.
-                .mask {
-                    VStack(spacing: 0) {
-                        LinearGradient(
-                            colors: [.clear, .black],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        .frame(height: OreTheme.RowHeight.bar + OreTheme.Space.sm)
-                        Color.black
-                        // The dock is translucent by design, but transcript
-                        // prose must not remain readable through an alert or
-                        // the composer while the reader scrolls. The resting
-                        // bottom inset already keeps the newest row above this
-                        // boundary; this fade handles rows moving underneath
-                        // it, preserving the wallpaper refraction without
-                        // mixing two layers of text.
-                        LinearGradient(
-                            colors: [.black, .clear],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        .frame(height: dockHeight + OreTheme.Space.sm)
+    private func transcriptViewport(chat: ChatState, chatSummary: ChatSummary?) -> some View {
+        // Everything under here that moves with the dock reads its height from
+        // the shared metrics object, so a dock-height change re-runs this
+        // closure alone rather than the whole chat column. See `dock`.
+        ComposerDockInset(metrics: dock) { dockHeight in
+            ZStack(alignment: .bottomLeading) {
+                if !chat.hasRows && !chat.isBusy {
+                    ResearchEmptyState(
+                        identity: chatSummary.flatMap { ResearchIdentity.matching(researchTitle: $0.title) }
+                            ?? model.researchIdentity(for: workspace),
+                        title: chatSummary?.title,
+                        seed: chatSummary?.id.rawValue ?? workspace.id.rawValue,
+                        onSuggestion: { suggestion in
+                            draft = suggestion
+                            composerFocused = true
+                        }
+                    )
+                    // Centered in the part of the pane the floating dock leaves
+                    // uncovered, so its suggestion chips never hide behind glass.
+                    .padding(.bottom, dockHeight)
+                } else {
+                    TranscriptHost(
+                        chat: chat,
+                        worktreePath: workspace.worktreePath,
+                        agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "",
+                        agentHarness: chatSummary?.harness,
+                        searchQuery: isSearching ? effectiveSearchQuery : "",
+                        persistenceKey: transcriptScrollKey(chatSummary),
+                        expandedActivityGroups: expandedActivityGroups,
+                        canFork: chatSummary?.capabilities.supportsSessionFork ?? false,
+                        onRevert: { revertTarget = $0 },
+                        onToggleActivity: { toggleActivity($0) },
+                        onOpenFile: { openAgentFile($0) },
+                        onTurnAction: { turn, action in handleTurnAction(turn, action) },
+                        scrollAnchor: scrollAnchor,
+                        // A hair of air between the newest row and the dock's glass.
+                        bottomInset: dockHeight + OreTheme.Space.sm,
+                        // …and head room under the floating tab strip, so the top
+                        // row rests below the pills while scrolled rows slide
+                        // underneath them.
+                        topInset: OreTheme.RowHeight.bar + OreTheme.Space.sm
+                    )
+                    .equatable()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // The scroll-edge treatment, done on the content instead of
+                    // the chrome: rows dissolve as they slide up toward the tab
+                    // pills. A mask is clipped to this pane by construction, so —
+                    // unlike the scrim rectangle it replaces — it cannot print an
+                    // edge against the inspector, and full-contrast text can never
+                    // sit level with the pills or the window title.
+                    .modifier(TranscriptEdgeFade(
+                        top: OreTheme.RowHeight.bar + OreTheme.Space.sm,
+                        bottom: dockHeight + OreTheme.Space.sm,
+                        transcriptKey: transcriptScrollKey(chatSummary)
+                    ))
+                    .overlay(alignment: .bottomTrailing) {
+                        // Riding above the floating dock, not behind it. Its own
+                        // view, so a follow flip mid-gesture re-runs the button
+                        // rather than this whole column.
+                        JumpToLatestOverlay(anchor: scrollAnchor)
+                            .padding(.bottom, dockHeight)
                     }
                 }
-                .overlay(alignment: .bottomTrailing) {
-                    // Riding above the floating dock, not behind it.
-                    jumpToLatestOverlay.padding(.bottom, dockHeight)
-                }
+                // The "agent is working" state now lives on the composer itself
+                // (an animated border plus an inline status row), so there is no
+                // longer a separate floating pill hovering over the transcript.
             }
-            // The "agent is working" state now lives on the composer itself
-            // (an animated border plus an inline status row), so there is no
-            // longer a separate floating pill hovering over the transcript.
         }
     }
 
-    private var transcriptScrollKey: String {
+    private func transcriptScrollKey(_ chatSummary: ChatSummary?) -> String {
         "ore.chatScroll.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
     }
 
     @ViewBuilder
     private func chatBody(paneHeight: CGFloat) -> some View {
+        // Resolved once per pass and handed down. As computed properties these
+        // were re-resolved at every one of the body's ~100 reads, each one a
+        // filter and sort over every chat in the app.
+        let chatSummary = model.activeChat(for: workspace.id)
+        let chat = chatSummary.map { model.chat(for: $0.id) } ?? ChatState()
+        let reviewingPlan = isReviewingPlan(chat)
+        let nudge = composerSuggestion(chat: chat, chatSummary: chatSummary)
         // The transcript fills the column and the dock *floats over its foot*
         // on glass — rows scroll underneath the composer, which is what gives
         // Liquid Glass something to refract. Stacking the composer below the
@@ -480,7 +483,7 @@ struct ChatPane: View {
                     )
                 }
             }
-            transcriptViewport
+            transcriptViewport(chat: chat, chatSummary: chatSummary)
                 // Transition snapshots of an infinitely-sized empty view could
                 // paint over sibling split-view columns while changing tabs. The
                 // transcript viewport owns and clips all of its content now.
@@ -500,8 +503,11 @@ struct ChatPane: View {
             // showing the generic Allow/Deny alongside that card is two
             // prompts for the same decision. The dedicated card owns it, and
             // answering there also allows (or denies) this permission.
-            if let permission = chat.pendingPermission,
-               !hidesGenericPermission(permission) {
+            // The oldest request the generic card owns. Parallel tool calls can
+            // have several open; answering one brings up the next.
+            if let permission = chat.pendingPermissions.first(where: {
+                !hidesGenericPermission($0, in: chat)
+            }) {
                 PermissionCard(request: permission) { decision in
                     model.resolvePermission(permission.id, decision: decision, for: workspace.id)
                 }
@@ -553,18 +559,14 @@ struct ChatPane: View {
                 .id(requestID?.rawValue ?? markdown)
             }
 
-            if !queuedMessages.isEmpty {
-                MessageQueueCard(messages: $queuedMessages) { record, text in
-                    await model.updateQueuedMessage(record, text: text)
-                } onDelete: { record in
-                    await model.deleteQueuedMessage(record)
-                    queuedMessages.removeAll { $0.id == record.id }
-                }
-                .frame(maxWidth: OreTheme.contentMaxWidth)
-                .padding(.horizontal, OreTheme.Space.md)
+            if !queuedMessages.isEmpty && (reviewingPlan || chat.pendingQuestion != nil) {
+                queueShelf
+                    .oreCard(padding: 10, radius: 14)
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .padding(.horizontal, OreTheme.Space.md)
             }
 
-            if !chat.draftComments.isEmpty && !isReviewingPlan {
+            if !chat.draftComments.isEmpty && !reviewingPlan {
                 DraftCommentsBar(
                     comments: chat.draftComments,
                     origin: chatSummary.flatMap {
@@ -584,7 +586,7 @@ struct ChatPane: View {
             // The reference design's floating nudge: one contextual next step
             // hovering above the composer when the agent is idle and nothing
             // else is asking for the user's attention.
-            if let suggestion = composerSuggestion {
+            if let suggestion = nudge {
                 ComposerSuggestionChip(
                     text: suggestion.title,
                     icon: suggestion.icon,
@@ -602,7 +604,7 @@ struct ChatPane: View {
             // Hard failures — usage limits especially — belong where the user
             // is about to act, not buried as a red row up in the transcript.
             if let error = chat.prominentError {
-                composerErrorBanner(error)
+                composerErrorBanner(error, chat: chat, chatSummary: chatSummary)
             } else if let scheduled = model.scheduledContinuation(for: chatSummary?.id) {
                 ScheduledContinuationBanner(item: scheduled, onCancel: cancelScheduledContinuation)
                     .frame(maxWidth: OreTheme.contentMaxWidth)
@@ -635,8 +637,8 @@ struct ChatPane: View {
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.vertical, 10)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if !isReviewingPlan {
-                composer(paneHeight: paneHeight)
+            } else if !reviewingPlan {
+                composer(paneHeight: paneHeight, chat: chat, chatSummary: chatSummary)
             }
             }
             .background(
@@ -649,15 +651,23 @@ struct ChatPane: View {
             )
             // The dock's cards declare transitions, but nothing *drove* them:
             // with no animation bound to these state changes, a suggestion
-            // chip vanished in a single frame, the measured dock height
-            // snapped, and the transcript's inset — pinned to it — jumped with
-            // a visible jerk. Animating the dock lets the height glide, and
-            // the scroll inset follows it frame by frame.
-            .animation(.easeOut(duration: 0.18), value: composerSuggestion?.id)
+            // chip vanished in a single frame. Animating the dock slides the
+            // cards. The measured height is a different matter: the preference
+            // reads layout, which moves straight to the final size while the
+            // cards' offsets animate at render time, so the inset (and the
+            // fade band) step once per card change rather than gliding.
+            .animation(.easeOut(duration: 0.18), value: nudge?.id)
             .animation(.easeOut(duration: 0.18), value: chat.pendingQuestion?.id)
             .animation(.easeOut(duration: 0.18), value: chat.draftComments.isEmpty)
         }
-        .onPreferenceChange(ComposerDockHeightKey.self) { dockHeight = $0 }
+        .onPreferenceChange(ComposerDockHeightKey.self) { height in
+            // Whole points, and only on a real change: sub-point layout noise
+            // re-inset the transcript for nothing. A composer wrap usually
+            // lands here already applied (`noteComposerTextHeight`), in which
+            // case this write is skipped entirely.
+            let rounded = height.rounded()
+            if rounded != dock.height { dock.height = rounded }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .layoutPriority(1)
         .task(id: chatSummary?.id) {
@@ -687,9 +697,11 @@ struct ChatPane: View {
             composerFocused = true
             model.consumeComposerInjection(injection.generation)
         }
-        .task(id: queuedMessagesTaskID) {
+        .task(id: queuedMessagesTaskID(chatSummary)) {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
-            queuedMessages = await model.queuedMessages(for: id)
+            let records = await model.queuedMessages(for: id)
+            guard !Task.isCancelled, chatSummary?.id == id else { return }
+            queuedMessages = records
         }
         .onChange(of: draft) { _, value in
             // The guard keeps a tab switch from writing the previous tab's text
@@ -765,7 +777,9 @@ struct ChatPane: View {
             // what normally records the text, and it cannot fire on a view that
             // is going away — so a prompt `finishVoice` just committed would be
             // lost without this.
-            if let chatSummary, draftOwnerID == chatSummary.id {
+            // A fresh lookup, not this pass's snapshot: the pane can be torn
+            // down in the same update that changed the active chat.
+            if let chatSummary = self.chatSummary, draftOwnerID == chatSummary.id {
                 model.setDraft(draft, for: chatSummary)
             }
             model.flushPendingDrafts()
@@ -802,7 +816,7 @@ struct ChatPane: View {
         // can arrive from the assistant/MCP rather than this view's picker.
         // Reconcile either case automatically so an effort from the previous
         // model never remains selected for a different capability set.
-        .task(id: effortCapabilityKey) {
+        .task(id: effortCapabilityKey(chatSummary)) {
             if let tab = chatSummary { clampEffort(to: tab) }
         }
         .onChange(of: fastModeEnabled) { _, enabled in
@@ -811,6 +825,7 @@ struct ChatPane: View {
         }
         .task(id: workspace.id) {
             workspaceFileIndex = Self.flattenFiles(await model.workspaceFiles(for: workspace))
+            mentionIndex = MentionSuggestionIndex(files: workspaceFileIndex)
             voiceFileMatcher = makeVoiceFileMatcher()
         }
         .confirmationDialog(
@@ -903,27 +918,39 @@ struct ChatPane: View {
         @Binding var searchFocusRequest: Int
         @State private var hoveredTabKey: String?
 
-        private var chat: ChatState { model.chat(for: workspace.id) }
-        private var chatSummary: ChatSummary? { model.activeChat(for: workspace.id) }
-
-        /// Ephemeral chats (the find bar's Answers chat) never render as tabs.
-        private var visibleTabs: [ChatSummary] {
-            model.chats(for: workspace.id).filter {
-                !model.isEphemeralChat($0.id)
-                    && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
-            }
-        }
-
         var body: some View {
+        // Resolved once per pass. Each label used to re-filter and re-sort the
+        // tab list for its own crowding and close-button checks — quadratic in
+        // tabs, on every summary change anywhere.
+        let allTabs = model.chats(for: workspace.id)
+        // Ephemeral chats (the find bar's Answers chat) never render as tabs.
+        let tabs = allTabs.filter {
+            !model.isEphemeralChat($0.id)
+                && !$0.title.hasPrefix(AppModel.ephemeralChatPrefix)
+        }
+        let activeID = model.activeChat(for: workspace.id)?.id
+        let activeFilePath = model.activeFilePath[workspace.id]
+        let openFilePaths = model.openFilePaths[workspace.id] ?? []
+        // Past four tabs the strip drowns in truncated titles; background tabs
+        // collapse to mark + short name and the selected tab keeps its full one.
+        let isCrowded = tabs.count + openFilePaths.count > 4
+        let activeTabKey = activeFilePath.map { "file:\($0)" }
+            ?? activeID.map { "chat:\($0.rawValue)" }
+            ?? ""
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: OreTheme.Space.xs) {
-                    ForEach(visibleTabs) { tab in
+                    ForEach(tabs) { tab in
                         Button {
                             model.selectChat(tab.id, in: workspace.id)
                             model.showChatInCenter(workspace.id)
                         } label: {
-                            tabLabel(tab)
+                            tabLabel(
+                                tab,
+                                isSelected: tab.id == activeID && activeFilePath == nil,
+                                isCrowded: isCrowded,
+                                isClosable: tabs.count > 1
+                            )
                         }
                         .buttonStyle(.plain)
                         .id("chat:\(tab.id.rawValue)")
@@ -946,7 +973,7 @@ struct ChatPane: View {
                                     model.openSplitChat(tab.id, in: workspace.id)
                                 }
                             }
-                            if model.chats(for: workspace.id).count > 1 {
+                            if allTabs.count > 1 {
                                 Button("Close") { requestCloseChat(tab) }
                             }
                         }
@@ -954,9 +981,9 @@ struct ChatPane: View {
 
                     // File diffs opened from the review list show up here as
                     // tabs, so a diff reads as an open document, not a side pane.
-                    ForEach(model.openFilePaths[workspace.id] ?? [], id: \.self) { path in
+                    ForEach(openFilePaths, id: \.self) { path in
                         Button { model.selectDiffFile(path, in: workspace.id) } label: {
-                            fileTabLabel(path)
+                            fileTabLabel(path, isSelected: activeFilePath == path, isCrowded: isCrowded)
                         }
                         .buttonStyle(.plain)
                         .id("file:\(path)")
@@ -970,6 +997,13 @@ struct ChatPane: View {
                 // and the last tab still can't slide under the + button.
                 .padding(.horizontal, tabControlAllowance)
                 .frame(minWidth: availableWidth)
+                // On macOS 26 every pill is its own Liquid Glass, each
+                // sampling the transcript scrolling beneath the strip. One
+                // container renders the siblings together. Zero spacing keeps
+                // pills that sit apart from melting into each other, and the
+                // container lives inside the scroll view so its clip still
+                // applies. Earlier releases draw flat fills and are untouched.
+                .modifier(TabStripGlassGroup())
             }
             .frame(maxWidth: .infinity)
             .onChange(of: activeTabKey) { _, key in
@@ -986,7 +1020,9 @@ struct ChatPane: View {
             // underneath stay readable through the blur, and the cluster reads
             // as one floating control group the way Apple gathers toolbar
             // buttons on shared glass.
-            trailingControls
+            // Only the active tab's state, and created if missing as before:
+            // the checkpoint menu needs it even while a file tab is showing.
+            trailingControls(chat: activeID.map { model.chat(for: $0) })
                 .padding(.horizontal, OreTheme.Space.xs)
                 .oreGlassSurface(.capsule, elevation: .inset)
                 .padding(.trailing, OreTheme.Space.xs)
@@ -1007,19 +1043,6 @@ struct ChatPane: View {
     /// it back.
     private var tabControlAllowance: CGFloat {
         136
-    }
-
-    private var activeTabKey: String {
-        if let path = model.activeFilePath[workspace.id] { return "file:\(path)" }
-        if let id = chatSummary?.id { return "chat:\(id.rawValue)" }
-        return ""
-    }
-
-    /// Past four tabs the strip drowns in truncated titles; background tabs
-    /// collapse to mark + short name and the selected tab keeps its full one.
-    private var isCrowded: Bool {
-        visibleTabs.count
-            + (model.openFilePaths[workspace.id]?.count ?? 0) > 4
     }
 
     /// "Femtosecond Chemistry" → "Femtosecond": the first word carries the
@@ -1043,8 +1066,7 @@ struct ChatPane: View {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    private func fileTabLabel(_ path: String) -> some View {
-        let isSelected = model.activeFilePath[workspace.id] == path
+    private func fileTabLabel(_ path: String, isSelected: Bool, isCrowded: Bool) -> some View {
         let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             SourceFileIcon(path: path, size: 16)
@@ -1075,10 +1097,15 @@ struct ChatPane: View {
         }
     }
 
-    private func tabLabel(_ tab: ChatSummary) -> some View {
-        let isSelected = tab.id == chatSummary?.id && model.activeFilePath[workspace.id] == nil
-        let tabState = model.chat(for: tab.id)
-        let isWorking = tabState.isBusy
+    private func tabLabel(
+        _ tab: ChatSummary, isSelected: Bool, isCrowded: Bool, isClosable: Bool
+    ) -> some View {
+        // Read without creating. `chat(for:)` here built state and loaded the
+        // history of every tab in the strip; a tab with no state yet is not
+        // running and has no draft attachments this session. Hovering warms
+        // it (below), so a click or a transcript copy still finds it loaded.
+        let tabState = model.chatStates[tab.id]
+        let isWorking = tabState?.isBusy ?? false
         let compact = isCrowded && !isSelected
         return HStack(spacing: 6) {
             HarnessMark(harness: tab.harness, size: 14, isMuted: !isSelected && !isWorking)
@@ -1094,7 +1121,7 @@ struct ChatPane: View {
                 Text(compact ? shortTitle(tab.title) : tab.title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
-                if !compact, !tab.draftText.isEmpty || !tabState.draftAttachments.isEmpty {
+                if !compact, !tab.draftText.isEmpty || !(tabState?.draftAttachments.isEmpty ?? true) {
                     Image(systemName: "pencil").font(.system(size: 8))
                 }
                 if tab.queuedMessageCount > 0 {
@@ -1103,7 +1130,7 @@ struct ChatPane: View {
                 }
                 // Compact tabs keep the close affordance on hover — hiding it
                 // entirely forced a select-then-close dance.
-                if visibleTabs.count > 1,
+                if isClosable,
                    !compact || hoveredTabKey == "chat:\(tab.id.rawValue)" {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .semibold))
@@ -1145,8 +1172,12 @@ struct ChatPane: View {
         .contentShape(RoundedRectangle(cornerRadius: OreTheme.tabRadius))
         .onHover { hovering in
             let key = "chat:\(tab.id.rawValue)"
-            if hovering { hoveredTabKey = key }
-            else if hoveredTabKey == key { hoveredTabKey = nil }
+            if hovering {
+                hoveredTabKey = key
+                if model.chatStates[tab.id] == nil { _ = model.chat(for: tab.id) }
+            } else if hoveredTabKey == key {
+                hoveredTabKey = nil
+            }
         }
     }
 
@@ -1162,7 +1193,8 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private var trailingControls: some View {
+    private func trailingControls(chat: ChatState?) -> some View {
+        let revertableTurns = chat?.revertableTurns ?? []
         HStack(spacing: OreTheme.Space.xs) {
             Button {
                 // ⌘F never closes: pressed with the bar already open it
@@ -1197,9 +1229,9 @@ struct ChatPane: View {
             .help("New tab (⌘T)")
 
             Menu {
-                if !chat.revertableTurns.isEmpty {
+                if !revertableTurns.isEmpty {
                     Section("Checkpoints") {
-                        ForEach(Array(chat.revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
+                        ForEach(Array(revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
                             Button("Before turn \(index + 1)") { revertTarget = turn }
                         }
                     }
@@ -1212,7 +1244,7 @@ struct ChatPane: View {
                         }
                     }
                 }
-                if chat.revertableTurns.isEmpty && closed.isEmpty {
+                if revertableTurns.isEmpty && closed.isEmpty {
                     Text("No history yet")
                 }
             } label: {
@@ -1226,33 +1258,46 @@ struct ChatPane: View {
     }
     }
 
-    @ViewBuilder
-    private func modelChoices(for tab: ChatSummary) -> some View {
-        Text("Default model").tag("")
-        ForEach(model.knownModels(for: tab.harness)) { choice in
-            Text(choice.displayName).tag(choice.id)
-        }
-        if let selected = tab.model,
-           !model.knownModels(for: tab.harness).contains(where: { $0.id == selected }) {
-            Text(selected).tag(selected)
-        }
-    }
-
     // MARK: - Composer
 
-    private func composer(paneHeight: CGFloat) -> some View {
-        VStack(spacing: OreTheme.Space.sm) {
+    private var queueShelf: some View {
+        MessageQueueShelf(messages: queuedMessages) { record, text in
+            try await model.updateQueuedMessage(record, text: text)
+            await reloadQueue(for: record)
+        } onDelete: { record in
+            try await model.deleteQueuedMessage(record)
+            await reloadQueue(for: record)
+        } onMove: { record, direction in
+            try await model.moveQueuedMessage(record, direction: direction)
+            await reloadQueue(for: record)
+        }
+        .id(chatSummary?.id)
+    }
+
+    private func reloadQueue(for record: QueuedMessageRecord) async {
+        guard let rawID = record.chatID else { return }
+        let id = ChatID(rawValue: rawID)
+        let records = await model.queuedMessages(for: id)
+        guard chatSummary?.id == id else { return }
+        queuedMessages = records
+    }
+
+    private func composer(paneHeight: CGFloat, chat: ChatState, chatSummary: ChatSummary?) -> some View {
+        let external = externalAttachments(chat)
+        let mentions = mentionSuggestions(chat)
+        return VStack(spacing: OreTheme.Space.sm) {
+            if !queuedMessages.isEmpty {
+                queueShelf
+                Divider().overlay(OreTheme.hairline)
+            }
+
             if chat.isBusy {
+                // Handed the state, not its values: the status row reads
+                // `lastEventAt` and friends itself, so a streaming event
+                // redraws that row instead of this whole conversation column.
                 ComposerBusyStatus(
                     harness: chatSummary?.harness ?? workspace.harness,
-                    status: chat.status,
-                    startedAt: chat.turnStartedAt,
-                    lastEventAt: chat.lastEventAt,
-                    runningToolLabel: chat.runningToolLabel,
-                    // Booting a one-shot CLI takes seconds before its first
-                    // event; the status row says so rather than claiming work
-                    // is already happening.
-                    isStarting: !chat.hasTurnEventArrived,
+                    chat: chat,
                     onStop: { model.interrupt(workspace.id) }
                 )
                 .transition(.opacity)
@@ -1276,9 +1321,9 @@ struct ChatPane: View {
                     )
             }
 
-            if !externalAttachments.isEmpty {
+            if !external.isEmpty {
                 AttachmentChipStrip(
-                    attachments: externalAttachments.map {
+                    attachments: external.map {
                         AttachmentChipStrip.IndexedAttachment(index: $0.offset, attachment: $0.element)
                     },
                     worktreePath: workspace.worktreePath,
@@ -1305,7 +1350,7 @@ struct ChatPane: View {
                 .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
-            if !mentionSuggestions.isEmpty {
+            if !mentions.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
                         Text("REFERENCE A FILE")
@@ -1319,7 +1364,7 @@ struct ChatPane: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
 
-                    ForEach(mentionSuggestions.prefix(6)) { node in
+                    ForEach(mentions.prefix(6)) { node in
                         Button { tagFile(node) } label: {
                             HStack(spacing: 8) {
                                 SourceFileIcon(path: node.path, size: 17)
@@ -1346,26 +1391,15 @@ struct ChatPane: View {
                 .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
-            if voice.isActive || voiceSettle != nil {
-                // In voice mode the input area itself becomes the transcript:
-                // the words land where they will be sent from, set in serif
-                // quotes so they read as speech-in-progress rather than typed
-                // text.
-                VoiceComposerTranscript(
-                    prefix: draft,
-                    transcript: voiceSettle?.quote ?? voiceQuote,
-                    isListening: voice.isListening,
-                    isSettled: voiceSettle != nil,
-                    // Never let the settled prompt squeeze the toolbar out of a
-                    // short window: cap it to a slice of the pane.
-                    maxLines: min(6, max(2, Int(paneHeight * 0.35 / 22)))
-                )
-                .frame(minHeight: 38, alignment: .topLeading)
-                .transition(.opacity)
-            } else {
+            // The editor stays mounted under the voice transcript instead of
+            // being swapped out for it. The swap tore down the scroll view and
+            // text stack at every dictation and rebuilt both, with a fresh
+            // height measurement, when the mic stopped.
+            let isVoiceComposing = voice.isActive || voiceSettle != nil
+            ZStack(alignment: .topLeading) {
                 InlineMentionTextEditor(
                     text: $draft,
-                    mentionNames: attachments
+                    mentionNames: chat.draftAttachments
                         .filter {
                             !$0.relativePath.hasPrefix(".context/attachments/")
                                 || inlinePastedPaths.contains($0.relativePath)
@@ -1375,13 +1409,23 @@ struct ChatPane: View {
                     onPaste: handlePasteboard,
                     onCopy: handleComposerCopy,
                     previewURL: previewURL(for:),
-                    onHeightChange: { composerTextHeight = $0 }
+                    onHeightChange: { noteComposerTextHeight($0) },
+                    heightCap: Self.composerEditorCap
                 )
-                    .frame(height: min(max(composerTextHeight, 38), 200))
+                    // Collapsed to the one-line floor while hidden, so the
+                    // voice transcript alone decides the box's height.
+                    .frame(
+                        height: isVoiceComposing
+                            ? Self.composerEditorFloor
+                            : Self.composerEditorHeight(composerTextHeight)
+                    )
                     .focused($composerFocused)
+                    .opacity(isVoiceComposing ? 0 : 1)
+                    .allowsHitTesting(!isVoiceComposing)
+                    .accessibilityHidden(isVoiceComposing)
                     .overlay(alignment: .topLeading) {
-                        if draft.isEmpty {
-                            Text(placeholder)
+                        if draft.isEmpty && !isVoiceComposing {
+                            Text(placeholder(chat))
                                 .font(.system(size: OreTheme.Font.prose))
                                 .foregroundStyle(.tertiary)
                                 // Match the editor's textContainerInset (5×6) so the
@@ -1392,10 +1436,33 @@ struct ChatPane: View {
                                 .allowsHitTesting(false)
                         }
                     }
+
+                if isVoiceComposing {
+                    // In voice mode the input area itself becomes the transcript:
+                    // the words land where they will be sent from, set in serif
+                    // quotes so they read as speech-in-progress rather than typed
+                    // text.
+                    VoiceComposerTranscript(
+                        prefix: draft,
+                        transcript: voiceSettle?.quote ?? voiceQuote,
+                        isListening: voice.isListening,
+                        isSettled: voiceSettle != nil,
+                        // Never let the settled prompt squeeze the toolbar out of a
+                        // short window: cap it to a slice of the pane.
+                        maxLines: min(6, max(2, Int(paneHeight * 0.35 / 22)))
+                    )
+                    .frame(minHeight: Self.composerEditorFloor, alignment: .topLeading)
+                    .transition(.opacity)
+                }
+            }
+            .onChange(of: isVoiceComposing) { _, composing in
+                // A hidden editor must not keep taking keystrokes. Removing it
+                // used to drop focus on its own; keep that.
+                if composing { composerFocused = false }
             }
 
             if let tab = chatSummary {
-                composerToolbar(for: tab)
+                composerToolbar(for: tab, chat: chat)
             }
         }
         // While the agent runs, the composer's own border animates — the input
@@ -1425,7 +1492,32 @@ struct ChatPane: View {
         }
     }
 
-    private func composerToolbar(for tab: ChatSummary) -> some View {
+    /// The composer editor's frame: a one-line floor, and a cap past which the
+    /// draft scrolls inside the composer instead of growing it.
+    static let composerEditorFloor: CGFloat = 38
+    static let composerEditorCap: CGFloat = 200
+
+    static func composerEditorHeight(_ measured: CGFloat) -> CGFloat {
+        min(max(measured, composerEditorFloor), composerEditorCap)
+    }
+
+    /// A line wrap in one state pass. The dock is the editor's frame plus
+    /// everything around it, so the editor's growth is the dock's growth too:
+    /// moving both together lands the transcript's inset in the same pass as
+    /// the taller composer. Writing only the text height left the inset a pass
+    /// behind (a second body evaluation once the dock's preference caught up,
+    /// and a frame of the newest row sliding under the glass). The preference
+    /// still reports the laid-out height afterwards and corrects any drift;
+    /// when this guess was right, that write is skipped.
+    private func noteComposerTextHeight(_ height: CGFloat) {
+        let delta = Self.composerEditorHeight(height) - Self.composerEditorHeight(composerTextHeight)
+        composerTextHeight = height
+        guard delta != 0, dock.height > 0, !voice.isActive, voiceSettle == nil else { return }
+        dock.height = (dock.height + delta).rounded()
+    }
+
+    /// `tab` is the active chat's summary: the toolbar only exists when there is one.
+    private func composerToolbar(for tab: ChatSummary, chat: ChatState) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
@@ -1433,36 +1525,26 @@ struct ChatPane: View {
                 if supportsEffort(for: tab) {
                     effortButton(for: tab)
                 }
-                permissionChip
+                permissionChip(chat: chat, chatSummary: tab)
                 modeControls(for: tab)
-
-                if let usage = chat.usage ?? tab.contextUsage,
-                   let window = usage.contextWindow, window > 0 {
-                    ContextMeter(
-                        used: usage.totalContextTokens,
-                        window: window,
-                        usage: usage,
-                        modelName: tab.model
-                    )
-                }
-
+                ComposerContextMeter(chat: chat, tab: tab)
                 Spacer(minLength: OreTheme.Space.md)
-                composerSendCluster
+                composerSendCluster(chat: chat, chatSummary: tab)
             }
 
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
                 modelChooserButton(for: tab)
-                permissionChip
+                permissionChip(chat: chat, chatSummary: tab)
                 modeControls(for: tab)
                 Spacer(minLength: OreTheme.Space.md)
-                composerSendCluster
+                composerSendCluster(chat: chat, chatSummary: tab)
             }
         }
         .frame(minHeight: 34)
     }
 
-    private var permissionChip: some View {
+    private func permissionChip(chat: ChatState, chatSummary: ChatSummary?) -> some View {
         let current = chatSummary?.permissionMode ?? workspace.permissionMode
         // Switching is always allowed in an open chat. On a harness that binds
         // its policy per turn the change lands on the next one, and saying so
@@ -1497,7 +1579,7 @@ struct ChatPane: View {
 
     /// Generic Allow/Deny is the wrong surface when a dedicated card already
     /// answers the same permission request.
-    private func hidesGenericPermission(_ permission: PermissionRequest) -> Bool {
+    private func hidesGenericPermission(_ permission: PermissionRequest, in chat: ChatState) -> Bool {
         if permission.toolName == "AskUserQuestion" { return true }
         if permission.toolName == "ExitPlanMode", case .proposal = chat.plan {
             return true
@@ -1731,8 +1813,7 @@ struct ChatPane: View {
         .popover(isPresented: $showEffortChooser, arrowEdge: .bottom) {
             EffortChooser(
                 selection: $reasoningEffort,
-                efforts: efforts,
-                harness: tab.harness
+                efforts: efforts
             )
         }
         .help(efforts.count == 1
@@ -1749,7 +1830,10 @@ struct ChatPane: View {
                 .font(.system(size: OreTheme.Font.body))
                 .lineLimit(1)
                 .contentTransition(.numericText())
-            Color.clear.frame(width: 7, height: 1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .opacity(effortScrollProgress == 0 ? 1 : 0)
         }
         .padding(.horizontal, 9)
         .frame(height: 26)
@@ -1793,7 +1877,7 @@ struct ChatPane: View {
     /// Changes whenever the selected model's effective effort capabilities do.
     /// It deliberately includes the discovered values, not only the model id:
     /// a late CLI catalog refresh can correct a stale built-in catalog in place.
-    private var effortCapabilityKey: String {
+    private func effortCapabilityKey(_ chatSummary: ChatSummary?) -> String {
         guard let tab = chatSummary else { return "none" }
         return ([tab.harness.rawValue, tab.model ?? "default"]
             + availableEfforts(for: tab).map(\.rawValue))
@@ -1893,35 +1977,37 @@ struct ChatPane: View {
         return true
     }
 
-    private func harnessIcon(_ harness: HarnessKind) -> String {
-        switch harness {
-        case .claudeCode: "sparkles"
-        case .codex: "bolt.fill"
-        case .cursorAgent: "cursorarrow.rays"
-        }
-    }
-
     /// Speaker, mic and send are one trailing cluster: same 30pt circle, 8pt
     /// between them, and a wider gap from the chips so the accent action
     /// isn't crowded.
-    private var composerSendCluster: some View {
+    private func composerSendCluster(chat: ChatState, chatSummary: ChatSummary?) -> some View {
         HStack(spacing: OreTheme.Space.sm) {
-            speakerButton
+            speakerButton(chatSummary)
             micButton
-            sendButton
+            sendButton(chat)
         }
     }
 
     /// Per-tab narration toggle: on means this chat's agent activity is
     /// spoken aloud, even when the tab is in the background (where it only
     /// interjects for things that need the user).
-    private var speakerButton: some View {
-        let narrationOn = chatSummary.map { model.narration.isEnabled($0.id) } ?? false
+    private func speakerButton(_ chatSummary: ChatSummary?) -> some View {
+        let assistantMuted = model.narration.isMuted
+        let narrationOn = !assistantMuted
+            && (chatSummary.map { model.narration.isEnabled($0.id) } ?? false)
         let isSpeaking = narrationOn && chatSummary != nil
             && model.narration.speakingChatID == chatSummary?.id
         return Button {
             guard let chatID = chatSummary?.id else { return }
-            model.narration.toggle(chatID)
+            if assistantMuted {
+                // Muted everywhere: flipping a toggle nobody can hear would
+                // look broken, so this speaker lifts the mute and narrates
+                // this tab.
+                model.narration.setMuted(false)
+                if !model.narration.isEnabled(chatID) { model.narration.toggle(chatID) }
+            } else {
+                model.narration.toggle(chatID)
+            }
         } label: {
             Image(systemName: narrationOn ? "speaker.wave.2.fill" : "speaker.slash")
                 .font(.system(size: 13, weight: .semibold))
@@ -1945,9 +2031,11 @@ struct ChatPane: View {
         // ⌥⌘S next to the mic's ⌥⌘M: the two voice controls are one pair, and
         // S is the only free letter that names what it does.
         .keyboardShortcut("s", modifiers: [.option, .command])
-        .help(narrationOn
-            ? "Stop narrating agent activity (⌥⌘S)"
-            : "Narrate agent activity aloud (⌥⌘S)")
+        .help(assistantMuted
+            ? "The assistant is muted — unmute and narrate this tab (⌥⌘S)"
+            : narrationOn
+                ? "Stop narrating agent activity (⌥⌘S)"
+                : "Narrate agent activity aloud (⌥⌘S)")
     }
 
     private var micButton: some View {
@@ -2371,7 +2459,7 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private var sendButton: some View {
+    private func sendButton(_ chat: ChatState) -> some View {
         if #available(macOS 26.0, *) {
             Button(action: send) {
                 Image(systemName: chat.willQueueNextMessage ? "text.append" : "arrow.up")
@@ -2400,7 +2488,7 @@ struct ChatPane: View {
         }
     }
 
-    private var placeholder: String {
+    private func placeholder(_ chat: ChatState) -> String {
         if case .preparing = voice.status { return "Starting dictation…" }
         if case .downloadingModel = voice.status { return "Downloading speech model…" }
         if case .error(let message) = voice.status { return message }
@@ -2464,7 +2552,7 @@ struct ChatPane: View {
         }
     }
 
-    private var externalAttachments: [(offset: Int, element: Attachment)] {
+    private func externalAttachments(_ chat: ChatState) -> [(offset: Int, element: Attachment)] {
         Array(chat.draftAttachments.enumerated()).filter {
             $0.element.relativePath.hasPrefix(".context/attachments/")
                 && !inlinePastedPaths.contains($0.element.relativePath)
@@ -2672,35 +2760,12 @@ struct ChatPane: View {
         return ComposerCommand.all.filter { query.isEmpty || $0.name.dropFirst().hasPrefix(query) }
     }
 
-    private var mentionSuggestions: [WorkspaceFileNode] {
+    private func mentionSuggestions(_ chat: ChatState) -> [WorkspaceFileNode] {
         guard let mention = activeMention else { return [] }
-        let query = mention.query.lowercased()
         // One set, not an array `contains` per file: with hundreds of files
         // in the index the per-keystroke filter was quadratic.
         let attachedPaths = Set(chat.draftAttachments.map(\.relativePath))
-        return workspaceFileIndex
-            .filter { node in
-                !node.isDirectory
-                    && !attachedPaths.contains(node.path)
-                    && (query.isEmpty
-                        || node.name.lowercased().contains(query)
-                        || node.path.lowercased().contains(query))
-            }
-            .sorted { first, second in
-                let firstName = first.name.lowercased().hasPrefix(query)
-                let secondName = second.name.lowercased().hasPrefix(query)
-                if firstName != secondName { return firstName }
-                // A bare `@` should lead with useful project files instead of
-                // dotfiles such as .git and .replit. Explicit queries can still
-                // find those files normally.
-                if query.isEmpty {
-                    let firstHidden = first.path.split(separator: "/").contains { $0.hasPrefix(".") }
-                    let secondHidden = second.path.split(separator: "/").contains { $0.hasPrefix(".") }
-                    if firstHidden != secondHidden { return !firstHidden }
-                }
-                if first.path.count != second.path.count { return first.path.count < second.path.count }
-                return first.path.localizedCaseInsensitiveCompare(second.path) == .orderedAscending
-            }
+        return mentionIndex.suggestions(query: mention.query, excluding: attachedPaths)
     }
 
     private var activeMention: (range: Range<String.Index>, query: String)? {
@@ -2739,7 +2804,7 @@ struct ChatPane: View {
     }
 
     private func acceptFirstMentionSuggestion() -> Bool {
-        guard let first = mentionSuggestions.first else { return false }
+        guard let first = mentionSuggestions(chat).first else { return false }
         tagFile(first)
         return true
     }
@@ -2781,13 +2846,16 @@ struct ChatPane: View {
         model.openSourceFile(path, in: workspace.id, line: focusLine)
     }
 
-    private func composerErrorBanner(_ error: ChatState.ProminentError) -> some View {
+    private func composerErrorBanner(
+        _ error: ChatState.ProminentError, chat: ChatState, chatSummary: ChatSummary?
+    ) -> some View {
         let harness = chatSummary?.harness ?? workspace.harness
         let update = model.harnessCLIUpdate
         let matchingUpdate: AppModel.HarnessCLIUpdate? = update?.kind == harness ? update : nil
         return ProminentErrorBanner(
             error: error,
             harnessName: harness.displayName,
+            signInCommand: HarnessSetup.signInCommand(for: harness),
             scheduled: model.scheduledContinuation(for: chatSummary?.id),
             cliUpdate: matchingUpdate,
             onContinueWhenAvailable: scheduleContinuation,
@@ -2796,6 +2864,9 @@ struct ChatPane: View {
             onUpdateCLI: {
                 guard let chatSummary else { return }
                 model.updateHarnessCLI(for: chatSummary)
+            },
+            onCopySignIn: {
+                model.refreshHarnesses()
             },
             onDismiss: { chat.dismissProminentError() }
         )
@@ -3062,6 +3133,10 @@ private struct CrossTabAnswerPanel: View {
     var state: ChatState
     let onAnswer: (String) -> Void
     @State private var freeform = ""
+    /// Parsed once per answer text. This body also re-runs for busy flips and
+    /// for typing in the question's reply field, none of which move the
+    /// markdown.
+    @State private var answerMarkdown = MarkdownTextMemo()
 
     private var answer: String? {
         state.rows.last { $0.kind == .assistantText && !$0.text.isEmpty }?.text
@@ -3086,7 +3161,7 @@ private struct CrossTabAnswerPanel: View {
                 questionView(question)
             } else if let answer {
                 ScrollView {
-                    Text((try? AttributedString(markdown: answer)) ?? AttributedString(answer))
+                    Text(answerMarkdown.attributed(for: answer))
                         .font(.system(size: OreTheme.Font.prose))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3355,52 +3430,65 @@ struct AgentPresenceStrip: View {
 /// quiet row above the text, paired with the composer's animated busy border.
 private struct ComposerBusyStatus: View {
     let harness: HarnessKind
-    let status: AgentStatus
-    var startedAt: Date?
-    var lastEventAt: Date?
-    var runningToolLabel: String?
-    var isStarting: Bool = false
+    /// Read here rather than unpacked by the caller: `lastEventAt` moves on
+    /// every streamed event, and only this row should redraw for it.
+    let chat: ChatState
     let onStop: () -> Void
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            HStack(spacing: 7) {
-                // Who is working, in the same visual language as the header's
-                // presence line: the agent's mark and a live green dot. The
-                // composer's sweeping border already supplies the motion.
-                HarnessMark(harness: harness, size: 15)
-                Circle()
-                    .fill(OreTheme.Presence.active)
-                    .frame(width: 6, height: 6)
-                Text(ComposerBusyCopy.label(
-                    harness: harness,
-                    status: status,
-                    runningToolLabel: runningToolLabel,
-                    isStarting: isStarting,
-                    lastEventAt: lastEventAt,
-                    now: context.date
-                ))
-                .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                .foregroundStyle(.secondary)
-                if let startedAt {
-                    Text(ComposerBusyCopy.turnElapsed(from: startedAt, to: context.date))
-                        .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 0)
-                Button(action: onStop) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 8, weight: .bold))
-                        Text("Stop")
-                            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+        let status = chat.status
+        let startedAt = chat.turnStartedAt
+        let lastEventAt = chat.lastEventAt
+        let runningToolLabel = chat.runningToolLabel
+        // Booting a one-shot CLI takes seconds before its first event; the
+        // status row says so rather than claiming work is already happening.
+        let isStarting = !chat.hasTurnEventArrived
+        HStack(spacing: 7) {
+            // Who is working, in the same visual language as the header's
+            // presence line: the agent's mark and a live green dot. The
+            // composer's sweeping border already supplies the motion.
+            HarnessMark(harness: harness, size: 15)
+            Circle()
+                .fill(OreTheme.Presence.active)
+                .frame(width: 6, height: 6)
+            // Only the clock-driven labels sit inside the timeline, so the
+            // mark and the Stop button aren't rebuilt every second.
+            TimelineView(StatusClockSchedule(
+                anchor: startedAt ?? .distantPast,
+                paused: controlActiveState != .key
+            )) { context in
+                HStack(spacing: 7) {
+                    Text(ComposerBusyCopy.label(
+                        harness: harness,
+                        status: status,
+                        runningToolLabel: runningToolLabel,
+                        isStarting: isStarting,
+                        lastEventAt: lastEventAt,
+                        now: context.date
+                    ))
+                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    if let startedAt {
+                        Text(ComposerBusyCopy.turnElapsed(from: startedAt, to: context.date))
+                            .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.tertiary)
                     }
-                    .foregroundStyle(.red)
                 }
-                .buttonStyle(OrePressableButtonStyle())
-                .keyboardShortcut(".", modifiers: .command)
-                .help("Stop the running turn (⌘.)")
             }
+            Spacer(minLength: 0)
+            Button(action: onStop) {
+                HStack(spacing: 4) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 8, weight: .bold))
+                    Text("Stop")
+                        .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                }
+                .foregroundStyle(.red)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .keyboardShortcut(".", modifiers: .command)
+            .help("Stop the running turn (⌘.)")
         }
         .padding(.horizontal, 2)
     }
@@ -3415,29 +3503,87 @@ private struct ComposerBusyStatus: View {
 private struct ComposerWaitingStatus: View {
     let tasks: [AgentBackgroundTask]
     var startedAt: Date?
+    @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            HStack(spacing: 7) {
-                Image(systemName: "hourglass")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .symbolEffect(.pulse, options: .repeating)
-                Text(ComposerBusyCopy.waitingLabel(tasks))
-                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                if let startedAt {
+        HStack(spacing: 7) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+            Text(ComposerBusyCopy.waitingLabel(tasks))
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let startedAt {
+                // The clock ticks only this label, not the whole row.
+                TimelineView(StatusClockSchedule(
+                    anchor: startedAt,
+                    paused: controlActiveState != .key
+                )) { context in
                     Text(ComposerBusyCopy.elapsed(from: startedAt, to: context.date))
                         .font(.system(size: OreTheme.Font.caption, weight: .medium).monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
-                Spacer(minLength: 0)
             }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 2)
         .help(tasks.map(\.description).filter { !$0.isEmpty }.joined(separator: "\n"))
+    }
+}
+
+/// The composer status rows' one-second clock.
+///
+/// `.periodic(from: .now, by: 1)` restarted its phase on every parent render,
+/// and kept ticking behind a window nobody was looking at. This one ticks on
+/// whole seconds from a fixed anchor, so a redraw lands on the same grid, and
+/// stops while the window isn't key — the pause every decorative timeline in
+/// the app already takes. The labels catch up when the window is focused.
+struct StatusClockSchedule: TimelineSchedule {
+    var anchor: Date
+    var paused: Bool
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        if paused {
+            var pending: Date? = startDate
+            return AnyIterator {
+                defer { pending = nil }
+                return pending
+            }
+        }
+        // The last whole second from the anchor at or before `startDate`.
+        // Whole seconds are exact in `Double` for any date this far from the
+        // anchor, and an anchor at `.distantPast` just means "no alignment".
+        let offset = startDate.timeIntervalSince(anchor)
+        var next = offset.isFinite && abs(offset) < 1e12
+            ? anchor.addingTimeInterval(offset.rounded(.down))
+            : startDate
+        return AnyIterator {
+            defer { next = next.addingTimeInterval(1) }
+            return next
+        }
+    }
+}
+
+/// The toolbar's context meter, split out so `usage` — rewritten as a turn
+/// streams — redraws the meter instead of the whole composer column.
+private struct ComposerContextMeter: View {
+    let chat: ChatState
+    let tab: ChatSummary
+
+    var body: some View {
+        if let usage = chat.usage ?? tab.contextUsage,
+           let window = usage.contextWindow, window > 0 {
+            ContextMeter(
+                used: usage.totalContextTokens,
+                window: window,
+                usage: usage,
+                modelName: tab.model
+            )
+        }
     }
 }
 
@@ -4041,61 +4187,6 @@ private struct ModelChooser: View {
     }
 }
 
-private struct EffortChooser: View {
-    @Binding var selection: ReasoningEffort
-    let efforts: [ReasoningEffort]
-    let harness: HarnessKind
-
-    var body: some View {
-        let scale = EffortPickerScale(efforts: efforts)
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("Reasoning effort", systemImage: "chart.bar.fill")
-                    .font(.headline)
-                Spacer()
-                Text(selection.displayName).foregroundStyle(.secondary)
-            }
-            if let range = scale.sliderRange {
-                Slider(value: indexBinding, in: range, step: 1)
-                HStack {
-                    Text("Faster")
-                    Spacer()
-                    Text("Deeper")
-                }
-                .font(.caption).foregroundStyle(.secondary)
-            } else if let only = efforts.first {
-                Label(
-                    "\(only.displayName) is selected automatically for this model.",
-                    systemImage: "checkmark.circle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            } else {
-                Text("This model does not expose a reasoning-effort control.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Text(harness == .claudeCode
-                ? "Applied through your Claude Code session. Scroll the chip to adjust."
-                : "Applied to the next Codex turn. Scroll the chip to adjust.")
-                .font(.caption).foregroundStyle(.secondary)
-        }
-        .padding(14)
-        .frame(width: 300)
-    }
-
-    private var indexBinding: Binding<Double> {
-        let scale = EffortPickerScale(efforts: efforts)
-        return Binding(
-            get: { scale.value(for: selection) },
-            set: {
-                guard let resolved = scale.selection(at: $0) else { return }
-                selection = resolved
-            }
-        )
-    }
-}
-
 /// The safe, testable index mapping behind the effort slider. A slider exists
 /// only when there are at least two choices; SwiftUI treats `0...0` as an
 /// invalid slider interval and traps while presenting the popover.
@@ -4199,23 +4290,27 @@ private struct ContextMeter: View {
 private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
     var harnessName: String = "CLI"
+    var signInCommand: String = "claude auth login"
     var scheduled: ScheduledContinuation?
     var cliUpdate: AppModel.HarnessCLIUpdate?
     var onContinueWhenAvailable: () -> Void
     var onCancelSchedule: () -> Void
     var onRetry: () -> Void
     var onUpdateCLI: () -> Void
+    var onCopySignIn: (() -> Void)?
     let onDismiss: () -> Void
 
     private var tint: Color {
-        if error.needsCLIUpgrade { return OreTheme.warning }
+        if error.needsCLIUpgrade || error.needsSignIn { return OreTheme.warning }
         return error.isUsageLimit ? OreTheme.warning : .red
     }
     private var icon: String {
+        if error.needsSignIn { return "person.crop.circle.badge.exclamationmark" }
         if error.needsCLIUpgrade { return "arrow.down.app.fill" }
         return error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
     }
     private var title: String {
+        if error.needsSignIn { return "\(harnessName) needs you to sign in" }
         if error.needsCLIUpgrade { return "\(harnessName) needs an update" }
         return error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
     }
@@ -4247,7 +4342,21 @@ private struct ProminentErrorBanner: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if error.needsCLIUpgrade {
+                if error.needsSignIn {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(signInCommand, forType: .string)
+                        onCopySignIn?()
+                    } label: {
+                        Label("Copy sign-in command", systemImage: "doc.on.doc")
+                            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(tint.opacity(0.18), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copies `\(signInCommand)` — run it in Terminal, then retry")
+                } else if error.needsCLIUpgrade {
                     updateCLIButton
                 } else if error.isUsageLimit {
                     if let scheduled {
@@ -4631,7 +4740,11 @@ private struct PlanApprovalCard: View {
     let onHandoff: () -> Void
     let onApprove: (String) -> Void
     let onReject: (String) -> Void
-    @State private var feedback = ""
+    /// Rendered once per plan, in `.task(id:)`. As a computed property read in
+    /// `body` this re-parsed the markdown *and* re-ran the syntax highlighter
+    /// over every fenced block on each keystroke in the feedback field — and,
+    /// while the plan streams in behind the card, on each pane pass too.
+    @State private var planBody = AttributedString()
 
     var body: some View {
         VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
@@ -4673,6 +4786,52 @@ private struct PlanApprovalCard: View {
                 }
             }
 
+            // The feedback field and the decision row own the draft between
+            // them, so typing in it never reaches this card's body — and so
+            // never touches the rendered plan above, or the comments bar.
+            PlanDecisionControls(
+                onHandoff: onHandoff,
+                onApprove: onApprove,
+                onReject: onReject
+            )
+        }
+        .oreCard(padding: 12)
+        .overlay {
+            RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
+                .fill(Color.purple.opacity(0.08))
+                .allowsHitTesting(false)
+        }
+        .task(id: markdown) {
+            planBody = Self.render(markdown)
+        }
+    }
+
+    /// Main-actor by necessity: `SyntaxHighlighter.shared` and `NSFont` are.
+    /// Running it from `.task` still moves it off the body path, so the cost is
+    /// once per plan revision rather than once per keystroke.
+    private static func render(_ markdown: String) -> AttributedString {
+        let source = PlanProposalPolicy.normalizedMarkdown(markdown) ?? ""
+        guard !source.isEmpty else { return AttributedString("Plan body is still being written.") }
+        let rendered = MarkdownRenderer(
+            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
+            textColor: .labelColor,
+            highlighter: SyntaxHighlighter.shared
+        ).render(source, highlighting: .all)
+        return AttributedString(rendered)
+    }
+}
+
+/// The plan card's feedback field and the buttons that read it. Split off so
+/// the draft lives beside its only readers: every keystroke used to re-run the
+/// whole card, which re-rendered the plan markdown.
+private struct PlanDecisionControls: View {
+    let onHandoff: () -> Void
+    let onApprove: (String) -> Void
+    let onReject: (String) -> Void
+    @State private var feedback = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
             TextField("Feedback or revision notes…", text: $feedback)
                 .onSubmit { onApprove(feedback) }
             HStack {
@@ -4703,56 +4862,6 @@ private struct PlanApprovalCard: View {
                     .help("Open this plan in a new tab so you can run it with another agent")
             }
         }
-        .oreCard(padding: 12)
-        .overlay {
-            RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
-                .fill(Color.purple.opacity(0.08))
-                .allowsHitTesting(false)
-        }
-    }
-
-    private var displayMarkdown: String {
-        PlanProposalPolicy.normalizedMarkdown(markdown) ?? ""
-    }
-
-    private var planBody: AttributedString {
-        let source = displayMarkdown
-        guard !source.isEmpty else { return AttributedString("Plan body is still being written.") }
-        let rendered = MarkdownRenderer(
-            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
-            textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
-        ).render(source, highlighting: .all)
-        return AttributedString(rendered)
-    }
-}
-
-private struct MessageQueueCard: View {
-    @Binding var messages: [QueuedMessageRecord]
-    let onSave: (QueuedMessageRecord, String) async -> Void
-    let onDelete: (QueuedMessageRecord) async -> Void
-
-    var body: some View {
-        DisclosureGroup("Queued messages (\(messages.count))") {
-            VStack(spacing: 6) {
-                ForEach(messages.indices, id: \.self) { index in
-                    HStack {
-                        TextField("Queued message", text: $messages[index].text)
-                            .onSubmit {
-                                let record = messages[index]
-                                Task { await onSave(record, record.text) }
-                            }
-                        Button(role: .destructive) {
-                            let record = messages[index]
-                            Task { await onDelete(record) }
-                        } label: { Image(systemName: "trash") }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(.top, 6)
-        }
-        .oreCard(padding: 12, radius: 14)
     }
 }
 
@@ -4892,11 +5001,42 @@ private struct ComposerDockHeightKey: PreferenceKey {
     }
 }
 
+/// The dock height as a reference, so the pane can publish it without every
+/// reader of the chat column being invalidated with it.
+///
+/// The preference is measured inside the dock's animated subtree
+/// (`ComposerDockHeightKey` sits under `.animation(_:value:)`), so a card
+/// appearing can report the growth either as one step or interpolated across
+/// the transition — the code alone does not settle which, and both readings
+/// have been argued in the tree's own comments. Publishing through an
+/// `@Observable` box makes the question moot on this side: even a per-frame
+/// sweep only re-evaluates `ComposerDockInset`.
+@MainActor
+@Observable
+final class ComposerDockMetrics {
+    /// Whole points; see `ChatPane.dock`.
+    var height: CGFloat = 0
+}
+
+/// Hands the dock's current height to the transcript stack. The content
+/// closure is stored, so a height change re-runs *this* body — not the
+/// enclosing `chatBody`, which would re-resolve the active chat and rebuild
+/// every dock card to move an inset by a point.
+private struct ComposerDockInset<Content: View>: View {
+    let metrics: ComposerDockMetrics
+    @ViewBuilder var content: (CGFloat) -> Content
+
+    var body: some View {
+        content(metrics.height)
+    }
+}
+
 struct TranscriptHost: View, Equatable {
     var chat: ChatState
     var worktreePath: String
     /// Short agent name ("Claude") for the transcript's turn headers.
     var agentName: String
+    var agentHarness: HarnessKind? = nil
     /// The find bar's live query; empty when the bar is closed.
     var searchQuery: String
     var persistenceKey: String
@@ -4945,6 +5085,7 @@ struct TranscriptHost: View, Equatable {
             && lhs.scrollAnchor === rhs.scrollAnchor
             && lhs.worktreePath == rhs.worktreePath
             && lhs.agentName == rhs.agentName
+            && lhs.agentHarness == rhs.agentHarness
             && lhs.searchQuery == rhs.searchQuery
             && lhs.persistenceKey == rhs.persistenceKey
             && lhs.canFork == rhs.canFork
@@ -4960,6 +5101,7 @@ struct TranscriptHost: View, Equatable {
             rows: displayRows,
             isBusy: chat.isBusy,
             agentName: agentName,
+            agentHarness: agentHarness,
             searchQuery: searchQuery,
             worktreePath: worktreePath,
             persistenceKey: persistenceKey,
@@ -4973,7 +5115,9 @@ struct TranscriptHost: View, Equatable {
             // when the reader scrolls away.
             scrollAnchor: scrollAnchor,
             bottomInset: bottomInset,
-            topInset: topInset
+            topInset: topInset,
+            // Read after `displayRows` above, which is what bumps it.
+            structureToken: memo.structureToken
         )
         // An NSViewRepresentable keeps its coordinator when only its inputs
         // change. Without an explicit conversation identity, switching tabs
@@ -5001,8 +5145,124 @@ struct TranscriptHost: View, Equatable {
                 if case .proposal = chat.plan { return chat.planTurnID }
                 return nil
             }(),
-            revision: chat.rowsRevision
+            revision: chat.rowsRevision,
+            structuralRevision: chat.structuralRevision
         )
+    }
+}
+
+/// File @-mention candidates, prepared once when the workspace index loads so
+/// a ChatPane pass mid-mention does not re-filter and re-sort every file.
+final class MentionSuggestionIndex {
+    /// A file with the fields the filter and the sort compare, lowercased and
+    /// counted once at load. Doing it inside the comparator allocated two
+    /// strings per comparison — O(n log n) allocations per keystroke.
+    private struct Candidate {
+        let node: WorkspaceFileNode
+        let lowerName: String
+        let lowerPath: String
+        let pathLength: Int
+        /// Any segment starting with a dot: `.git`, `.replit`, and so on.
+        let isHidden: Bool
+    }
+
+    /// What the mention menu can actually show (it renders `prefix(6)`), with
+    /// enough slack that scrolling a longer list stays possible. Truncating
+    /// before the caller keeps a 10,000-file worktree from copying an array of
+    /// every file on each mention.
+    static let resultLimit = 50
+
+    private let candidates: [Candidate]
+    private var cachedQuery: String?
+    private var cachedExcluding: Set<String> = []
+    private var cachedResults: [WorkspaceFileNode] = []
+
+    init(files: [WorkspaceFileNode]) {
+        candidates = files.lazy.filter { !$0.isDirectory }.map { node in
+            Candidate(
+                node: node,
+                lowerName: node.name.lowercased(),
+                lowerPath: node.path.lowercased(),
+                pathLength: node.path.count,
+                isHidden: node.path.split(separator: "/").contains { $0.hasPrefix(".") }
+            )
+        }
+    }
+
+    func suggestions(
+        query: String,
+        excluding: Set<String>
+    ) -> [WorkspaceFileNode] {
+        let normalized = query.lowercased()
+        // The mention menu is rebuilt on every ChatPane pass — a busy flip, a
+        // transcript row, a dock card — not only when the query moves.
+        if cachedQuery == normalized, cachedExcluding == excluding {
+            return cachedResults
+        }
+        let matches = candidates.filter { candidate in
+            !excluding.contains(candidate.node.path)
+                && (normalized.isEmpty
+                    || candidate.lowerName.contains(normalized)
+                    || candidate.lowerPath.contains(normalized))
+        }
+        let results = matches
+            .sorted { first, second in
+                let firstName = first.lowerName.hasPrefix(normalized)
+                let secondName = second.lowerName.hasPrefix(normalized)
+                if firstName != secondName { return firstName }
+                // A bare `@` should lead with useful project files instead of
+                // dotfiles such as .git and .replit. Explicit queries can still
+                // find those files normally.
+                if normalized.isEmpty, first.isHidden != second.isHidden {
+                    return !first.isHidden
+                }
+                if first.pathLength != second.pathLength {
+                    return first.pathLength < second.pathLength
+                }
+                return first.node.path.localizedCaseInsensitiveCompare(second.node.path)
+                    == .orderedAscending
+            }
+            .prefix(Self.resultLimit)
+            .map(\.node)
+        cachedQuery = normalized
+        cachedExcluding = excluding
+        cachedResults = results
+        return results
+    }
+}
+
+/// Own view around the jump button so a follow flip mid-gesture re-runs just
+/// this overlay, not the whole chat column that hosts it.
+struct JumpToLatestOverlay: View {
+    let anchor: TranscriptScrollAnchor
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let away = anchor.isAwayFromBottom
+        ZStack {
+            if away {
+                JumpToLatestButton { anchor.jumpToBottom() }
+                    .transition(
+                        reduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity)
+                    )
+            }
+        }
+        .padding(.trailing, OreTheme.Space.md)
+        .padding(.bottom, OreTheme.Space.sm)
+        .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.8), value: away)
+    }
+}
+
+/// Groups every tab pill into one Liquid Glass container on macOS 26 so the
+/// siblings sample the transcript underneath together. Earlier releases draw
+/// flat fills and are untouched.
+private struct TabStripGlassGroup: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: 0) { content }
+        } else {
+            content
+        }
     }
 }
 
@@ -5037,6 +5297,256 @@ struct JumpToLatestButton: View {
     }
 }
 
+/// Parsed markdown memoized by source text. Cross-tab answers re-run their
+/// body for busy flips and free-form typing; none of that should re-parse.
+private final class MarkdownTextMemo {
+    private var source: String?
+    private var attributed = AttributedString()
+
+    func attributed(for markdown: String) -> AttributedString {
+        if source == markdown { return attributed }
+        source = markdown
+        // Prose size explicitly: the rendered run carries its own font, so the
+        // call site's `.font(.system(size: .prose))` no longer reaches it and
+        // the default 13 pt would quietly shrink the answer.
+        let rendered = MarkdownRenderer(baseFont: .systemFont(ofSize: OreTheme.Font.prose))
+            .render(markdown)
+        attributed = AttributedString(rendered)
+        return attributed
+    }
+}
+
+/// Fades transcript rows as they slide under the floating tab strip and
+/// composer dock. A mask on the content cannot print an edge against the
+/// inspector the way a scrim rectangle over the chrome could.
+private struct TranscriptEdgeFade: ViewModifier {
+    let top: CGFloat
+    let bottom: CGFloat
+    /// Identity of the conversation under the fade. Kept so SwiftUI can tell
+    /// apart two hosts that share the same insets.
+    let transcriptKey: String
+
+    /// Read once, not per body pass: an experiment switch, not a setting.
+    /// `defaults write <bundle id> ore.debug.appKitTranscriptFade -bool YES`.
+    private static let usesAppKitFade = UserDefaults.standard.bool(
+        forKey: "ore.debug.appKitTranscriptFade"
+    )
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if Self.usesAppKitFade {
+            // The SwiftUI mask below is a compositing filter over the hosted
+            // scroll view: SwiftUI has to render the transcript into an
+            // offscreen buffer and mask it every frame it moves, and the glass
+            // dock then samples that buffer. The AppKit path hands the same
+            // gradient to Core Animation as a mask on the clip view's layer,
+            // where scrolling is the render server moving an already-drawn
+            // layer. Off by default until Animation Hitches says which wins.
+            content.background(
+                AppKitTranscriptFade(top: top, bottom: bottom)
+                    .id(transcriptKey)
+            )
+        } else {
+            maskedFade(content)
+        }
+    }
+
+    private func maskedFade(_ content: Content) -> some View {
+        content.mask {
+            GeometryReader { proxy in
+                let height = max(proxy.size.height, 1)
+                let topStop = min(max(top / height, 0), 1)
+                let bottomStop = min(max(bottom / height, 0), 1)
+                // Monotonic even when the dock is taller than what is left of
+                // the pane (a short window with a plan card open): out-of-order
+                // stops are undefined, and the fade inverted.
+                let bottomEdge = max(topStop, 1 - bottomStop)
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .black, location: topStop),
+                        .init(color: .black, location: bottomEdge),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+            .allowsHitTesting(false)
+            // `transcriptKey` is part of the modifier's identity so a tab
+            // switch rebuilds the mask with the new host rather than animating
+            // between unrelated transcripts.
+            .id(transcriptKey)
+        }
+    }
+}
+
+/// The same top/bottom fade as `TranscriptEdgeFade`'s SwiftUI mask, installed
+/// as a Core Animation mask on the transcript's clip view instead.
+///
+/// Behind `ore.debug.appKitTranscriptFade` because it trades one known cost for
+/// another: it takes the per-frame offscreen composite out of SwiftUI's hands,
+/// but a masked clip view also opts the scroll view out of AppKit's copy-on-
+/// scroll overdraw. Only a trace can say which is cheaper on real content.
+///
+/// The mask goes on the *clip* view, not the scroll view, so the overlay
+/// scroller's knob stays at full contrast right up to both edges — the SwiftUI
+/// mask fades the knob with the text.
+private struct AppKitTranscriptFade: NSViewRepresentable {
+    let top: CGFloat
+    let bottom: CGFloat
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.insets = (top, bottom)
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.insets = (top, bottom)
+    }
+
+    static func dismantleNSView(_ probe: Probe, coordinator: ()) {
+        probe.detach()
+    }
+
+    /// A zero-cost sibling of the transcript, used only to find it. Layout is
+    /// SwiftUI's; everything this view does happens on the layer.
+    final class Probe: NSView {
+        var insets: (top: CGFloat, bottom: CGFloat) = (0, 0) {
+            didSet {
+                guard insets != oldValue else { return }
+                applyLocations()
+            }
+        }
+
+        private weak var clipView: NSClipView?
+        private let gradient = CAGradientLayer()
+        private var isObserving = false
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { detach(); return }
+            attach()
+            // The transcript's scroll view may not be installed yet on the pass
+            // this probe arrives in — the same race `OreScrollerOverlay` runs.
+            if clipView == nil {
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated { self?.attach() }
+                }
+            }
+        }
+
+        func detach() {
+            if isObserving {
+                NotificationCenter.default.removeObserver(self)
+                isObserving = false
+            }
+            if clipView?.layer?.mask === gradient { clipView?.layer?.mask = nil }
+            gradient.removeFromSuperlayer()
+            clipView = nil
+        }
+
+        private func attach() {
+            guard window != nil, clipView == nil, let clip = findTranscriptClipView() else { return }
+            clip.wantsLayer = true
+            guard let layer = clip.layer else { return }
+            gradient.colors = [
+                NSColor.clear.cgColor,
+                NSColor.black.cgColor,
+                NSColor.black.cgColor,
+                NSColor.clear.cgColor,
+            ]
+            // A clip view over a flipped table is itself flipped, and AppKit
+            // flips its backing layer's geometry to match — so unit y = 0 is
+            // the top. Reading the view rather than assuming keeps the fade the
+            // right way up if that ever stops holding.
+            let topFirst = clip.isFlipped
+            gradient.startPoint = CGPoint(x: 0.5, y: topFirst ? 0 : 1)
+            gradient.endPoint = CGPoint(x: 0.5, y: topFirst ? 1 : 0)
+            clipView = clip
+            layer.mask = gradient
+            pinToVisibleRect()
+            applyLocations()
+
+            clip.postsBoundsChangedNotifications = true
+            clip.postsFrameChangedNotifications = true
+            if !isObserving {
+                isObserving = true
+                // The mask lives in the clip view's own coordinate space, which
+                // *scrolls*: without re-pinning it on every bounds change the
+                // fade would slide away with the content on the first flick.
+                NotificationCenter.default.addObserver(
+                    self, selector: #selector(clipGeometryChanged),
+                    name: NSView.boundsDidChangeNotification, object: clip
+                )
+                NotificationCenter.default.addObserver(
+                    self, selector: #selector(clipGeometryChanged),
+                    name: NSView.frameDidChangeNotification, object: clip
+                )
+            }
+        }
+
+        @objc private func clipGeometryChanged(_ note: Notification) {
+            pinToVisibleRect()
+            applyLocations()
+        }
+
+        /// Frame assignments only, with implicit animations off: a scroll tick
+        /// must not queue a 0.25 s default animation on the mask.
+        private func pinToVisibleRect() {
+            guard let clipView, clipView.layer?.mask === gradient else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            gradient.frame = clipView.bounds
+            CATransaction.commit()
+        }
+
+        private func applyLocations() {
+            guard let clipView, clipView.layer?.mask === gradient else { return }
+            let height = max(clipView.bounds.height, 1)
+            let topStop = min(max(insets.top / height, 0), 1)
+            let bottomStop = min(max(insets.bottom / height, 0), 1)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            gradient.locations = [
+                0,
+                NSNumber(value: Double(topStop)),
+                NSNumber(value: Double(max(topStop, 1 - bottomStop))),
+                1,
+            ]
+            CATransaction.commit()
+        }
+
+        /// The transcript is a sibling subtree, not an ancestor: climb, and at
+        /// each level look for the scroll view whose document is the transcript
+        /// table. Matching on `NSTableView` keeps this off the composer's and
+        /// the review pane's scroll views if the hierarchy is ever rearranged.
+        private func findTranscriptClipView() -> NSClipView? {
+            var root: NSView? = superview
+            for _ in 0..<5 {
+                guard let candidate = root else { break }
+                if let scroll = Self.transcriptScrollView(in: candidate) {
+                    return scroll.contentView
+                }
+                root = candidate.superview
+            }
+            return nil
+        }
+
+        private static func transcriptScrollView(in view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView, scroll.documentView is NSTableView {
+                return scroll
+            }
+            for subview in view.subviews {
+                if let found = transcriptScrollView(in: subview) { return found }
+            }
+            return nil
+        }
+    }
+}
+
 /// A small accent dot that breathes while an agent works, so a background tab
 /// reads as "running" even after the sheen is dimmed by the tab's reduced
 /// opacity.
@@ -5045,16 +5555,10 @@ private struct BusyTabDot: View {
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
-        let paused = reduceMotion || controlActiveState != .key
-        TimelineView(.animation(minimumInterval: OreTheme.decorativeAnimationInterval, paused: paused)) { context in
-            let cycle = 1.4
-            let t = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle) / cycle
-            let pulse = 0.5 - 0.5 * cos(t * 2 * Double.pi)
-            Circle()
-                .fill(Color.accentColor)
-                .frame(width: 6, height: 6)
-                .opacity(reduceMotion ? 1 : (0.3 + 0.7 * pulse))
-        }
+        // Breathes in CoreAnimation (`PulsingDot`): a strip of busy tabs no
+        // longer wakes the main thread twelve times a second per tab.
+        PulsingDot(isAnimated: !reduceMotion, isPaused: controlActiveState != .key)
+            .frame(width: 6, height: 6)
     }
 }
 

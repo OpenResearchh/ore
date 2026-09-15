@@ -32,9 +32,12 @@ public actor InProcessCoreClient: CoreClient {
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
     private var engineTasks: [WorkspaceID: [Task<Void, Never>]] = [:]
     private var gitClients: [String: GitClient] = [:]
+    private var backgroundPollingEnabled = true
     var harnessProbes: [HarnessProbeResult] = []
     var harnessUpdates: [HarnessUpdateStatus] = []
     private var lastHarnessUpdateCheck: Date?
+    /// What the previous run learned about the harnesses, read once from disk.
+    private var harnessCache: HarnessDiscoveryCache?
     /// The check awaits the network, and the actor releases between awaits, so
     /// launch and a Refresh click can otherwise overlap on the same registries.
     private var harnessUpdateCheckInFlight = false
@@ -232,15 +235,9 @@ public actor InProcessCoreClient: CoreClient {
             let chat = try await engine(for: workspaceID).setDraft(chatID: chatID, text: text)
             continuation.yield(.chatUpdated(chat))
 
-        case .listChats(let workspaceID):
-            try await listChats(workspaceID)
-
         case .sendMessage(let request):
             let engine = try await engine(for: request.workspaceID)
             _ = try await engine.send(request)
-
-        case .interruptTurn(let id):
-            try await engine(for: id).interrupt()
 
         case .interruptChatTurn(let id, let chatID):
             try await engine(for: id).interrupt(chatID: chatID)
@@ -277,12 +274,6 @@ public actor InProcessCoreClient: CoreClient {
         case .revertChatToCheckpoint(let id, let chatID, let turnID):
             try await engine(for: id).revert(to: turnID, chatID: chatID)
 
-        case .startSession(let id, let request):
-            _ = try await engine(for: id).ensureSession(request)
-
-        case .startChatSession(let id, let chatID, let request):
-            _ = try await engine(for: id).ensureSession(request, chatID: chatID)
-
         case .stopSession(let id):
             try await engine(for: id).stopSession()
 
@@ -315,9 +306,13 @@ public actor InProcessCoreClient: CoreClient {
             async let catalogs = harnessRegistry.discoverAllModels()
             harnessProbes = await probes
             continuation.yield(.harnessProbeCompleted(harnessProbes))
-            for (harness, models) in await catalogs {
+            let discovered = await catalogs
+            for (harness, models) in discovered {
                 recordModels(models, for: harness)
             }
+            // An explicit probe is the user asking about right now; what it
+            // found replaces whatever launch would otherwise reuse.
+            persistCatalogs(discovered)
             await reconcileAssistantConfiguration()
 
         case .checkHarnessUpdates(let force):
@@ -340,33 +335,143 @@ public actor InProcessCoreClient: CoreClient {
         // agent launch doesn't stall on it.
         ShellEnvironment.warm()
 
-        // The product's own hidden workspace. Ensured before the engines load
-        // so it starts — and resumes its session — exactly like any other
-        // workspace; `store.workspaces()` below deliberately excludes it.
-        if let assistant = ((try? await AssistantManager.ensureAssistant(store: store)) ?? nil) {
-            _ = try? await makeEngine(for: assistant)
-            startAssistantBridge()
-        }
+        // The product's own hidden workspace. Ensured before anything is
+        // published so it rides the first snapshot and starts — and resumes
+        // its session — exactly like any other workspace; `store.workspaces()`
+        // below deliberately excludes it.
+        let assistant = (try? await AssistantManager.ensureAssistant(store: store)) ?? nil
+        let records = try await store.workspaces()
 
-        for record in try await store.workspaces() {
-            _ = try? await makeEngine(for: record)
-        }
-        try await restoreOrphanedDreams()
+        // The sidebar is waiting on this, and stored rows are enough to draw
+        // it. With no engine running yet the snapshot is built from the store
+        // alone; each engine's live state follows as its own update, so launch
+        // no longer waits for the whole fleet to start one engine at a time.
         try await resync(nil)
 
+        // Behind the first paint, alongside the engines: probing spawns every
+        // agent CLI, and nothing on screen needs it to draw.
         Task { [weak self] in
-            guard let self else { return }
-            async let probes = self.harnessRegistry.probeAll()
-            async let catalogs = self.harnessRegistry.discoverAllModels()
-            await self.recordProbes(probes)
-            for (harness, models) in await catalogs {
-                await self.recordModels(models, for: harness)
+            await self?.discoverHarnessesAtLaunch()
+        }
+
+        if assistant != nil { startAssistantBridge() }
+        await startEngines((assistant.map { [$0] } ?? []) + records)
+        try await restoreOrphanedDreams()
+    }
+
+    /// Enough to keep git and SQLite from being hit by the whole fleet at
+    /// once, while a dozen workspaces still come up in a few rounds.
+    static let engineStartupConcurrency = 4
+
+    private func startEngines(_ records: [WorkspaceRecord]) async {
+        await withTaskGroup(of: Void.self) { group in
+            var running = 0
+            for record in records {
+                if running >= Self.engineStartupConcurrency {
+                    _ = await group.next()
+                    running -= 1
+                }
+                group.addTask { await self.startEngineAtLaunch(record) }
+                running += 1
             }
-            await self.reconcileAssistantConfiguration()
-            // Behind the probe, and behind everything the user is waiting for:
-            // whether Codex shipped a point release is never worth a slower
-            // launch, and the card can appear a second late.
-            await self.checkHarnessUpdates(force: false)
+        }
+    }
+
+    /// An engine's streams replay its state on subscription, but those can
+    /// land before its chats and status have loaded; one summary once `start`
+    /// has finished is what replaces the stored row the snapshot carried.
+    private func startEngineAtLaunch(_ record: WorkspaceRecord) async {
+        let engine: WorkspaceEngine
+        do {
+            engine = try await makeEngine(for: record)
+        } catch {
+            return
+        }
+        let summary = await engine.summary()
+        publishFromActiveEngine(.workspaceUpdated(summary), id: record.workspaceID, engine: engine)
+    }
+
+    /// Probes, then model catalogs, then the update check — reusing what the
+    /// last run learned where it is still true, since every piece of this
+    /// spawns a CLI or queries a registry and almost never changes between
+    /// launches.
+    private func discoverHarnessesAtLaunch() async {
+        let probes = await harnessRegistry.probeAll()
+        recordProbes(probes)
+
+        let cache = loadedHarnessCache()
+        let now = Date()
+        var missing: Set<HarnessKind> = []
+        for harness in harnessRegistry.available {
+            let version = probes.first { $0.kind == harness.kind }?.version
+            if let models = cache.catalog(for: harness.kind, harnessVersion: version, now: now) {
+                recordModels(models, for: harness.kind)
+            } else {
+                missing.insert(harness.kind)
+            }
+        }
+        if !missing.isEmpty {
+            let discovered = await harnessRegistry.discoverModels(for: missing)
+            for (harness, models) in discovered {
+                recordModels(models, for: harness)
+            }
+            persistCatalogs(discovered)
+        }
+        await reconcileAssistantConfiguration()
+
+        // A check the previous run made still holds if the installed versions
+        // it compared against haven't moved; adopting it spends the throttle
+        // exactly as if this run had made it.
+        if harnessUpdates.isEmpty, lastHarnessUpdateCheck == nil,
+           let cached = cache.updates(matching: probes, now: Date()) {
+            harnessUpdates = cached
+            lastHarnessUpdateCheck = cache.lastUpdateCheck
+            continuation.yield(.harnessUpdatesChecked(cached))
+        }
+        // Behind the probe, and behind everything the user is waiting for:
+        // whether Codex shipped a point release is never worth a slower
+        // launch, and the card can appear a second late.
+        await checkHarnessUpdates(force: false)
+    }
+
+    /// Beside the database, like the assistant's home: a scratch `ORE_HOME`
+    /// or a test fixture gets its own, and an in-memory store gets none.
+    private var harnessCacheURL: URL? {
+        store.url?.deletingLastPathComponent()
+            .appendingPathComponent("harness-cache.json")
+    }
+
+    private func loadedHarnessCache() -> HarnessDiscoveryCache {
+        if let harnessCache { return harnessCache }
+        let loaded = harnessCacheURL.map(HarnessDiscoveryCache.load(from:)) ?? HarnessDiscoveryCache()
+        harnessCache = loaded
+        return loaded
+    }
+
+    private func updateHarnessCache(_ change: (inout HarnessDiscoveryCache) -> Void) {
+        guard let url = harnessCacheURL else { return }
+        var cache = loadedHarnessCache()
+        change(&cache)
+        harnessCache = cache
+        cache.save(to: url)
+    }
+
+    private func persistCatalogs(_ discovered: [(HarnessKind, [AgentModel])]) {
+        let worthKeeping = discovered.filter {
+            HarnessDiscoveryCache.cachedCatalogKinds.contains($0.0) && !$0.1.isEmpty
+        }
+        guard !worthKeeping.isEmpty else { return }
+        let probes = harnessProbes
+        let now = Date()
+        updateHarnessCache { cache in
+            for (harness, models) in worthKeeping {
+                cache.storeCatalog(
+                    models,
+                    for: harness,
+                    harnessVersion: probes.first { $0.kind == harness }?.version,
+                    now: now
+                )
+            }
         }
     }
 
@@ -416,13 +521,19 @@ public actor InProcessCoreClient: CoreClient {
             for await status in group { results.append(status) }
             return results
         }
+        let sorted = statuses.sorted { $0.kind.rawValue < $1.kind.rawValue }
         // Only a check that actually reached a channel spends the throttle. A
         // laptop that launched offline should find out when it reconnects, not
-        // in six hours.
+        // in six hours. Persisted, or every relaunch re-queried the registries.
         if statuses.contains(where: { $0.failure == nil }) {
-            lastHarnessUpdateCheck = Date()
+            let now = Date()
+            lastHarnessUpdateCheck = now
+            updateHarnessCache { cache in
+                cache.lastUpdateCheck = now
+                cache.updates = sorted
+            }
         }
-        harnessUpdates = statuses.sorted { $0.kind.rawValue < $1.kind.rawValue }
+        harnessUpdates = sorted
         continuation.yield(.harnessUpdatesChecked(harnessUpdates))
     }
 
@@ -474,16 +585,6 @@ public actor InProcessCoreClient: CoreClient {
             return
         }
         continuation.yield(.snapshot(snapshot))
-    }
-
-    private func listChats(_ workspaceID: WorkspaceID) async throws {
-        let revision = listRevision
-        let chats = try await engine(for: workspaceID).chatSummaries()
-        guard revision == listRevision else {
-            try await listChats(workspaceID)
-            return
-        }
-        continuation.yield(.chatsListed(workspaceID, chats))
     }
 
     func markListMutation() {
@@ -701,10 +802,11 @@ public actor InProcessCoreClient: CoreClient {
         // `ore.toml` is repository content — after a clone, someone else's —
         // so its scripts wait for the user to read and allow them once.
         let scripts = configuration.scripts
-        if scripts.setup != nil || scripts.archive != nil {
+        if scripts.setup != nil || scripts.run != nil || scripts.archive != nil {
             let approved = (try? await store.repositoryScriptsApproved(
                 repositoryPath: record.repositoryPath,
                 setup: scripts.setup,
+                run: scripts.run,
                 archive: scripts.archive
             )) == true
             if !approved {
@@ -712,6 +814,7 @@ public actor InProcessCoreClient: CoreClient {
                     workspaceID: record.workspaceID,
                     repositoryPath: record.repositoryPath,
                     setup: scripts.setup,
+                    run: scripts.run,
                     archive: scripts.archive
                 )))
             } else if let setup = scripts.setup {
@@ -739,21 +842,27 @@ public actor InProcessCoreClient: CoreClient {
         let scripts = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
         ).scripts
-        guard scripts.setup == approval.setup, scripts.archive == approval.archive else {
+        guard scripts.setup == approval.setup,
+              scripts.run == approval.run,
+              scripts.archive == approval.archive
+        else {
             continuation.yield(.repositoryScriptsNeedApproval(RepositoryScriptsApproval(
                 workspaceID: approval.workspaceID,
                 repositoryPath: record.repositoryPath,
                 setup: scripts.setup,
-                archive: scripts.archive
+                run: scripts.run,
+                archive: scripts.archive,
+                runsSetup: approval.runsSetup
             )))
             return
         }
         try await store.approveRepositoryScripts(
             repositoryPath: record.repositoryPath,
             setup: scripts.setup,
+            run: scripts.run,
             archive: scripts.archive
         )
-        if let setup = scripts.setup {
+        if approval.runsSetup, let setup = scripts.setup {
             await runScript(
                 setup,
                 in: URL(fileURLWithPath: record.worktreePath),
@@ -780,6 +889,7 @@ public actor InProcessCoreClient: CoreClient {
             let approved = (try? await store.repositoryScriptsApproved(
                 repositoryPath: record.repositoryPath,
                 setup: configuration.scripts.setup,
+                run: configuration.scripts.run,
                 archive: archiveScript
             )) == true
             if approved {
@@ -923,6 +1033,10 @@ public actor InProcessCoreClient: CoreClient {
     func push(_ id: WorkspaceID) async throws {
         let (record, git, worktree) = try await workspaceAndGit(id)
         try await git.runSerialized(["push", "-u", "origin", record.branch], in: worktree)
+        // A push moves the PR's checks without going through `gh`, so the
+        // remembered PR (and its check status) is stale now.
+        await GitHubClient(repositoryURL: URL(fileURLWithPath: record.repositoryPath))
+            .forgetCachedPullRequests()
         try await resync(id)
     }
 
@@ -1015,7 +1129,8 @@ public actor InProcessCoreClient: CoreClient {
             store: store,
             git: git,
             harnessRegistry: harnessRegistry,
-            allowAPIKeyFallback: allowAPIKeyFallback
+            allowAPIKeyFallback: allowAPIKeyFallback,
+            backgroundPollingEnabled: backgroundPollingEnabled
         )
         engines[record.workspaceID] = engine
 
@@ -1029,21 +1144,15 @@ public actor InProcessCoreClient: CoreClient {
                 await self.publishFromActiveEngine(
                     .agent(id, routed.chatID, routed.event), id: id, engine: engine
                 )
-                await self.recordHarnessRateLimit(
-                    chatID: routed.chatID, event: routed.event
+                // Deltas are nearly the whole stream and can't say anything
+                // about quota or provider health; they skip the extra hops.
+                guard InProcessCoreClient.carriesHarnessHealth(routed.event) else { continue }
+                await self.observeHarnessHealth(
+                    chatID: routed.chatID,
+                    event: routed.event,
+                    workspaceHarness: HarnessKind(rawValue: record.harness) ?? .claudeCode,
+                    isAssistant: engine.isAssistantWorkspace
                 )
-                // The Assistant is the product's own agent. A rate-limited or
-                // dead CLI must not mute it while another harness is ready.
-                // Project tabs keep their harness; only this workspace moves.
-                await self.noteDreamHarnessRateLimit(
-                    harness: HarnessKind(rawValue: record.harness) ?? .claudeCode,
-                    event: routed.event
-                )
-                if engine.isAssistantWorkspace {
-                    await self.considerAssistantFailover(
-                        chatID: routed.chatID, event: routed.event
-                    )
-                }
             }
         }
         let summaryTask = Task { [weak self] in
@@ -1090,30 +1199,75 @@ public actor InProcessCoreClient: CoreClient {
         return engine
     }
 
-    func recordHarnessRateLimit(chatID: ChatID, event: AgentEvent) async {
-        guard let chat = try? await store.chat(chatID),
-              let harness = HarnessKind(rawValue: chat.harness)
-        else { return }
+    /// The only events any health consumer below acts on: quota reports,
+    /// errors, and turn boundaries.
+    nonisolated static func carriesHarnessHealth(_ event: AgentEvent) -> Bool {
+        switch event {
+        case .rateLimit, .sessionError, .turnCompleted: return true
+        default: return false
+        }
+    }
 
-        let report: RateLimitReport
+    private func observeHarnessHealth(
+        chatID: ChatID,
+        event: AgentEvent,
+        workspaceHarness: HarnessKind,
+        isAssistant: Bool
+    ) async {
+        await recordHarnessRateLimit(chatID: chatID, event: event)
+        noteDreamHarnessRateLimit(harness: workspaceHarness, event: event)
+        // The Assistant is the product's own agent. A rate-limited or dead CLI
+        // must not mute it while another harness is ready. Project tabs keep
+        // their harness; only this workspace moves.
+        if isAssistant {
+            await considerAssistantFailover(chatID: chatID, event: event)
+        }
+    }
+
+    func recordHarnessRateLimit(chatID: ChatID, event: AgentEvent) async {
+        // Classified before the store is read: this runs for agent events, and
+        // only these few can change what is known about a harness's quota.
+        enum Change {
+            case report(RateLimitReport)
+            case cleared
+            case exhaustedByError
+        }
+        let change: Change
         switch event {
         case .rateLimit(let value):
-            report = value
+            change = .report(value)
         case .turnCompleted(let result) where result.outcome != .failed:
             // A successful turn is stronger evidence than an older exhausted
             // snapshot, including one whose provider supplied no reset time.
-            harnessRateLimits.removeValue(forKey: harness)
-            return
+            change = .cleared
         case .sessionError, .turnCompleted:
             guard AssistantFailoverPolicy.reason(for: event) == .rateLimited else { return }
+            change = .exhaustedByError
+        default:
+            return
+        }
+
+        // Read per event rather than cached: a chat's harness moves on
+        // failover and on a user switch, and these events arrive a few times
+        // per turn, not per token.
+        let stored = try? await store.chat(chatID)
+        guard let chat = stored else { return }
+        guard let harness = HarnessKind(rawValue: chat.harness) else { return }
+
+        let report: RateLimitReport
+        switch change {
+        case .report(let value):
+            report = value
+        case .cleared:
+            harnessRateLimits.removeValue(forKey: harness)
+            return
+        case .exhaustedByError:
             let previous = harnessRateLimits[harness]?.report
             report = RateLimitReport(
                 status: .exhausted,
                 window: previous?.window,
                 resetsAt: previous?.resetsAt
             )
-        default:
-            return
         }
 
         harnessRateLimits[harness] = HarnessRateLimitObservation(
@@ -1157,6 +1311,19 @@ public actor InProcessCoreClient: CoreClient {
         engineTasks.removeValue(forKey: id)?.forEach { $0.cancel() }
     }
 
+    /// A GUI host can suspend periodic git work while hidden. Headless clients
+    /// retain polling by default; explicit actions and filesystem events are
+    /// independent of this setting.
+    public func setBackgroundPollingEnabled(_ enabled: Bool) async {
+        guard backgroundPollingEnabled != enabled else { return }
+        backgroundPollingEnabled = enabled
+        for engine in engines.values {
+            // A newer visibility change can arrive while an engine catches up.
+            guard backgroundPollingEnabled == enabled else { return }
+            await engine.setBackgroundPollingEnabled(enabled)
+        }
+    }
+
     public func shutdown() async {
         stopAssistantBridge()
         for id in engines.keys {
@@ -1177,7 +1344,9 @@ public actor InProcessCoreClient: CoreClient {
                 executablePath: shell,
                 arguments: ShellEnvironment.commandArguments(for: shell, script: script),
                 workingDirectory: directory,
-                environment: ShellEnvironment.childEnvironment()
+                environment: ShellEnvironment.childEnvironment(),
+                // The failure report is built from stdout; stderr was never read.
+                discardStandardError: true
             )
         } catch {
             // Silently returning here is how a setup script that never ran
@@ -1226,6 +1395,12 @@ public actor InProcessCoreClient: CoreClient {
 
     public func diff(workspaceID: WorkspaceID, againstBase: Bool = true) async throws -> [FileDiff] {
         try await engine(for: workspaceID).diff(againstBase: againstBase)
+    }
+
+    /// A file as it was at the workspace's merge base, or nil when it did not
+    /// exist there. Binary-safe: this is how a deleted image is still shown.
+    public func baseFileData(workspaceID: WorkspaceID, path: String) async throws -> Data? {
+        try await engine(for: workspaceID).baseFileData(path: path)
     }
 
     public func suggestedGitAction(workspaceID: WorkspaceID) async throws -> SuggestedGitAction {
@@ -1336,6 +1511,10 @@ public actor InProcessCoreClient: CoreClient {
 
     public func deleteQueuedMessage(id: Int64) async throws {
         try await store.deleteQueuedMessage(id: id)
+    }
+
+    public func moveQueuedMessage(id: Int64, direction: Int) async throws {
+        try await store.moveQueuedMessage(id: id, direction: direction)
     }
 
     public func forwardFailingChecks(workspaceID: WorkspaceID) async throws {
@@ -1526,6 +1705,14 @@ public actor InProcessCoreClient: CoreClient {
         try await store.blocks(turnID: turnID)
     }
 
+    /// A chat's whole history in one query rather than one `blocks(turnID:)`
+    /// per turn. One entry per turn that has blocks, in transcript order, each
+    /// with its blocks by ordinal; turns without blocks are omitted, so match
+    /// entries to `transcript(chatID:)` by `turnID`.
+    public func blocks(chatID: ChatID) async throws -> [(turnID: TurnID, blocks: [BlockRecord])] {
+        try await store.blocks(chatID: chatID)
+    }
+
     public func search(
         _ query: String,
         scope: OreStore.SearchScope = .projects,
@@ -1549,13 +1736,33 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(workspaceID) else {
             throw OreCoreError.workspaceNotFound(workspaceID)
         }
-        let configuration = OreConfiguration.load(
+        let scripts = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
-        )
+        ).scripts
+        var runScriptApproval: RepositoryScriptsApproval?
+        if scripts.run != nil {
+            let approved = (try? await store.repositoryScriptsApproved(
+                repositoryPath: record.repositoryPath,
+                setup: scripts.setup,
+                run: scripts.run,
+                archive: scripts.archive
+            )) == true
+            if !approved {
+                runScriptApproval = RepositoryScriptsApproval(
+                    workspaceID: workspaceID,
+                    repositoryPath: record.repositoryPath,
+                    setup: scripts.setup,
+                    run: scripts.run,
+                    archive: scripts.archive,
+                    runsSetup: false
+                )
+            }
+        }
         return WorkspaceEnvironment(
             worktreePath: record.worktreePath,
-            runScript: configuration.scripts.run,
-            setupScript: configuration.scripts.setup
+            runScript: scripts.run,
+            setupScript: scripts.setup,
+            runScriptApproval: runScriptApproval
         )
     }
 
@@ -1570,9 +1777,11 @@ public actor InProcessCoreClient: CoreClient {
         async let catalogs = harnessRegistry.discoverAllModels()
         harnessProbes = await probes
         continuation.yield(.harnessProbeCompleted(harnessProbes))
-        for (harness, models) in await catalogs {
+        let discovered = await catalogs
+        for (harness, models) in discovered {
             recordModels(models, for: harness)
         }
+        persistCatalogs(discovered)
         await reconcileAssistantConfiguration()
         // Re-check against the channel, not just the binary: this is what
         // clears the update card, and what tells the user when an upgrade
@@ -1600,6 +1809,92 @@ public actor InProcessCoreClient: CoreClient {
         public var worktreePath: String
         public var runScript: String?
         public var setupScript: String?
+        /// Set when `runScript` hasn't been allowed on this Mac: what ⌘R asks
+        /// about instead of running it.
+        public var runScriptApproval: RepositoryScriptsApproval?
+    }
+}
+
+/// What launch may reuse from the previous run's harness discovery, stored as
+/// `harness-cache.json` beside the database.
+///
+/// Every entry is keyed to what would invalidate it — a catalog to the CLI
+/// version that produced it, an update check to the installed versions it
+/// compared — so reuse can only skip work, never show a stale answer about a
+/// binary that has since changed. An unreadable file is simply an empty cache.
+struct HarnessDiscoveryCache: Codable, Sendable, Equatable {
+    struct Catalog: Codable, Sendable, Equatable {
+        var harnessVersion: String?
+        var fetchedAt: Date
+        var models: [AgentModel]
+    }
+
+    /// Keyed by `HarnessKind.rawValue`: a string-keyed dictionary encodes as a
+    /// JSON object, an enum-keyed one as a flat array.
+    var catalogs: [String: Catalog] = [:]
+    var lastUpdateCheck: Date?
+    var updates: [HarnessUpdateStatus] = []
+
+    /// Server-side catalogs do change without a CLI upgrade; half a day bounds
+    /// how long a new model can stay hidden, and Refresh always fetches.
+    static let catalogLifetime: TimeInterval = 12 * 60 * 60
+
+    /// Only catalogs that cost a process: Codex starts an app-server and Cursor
+    /// runs `--list-models`. Claude's list ships in this build, so caching it
+    /// could only hide a newer one.
+    static let cachedCatalogKinds: Set<HarnessKind> = [.codex, .cursorAgent]
+
+    func catalog(for kind: HarnessKind, harnessVersion: String?, now: Date) -> [AgentModel]? {
+        guard Self.cachedCatalogKinds.contains(kind),
+              let entry = catalogs[kind.rawValue],
+              entry.harnessVersion == harnessVersion,
+              entry.fetchedAt <= now,
+              now.timeIntervalSince(entry.fetchedAt) < Self.catalogLifetime,
+              !entry.models.isEmpty
+        else { return nil }
+        return entry.models
+    }
+
+    mutating func storeCatalog(
+        _ models: [AgentModel],
+        for kind: HarnessKind,
+        harnessVersion: String?,
+        now: Date
+    ) {
+        guard Self.cachedCatalogKinds.contains(kind), !models.isEmpty else { return }
+        catalogs[kind.rawValue] = Catalog(
+            harnessVersion: harnessVersion, fetchedAt: now, models: models
+        )
+    }
+
+    /// The last update check, when it is inside the throttle window and was
+    /// made against exactly the harnesses and versions installed now.
+    func updates(matching probes: [HarnessProbeResult], now: Date) -> [HarnessUpdateStatus]? {
+        guard let lastUpdateCheck,
+              lastUpdateCheck <= now,
+              now.timeIntervalSince(lastUpdateCheck) < InProcessCoreClient.harnessUpdateCheckInterval,
+              !updates.isEmpty
+        else { return nil }
+        let installed = probes.filter(\.isInstalled)
+        guard Set(installed.map(\.kind)) == Set(updates.map(\.kind)) else { return nil }
+        for probe in installed {
+            guard let status = updates.first(where: { $0.kind == probe.kind }),
+                  status.installedVersion == HarnessVersion.normalize(probe.version)
+            else { return nil }
+        }
+        return updates
+    }
+
+    static func load(from url: URL) -> HarnessDiscoveryCache {
+        guard let data = try? Data(contentsOf: url),
+              let cache = try? JSONDecoder().decode(HarnessDiscoveryCache.self, from: data)
+        else { return HarnessDiscoveryCache() }
+        return cache
+    }
+
+    func save(to url: URL) {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }
 
@@ -1608,10 +1903,9 @@ private extension CoreCommand {
     var workspaceID: WorkspaceID? {
         switch self {
         case .archiveWorkspace(let id), .unarchiveWorkspace(let id),
-             .interruptTurn(let id), .stopSession(let id), .listChats(let id):
+             .stopSession(let id):
             return id
-        case .deleteWorkspace(let id, _), .setPermissionMode(let id, _),
-             .startSession(let id, _):
+        case .deleteWorkspace(let id, _), .setPermissionMode(let id, _):
             return id
         case .renameWorkspace(let id, _, _), .setWorkspacePinned(let id, _),
              .addDiffComment(let id, _), .clearDiffComments(let id, _),
@@ -1638,7 +1932,7 @@ private extension CoreCommand {
              .setChatDraft(let id, _, _), .interruptChatTurn(let id, _),
              .setChatPermissionMode(let id, _, _),
              .setChatEffort(let id, _, _),
-             .startChatSession(let id, _, _), .stopChatSession(let id, _):
+             .stopChatSession(let id, _):
             return id
         case .resolveChatPermission(let id, _, _, _, _),
              .answerChatQuestion(let id, _, _, _),

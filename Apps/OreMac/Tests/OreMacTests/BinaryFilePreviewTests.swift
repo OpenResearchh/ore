@@ -100,6 +100,31 @@ struct BinaryFilePreviewTests {
         #expect(BinaryFileKind(path: "blob.xyz").label == "Binary file")
     }
 
+    // MARK: - Revalidation
+
+    /// The git generation moves for a write *anywhere* in the worktree. Keying
+    /// a preview on it reloaded — and blanked — this file whenever an agent
+    /// touched an unrelated one. The stamp answers the narrower question.
+    @Test func theStampOnlyMovesWhenThisFileMoves() throws {
+        let root = try scratchDirectory()
+        try write(png: CGSize(width: 8, height: 8), to: root, named: "icon.png")
+
+        let first = try #require(WorktreeFileStamp.read(root: root.path, relativePath: "icon.png"))
+        // A write somewhere else in the worktree.
+        try Data("unrelated".utf8).write(to: root.appendingPathComponent("notes.txt"))
+        #expect(WorktreeFileStamp.read(root: root.path, relativePath: "icon.png") == first)
+
+        try Data(repeating: 0, count: 4_096).write(to: root.appendingPathComponent("icon.png"))
+        #expect(WorktreeFileStamp.read(root: root.path, relativePath: "icon.png") != first)
+    }
+
+    @Test func aFileThatIsNotThereHasNoStamp() throws {
+        let root = try scratchDirectory()
+        #expect(WorktreeFileStamp.read(root: root.path, relativePath: "gone.png") == nil)
+        // A diff's paths come from the agent, so they are not to be trusted.
+        #expect(WorktreeFileStamp.read(root: root.path, relativePath: "../../etc/passwd") == nil)
+    }
+
     // MARK: - Helpers
 
     private func scratchDirectory() throws -> URL {

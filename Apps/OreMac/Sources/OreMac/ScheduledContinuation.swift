@@ -93,13 +93,6 @@ enum UsageLimitReset {
         return "\(day)\(time) (\(identifier))"
     }
 
-    static func relativeLabel(until date: Date, now: Date = Date()) -> String {
-        if date <= now { return "now" }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: date, relativeTo: now)
-    }
-
     private static func firstTime(in message: String) -> (hour: Int, minute: Int)? {
         let pattern = #"(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),

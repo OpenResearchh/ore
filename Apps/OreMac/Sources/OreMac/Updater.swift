@@ -21,14 +21,17 @@ final class Updater {
     private(set) var canCheckForUpdates = false
 
     private var observation: NSKeyValueObservation?
+    private var isStarted = false
 
     init() {
-        // `startingUpdater: true` begins the scheduled background check. The
-        // user is asked before the first automatic check, which is Sparkle's
+        // Created stopped: starting reads the appcast settings, schedules the
+        // background check and may prompt, none of which belongs before the
+        // first frame. `startIfNeeded()` runs once the window is up. The user
+        // is asked before the first automatic check, which is Sparkle's
         // default and the right one — silently phoning home on first launch is
         // not something to opt a user into.
         controller = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -43,7 +46,17 @@ final class Updater {
         }
     }
 
+    /// Begins the scheduled background check. Idempotent. Until it runs,
+    /// `canCheckForUpdates` stays false and the menu item disabled.
+    func startIfNeeded() {
+        guard !isStarted else { return }
+        isStarted = true
+        controller.startUpdater()
+    }
+
     func checkForUpdates() {
+        // A check on a stopped updater does nothing; start it on demand.
+        startIfNeeded()
         controller.checkForUpdates(nil)
     }
 

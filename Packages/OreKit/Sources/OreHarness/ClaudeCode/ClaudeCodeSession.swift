@@ -17,6 +17,10 @@ public actor ClaudeCodeSession: AgentSession {
     private nonisolated let continuation: AsyncStream<AgentEvent>.Continuation
     private let configuration: SessionConfiguration
     private let executablePath: String
+    /// Whether this CLI knows `--allow-dangerously-skip-permissions`. With it a
+    /// running session can be switched into Bypass; without it the CLI refuses
+    /// and the engine relaunches the session in the new mode instead.
+    private let allowsBypassSwitch: Bool
 
     private var translator: ClaudeCodeTranslator
     /// The current mode, which the control channel keeps in step with the
@@ -32,6 +36,9 @@ public actor ClaudeCodeSession: AgentSession {
     /// one of these must be answered — including on interrupt and on shutdown.
     private var pendingPermissions: [PermissionRequestID: JSONValue] = [:]
     private var pendingControlRequests: [String: CheckedContinuation<Void, any Error>] = [:]
+    /// Cancelled with the request they guard, so answered requests don't
+    /// leave a sleeping task behind.
+    private var controlRequestTimeouts: [String: Task<Void, Never>] = [:]
     private var controlRequestCounter = 0
     /// Last few stderr lines, attached to errors so a bug report explains
     /// itself without a debug build.
@@ -45,10 +52,12 @@ public actor ClaudeCodeSession: AgentSession {
         id: SessionID,
         executablePath: String,
         configuration: SessionConfiguration,
-        capabilities: HarnessCapabilities
+        capabilities: HarnessCapabilities,
+        allowsBypassSwitch: Bool = false
     ) {
         self.id = id
         self.executablePath = executablePath
+        self.allowsBypassSwitch = allowsBypassSwitch
         self.configuration = configuration
         self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
@@ -171,10 +180,37 @@ public actor ClaudeCodeSession: AgentSession {
         // carry the change and would otherwise come back on the stale mode.
         permissionMode = mode
         guard process != nil, !isStopping else { return }
-        try await sendControlRequest(
-            ClaudeControlPayload.setPermissionMode(mode),
-            timeout: .seconds(10)
-        )
+        do {
+            try await sendControlRequest(
+                ClaudeControlPayload.setPermissionMode(mode),
+                timeout: .seconds(10)
+            )
+        } catch let error where Self.isBypassLaunchRefusal(error) {
+            // A CLI without the allow flag, or a session launched before it:
+            // Bypass can only be entered at launch. Said that way, the engine
+            // relaunches an idle session on the stored mode rather than
+            // surfacing the CLI's refusal as a transport failure.
+            throw HarnessError.unsupportedCapability("switching a running session to Bypass")
+        }
+    }
+
+    /// The launch mode, plus the flag that lets a running session move into
+    /// Bypass later. The flag only *permits* bypassing: the session still
+    /// starts in `mode`, and only ORE's control channel changes it.
+    nonisolated static func permissionArguments(
+        mode: PermissionMode,
+        allowsBypassSwitch: Bool
+    ) -> [String] {
+        var arguments = ["--permission-mode", mode.rawValue]
+        if allowsBypassSwitch { arguments.append("--allow-dangerously-skip-permissions") }
+        return arguments
+    }
+
+    /// "Cannot set permission mode to bypassPermissions because the session was
+    /// not launched with --dangerously-skip-permissions."
+    nonisolated static func isBypassLaunchRefusal(_ error: any Error) -> Bool {
+        guard case HarnessError.transportFailure(let message) = error else { return false }
+        return message.contains("dangerously-skip-permissions")
     }
 
 
@@ -286,13 +322,11 @@ public actor ClaudeCodeSession: AgentSession {
     /// everything else is a bug report.
     private func classifyExit(status: Int32, stderr: String) -> SessionError {
         let lowercased = stderr.lowercased()
-        if lowercased.contains("not logged in")
-            || lowercased.contains("authentication")
-            || lowercased.contains("invalid api key")
-            || lowercased.contains("please run /login") {
+        if Self.looksLikeAuthFailure(lowercased) {
             return SessionError(
                 kind: .notAuthenticated,
-                message: "Claude Code is not signed in. Run `claude /login` in the terminal pane.",
+                message: "Claude Code isn't signed in. Run `claude auth login` in a terminal, "
+                    + "then send the message again.",
                 detail: stderr,
                 isRecoverable: false
             )
@@ -315,6 +349,21 @@ public actor ClaudeCodeSession: AgentSession {
         )
     }
 
+    /// Exit text and mid-turn transport failures that mean "sign in again",
+    /// including the OAuth refresh failure that used to leave a red bubble
+    /// with no recovery action.
+    nonisolated static func looksLikeAuthFailure(_ lowercased: String) -> Bool {
+        lowercased.contains("not logged in")
+            || lowercased.contains("please run /login")
+            || lowercased.contains("auth login")
+            || lowercased.contains("invalid api key")
+            || lowercased.contains("oauth")
+            || lowercased.contains("session expired")
+            || lowercased.contains("could not be refreshed")
+            || lowercased.contains("failed to authenticate")
+            || (lowercased.contains("authentication") && !lowercased.contains("permission"))
+    }
+
     // MARK: - Control channel
 
     private func sendControlRequest(_ request: JSONValue, timeout: Duration) async throws {
@@ -327,8 +376,8 @@ public actor ClaudeCodeSession: AgentSession {
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             pendingControlRequests[requestID] = continuation
-            Task { [weak self] in
-                try? await Task.sleep(for: timeout)
+            controlRequestTimeouts[requestID] = Task { [weak self] in
+                do { try await Task.sleep(for: timeout) } catch { return }
                 await self?.resumeControlRequest(
                     id: requestID,
                     error: HarnessError.transportFailure(
@@ -340,6 +389,7 @@ public actor ClaudeCodeSession: AgentSession {
     }
 
     private func resumeControlRequest(id: String, error: (any Error)?) {
+        controlRequestTimeouts.removeValue(forKey: id)?.cancel()
         guard let continuation = pendingControlRequests.removeValue(forKey: id) else { return }
         if let error {
             continuation.resume(throwing: error)
@@ -351,6 +401,8 @@ public actor ClaudeCodeSession: AgentSession {
     private func failAllPendingControlRequests(reason: String) {
         let pending = pendingControlRequests
         pendingControlRequests.removeAll()
+        for (_, timeout) in controlRequestTimeouts { timeout.cancel() }
+        controlRequestTimeouts.removeAll()
         for (_, continuation) in pending {
             continuation.resume(throwing: HarnessError.transportFailure(reason))
         }
@@ -398,7 +450,10 @@ public actor ClaudeCodeSession: AgentSession {
         if let model = configuration.model {
             arguments += ["--model", model]
         }
-        arguments += ["--permission-mode", permissionMode.rawValue]
+        arguments += Self.permissionArguments(
+            mode: permissionMode,
+            allowsBypassSwitch: allowsBypassSwitch
+        )
 
         switch configuration.resume {
         case .fresh:

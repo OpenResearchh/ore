@@ -82,4 +82,23 @@ struct TranscriptScrollPolicyTests {
         policy.userDidEndScroll(atBottom: true)
         #expect(!policy.deferOffscreenRedraws)
     }
+
+    @Test func measuringIsHeldBackOnlyMidGestureAwayFromTheFoot() {
+        var policy = TranscriptScrollPolicy()
+        // Following: the row is on screen and its height is wanted now.
+        #expect(!policy.defersOffscreenHeights)
+
+        policy.userDidBeginScroll()
+        // Still reading as "at the bottom" mid-flick: the row is in view.
+        #expect(!policy.defersOffscreenHeights)
+
+        policy.userDidScroll(atBottom: false)
+        #expect(policy.defersOffscreenHeights)
+
+        policy.userDidEndScroll(atBottom: false)
+        // Settled part-way up: nothing is competing with the gesture any more,
+        // so the document goes back to being its true length.
+        #expect(!policy.defersOffscreenHeights)
+        #expect(policy.deferOffscreenRedraws)
+    }
 }

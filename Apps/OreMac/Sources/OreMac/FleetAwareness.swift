@@ -150,6 +150,11 @@ struct FleetWatcher: Sendable, Equatable {
             signals.removeValue(forKey: workspace.id)
             return []
         }
+        // No base sync yet: the launch snapshot carries stored rows only, and
+        // the engine computes base sync in the background. Taking this as the
+        // baseline would announce an already-conflicting or already-behind
+        // workspace as a fresh milestone once the real value lands.
+        guard workspace.baseSync != nil else { return [] }
         let conflicts = workspace.baseSync?.wouldConflict ?? false
         let behind = workspace.baseSync?.workspaceBehindOrigin ?? 0
         let base = workspace.baseSync?.defaultBranch ?? workspace.baseBranch

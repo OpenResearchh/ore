@@ -46,6 +46,9 @@ struct VoiceChordRecognizer {
 
     /// True while a hold could still begin, which is when a timer is worth arming.
     var isPending: Bool { armedAt != nil && !aborted && !armed }
+    /// True from the moment the flags reach exactly the chord until they all
+    /// lift — the only span in which a key or click can change the outcome.
+    var isChordDown: Bool { armedAt != nil }
     var isAwaitingRelease: Bool { armedAt != nil && !aborted && armed }
 
     /// A key or click while the chord is down means the user was typing a real
@@ -209,7 +212,13 @@ final class VoiceHotkeyMonitor {
     /// still works while ORE is frontmost.
     private(set) var isTrusted = false
 
+    /// Modifier changes only — always installed. Cheap: they fire when a
+    /// modifier moves, not on every keystroke in every app.
     private var monitors: [Any] = []
+    /// Key-down and mouse-down, installed only while a gesture or the
+    /// assistant can use them. Watching them permanently woke ORE on every
+    /// keystroke and click system-wide.
+    private var inputMonitors: [Any] = []
     private var recognizer = VoiceChordRecognizer()
     private var isRunning = false
     private var holdTimer: Task<Void, Never>?
@@ -243,39 +252,87 @@ final class VoiceHotkeyMonitor {
 
     var isGlobal: Bool { isTrusted }
 
+    /// Whether key and click events are worth watching: while the chord is
+    /// down they cancel a gesture, and while the assistant is engaged Escape
+    /// stops it. Any other time they can't change anything.
+    nonisolated static func needsInputMonitors(
+        isRunning: Bool,
+        isChordDown: Bool,
+        isAssistantEngaged: Bool
+    ) -> Bool {
+        isRunning && (isChordDown || isAssistantEngaged)
+    }
+
     func start() {
         guard !isRunning else { return }
         isRunning = true
         refreshTrust()
+        monitors = Self.addMonitors(matching: .flagsChanged)
+        observeAssistantEngagement()
+        updateInputMonitors()
+    }
 
-        // Local monitors see events aimed at ORE; global monitors see everything
-        // else and need Accessibility. Both are required for full coverage.
-        let watched: NSEvent.EventTypeMask = [
-            .flagsChanged, .keyDown,
-            .leftMouseDown, .rightMouseDown, .otherMouseDown,
-        ]
-
+    /// Local monitors see events aimed at ORE; global monitors see everything
+    /// else and need Accessibility. Both are required for full coverage.
+    private static func addMonitors(matching mask: NSEvent.EventTypeMask) -> [Any] {
+        var added: [Any] = []
         let local = NSEvent.addLocalMonitorForEvents(
-            matching: watched,
+            matching: mask,
             handler: { event in
                 MainActor.assumeIsolated { VoiceHotkeyMonitor.shared.handle(event) }
                 return event  // observe only; never swallow the event
             }
         )
-        if let local { monitors.append(local) }
+        if let local { added.append(local) }
 
         let global = NSEvent.addGlobalMonitorForEvents(
-            matching: watched,
+            matching: mask,
             handler: { event in
                 MainActor.assumeIsolated { VoiceHotkeyMonitor.shared.handle(event) }
             }
         )
-        if let global { monitors.append(global) }
+        if let global { added.append(global) }
+        return added
+    }
+
+    /// Adds or removes the key/click monitors to match `needsInputMonitors`.
+    private func updateInputMonitors() {
+        let needed = Self.needsInputMonitors(
+            isRunning: isRunning,
+            isChordDown: recognizer.isChordDown,
+            isAssistantEngaged: isAssistantEngaged?() == true
+        )
+        if needed, inputMonitors.isEmpty {
+            inputMonitors = Self.addMonitors(matching: [
+                .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+            ])
+        } else if !needed, !inputMonitors.isEmpty {
+            inputMonitors.forEach(NSEvent.removeMonitor)
+            inputMonitors.removeAll()
+        }
+    }
+
+    /// The assistant can become engaged without a chord — a spoken
+    /// interjection, say — and Escape has to work then too. Its phase is
+    /// observable, so follow it rather than polling. Observation fires once
+    /// per registration, hence the re-arm.
+    private func observeAssistantEngagement() {
+        guard isRunning else { return }
+        withObservationTracking {
+            _ = isAssistantEngaged?()
+        } onChange: {
+            Task { @MainActor in
+                VoiceHotkeyMonitor.shared.updateInputMonitors()
+                VoiceHotkeyMonitor.shared.observeAssistantEngagement()
+            }
+        }
     }
 
     func stop() {
         monitors.forEach(NSEvent.removeMonitor)
         monitors.removeAll()
+        inputMonitors.forEach(NSEvent.removeMonitor)
+        inputMonitors.removeAll()
         isRunning = false
         holdTimer?.cancel()
         holdTimer = nil
@@ -308,6 +365,8 @@ final class VoiceHotkeyMonitor {
     // MARK: - Gesture
 
     private func handle(_ event: NSEvent) {
+        // Last, after the gesture and any command it published have settled.
+        defer { updateInputMonitors() }
         switch event.type {
         case .flagsChanged:
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)

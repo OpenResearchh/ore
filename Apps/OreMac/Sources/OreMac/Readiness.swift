@@ -299,7 +299,7 @@ extension Readiness {
 enum HarnessSetup {
     static func signInCommand(for kind: HarnessKind) -> String {
         switch kind {
-        case .claudeCode: "claude /login"
+        case .claudeCode: "claude auth login"
         case .codex: "codex login"
         case .cursorAgent: "cursor-agent login"
         }

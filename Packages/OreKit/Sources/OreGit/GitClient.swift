@@ -20,6 +20,35 @@ public actor GitClient {
     /// Last successful `fetch origin <branch>`, so sibling worktrees share a
     /// cooldown instead of each hitting the network on every poll.
     private var lastRemoteFetch: [String: ContinuousClock.Instant] = [:]
+    /// Last failed fetch, so an offline machine doesn't retry on every tick of
+    /// every worktree.
+    private var lastFailedRemoteFetch: [String: ContinuousClock.Instant] = [:]
+    /// A fetch already on the wire. Every engine of a repository starts at
+    /// launch at once; they wait on the one fetch instead of queueing N more.
+    private var remoteFetchesInFlight: [String: Task<Void, any Error>] = [:]
+    /// How long a successful fetch satisfies non-forced callers. Base sync is
+    /// a banner, not a live feed: minutes of lag cost nothing, while a network
+    /// fetch per worktree per tick was a steady stream of processes.
+    static let remoteFetchCooldown: Duration = .seconds(300)
+    static let failedRemoteFetchCooldown: Duration = .seconds(60)
+    /// Network fetches actually started. Tests assert coalescing against it.
+    private(set) var remoteFetchCount = 0
+
+    /// `merge-base` answers keyed by directory and base branch, valid while
+    /// HEAD and both candidate base refs resolve to the same commits.
+    private var mergeBaseMemo: [String: (fingerprint: String, result: String?)] = [:]
+    /// Full `mergeBase` computations (memo misses). Tests assert against it.
+    private(set) var mergeBaseComputationCount = 0
+
+    /// `git remote` and the default branch only change with the repository's
+    /// config (or, for the default branch, rarely at all), yet every base-sync
+    /// tick and git-action refresh used to ask both again.
+    private var configURL: URL??
+    private var remoteMemo: (config: ConfigStamp, hasRemote: Bool)?
+    private var defaultBranchMemo: (
+        config: ConfigStamp, at: ContinuousClock.Instant, branch: String
+    )?
+    static let defaultBranchMemoLifetime: Duration = .seconds(300)
 
     public init(repositoryURL: URL, executablePath: String? = nil) throws {
         self.repositoryURL = repositoryURL
@@ -53,6 +82,32 @@ public actor GitClient {
             stdin: stdin,
             environmentOverrides: environmentOverrides,
             allowedExitCodes: allowedExitCodes
+        )
+    }
+
+    /// A file's bytes as of `revision`, or nil when it did not exist there or
+    /// is larger than `maximumBytes`.
+    ///
+    /// `run` decodes standard output as UTF-8, which is fine for porcelain and
+    /// ruinous for an image, so blob contents take their own binary-safe path.
+    /// It is how the review pane shows what a deleted or replaced image was.
+    public func fileData(
+        atRevision revision: String,
+        path: String,
+        in directory: URL? = nil,
+        maximumBytes: Int = 20_000_000
+    ) async -> Data? {
+        let object = "\(revision):\(path)"
+        guard let size = try? await run(["cat-file", "-s", object], in: directory) else {
+            return nil
+        }
+        guard let bytes = Int(size.trimmedStandardOutput), bytes <= maximumBytes else {
+            return nil
+        }
+        return try? await GitProcess.runData(
+            executablePath: executablePath,
+            arguments: ["cat-file", "blob", object],
+            workingDirectory: directory ?? repositoryURL
         )
     }
 
@@ -110,13 +165,6 @@ public actor GitClient {
 
     // MARK: - Repository facts
 
-    /// The repository's common git directory — shared by every worktree, and
-    /// where ORE's own refs live.
-    public func commonGitDirectory() async throws -> URL {
-        let output = try await run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        return URL(fileURLWithPath: output.trimmedStandardOutput)
-    }
-
     public func topLevel() async throws -> URL {
         let output = try await run(["rev-parse", "--show-toplevel"])
         return URL(fileURLWithPath: output.trimmedStandardOutput)
@@ -153,7 +201,36 @@ public actor GitClient {
     /// is a stale `origin/` ref when the user is working offline or ahead.
     /// Repositories with no remote are unaffected — the `origin/` lookup simply
     /// fails and the local ref stands.
+    ///
+    /// Memoized on the commits involved: one `show-ref` tells whether HEAD or
+    /// either base ref moved, instead of up to three processes for every diff,
+    /// ahead-count and git-action refresh.
     public func mergeBase(with baseBranch: String, in directory: URL? = nil) async -> String? {
+        let key = "\((directory ?? repositoryURL).path)\u{0}\(baseBranch)"
+        // `show-ref --head` prints HEAD plus whichever of the two refs exist,
+        // each with its name, and never fails over a missing one. Not
+        // `rev-parse --revs-only`: after the first missing ref it treats the
+        // rest as paths and silently drops them from the fingerprint.
+        let fingerprint = try? await run(
+            ["show-ref", "--head", "refs/heads/\(baseBranch)", "refs/remotes/origin/\(baseBranch)"],
+            in: directory
+        ).trimmedStandardOutput
+        if let fingerprint, let memo = mergeBaseMemo[key], memo.fingerprint == fingerprint {
+            return memo.result
+        }
+        let result = await computeMergeBase(with: baseBranch, in: directory)
+        // Only HEAD matched: the base is a sha or some other revision the
+        // fingerprint can't see move, so it is never remembered.
+        guard let fingerprint, fingerprint.contains("\n") else { return result }
+        // One entry per worktree and base; the bound only matters for a very
+        // long session with churning base branches.
+        if mergeBaseMemo.count > 256 { mergeBaseMemo.removeAll() }
+        mergeBaseMemo[key] = (fingerprint, result)
+        return result
+    }
+
+    private func computeMergeBase(with baseBranch: String, in directory: URL?) async -> String? {
+        mergeBaseComputationCount += 1
         var best: String?
         for ref in ["origin/\(baseBranch)", baseBranch] {
             guard let candidate = try? await run(
@@ -246,7 +323,24 @@ public actor GitClient {
     /// The repository's default branch, in the order a developer would guess:
     /// what the remote says its HEAD is, then the usual names, then whatever is
     /// currently checked out.
+    ///
+    /// Remembered for a few minutes while the config is unchanged. Only a
+    /// confident answer is kept: the current-branch fallback moves with every
+    /// checkout, so it is re-derived each time.
     public func defaultBranch() async -> String {
+        let stamp = await configStamp()
+        if let stamp, let memo = defaultBranchMemo, memo.config == stamp,
+           memo.at.duration(to: .now) < Self.defaultBranchMemoLifetime {
+            return memo.branch
+        }
+        if let branch = await confidentDefaultBranch() {
+            if let stamp { defaultBranchMemo = (stamp, .now, branch) }
+            return branch
+        }
+        return (try? await currentBranch()) .flatMap { $0 } ?? "main"
+    }
+
+    private func confidentDefaultBranch() async -> String? {
         if let output = try? await run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
             let value = output.trimmedStandardOutput
             if let slash = value.lastIndex(of: "/") {
@@ -256,12 +350,45 @@ public actor GitClient {
         for candidate in ["main", "master"] where await branchExists(candidate) {
             return candidate
         }
-        return (try? await currentBranch()) .flatMap { $0 } ?? "main"
+        return nil
     }
 
+    /// Remotes live in the repository config, so the answer holds until that
+    /// file changes — `gh repo create --source` adding `origin` included.
     public func hasRemote() async -> Bool {
+        let stamp = await configStamp()
+        if let stamp, let memo = remoteMemo, memo.config == stamp {
+            return memo.hasRemote
+        }
         guard let output = try? await run(["remote"]) else { return false }
-        return !output.trimmedStandardOutput.isEmpty
+        let hasRemote = !output.trimmedStandardOutput.isEmpty
+        if let stamp { remoteMemo = (stamp, hasRemote) }
+        return hasRemote
+    }
+
+    struct ConfigStamp: Equatable {
+        var modified: Date?
+        var size: Int?
+    }
+
+    /// Modification time and size of the shared `config`. nil when it can't
+    /// be read, which disables the memos rather than trusting a stale answer.
+    private func configStamp() async -> ConfigStamp? {
+        if configURL == nil {
+            // Resolved once: `--git-path config` lands in the common directory
+            // for every worktree, and it never moves. A failure is remembered
+            // too, so a non-repository doesn't spawn this on every call.
+            let resolved = try? await gitPath("config")
+            configURL = .some(resolved)
+        }
+        guard let url = configURL ?? nil else { return nil }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return nil
+        }
+        return ConfigStamp(
+            modified: attributes[.modificationDate] as? Date,
+            size: (attributes[.size] as? NSNumber)?.intValue
+        )
     }
 
     /// Remote branches (without the `origin/` prefix), for choosing a PR base.
@@ -296,15 +423,48 @@ public actor GitClient {
     }
 
     /// Fetch one remote branch. Coalesced so N worktrees of the same repo don't
-    /// hammer origin every poll.
+    /// hammer origin every poll: a non-forced call is satisfied by any fetch
+    /// that succeeded within `remoteFetchCooldown` (or failed within
+    /// `failedRemoteFetchCooldown`), or joins one in flight. `force` is for the
+    /// user asking to pull, and always hits the network.
     public func fetchRemoteBranch(_ name: String, force: Bool = false) async throws {
         guard await hasRemote() else { return }
         let key = "origin/\(name)"
-        if !force, let last = lastRemoteFetch[key], last.duration(to: .now) < .seconds(30) {
+        if !force, let last = lastRemoteFetch[key],
+           last.duration(to: .now) < Self.remoteFetchCooldown {
             return
         }
-        try await runSerialized(["fetch", "--quiet", "origin", name])
+        if !force, let failed = lastFailedRemoteFetch[key],
+           failed.duration(to: .now) < Self.failedRemoteFetchCooldown {
+            return
+        }
+        if let inFlight = remoteFetchesInFlight[key] {
+            // A non-forced caller shares the outcome; a forced one wants a
+            // fetch that started after it asked, so it only waits its turn.
+            guard force else {
+                try await inFlight.value
+                return
+            }
+            _ = try? await inFlight.value
+        }
+        let fetch = Task { try await self.performRemoteFetch(name, key: key) }
+        remoteFetchesInFlight[key] = fetch
+        defer {
+            if remoteFetchesInFlight[key] == fetch { remoteFetchesInFlight[key] = nil }
+        }
+        try await fetch.value
+    }
+
+    private func performRemoteFetch(_ name: String, key: String) async throws {
+        remoteFetchCount += 1
+        do {
+            try await runSerialized(["fetch", "--quiet", "origin", name])
+        } catch {
+            lastFailedRemoteFetch[key] = .now
+            throw error
+        }
         lastRemoteFetch[key] = .now
+        lastFailedRemoteFetch[key] = nil
     }
 
     /// Whether any working tree — the main checkout included — has this
@@ -555,12 +715,41 @@ enum GitProcess {
         )
     }
 
+    /// `run`, for output that must stay bytes.
+    static func runData(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: URL
+    ) async throws -> Data {
+        let process = try ChildProcess(
+            executablePath: executablePath,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: gitEnvironment()
+        )
+        async let standardOutput = process.stdoutChunks.collectData()
+        async let standardError = process.stderrChunks.collectText()
+        process.closeStandardInput()
+
+        let output = await standardOutput
+        let errorOutput = await standardError
+        let status = await process.waitForExit()
+        guard status == 0 else {
+            throw GitError.commandFailed(
+                arguments: arguments,
+                exitCode: status,
+                message: errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return output
+    }
+
     /// Git's environment, with anything interactive disabled.
     ///
     /// A GUI app has no terminal to type a passphrase into: without this, a
     /// repository whose remote needs credentials hangs forever instead of
     /// failing with something we can show the user.
-    private static func gitEnvironment() -> [String: String] {
+    static func gitEnvironment() -> [String: String] {
         var environment = ShellEnvironment.childEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GIT_OPTIONAL_LOCKS"] = "0"

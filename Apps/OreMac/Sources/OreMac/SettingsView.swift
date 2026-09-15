@@ -6,10 +6,45 @@ import OreTelemetry
 import ServiceManagement
 import SwiftUI
 
+/// The Settings scene's root: a shell with no inputs of its own.
+///
+/// AppKit keeps the Settings hosting view for the whole process once it has
+/// been opened, and re-runs its root body on display cycles to answer
+/// `NSHostingView.minSize()` (see `refreshLaunchAtLogin`). Keeping that root
+/// trivial means the re-run stops here: `SettingsPanes` takes no inputs, so
+/// SwiftUI has nothing new to hand it and skips its body.
+///
+/// With `ore.debug.unmountClosedSettings` set, the panes are also dropped
+/// while the window is closed — off by default, because it resets the pane's
+/// local state (the selected agent, an open license) between openings.
+struct SettingsView: View {
+    private static let unmountsWhileClosed =
+        UserDefaults.standard.bool(forKey: "ore.debug.unmountClosedSettings")
+
+    @State private var isOnScreen = true
+
+    var body: some View {
+        if Self.unmountsWhileClosed {
+            // A ZStack, not a Group: its appear/disappear belong to the
+            // container, so swapping the panes out can't re-trigger them.
+            ZStack {
+                if isOnScreen {
+                    SettingsPanes()
+                }
+            }
+            .frame(width: 950, height: 650)
+            .onAppear { isOnScreen = true }
+            .onDisappear { isOnScreen = false }
+        } else {
+            SettingsPanes()
+        }
+    }
+}
+
 /// Settings is an inspector, not a pile of unrelated forms. The left rail is
 /// stable navigation; the detail side explains the selected system and shows
 /// the real CLI probe/model data that the running core is using.
-struct SettingsView: View {
+private struct SettingsPanes: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage(AppModel.DefaultKey.newChatHarness) private var harnessRaw = ""
     @AppStorage(AppModel.DefaultKey.newChatModel) private var defaultModel = ""
@@ -54,6 +89,9 @@ struct SettingsView: View {
     /// Cached: `FinishPhraseStore.currentSpoken` decodes JSON, and this body
     /// re-runs every display cycle. Refreshed when the tuning sheet closes.
     @State private var finishPhraseSpoken = FinishPhraseStore.currentSpoken
+    /// Cached for the same reason: it asks `SystemLanguageModel` for its
+    /// availability. Refreshed each time the narration card appears.
+    @State private var summarizerAvailability = ""
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "General"
@@ -64,6 +102,7 @@ struct SettingsView: View {
         case environment = "Environment"
         case dreams = "Dreams"
         case privacy = "Privacy"
+        case about = "About"
         var id: String { rawValue }
         var icon: String {
             switch self {
@@ -75,6 +114,7 @@ struct SettingsView: View {
             case .environment: "terminal"
             case .dreams: "moon.stars"
             case .privacy: "hand.raised"
+            case .about: "info.circle"
             }
         }
         var detail: String {
@@ -87,6 +127,7 @@ struct SettingsView: View {
             case .environment: "Understand where work lives and what every terminal and agent inherits."
             case .dreams: "Overnight research while this Mac is idle. Off by default, read-only, budgeted."
             case .privacy: "What ORE sends, what it never sends, and how to see or stop it."
+            case .about: "Who makes ORE, its license, and the open-source work it is built on."
             }
         }
     }
@@ -140,11 +181,12 @@ struct SettingsView: View {
 
                 Spacer(minLength: 12)
 
+                let readyHarnesses = appModel.readyHarnesses
                 HStack(spacing: 7) {
                     Circle()
-                        .fill(appModel.readyHarnesses.isEmpty ? Color.orange : Color.green)
+                        .fill(readyHarnesses.isEmpty ? Color.orange : Color.green)
                         .frame(width: 7, height: 7)
-                    Text("\(appModel.readyHarnesses.count) agents ready")
+                    Text("\(readyHarnesses.count) agents ready")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -171,7 +213,12 @@ struct SettingsView: View {
                 .padding(.vertical, 26)
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+                // Every card on the page slides under the pointer while this
+                // scrolls; both are no-ops unless their debug switch is set.
+                .environment(\.oreFlatGlass, OreGlassDebug.flatScrollingCards)
+                .oreGlassGroup()
             }
+            .oreOverlayScrollers()
             .background(Color.clear)
         }
         .frame(width: 950, height: 650)
@@ -204,6 +251,7 @@ struct SettingsView: View {
         case .environment: environment
         case .dreams: dreams
         case .privacy: PrivacySettings()
+        case .about: AboutSettings()
         }
     }
 
@@ -317,9 +365,12 @@ struct SettingsView: View {
                 // Whether the smarter narration path exists on this machine.
                 // "Ready" versus "turn on Apple Intelligence" is the answer to
                 // why narration is or isn't summarizing the agent's own words.
-                Text("On-device summaries — \(appModel.narration.summarizerAvailability)")
+                Text("On-device summaries — \(summarizerAvailability)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .onAppear {
+                        summarizerAvailability = appModel.narration.summarizerAvailability
+                    }
             }
             SettingsCard(title: "Voice input", icon: "mic") {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")
@@ -937,9 +988,10 @@ struct SettingsView: View {
     private func beginHarnessAuthentication() {
         authenticationNotice = nil
         if selectedHarness == .claudeCode {
+            let command = HarnessSetup.signInCommand(for: .claudeCode)
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("claude", forType: .string)
-            authenticationNotice = "Copied `claude`. Run it in Terminal and choose your account, then press Refresh."
+            NSPasteboard.general.setString(command, forType: .string)
+            authenticationNotice = "Copied `\(command)`. Run it in Terminal, finish the browser login, then press Refresh."
             return
         }
 
@@ -970,8 +1022,10 @@ private struct PrivacySettings: View {
     @State private var pending: [TelemetryInspection.PendingEvent] = []
     @State private var showsPending = false
     @State private var copiedInstallID = false
-
-    private var installID: String? { TelemetryInspection.installID(home: OreHome.directory) }
+    /// Loaded once per appearance, off the main actor: it opens the telemetry
+    /// SQLite store, and used to do so from a computed property read twice in
+    /// `body`.
+    @State private var installID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1055,6 +1109,11 @@ private struct PrivacySettings: View {
                     .foregroundStyle(.tertiary)
             }
         }
+        .task {
+            installID = await Task.detached(priority: .userInitiated) {
+                TelemetryInspection.installID(home: OreHome.directory)
+            }.value
+        }
         // Recording has to stop the moment the switch moves, not at the next
         // launch: the queue is purged here, and `make` refuses to build a
         // recording client next time.
@@ -1075,8 +1134,203 @@ private struct PrivacySettings: View {
         "API keys and agent CLI credentials",
     ]
 
+    /// The store is SQLite on disk; read it off the main actor.
     private func reload() {
-        pending = TelemetryInspection.pending(home: OreHome.directory)
+        Task {
+            pending = await Task.detached(priority: .userInitiated) {
+                TelemetryInspection.pending(home: OreHome.directory)
+            }.value
+        }
+    }
+}
+
+/// Who makes ORE, the license it is shared under, and the open-source work it
+/// ships — with every license text reproduced in the app, as those licenses ask.
+private struct AboutSettings: View {
+    @State private var openDocument: LegalDocument?
+    @State private var documentText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(title: "ORE", icon: "info.circle") {
+                HStack(spacing: 14) {
+                    OreAppIcon(size: 56)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("ORE")
+                            .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        Text("Version \(OreAbout.version)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        Text("Made by \(OreAbout.company)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                HStack(spacing: 8) {
+                    linkButton("Website", systemImage: "globe", url: OreAbout.website)
+                    linkButton("Source code", systemImage: "chevron.left.forwardslash.chevron.right", url: OreAbout.repository)
+                    linkButton("Release notes", systemImage: "doc.text", url: OreAbout.releaseNotes)
+                    linkButton("Privacy contact", systemImage: "envelope", url: OreAbout.privacyContact)
+                    Spacer(minLength: 0)
+                }
+            }
+
+            SettingsCard(title: "License", icon: "checkmark.seal") {
+                Text(OreAbout.copyright)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                Text("ORE is open source under the \(OreAbout.licenseName): you may use, change and share it on those terms, and it comes without warranty.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    documentButton(.license, show: "View license", hide: "Hide license")
+                    documentButton(.notice, show: "View notice", hide: "Hide notice")
+                    Spacer()
+                }
+                if openDocument == .license || openDocument == .notice {
+                    documentView
+                }
+            }
+
+            SettingsCard(title: "Acknowledgements", icon: "heart") {
+                Text("ORE is built on open-source work. Each project keeps its own license, and every one is reproduced in full inside the app.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(spacing: 0) {
+                    ForEach(ThirdPartyComponent.all) { component in
+                        componentRow(component)
+                        if component != ThirdPartyComponent.all.last { Divider() }
+                    }
+                }
+                HStack {
+                    documentButton(
+                        .thirdPartyLicenses,
+                        show: "View full license texts",
+                        hide: "Hide full license texts"
+                    )
+                    Spacer()
+                }
+                if openDocument == .thirdPartyLicenses {
+                    documentView
+                }
+            }
+
+            Text("Claude, Codex and Cursor are trademarks of their respective owners. ORE is not affiliated with or endorsed by them.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func linkButton(_ title: String, systemImage: String, url: URL) -> some View {
+        Button { NSWorkspace.shared.open(url) } label: {
+            Label(title, systemImage: systemImage)
+        }
+        .help(url.absoluteString.replacingOccurrences(of: "mailto:", with: ""))
+    }
+
+    /// Opens the text in place. Read from the bundle on the click, never in
+    /// `body`, which Settings re-runs every display cycle.
+    private func documentButton(_ document: LegalDocument, show: String, hide: String) -> some View {
+        Button(openDocument == document ? hide : show) {
+            if openDocument == document {
+                openDocument = nil
+            } else {
+                documentText = document.text
+                    ?? "This build doesn't include \(document.rawValue). It is at the root of the source repository."
+                openDocument = document
+            }
+        }
+    }
+
+    private var documentView: some View {
+        LegalTextView(text: documentText)
+            .frame(height: 280)
+            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func componentRow(_ component: ThirdPartyComponent) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(component.name)
+                    .font(.callout.weight(.medium))
+                Text("\(component.purpose) · \(component.credit)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Text(component.license)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Button { NSWorkspace.shared.open(component.url) } label: {
+                Image(systemName: "arrow.up.right.square")
+            }
+            .buttonStyle(.plain)
+            .help("Open \(component.name)")
+        }
+        .padding(.vertical, 7)
+    }
+}
+
+/// A license text, read-only and selectable.
+///
+/// Not a SwiftUI `Text` in a `ScrollView`: ThirdPartyLicenses is ~59 KB, and a
+/// selectable `Text` lays the whole of it out as one block inside a scroll
+/// view nested in the page's own. An NSTextView with non-contiguous layout
+/// only lays out what is on screen, and its overlay-only scroll view matches
+/// every other scroller in the app.
+private struct LegalTextView: NSViewRepresentable {
+    let text: String
+
+    final class Coordinator {
+        var lastApplied: String?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        // TextKit 1 from the start: non-contiguous layout is a layout-manager
+        // feature, and reaching for `layoutManager` on a TextKit 2 view swaps
+        // its whole text stack out after the fact.
+        let textView = NSTextView(usingTextLayoutManager: false)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.textContainer?.widthTracksTextView = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textColor = .labelColor
+        textView.layoutManager?.allowsNonContiguousLayout = true
+
+        let scroll = OreOverlayScrollView()
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = scroll.documentView as? NSTextView else { return }
+        // Compared against what was last applied, not `textView.string`,
+        // which would bridge the whole document on every update.
+        guard context.coordinator.lastApplied != text else { return }
+        context.coordinator.lastApplied = text
+        textView.textStorage?.setAttributedString(NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.labelColor,
+            ]
+        ))
+        textView.scroll(.zero)
     }
 }
 
@@ -1122,6 +1376,12 @@ private struct ProjectsSettings: View {
     @State private var configs: [String: OreConfiguration] = [:]
     @State private var newEntry: [String: String] = [:]
     @State private var loaded = false
+    /// Edits not yet written to `ore.toml`. Every keystroke in a script field
+    /// is an edit, and each used to be a TOML encode plus an atomic file write
+    /// on the main actor; now they settle for a moment and write once.
+    @State private var unsaved: [String: OreConfiguration] = [:]
+
+    private static let persistDebounce: Duration = .milliseconds(400)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1132,7 +1392,7 @@ private struct ProjectsSettings: View {
             ForEach(repositories, id: \.self) { repo in
                 let config = Binding(
                     get: { configs[repo] ?? OreConfiguration() },
-                    set: { configs[repo] = $0; persist(repo, $0) }
+                    set: { configs[repo] = $0; unsaved[repo] = $0 }
                 )
                 SettingsCard(title: (repo as NSString).lastPathComponent, icon: "folder") {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1147,10 +1407,36 @@ private struct ProjectsSettings: View {
         }
         .task {
             guard !loaded else { return }
-            for repo in repositories {
-                configs[repo] = OreConfiguration.load(repositoryPath: URL(fileURLWithPath: repo))
-            }
+            let repos = repositories
+            let found = await Task.detached(priority: .userInitiated) {
+                Dictionary(uniqueKeysWithValues: repos.map {
+                    ($0, OreConfiguration.load(repositoryPath: URL(fileURLWithPath: $0)))
+                })
+            }.value
+            // An edit made while the files were loading wins over the file.
+            configs.merge(found) { edited, _ in edited }
             loaded = true
+        }
+        // Restarts on every edit, so only a pause in typing reaches the disk.
+        .task(id: unsaved) {
+            guard !unsaved.isEmpty else { return }
+            try? await Task.sleep(for: Self.persistDebounce)
+            guard !Task.isCancelled else { return }
+            flushUnsaved()
+        }
+        // Leaving the pane cancels the debounce above; the last edit must
+        // still land.
+        .onDisappear { flushUnsaved() }
+    }
+
+    private func flushUnsaved() {
+        guard !unsaved.isEmpty else { return }
+        let writes = unsaved
+        unsaved = [:]
+        Task.detached(priority: .utility) {
+            for (repo, config) in writes {
+                Self.persist(repo, config)
+            }
         }
     }
 
@@ -1292,7 +1578,7 @@ private struct ProjectsSettings: View {
         config.wrappedValue = next
     }
 
-    private func persist(_ repo: String, _ config: OreConfiguration) {
+    private nonisolated static func persist(_ repo: String, _ config: OreConfiguration) {
         let url = URL(fileURLWithPath: repo)
         try? config.toTOML().write(
             to: url.appendingPathComponent(OreConfiguration.fileName),

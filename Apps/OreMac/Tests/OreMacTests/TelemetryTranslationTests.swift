@@ -115,7 +115,7 @@ struct TelemetryTranslationTests {
                     TurnResult(
                         turnID: turn,
                         outcome: .failed,
-                        summary: "error: cannot open /Users/tushar/secret/app.swift"
+                        summary: "error: cannot open /Users/ada/secret/app.swift"
                     )
                 )
             )
@@ -166,7 +166,7 @@ struct TelemetryTranslationTests {
         #expect(translator.observe(.workspaceRemoved(workspace)).isEmpty)
         #expect(
             translator.observe(
-                .commandFailed(CommandFailure(message: "boom", detail: "/Users/tushar/x.swift"))
+                .commandFailed(CommandFailure(message: "boom", detail: "/Users/ada/x.swift"))
             ).isEmpty,
             "commandFailed carries real paths in `detail` and must never be reported"
         )

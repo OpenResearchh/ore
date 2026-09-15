@@ -341,15 +341,17 @@ struct SyntaxHighlighterTests {
         #expect(keyword != type)
     }
 
-    @Test func swiftUsesTheParserRatherThanTheRegexFallback() {
-        // A user-defined type name is the cheap way to tell the two apart: the
-        // regex pass only knows a fixed keyword list, so `Square` would come
-        // back unstyled. Colouring it means a grammar actually parsed this.
-        let code = "struct Square { let side: Double }"
-        let typeName = color(of: "Square", in: code, language: "swift")
+    @Test func swiftUsesTheParserRatherThanTheLexerFallback() {
+        // A lowercase type annotation is the cheap way to tell the two apart:
+        // the lexer only calls a word a type by convention (capitalised, or
+        // after `struct`), so `meters` would come back unstyled. Colouring it
+        // means a grammar actually parsed this.
+        let code = "let side: meters = 1"
+        let typeName = color(of: "meters", in: code, language: "swift")
 
         #expect(typeName != nil)
         #expect(typeName != NSColor.labelColor, "the tree-sitter grammar did not load")
+        #expect(SyntaxLexer.tokens(for: code, language: "swift").allSatisfy { $0.kind != .type })
     }
 
     @Test func stringsAndCommentsAreColouredInJSON() {
@@ -360,7 +362,7 @@ struct SyntaxHighlighterTests {
         #expect(result.string == code)
     }
 
-    @Test func anUnknownLanguageStillGetsTheRegexPass() {
+    @Test func aLanguageWithoutAGrammarStillGetsTheLexer() {
         // Unhighlighted code in an app for reading code is worse than
         // approximate highlighting.
         let code = "def greet(name):\n    return \"hi\"  # a comment"
@@ -666,9 +668,9 @@ struct UserMessageAttachmentTests {
 /// white on white, which reads as the chips having disappeared.
 @MainActor
 struct TranscriptAppearanceTests {
-    private func editRow() -> TranscriptRow {
+    private func editRow(id: String = "tool-appearance") -> TranscriptRow {
         TranscriptRow(
-            id: "tool-appearance",
+            id: id,
             turnID: TurnID(rawValue: "t1"),
             kind: .toolCall,
             text: "Edit",
@@ -704,6 +706,33 @@ struct TranscriptAppearanceTests {
         #expect(darkPixels != lightPixels)
     }
 
+    @Test func pillsFollowTheWindowAppearanceEvenWhenTheAppIsDark() {
+        // The assistant window follows the Mac; the main window is smoked
+        // glass. NSApp.effectiveAppearance is the system, so a light window
+        // used to be served dark-mode chips keyed as "Aqua".
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+        application.appearance = NSAppearance(named: .darkAqua)
+
+        let row = editRow(id: "tool-appearance-window")
+        let lightChip = TranscriptCell.usingAppearance(NSAppearance(named: .aqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let darkChip = TranscriptCell.usingAppearance(NSAppearance(named: .darkAqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let lightFill = chipFill(lightChip)
+        let darkFill = chipFill(darkChip)
+        #expect(lightFill != nil)
+        #expect(darkFill != nil)
+        if let lightFill, let darkFill {
+            let lightLuma = lightFill.redComponent + lightFill.greenComponent + lightFill.blueComponent
+            let darkLuma = darkFill.redComponent + darkFill.greenComponent + darkFill.blueComponent
+            #expect(lightLuma < darkLuma, "light pills are a dark wash; dark pills are a light wash")
+        }
+    }
+
     @Test func footerFileChipsIncludeAWrapGutter() {
         // Wrapped footer chips used to sit stroke-to-stroke. The bitmap is
         // taller than the pill itself so a second row has a visible gap.
@@ -721,6 +750,198 @@ struct TranscriptAppearanceTests {
         #expect(footerHeight >= processHeight + 6)
     }
 
+    @Test func activityGroupChevronSitsOnTheTextBaseline() {
+        // The collapsed summary used to park every SF Symbol in a 12×12 box at
+        // y = -2, so the chevron floated off the caption line.
+        let thinking = TranscriptRow(
+            id: "th",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .thinking,
+            text: "Reasoning"
+        )
+        let tool = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Read",
+            toolName: "Read"
+        )
+        let group = TranscriptRow(
+            id: "activity-t1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "2 steps",
+            groupedRows: [thinking, tool]
+        )
+        let rendered = TranscriptCell.attributedText(for: group)
+        #expect(rendered.string.contains("2 steps"))
+        #expect(!rendered.string.contains("tool call"))
+
+        let font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        var attachments: [NSTextAttachment] = []
+        rendered.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            if let attachment = value as? NSTextAttachment {
+                attachments.append(attachment)
+            }
+        }
+        #expect(attachments.count == 1)
+        for attachment in attachments {
+            let expectedY = (font.capHeight - attachment.bounds.height) / 2
+            #expect(abs(attachment.bounds.origin.y - expectedY) < 0.05)
+        }
+    }
+
+    @Test func theActivityFoldCarriesTheTurnHeaderInlineAfterItsSteps() {
+        let tool = TranscriptRow(
+            id: "tool-inline-header",
+            turnID: TurnID(rawValue: "t9"),
+            kind: .toolCall,
+            text: "Read",
+            toolName: "Read"
+        )
+        let group = TranscriptRow(
+            id: "activity-inline-header",
+            turnID: TurnID(rawValue: "t9"),
+            kind: .activityGroup,
+            text: "17 steps",
+            groupedRows: [tool]
+        )
+        let header = "Claude · 11:35 PM"
+        let shown = TranscriptCell.displayedText(
+            for: group, worktreePath: "", responseCollapse: .none, turnHeader: header
+        ).string
+        #expect(shown.hasSuffix("17 steps  ·  Claude  ·  11:35 PM"))
+
+        // One line, not a header line stacked over the summary.
+        let withHeader = TranscriptCell.height(for: group, width: 600, turnHeader: header)
+        let without = TranscriptCell.height(for: group, width: 600)
+        #expect(abs(withHeader - without) < 1)
+    }
+
+    @Test func activityGroupCallsOutIssuesInRed() {
+        var failed = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Bash",
+            toolName: "Bash"
+        )
+        failed.isError = true
+        let group = TranscriptRow(
+            id: "activity-t1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "1 step",
+            groupedRows: [failed]
+        )
+        let rendered = TranscriptCell.attributedText(for: group)
+        #expect(rendered.string.contains("1 issue"))
+        var issueColor: NSColor?
+        let range = (rendered.string as NSString).range(of: "1 issue")
+        #expect(range.location != NSNotFound)
+        if range.location != NSNotFound {
+            issueColor = rendered.attribute(
+                .foregroundColor, at: range.location, effectiveRange: nil
+            ) as? NSColor
+        }
+        #expect(issueColor == NSColor.systemRed)
+    }
+
+    @Test func elapsedTimeClosesTheFooterAndLeavesTheActivityFold() {
+        let start = Date(timeIntervalSince1970: 0)
+        var edit = editRow(id: "tool-elapsed")
+        edit.createdAt = start
+        var later = edit
+        later.createdAt = start.addingTimeInterval(90)
+        let footer = TranscriptRow(
+            id: "footer-elapsed",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [edit, later]
+        )
+        let rendered = TranscriptCell.attributedText(for: footer)
+        #expect(rendered.string.hasSuffix("  ·  1m 30s"))
+        #expect(chipImage(in: rendered) != nil, "the files come first")
+
+        let group = TranscriptRow(
+            id: "activity-elapsed",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .activityGroup,
+            text: "2 steps",
+            groupedRows: [edit, later]
+        )
+        #expect(!TranscriptCell.attributedText(for: group).string.contains("1m 30s"))
+    }
+
+    @Test func aTurnWithoutEditsStillReportsItsTime() {
+        let start = Date(timeIntervalSince1970: 0)
+        var asked = TranscriptRow(
+            id: "user-elapsed", turnID: TurnID(rawValue: "t2"), kind: .userMessage, text: "hi"
+        )
+        asked.createdAt = start
+        var answered = TranscriptRow(
+            id: "reply-elapsed", turnID: TurnID(rawValue: "t2"), kind: .assistantText, text: "hello"
+        )
+        answered.createdAt = start.addingTimeInterval(138)
+        let footer = TranscriptRow(
+            id: "footer-no-edits",
+            turnID: TurnID(rawValue: "t2"),
+            kind: .turnFooter,
+            text: "",
+            groupedRows: [asked, answered]
+        )
+        #expect(TranscriptCell.attributedText(for: footer).string == "No files changed  ·  2m 18s")
+    }
+
+    @Test func aCellConfiguredBeforeJoiningTheWindowDrawsTheTablesAppearance() throws {
+        // A fresh cell isn't in the window yet, so its own appearance is the
+        // app's. With the Mac light, that baked dark-label chips into the
+        // always-dark glass window — some rows readable, others not.
+        let application = NSApplication.shared
+        let original = application.appearance
+        defer { application.appearance = original }
+        application.appearance = NSAppearance(named: .aqua)
+
+        let cell = TranscriptCell(identifier: NSUserInterfaceItemIdentifier("cell"))
+        cell.configure(
+            with: editRow(id: "tool-unattached"),
+            appearance: NSAppearance(named: .darkAqua),
+            onRevert: { _ in },
+            onToggleActivity: { _ in },
+            onOpenFile: { _ in }
+        )
+        let label = try #require(firstTextView(in: cell))
+        let text = try #require(label.textStorage)
+        let fill = try #require(chipFill(chipImage(in: text)))
+        #expect(fill.redComponent > 0.5, "a dark-glass chip is a light wash")
+    }
+
+    private func firstTextView(in view: NSView) -> NSTextView? {
+        if let text = view as? NSTextView { return text }
+        for subview in view.subviews {
+            if let found = firstTextView(in: subview) { return found }
+        }
+        return nil
+    }
+
+    @Test func darkGlassFileChipsAreALightWashNotAGreyTile() {
+        let row = editRow(id: "tool-glass")
+        let darkChip = TranscriptCell.usingAppearance(NSAppearance(named: .darkAqua)!) {
+            chipImage(in: TranscriptCell.attributedText(for: row))
+        }
+        let fill = chipFill(darkChip)
+        #expect(fill != nil)
+        if let fill {
+            // White ink over nothing: every channel equal and bright.
+            #expect(abs(fill.redComponent - fill.blueComponent) < 0.02)
+            #expect(fill.redComponent > 0.5)
+        }
+    }
+
     /// The PNG bytes of the row's first inline image — the file chip.
     private func chipPixels(in text: NSAttributedString) -> Data? {
         guard let found = chipImage(in: text), let tiff = found.tiffRepresentation else { return nil }
@@ -736,6 +957,14 @@ struct TranscriptAppearanceTests {
             }
         }
         return found
+    }
+
+    private func chipFill(_ image: NSImage?) -> NSColor? {
+        guard let image, let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              rep.pixelsWide > 0, rep.pixelsHigh > 0
+        else { return nil }
+        return rep.colorAt(x: rep.pixelsWide / 2, y: rep.pixelsHigh / 2)
     }
 }
 

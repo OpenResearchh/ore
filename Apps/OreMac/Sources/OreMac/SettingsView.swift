@@ -983,9 +983,10 @@ private struct SettingsPanes: View {
     private func beginHarnessAuthentication() {
         authenticationNotice = nil
         if selectedHarness == .claudeCode {
+            let command = HarnessSetup.signInCommand(for: .claudeCode)
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("claude", forType: .string)
-            authenticationNotice = "Copied `claude`. Run it in Terminal and choose your account, then press Refresh."
+            NSPasteboard.general.setString(command, forType: .string)
+            authenticationNotice = "Copied `\(command)`. Run it in Terminal, finish the browser login, then press Refresh."
             return
         }
 

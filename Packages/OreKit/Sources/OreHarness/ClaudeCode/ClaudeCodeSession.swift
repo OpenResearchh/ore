@@ -289,13 +289,11 @@ public actor ClaudeCodeSession: AgentSession {
     /// everything else is a bug report.
     private func classifyExit(status: Int32, stderr: String) -> SessionError {
         let lowercased = stderr.lowercased()
-        if lowercased.contains("not logged in")
-            || lowercased.contains("authentication")
-            || lowercased.contains("invalid api key")
-            || lowercased.contains("please run /login") {
+        if Self.looksLikeAuthFailure(lowercased) {
             return SessionError(
                 kind: .notAuthenticated,
-                message: "Claude Code is not signed in. Run `claude /login` in the terminal pane.",
+                message: "Claude Code isn't signed in. Run `claude auth login` in a terminal, "
+                    + "then send the message again.",
                 detail: stderr,
                 isRecoverable: false
             )
@@ -316,6 +314,21 @@ public actor ClaudeCodeSession: AgentSession {
             detail: stderr.isEmpty ? nil : stderr,
             isRecoverable: false
         )
+    }
+
+    /// Exit text and mid-turn transport failures that mean "sign in again",
+    /// including the OAuth refresh failure that used to leave a red bubble
+    /// with no recovery action.
+    nonisolated static func looksLikeAuthFailure(_ lowercased: String) -> Bool {
+        lowercased.contains("not logged in")
+            || lowercased.contains("please run /login")
+            || lowercased.contains("auth login")
+            || lowercased.contains("invalid api key")
+            || lowercased.contains("oauth")
+            || lowercased.contains("session expired")
+            || lowercased.contains("could not be refreshed")
+            || lowercased.contains("failed to authenticate")
+            || (lowercased.contains("authentication") && !lowercased.contains("permission"))
     }
 
     // MARK: - Control channel

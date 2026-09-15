@@ -96,14 +96,37 @@ final class ChatState {
         var message: String
         var isUsageLimit: Bool
         var needsCLIUpgrade: Bool
+        /// Sign back into the agent CLI — OAuth expired, logged out, etc.
+        var needsSignIn: Bool
         var resetsAt: Date?
 
-        init(message: String, isUsageLimit: Bool, resetsAt: Date?, needsCLIUpgrade: Bool = false) {
+        init(
+            message: String,
+            isUsageLimit: Bool,
+            resetsAt: Date?,
+            needsCLIUpgrade: Bool = false,
+            needsSignIn: Bool = false
+        ) {
             let unwrapped = ProviderErrorCopy.unwrap(message)
             self.message = unwrapped
             self.needsCLIUpgrade = needsCLIUpgrade || ProviderErrorCopy.needsCLIUpgrade(unwrapped)
-            self.isUsageLimit = !self.needsCLIUpgrade && isUsageLimit
+            self.needsSignIn = !self.needsCLIUpgrade
+                && (needsSignIn || Self.looksLikeSignInNeeded(unwrapped))
+            self.isUsageLimit = !self.needsCLIUpgrade && !self.needsSignIn && isUsageLimit
             self.resetsAt = resetsAt
+        }
+
+        private static func looksLikeSignInNeeded(_ text: String) -> Bool {
+            let value = text.lowercased()
+            return value.contains("not signed in")
+                || value.contains("not logged in")
+                || value.contains("oauth")
+                || value.contains("session expired")
+                || value.contains("could not be refreshed")
+                || value.contains("failed to authenticate")
+                || value.contains("auth login")
+                || value.contains("run `claude")
+                || value.contains("run claude")
         }
     }
     private(set) var prominentError: ProminentError?
@@ -449,12 +472,12 @@ final class ChatState {
                     kind: .error,
                     text: message
                 ))
-                prominentError = ProminentError(
-                    message: message,
-                    isUsageLimit: Self.looksLikeUsageLimit(message),
-                    resetsAt: rateLimit?.resetsAt
-                        ?? UsageLimitReset.parse(message)
-                )
+            prominentError = ProminentError(
+                message: message,
+                isUsageLimit: Self.looksLikeUsageLimit(message),
+                resetsAt: rateLimit?.resetsAt
+                    ?? UsageLimitReset.parse(message)
+            )
             }
 
         case .sessionError(let error):
@@ -473,7 +496,8 @@ final class ChatState {
                     ?? UsageLimitReset.parse(error.message)
                     ?? UsageLimitReset.parse(error.detail ?? ""),
                 needsCLIUpgrade: error.kind == .protocolMismatch
-                    || ProviderErrorCopy.needsCLIUpgrade(error.message)
+                    || ProviderErrorCopy.needsCLIUpgrade(error.message),
+                needsSignIn: error.kind == .notAuthenticated
             )
             // A turn claimed on send that no harness event ever confirmed, and
             // now the session has failed: the turn never started, so release it.

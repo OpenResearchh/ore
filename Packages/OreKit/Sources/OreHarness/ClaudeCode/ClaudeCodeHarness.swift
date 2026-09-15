@@ -127,21 +127,81 @@ public struct ClaudeCodeHarness: AgentHarness {
 
     /// Reads login state from the CLI's own stored credentials rather than by
     /// making a request — the doctor must be free to run.
+    ///
+    /// Current Claudes answer `auth status` as JSON by default
+    /// (`{"loggedIn":false,…}`). Older builds printed prose. An expired
+    /// subscription still looks "installed" and used to fall through to
+    /// `.unknown`, which hid Settings' sign-in button and left the chat with
+    /// only a red "OAuth session expired" bubble and no way to recover.
     private func probeAuthState(executablePath: String) async -> HarnessProbeResult.AuthState {
         let output = await CommandProbe.output(
             executablePath: executablePath,
             arguments: ["auth", "status"],
             timeout: .seconds(15)
         )
-        guard let output else { return .unknown }
+        return ClaudeAuthStatus.interpret(output)
+    }
+}
+
+/// Interprets `claude auth status` output across CLI shapes.
+enum ClaudeAuthStatus {
+    static func interpret(_ output: String?) -> HarnessProbeResult.AuthState {
+        guard let output, !output.isEmpty else { return .unknown }
+        if let loggedIn = jsonLoggedIn(output) {
+            return loggedIn ? .authenticated : .notAuthenticated
+        }
         let text = output.lowercased()
-        if text.contains("not logged in") || text.contains("no active") || text.contains("logged out") {
+        if text.contains("not logged in")
+            || text.contains("no active")
+            || text.contains("logged out")
+            || text.contains("login: expired")
+            || text.contains("log in again") {
             return .notAuthenticated
         }
         if text.contains("logged in") || text.contains("subscription") || text.contains("account") {
             return .authenticated
         }
         return .unknown
+    }
+
+    /// `{"loggedIn": false, …}` — the default shape since the CLI made JSON
+    /// the default for `auth status`.
+    private static func jsonLoggedIn(_ output: String) -> Bool? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "{" ,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let loggedIn = object["loggedIn"] as? Bool
+        else { return nil }
+        return loggedIn
+    }
+}
+
+/// Which launch flags a Claude CLI binary understands, asked once per binary.
+///
+/// `--help` rather than a version table: when the flag first shipped isn't
+/// something ORE should hard-code, and an older CLI given an unknown flag
+/// refuses to start at all. A CLI that hangs or can't run reads as "no".
+actor ClaudeFlagSupport {
+    static let shared = ClaudeFlagSupport()
+
+    private var answers: [String: Task<Bool, Never>] = [:]
+
+    func allowsBypassSwitch(executablePath: String) async -> Bool {
+        if let answer = answers[executablePath] { return await answer.value }
+        let probe = Task {
+            Self.helpOffersBypassSwitch(await CommandProbe.output(
+                executablePath: executablePath,
+                arguments: ["--help"],
+                timeout: .seconds(10)
+            ))
+        }
+        answers[executablePath] = probe
+        return await probe.value
+    }
+
+    nonisolated static func helpOffersBypassSwitch(_ help: String?) -> Bool {
+        help?.contains("--allow-dangerously-skip-permissions") ?? false
     }
 }
 

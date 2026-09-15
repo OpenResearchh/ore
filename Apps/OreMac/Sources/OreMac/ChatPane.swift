@@ -2802,6 +2802,7 @@ struct ChatPane: View {
         return ProminentErrorBanner(
             error: error,
             harnessName: harness.displayName,
+            signInCommand: HarnessSetup.signInCommand(for: harness),
             scheduled: model.scheduledContinuation(for: chatSummary?.id),
             cliUpdate: matchingUpdate,
             onContinueWhenAvailable: scheduleContinuation,
@@ -2810,6 +2811,9 @@ struct ChatPane: View {
             onUpdateCLI: {
                 guard let chatSummary else { return }
                 model.updateHarnessCLI(for: chatSummary)
+            },
+            onCopySignIn: {
+                model.refreshHarnesses()
             },
             onDismiss: { chat.dismissProminentError() }
         )
@@ -4284,23 +4288,27 @@ private struct ContextMeter: View {
 private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
     var harnessName: String = "CLI"
+    var signInCommand: String = "claude auth login"
     var scheduled: ScheduledContinuation?
     var cliUpdate: AppModel.HarnessCLIUpdate?
     var onContinueWhenAvailable: () -> Void
     var onCancelSchedule: () -> Void
     var onRetry: () -> Void
     var onUpdateCLI: () -> Void
+    var onCopySignIn: (() -> Void)?
     let onDismiss: () -> Void
 
     private var tint: Color {
-        if error.needsCLIUpgrade { return OreTheme.warning }
+        if error.needsCLIUpgrade || error.needsSignIn { return OreTheme.warning }
         return error.isUsageLimit ? OreTheme.warning : .red
     }
     private var icon: String {
+        if error.needsSignIn { return "person.crop.circle.badge.exclamationmark" }
         if error.needsCLIUpgrade { return "arrow.down.app.fill" }
         return error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
     }
     private var title: String {
+        if error.needsSignIn { return "\(harnessName) needs you to sign in" }
         if error.needsCLIUpgrade { return "\(harnessName) needs an update" }
         return error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
     }

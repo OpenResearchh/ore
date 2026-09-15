@@ -62,7 +62,7 @@ struct ReadinessTests {
     /// cursor-agent user to run `codex login`.
     @Test("Each harness gets its own sign-in command")
     func perHarnessCommands() {
-        #expect(HarnessSetup.signInCommand(for: .claudeCode) == "claude /login")
+        #expect(HarnessSetup.signInCommand(for: .claudeCode) == "claude auth login")
         #expect(HarnessSetup.signInCommand(for: .codex) == "codex login")
         #expect(HarnessSetup.signInCommand(for: .cursorAgent) == "cursor-agent login")
 

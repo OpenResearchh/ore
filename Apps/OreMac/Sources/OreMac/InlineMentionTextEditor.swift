@@ -178,12 +178,11 @@ final class AttachmentPreviewController {
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.lineFragmentPadding = 0
 
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        // Overlay, light knob and autohide come with the class.
+        let scroll = OreOverlayScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = ceil(measured.height) + padding * 2 > cap.height
-        scroll.autohidesScrollers = true
-        scroll.scrollerStyle = .overlay
         scroll.documentView = textView
         return scroll
     }
@@ -270,26 +269,32 @@ struct InlineMentionTextEditor: NSViewRepresentable {
     /// from *before* the layout it triggered — reported the height one
     /// keystroke late.
     var onHeightChange: (CGFloat) -> Void = { _ in }
+    /// The tallest the composer grows before the draft scrolls inside it. Must
+    /// match the frame cap the caller applies — below it, the editor never
+    /// scrolls internally (see `PinnedClipView`).
+    var heightCap: CGFloat = .greatestFiniteMagnitude
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, onTab: onTab, onHeightChange: onHeightChange)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
         // Overlay scrollers float above the text instead of insetting it. With
         // a legacy scroller, its appearance/disappearance as the draft crosses
         // the height cap shrank the text container width and re-wrapped every
         // line — the "shutter" the user saw when a space pushed to a new line.
-        scrollView.scrollerStyle = .overlay
-        // One knob family window-wide — see TranscriptView.
-        scrollView.scrollerKnobStyle = .light
+        // `OreOverlayScrollView` holds that answer even after the system
+        // scroller preference changes, with the window-wide light knob.
+        let scrollView = OreOverlayScrollView()
+        scrollView.contentView = PinnedClipView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
         scrollView.borderType = .noBorder
 
-        let editor = PromptTextView()
+        // TextKit 1 from the start. The height measurement and hover hit-testing
+        // read `layoutManager`, and the first such read on a TextKit 2 view
+        // tears its layout stack down and rebuilds it as TextKit 1.
+        let editor = PromptTextView(usingTextLayoutManager: false)
         editor.onPaste = onPaste
         editor.onCopy = onCopy
         editor.previewURL = previewURL
@@ -333,6 +338,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         context.coordinator.parentText = $text
         context.coordinator.onTab = onTab
         context.coordinator.onHeightChange = onHeightChange
+        context.coordinator.heightCap = heightCap
         if let editor = scrollView.documentView as? PromptTextView {
             editor.onPaste = onPaste
             editor.onCopy = onCopy
@@ -364,6 +370,7 @@ struct InlineMentionTextEditor: NSViewRepresentable {
         /// feeds the editor's frame, which re-measures, and only a genuine
         /// change propagates — so it converges in one step.
         private var lastReportedHeight: CGFloat = -1
+        var heightCap: CGFloat = .greatestFiniteMagnitude
 
         init(
             text: Binding<String>,
@@ -424,6 +431,12 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             layout.ensureLayout(for: container)
             let height = ceil(layout.usedRect(for: container).height)
                 + editor.textContainerInset.height * 2
+            // Decided before the caret scroll that follows an edit: a wrap
+            // grows the text a line before SwiftUI grows the frame, and without
+            // the pin NSTextView scrolled that line into view for one frame and
+            // then snapped back once the taller frame landed.
+            (editor.enclosingScrollView?.contentView as? PinnedClipView)?
+                .pinsToTop = height <= heightCap + 0.5
             guard abs(height - lastReportedHeight) > 0.5 else { return }
             lastReportedHeight = height
             if deferred {
@@ -544,6 +557,20 @@ struct InlineMentionTextEditor: NSViewRepresentable {
             if preservingSelection { editor.setSelectedRange(selection) }
             isApplying = false
         }
+    }
+}
+
+/// The composer's clip view. While the draft fits under the height cap the
+/// composer's frame is what grows, so there is never anything to scroll to —
+/// holding the origin at the top keeps a line wrap from scrolling the text for
+/// the single frame before the taller frame arrives.
+final class PinnedClipView: NSClipView {
+    var pinsToTop = true
+
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var bounds = super.constrainBoundsRect(proposedBounds)
+        if pinsToTop { bounds.origin.y = 0 }
+        return bounds
     }
 }
 

@@ -269,23 +269,18 @@ struct OreMacApp: App {
 
                 Divider()
 
-                // ⌃⌘A — Mail's archive chord. Stages a confirmation; archiving
-                // stops the agent and removes the checkout from disk.
-                Button("Archive Workspace") {
-                    if let id = model.selectedWorkspaceID { model.requestArchive(id) }
-                }
-                .keyboardShortcut("a", modifiers: [.control, .command])
-                .disabled(model.selectedWorkspace == nil)
+                // Each item that reads the model is its own view: a command
+                // read here is a read by the whole `Scene`, so one agent's
+                // status flip re-evaluated every window group, every command
+                // and the menu bar label — mid-scroll, sixty times a second
+                // while a fleet was busy. See `FleetCommand`.
+                ArchiveWorkspaceCommand().environment(model)
 
                 Button("Mark All Notifications Read") {
                     model.markAllNotificationsRead()
                 }
 
-                Button("Next Git Step") {
-                    model.performSuggestedGitAction()
-                }
-                .keyboardShortcut("g", modifiers: [.command, .option])
-                .disabled(!model.canPerformSuggestedGitAction)
+                NextGitStepCommand().environment(model)
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand().environment(updater)
@@ -296,10 +291,7 @@ struct OreMacApp: App {
                 OpenAssistantCommand()
                 OpenDreamsCommand().environment(model)
 
-                Button(model.narration.isMuted ? "Unmute Assistant" : "Mute Assistant") {
-                    model.narration.setMuted(!model.narration.isMuted)
-                }
-                .keyboardShortcut("s", modifiers: [.shift, .option, .command])
+                MuteAssistantCommand().environment(model)
 
                 Button("Command Palette") { isShowingPalette = true }
                     .keyboardShortcut("k", modifiers: .command)
@@ -406,15 +398,19 @@ struct OreMacApp: App {
             MenuBarDashboard()
                 .environment(model)
         } label: {
-            Image(systemName: model.attentionCount > 0 ? "sparkles.square.filled.on.square" : "sparkles")
+            MenuBarStatusIcon().environment(model)
         }
         .menuBarExtraStyle(.window)
     }
 
+    /// Through the model, not `sortedWorkspaces`: while the sidebar is holding
+    /// its order still under the pointer, ⌘3 has to land on the row *showing*
+    /// a ⌘3 badge, not on whatever the live sort has since promoted to third.
+    /// Reading a function rather than a property also keeps the scene from
+    /// observing the fleet list. See `SidebarOrderHold`.
     private func selectWorkspace(at index: Int) {
-        let workspaces = model.sortedWorkspaces
-        guard workspaces.indices.contains(index) else { return }
-        model.selectedWorkspaceID = workspaces[index].id
+        guard let id = model.shortcutWorkspaceID(at: index) else { return }
+        model.selectedWorkspaceID = id
     }
 
     private func requestNotificationPermission() async {
@@ -552,9 +548,7 @@ struct RootView: View {
     @AppStorage("ore.showsReview") private var showsReview = true
     @AppStorage("ore.showsSidebar") private var showsSidebar = true
     @AppStorage("ore.bottomPane") private var bottomPaneRaw = BottomPane.none.rawValue
-    @AppStorage("ore.terminalHeight") private var terminalHeight = 240.0
     @AppStorage("ore.reviewWidth") private var reviewWidth = 340.0
-    @State private var terminalDragStart: CGFloat?
     @State private var reviewDragStart: CGFloat?
     /// The presence strip's usage card (limits, tokens, spend).
     @State private var showsUsagePopover = false
@@ -763,39 +757,17 @@ struct RootView: View {
                 description: Text(failure)
             )
         } else if let workspace = model.selectedWorkspace {
-            Group {
-                if bottomPane == .terminal {
-                    GeometryReader { geometry in
-                        let resolvedTerminalHeight = min(
-                            min(max(terminalHeight, 150), 420),
-                            max(150, geometry.size.height - 365)
-                        )
-                        VStack(spacing: 0) {
-                            workspaceMain(workspace)
-                                .frame(
-                                    width: geometry.size.width,
-                                    height: max(360, geometry.size.height - resolvedTerminalHeight - 5)
-                                )
-                                .clipped()
-                            terminalResizeHandle
-                            TerminalPane(workspace: workspace) { bottomPane = .none }
-                                .frame(height: resolvedTerminalHeight)
-                        }
-                        .frame(
-                            width: geometry.size.width,
-                            height: geometry.size.height,
-                            alignment: .top
-                        )
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    VStack(spacing: 0) {
-                        workspaceMain(workspace)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .layoutPriority(1)
-                        bottomDock(workspace)
-                    }
-                }
+            // One structural path whether or not the terminal is open: only the
+            // bottom slot changes identity. The terminal branch used to wrap
+            // `workspaceMain` in a GeometryReader the dock branch didn't have,
+            // so ⌥⌘T rebuilt ChatPane, the transcript table, the review pane
+            // and the source editor — and every one lost its scroll position.
+            WorkspaceBottomSplit(showsTerminal: bottomPane == .terminal) {
+                workspaceMain(workspace)
+            } dock: {
+                bottomDock(workspace)
+            } terminal: {
+                TerminalPane(workspace: workspace) { bottomPane = .none }
             }
             .id(workspace.id)
             .background {
@@ -804,32 +776,6 @@ struct RootView: View {
         } else {
             welcome
         }
-    }
-
-    private var terminalResizeHandle: some View {
-        Rectangle()
-            .fill(OreTheme.hairline)
-            .frame(height: 5)
-            .overlay {
-                Capsule()
-                    .fill(Color.secondary.opacity(0.35))
-                    .frame(width: 34, height: 2)
-            }
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering { NSCursor.resizeUpDown.push() }
-                else { NSCursor.pop() }
-            }
-            .gesture(DragGesture(minimumDistance: 1)
-                .onChanged { value in
-                    if terminalDragStart == nil { terminalDragStart = terminalHeight }
-                    terminalHeight = min(
-                        max((terminalDragStart ?? terminalHeight) - value.translation.height, 150),
-                        420
-                    )
-                }
-                .onEnded { _ in terminalDragStart = nil })
-            .help("Drag to resize the terminal")
     }
 
     private func workspaceMain(_ workspace: WorkspaceSummary) -> some View {
@@ -1131,6 +1077,120 @@ struct RootView: View {
         .padding(.top, OreTheme.Space.sm)
         .animation(.smooth(duration: 0.3), value: model.banners.count)
         .animation(.smooth(duration: 0.3), value: model.pendingHarnessUpdates.count)
+    }
+}
+
+/// The terminal pane's height rules, pulled out of the view so they can be
+/// tested without a window.
+enum TerminalSplitLayout {
+    static let minimumHeight: CGFloat = 150
+    static let maximumHeight: CGFloat = 420
+    /// What the workspace above keeps however far the terminal is dragged:
+    /// the chat's tab strip, a few rows, and the composer.
+    static let workspaceReserve: CGFloat = 365
+
+    /// A dragged or persisted height, held to the pane's own bounds.
+    static func clamped(_ requested: CGFloat) -> CGFloat {
+        min(max(requested, minimumHeight), maximumHeight)
+    }
+
+    /// The height actually laid out. `containerHeight` is zero until the
+    /// column has been measured once; the request alone decides until then,
+    /// rather than flashing the minimum for a frame.
+    static func resolvedHeight(requested: CGFloat, containerHeight: CGFloat) -> CGFloat {
+        let height = clamped(requested)
+        guard containerHeight > 0 else { return height }
+        return min(height, max(minimumHeight, containerHeight - workspaceReserve))
+    }
+}
+
+/// The workspace column over its bottom slot: the collapsed dock bar, or the
+/// terminal under a drag handle.
+///
+/// `main` sits at the same structural position in both states, so toggling the
+/// terminal only swaps the slot beneath it. The column height and the live drag
+/// are this view's own state, so a window resize or a divider drag re-runs this
+/// small body instead of `RootView`'s.
+private struct WorkspaceBottomSplit<Main: View, Dock: View, Terminal: View>: View {
+    let showsTerminal: Bool
+    @ViewBuilder var main: Main
+    @ViewBuilder var dock: Dock
+    @ViewBuilder var terminal: Terminal
+
+    @AppStorage("ore.terminalHeight") private var terminalHeight = 240.0
+    /// Whole points, so sub-point layout jitter doesn't write state.
+    @State private var containerHeight: CGFloat = 0
+    /// The height while the divider is held. Persisted only when the drag ends:
+    /// writing `@AppStorage` per mouse event re-laid out the transcript and
+    /// round-tripped UserDefaults on every one.
+    @State private var dragHeight: CGFloat?
+    @State private var dragStart: CGFloat?
+
+    private var resolvedTerminalHeight: CGFloat {
+        TerminalSplitLayout.resolvedHeight(
+            requested: dragHeight ?? terminalHeight,
+            containerHeight: containerHeight
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            main
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+            if showsTerminal {
+                resizeHandle
+                terminal
+                    .frame(height: resolvedTerminalHeight)
+            } else {
+                dock
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { noteContainerHeight(proxy.size.height) }
+                    .onChange(of: proxy.size.height) { _, height in
+                        noteContainerHeight(height)
+                    }
+            }
+        }
+    }
+
+    private func noteContainerHeight(_ height: CGFloat) {
+        let rounded = height.rounded()
+        if rounded != containerHeight { containerHeight = rounded }
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(OreTheme.hairline)
+            .frame(height: 5)
+            .overlay {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 34, height: 2)
+            }
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeUpDown.push() }
+                else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = dragHeight ?? terminalHeight }
+                    let next = TerminalSplitLayout.clamped(
+                        (dragStart ?? terminalHeight) - value.translation.height
+                    )
+                    if next != dragHeight { dragHeight = next }
+                }
+                .onEnded { _ in
+                    if let dragHeight { terminalHeight = dragHeight }
+                    dragHeight = nil
+                    dragStart = nil
+                })
+            .help("Drag to resize the terminal")
     }
 }
 

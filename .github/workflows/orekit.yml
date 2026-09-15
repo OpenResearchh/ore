@@ -85,6 +85,38 @@ jobs:
       - name: Test
         run: swift test
 
+      # When the test process itself crashes rather than a test failing,
+      # SwiftPM only says "unexpected signal code 11" and prints no backtrace.
+      # macOS still writes a crash report; print its faulting thread so the
+      # frame that crashed is in the log.
+      - name: Show crash reports
+        if: failure()
+        run: |
+          sleep 10
+          shopt -s nullglob
+          for report in ~/Library/Logs/DiagnosticReports/*.ips; do
+            echo "::group::$(basename "$report")"
+            python3 - "$report" <<'PY'
+          import json, sys
+          _, _, body = open(sys.argv[1]).read().partition("\n")
+          report = json.loads(body)
+          images = report.get("usedImages", [])
+          threads = report.get("threads", [])
+          faulting = report.get("faultingThread", 0)
+          print("exception:", report.get("exception"))
+          print("termination:", report.get("termination", {}).get("indicator"))
+          print("faulting thread:", faulting)
+          frames = threads[faulting].get("frames", []) if faulting < len(threads) else []
+          for frame in frames[:60]:
+              index = frame.get("imageIndex", -1)
+              image = images[index].get("name", "?") if 0 <= index < len(images) else "?"
+              symbol = frame.get("symbol") or hex(frame.get("imageOffset", 0))
+              where = f" {frame['sourceFile']}:{frame.get('sourceLine', '')}" if frame.get("sourceFile") else ""
+              print(f"  {image:32} {symbol}{where}")
+          PY
+            echo "::endgroup::"
+          done
+
       - name: Build the app bundle
         run: ./Scripts/bundle.sh release
 

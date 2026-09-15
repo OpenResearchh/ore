@@ -841,22 +841,24 @@ public actor OreStore {
 
     /// `ore.toml` scripts run as the user, so they run only after the user has
     /// seen them. The approval covers this exact text; an edit asks again.
-    public func approveRepositoryScripts(repositoryPath: String, setup: String?, archive: String?) throws {
+    public func approveRepositoryScripts(
+        repositoryPath: String, setup: String?, run: String?, archive: String?
+    ) throws {
         try writer.write { db in
             try RepositoryScriptApprovalRecord(
-                repositoryPath: repositoryPath, setup: setup, archive: archive
+                repositoryPath: repositoryPath, setup: setup, run: run, archive: archive
             ).save(db)
         }
     }
 
     public nonisolated func repositoryScriptsApproved(
-        repositoryPath: String, setup: String?, archive: String?
+        repositoryPath: String, setup: String?, run: String?, archive: String?
     ) async throws -> Bool {
         try await writer.read { db in
             guard let record = try RepositoryScriptApprovalRecord.fetchOne(db, key: repositoryPath) else {
                 return false
             }
-            return record.setup == setup && record.archive == archive
+            return record.setup == setup && record.run == run && record.archive == archive
         }
     }
 

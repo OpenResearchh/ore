@@ -802,10 +802,11 @@ public actor InProcessCoreClient: CoreClient {
         // `ore.toml` is repository content — after a clone, someone else's —
         // so its scripts wait for the user to read and allow them once.
         let scripts = configuration.scripts
-        if scripts.setup != nil || scripts.archive != nil {
+        if scripts.setup != nil || scripts.run != nil || scripts.archive != nil {
             let approved = (try? await store.repositoryScriptsApproved(
                 repositoryPath: record.repositoryPath,
                 setup: scripts.setup,
+                run: scripts.run,
                 archive: scripts.archive
             )) == true
             if !approved {
@@ -813,6 +814,7 @@ public actor InProcessCoreClient: CoreClient {
                     workspaceID: record.workspaceID,
                     repositoryPath: record.repositoryPath,
                     setup: scripts.setup,
+                    run: scripts.run,
                     archive: scripts.archive
                 )))
             } else if let setup = scripts.setup {
@@ -840,21 +842,27 @@ public actor InProcessCoreClient: CoreClient {
         let scripts = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
         ).scripts
-        guard scripts.setup == approval.setup, scripts.archive == approval.archive else {
+        guard scripts.setup == approval.setup,
+              scripts.run == approval.run,
+              scripts.archive == approval.archive
+        else {
             continuation.yield(.repositoryScriptsNeedApproval(RepositoryScriptsApproval(
                 workspaceID: approval.workspaceID,
                 repositoryPath: record.repositoryPath,
                 setup: scripts.setup,
-                archive: scripts.archive
+                run: scripts.run,
+                archive: scripts.archive,
+                runsSetup: approval.runsSetup
             )))
             return
         }
         try await store.approveRepositoryScripts(
             repositoryPath: record.repositoryPath,
             setup: scripts.setup,
+            run: scripts.run,
             archive: scripts.archive
         )
-        if let setup = scripts.setup {
+        if approval.runsSetup, let setup = scripts.setup {
             await runScript(
                 setup,
                 in: URL(fileURLWithPath: record.worktreePath),
@@ -881,6 +889,7 @@ public actor InProcessCoreClient: CoreClient {
             let approved = (try? await store.repositoryScriptsApproved(
                 repositoryPath: record.repositoryPath,
                 setup: configuration.scripts.setup,
+                run: configuration.scripts.run,
                 archive: archiveScript
             )) == true
             if approved {
@@ -1727,13 +1736,33 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(workspaceID) else {
             throw OreCoreError.workspaceNotFound(workspaceID)
         }
-        let configuration = OreConfiguration.load(
+        let scripts = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
-        )
+        ).scripts
+        var runScriptApproval: RepositoryScriptsApproval?
+        if scripts.run != nil {
+            let approved = (try? await store.repositoryScriptsApproved(
+                repositoryPath: record.repositoryPath,
+                setup: scripts.setup,
+                run: scripts.run,
+                archive: scripts.archive
+            )) == true
+            if !approved {
+                runScriptApproval = RepositoryScriptsApproval(
+                    workspaceID: workspaceID,
+                    repositoryPath: record.repositoryPath,
+                    setup: scripts.setup,
+                    run: scripts.run,
+                    archive: scripts.archive,
+                    runsSetup: false
+                )
+            }
+        }
         return WorkspaceEnvironment(
             worktreePath: record.worktreePath,
-            runScript: configuration.scripts.run,
-            setupScript: configuration.scripts.setup
+            runScript: scripts.run,
+            setupScript: scripts.setup,
+            runScriptApproval: runScriptApproval
         )
     }
 
@@ -1780,6 +1809,9 @@ public actor InProcessCoreClient: CoreClient {
         public var worktreePath: String
         public var runScript: String?
         public var setupScript: String?
+        /// Set when `runScript` hasn't been allowed on this Mac: what ⌘R asks
+        /// about instead of running it.
+        public var runScriptApproval: RepositoryScriptsApproval?
     }
 }
 

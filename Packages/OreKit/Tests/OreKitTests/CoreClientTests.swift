@@ -296,6 +296,52 @@ struct CoreClientTests {
         await client.shutdown()
     }
 
+    @Test func aRunScriptWaitsForApprovalBeforeCommandR() async throws {
+        // ⌘R runs ore.toml's run script as the user, so it is approved like
+        // setup and archive. Allowing it from the terminal doesn't run setup.
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo setup > setup-marker.txt"
+        run = "echo serving"
+        """)
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "runner"
+        )))
+
+        guard case .workspaceAdded(let summary)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }), case .repositoryScriptsNeedApproval(let shown)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("expected the workspace and an approval request")
+            return
+        }
+        #expect(shown.run == "echo serving")
+
+        let unapproved = try await client.workspaceEnvironment(workspaceID: summary.id)
+        #expect(unapproved.runScript == "echo serving")
+        let request = try #require(unapproved.runScriptApproval)
+        #expect(!request.runsSetup)
+
+        await client.send(.approveRepositoryScripts(request))
+        var environment = unapproved
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < deadline, environment.runScriptApproval != nil {
+            try? await Task.sleep(for: .milliseconds(100))
+            environment = try await client.workspaceEnvironment(workspaceID: summary.id)
+        }
+        #expect(environment.runScriptApproval == nil)
+        #expect(!fixture.exists("setup-marker.txt", in: URL(fileURLWithPath: summary.worktreePath)))
+
+        await client.shutdown()
+    }
+
     @Test func aMissingCopiedFileIsReportedRatherThanSwallowed() async throws {
         let fixture = try await GitFixture.initialized()
         try fixture.write("ore.toml", """

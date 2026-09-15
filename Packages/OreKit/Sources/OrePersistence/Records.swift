@@ -614,12 +614,17 @@ public struct RepositoryScriptApprovalRecord: Codable, FetchableRecord, Persista
 
     public var repositoryPath: String
     public var setup: String?
+    public var run: String?
     public var archive: String?
     public var approvedAt: Date
 
-    public init(repositoryPath: String, setup: String?, archive: String?, approvedAt: Date = Date()) {
+    public init(
+        repositoryPath: String, setup: String?, run: String?, archive: String?,
+        approvedAt: Date = Date()
+    ) {
         self.repositoryPath = repositoryPath
         self.setup = setup
+        self.run = run
         self.archive = archive
         self.approvedAt = approvedAt
     }

@@ -491,6 +491,15 @@ public enum OreSchema {
             try db.execute(sql: "UPDATE queuedMessage SET sortIndex = id")
         }
 
+        migrator.registerMigration("v14.repositoryScriptApprovalRun") { db in
+            // ⌘R runs `ore.toml`'s run script as the user too, so it is
+            // approved with the others. Rows from before hold no run text, so
+            // a repository that has one asks once more.
+            try db.alter(table: "repositoryScriptApproval") { table in
+                table.add(column: "run", .text)
+            }
+        }
+
         return migrator
     }
 }

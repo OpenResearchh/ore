@@ -571,7 +571,7 @@ struct TerminalPane: View {
         }
 
         if let script = environment?.runScript {
-            Button { runScript(script) } label: {
+            Button { runScript() } label: {
                 Label("Run", systemImage: "play.fill").font(.system(size: OreTheme.Font.body))
             }
             .buttonStyle(.plain)
@@ -589,9 +589,20 @@ struct TerminalPane: View {
         registry.closeTab(tab.id, for: workspace.id)
     }
 
-    private func runScript(_ script: String) {
-        guard let environment else { return }
-        registry.run(script, in: workspace.id, workingDirectory: environment.worktreePath)
+    /// `ore.toml` is repository content, so a run script nobody has allowed
+    /// asks first. The environment is read again on every press, so an
+    /// approval given since the pane opened, or an edit to the file, counts.
+    private func runScript() {
+        Task {
+            guard let fresh = await model.workspaceEnvironment(for: workspace.id) else { return }
+            environment = fresh
+            guard let script = fresh.runScript else { return }
+            if let approval = fresh.runScriptApproval {
+                model.requestScriptApproval(approval)
+            } else {
+                registry.run(script, in: workspace.id, workingDirectory: fresh.worktreePath)
+            }
+        }
     }
 }
 

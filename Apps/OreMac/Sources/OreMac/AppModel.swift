@@ -2481,6 +2481,13 @@ final class AppModel {
     /// first. The main window asks about the first one.
     var pendingScriptApprovals: [RepositoryScriptsApproval] = []
 
+    /// Ask about a workspace's scripts, replacing any older question about the
+    /// same workspace.
+    func requestScriptApproval(_ approval: RepositoryScriptsApproval) {
+        pendingScriptApprovals.removeAll { $0.workspaceID == approval.workspaceID }
+        pendingScriptApprovals.append(approval)
+    }
+
     func approveRepositoryScripts(_ approval: RepositoryScriptsApproval) {
         pendingScriptApprovals.removeAll { $0 == approval }
         Task { await client.send(.approveRepositoryScripts(approval)) }
@@ -3902,8 +3909,7 @@ final class AppModel {
             banners.append(Banner(message: failure.message, detail: failure.detail))
 
         case .repositoryScriptsNeedApproval(let approval):
-            pendingScriptApprovals.removeAll { $0.workspaceID == approval.workspaceID }
-            pendingScriptApprovals.append(approval)
+            requestScriptApproval(approval)
         }
     }
 

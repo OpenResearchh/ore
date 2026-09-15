@@ -1379,6 +1379,7 @@ private struct ScriptApprovalDialog: ViewModifier {
         let repository = URL(fileURLWithPath: approval.repositoryPath).lastPathComponent
         let commands = [
             approval.setup.map { "Setup, on every new workspace:\n\($0)" },
+            approval.run.map { "Run, with \u{2318}R in the terminal:\n\($0)" },
             approval.archive.map { "Archive, when a workspace is archived:\n\($0)" },
         ].compactMap { $0 }.joined(separator: "\n\n")
         return "The ore.toml in \(repository) wants to run these commands as you. "

@@ -70,6 +70,7 @@ struct TranscriptView: NSViewRepresentable {
     /// Short agent name ("Claude") for the turn header drawn above each turn's
     /// first prose row — who wrote this, and when.
     var agentName: String = ""
+    var agentHarness: HarnessKind? = nil
     /// The find bar's live query; empty means no search is open.
     var searchQuery: String = ""
     var worktreePath: String = ""
@@ -126,16 +127,13 @@ struct TranscriptView: NSViewRepresentable {
         tableView.delegate = context.coordinator
         context.coordinator.tableView = tableView
 
-        let scrollView = NSScrollView()
+        // Overlay, light knob and autohide come from `OreOverlayScrollView`,
+        // which also holds the overlay style when AppKit tries to reset it after
+        // a system scroller preference change. A legacy track reappearing here
+        // would narrow the table and throw away every measured row height.
+        let scrollView = OreOverlayScrollView()
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
-        scrollView.scrollerStyle = .overlay
-        // Pinned light: with `.default`, AppKit picks each knob's darkness by
-        // sampling what happens to be behind it — over glass that flipped per
-        // pane, one white knob beside one black. The window is always dark
-        // now, so every scroll surface pins the same answer.
-        scrollView.scrollerKnobStyle = .light
-        scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.automaticallyAdjustsContentInsets = false
@@ -198,6 +196,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.worktreePath = worktreePath
         context.coordinator.isBusy = isBusy
         context.coordinator.agentName = agentName
+        context.coordinator.agentHarness = agentHarness
         context.coordinator.bind(scrollAnchor: scrollAnchor)
         context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.setSearchQuery(searchQuery)
@@ -206,6 +205,9 @@ struct TranscriptView: NSViewRepresentable {
 
     static func dismantleNSView(_ container: TranscriptContainerView, coordinator: Coordinator) {
         NotificationCenter.default.removeObserver(coordinator)
+        // The measuring this coordinator did is the expensive part of opening a
+        // chat; the next one for the same chat inherits it.
+        coordinator.saveMeasuredHeights(force: true)
         // The anchor outlives this view (it is the pane's `@State`), so leaving
         // the closure attached would keep a dead coordinator reachable.
         coordinator.bind(scrollAnchor: nil)
@@ -221,8 +223,14 @@ struct TranscriptView: NSViewRepresentable {
         var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
         var canFork = false
         var worktreePath: String
-        var isBusy = false
+        var isBusy = false {
+            didSet { if isBusy != oldValue { pushHoverTracking(dismissPreview: false) } }
+        }
         var agentName = ""
+        var agentHarness: HarnessKind?
+        /// Names this chat's entry in `TranscriptHeightStore`, so a tab or
+        /// workspace switch — which builds a fresh coordinator — starts from
+        /// the heights the last one measured.
         let persistenceKey: String
 
         private var rows: [TranscriptRow] = []
@@ -253,10 +261,6 @@ struct TranscriptView: NSViewRepresentable {
         /// blank that only fills in once a scroll forces a re-measure. So the
         /// restore is deferred until the first real layout can honour it.
         private var pendingScrollRestore: CGFloat?
-        /// Coalesces UserDefaults writes so a trackpad flick isn't hundreds of
-        /// preference-file hits — those stalls are what made fast scrolling feel
-        /// like the table was fighting the gesture.
-        private var persistScrollWork: DispatchWorkItem?
         /// Rows whose text changed but whose reload hasn't been applied yet.
         /// Streaming deltas land ~40×/second; re-rendering the growing markdown
         /// block (twice — once to measure, once to draw) at that cadence is what
@@ -280,15 +284,59 @@ struct TranscriptView: NSViewRepresentable {
         /// corrected immediately — the document must stay the right length — but
         /// the redraw waits until the view settles, since nobody can see it.
         private var deferredRedraw: IndexSet = []
+        /// Rows below the viewport whose text grew while the reader was
+        /// scrolling somewhere else. Not even their height is noted until the
+        /// view settles: re-measuring a long streaming reply at every flush is
+        /// full TextKit layout nobody can see, landing between gesture frames.
+        private var deferredHeight: IndexSet = []
         /// Momentum keeps running past `didEndLiveScroll`, so settling is judged
-        /// by the offset going quiet rather than by the gesture ending.
-        private var settleWork: DispatchWorkItem?
+        /// by the offset going quiet rather than by the gesture ending. One
+        /// check stays armed and re-arms itself from `lastScrollActivity`:
+        /// cancelling a work item and scheduling a fresh one on every bounds
+        /// change was two allocations per frame of a flick, on exactly the path
+        /// the flick needs kept clear.
+        /// When the height store last took a copy. See `saveMeasuredHeights`.
+        private var lastHeightSave: CFTimeInterval = 0
+        private var lastScrollActivity: CFTimeInterval = 0
+        private var isSettleCheckArmed = false
+        /// True between `willStartLiveScroll` and `didEndLiveScroll`. A finger
+        /// resting on the trackpad posts no bounds changes, and that stillness
+        /// must not be read as the gesture having ended.
+        private var isSettleSuspended = false
         private static let settleInterval: TimeInterval = 0.12
-        /// The next chunk of the idle measuring sweep, if one is owed. Measuring
-        /// the whole transcript at once — which is what this replaces — was the
-        /// stall the reader felt as a scroll that could not keep up.
-        private var idleMeasureWork: DispatchWorkItem?
+        /// Whether a chunk of the idle measuring sweep is already owed.
+        private var isIdleMeasureScheduled = false
         private static let idleMeasureChunk = 50
+        /// Rows before this index are known measured, so each chunk resumes
+        /// here instead of rescanning from the top. Pulled back whenever a
+        /// height above it is invalidated.
+        private var nextUnmeasuredIndex = 0
+        /// Wall-clock budget per chunk. Bounded by time rather than row count:
+        /// fifty short rows are nothing, fifty whole-file tool outputs are a
+        /// dropped frame.
+        private static let idleMeasureBudget: CFTimeInterval = 0.004
+        /// The row the reader just folded or unfolded, for a moment after the
+        /// click. The change it causes is anchored on that row, so the thing
+        /// they clicked stays under the pointer rather than the top of the view.
+        private var toggleAnchor: (id: String, time: CFTimeInterval)?
+        /// Set while an animated follow pin is in flight (see
+        /// `animatesFollowPins`). Its bounds changes arrive over later frames,
+        /// after `withProgrammaticScroll` has already returned.
+        private var isAnimatingPin = false
+        private var pinGeneration = 0
+        /// Debug A/B for smoothing the 10 Hz step of following a stream: short
+        /// pins glide over a frame or two instead of jumping. Off unless set with
+        /// `defaults write <bundle id> ore.debug.animateFollowPins -bool YES`.
+        private static let animatesFollowPins =
+            UserDefaults.standard.bool(forKey: "ore.debug.animateFollowPins")
+        /// Debug A/B for the composer dock: when a card appears the bottom
+        /// inset grows and the pinned text jumps by that much in one frame.
+        /// Gliding the re-pin is the candidate fix, and it is off until
+        /// measured for the same reason as `animatesFollowPins` — an animation
+        /// on the scroll offset can fight the reader. Set with
+        /// `defaults write <bundle id> ore.debug.animateDockInset -bool YES`.
+        private static let animatesDockInset =
+            UserDefaults.standard.bool(forKey: "ore.debug.animateDockInset")
 
         init(
             persistenceKey: String,
@@ -307,6 +355,16 @@ struct TranscriptView: NSViewRepresentable {
         func update(rows newRows: [TranscriptRow], structureToken: Int? = nil) {
             guard let tableView else { return }
 
+            // A SwiftUI pass that only moved the insets — a dock card
+            // appearing, the composer wrapping a line — hands back the very
+            // same array. Shared storage is proof nothing changed, so the
+            // per-row comparison below is skipped rather than walked for a
+            // pass that cannot find anything.
+            if Self.sharesStorage(rows, newRows) {
+                lastStructureToken = structureToken
+                return
+            }
+
             let previous = rows
             if let structureToken, structureToken == lastStructureToken,
                updateStreamingRow(previous: previous, newRows: newRows) {
@@ -321,18 +379,18 @@ struct TranscriptView: NSViewRepresentable {
             // A row gaining or losing its turn header changes its height, so
             // those rows are invalidated the same way structural changes are.
             let headerChanges = recomputeAgentHeaders()
-            for index in headerChanges { heightCache.removeValue(forKey: rows[index].id) }
+            for index in headerChanges { invalidateHeight(at: index) }
 
             // Streaming appends to the last row far more often than it adds
             // one. Reloading only what changed is what keeps a long transcript
             // responsive while text arrives.
-            if previous.count == newRows.count {
+            if previous.count == newRows.count, previous.elementsEqualByID(newRows[...]) {
                 var changed: IndexSet = headerChanges
                 var structural = !headerChanges.isEmpty
                 for index in newRows.indices {
                     let difference = Self.difference(previous[index], newRows[index])
                     if difference.changed {
-                        heightCache.removeValue(forKey: newRows[index].id)
+                        invalidateHeight(at: index)
                         changed.insert(index)
                         if difference.structural { structural = true }
                     }
@@ -361,7 +419,7 @@ struct TranscriptView: NSViewRepresentable {
                 var stale = headerChanges.filteredIndexSet { $0 < previous.count }
                 for index in previous.indices
                 where Self.difference(previous[index], newRows[index]).changed {
-                    heightCache.removeValue(forKey: newRows[index].id)
+                    invalidateHeight(at: index)
                     stale.insert(index)
                 }
                 if !stale.isEmpty {
@@ -375,9 +433,17 @@ struct TranscriptView: NSViewRepresentable {
                         columnIndexes: IndexSet(integer: 0)
                     )
                 }
+            } else if let changes = Self.rowChanges(
+                from: previous.map(\.id), to: newRows.map(\.id)
+            ) {
+                applyRowChanges(changes, previous: previous, headerChanges: headerChanges)
             } else {
+                // A different transcript, not an edit of this one: nothing on
+                // screen has a place to be kept.
                 pendingTextReload.removeAll()
-                heightCache.removeAll()
+                deferredRedraw.removeAll()
+                deferredHeight.removeAll()
+                invalidateAllHeights()
                 tableView.reloadData()
             }
 
@@ -396,8 +462,8 @@ struct TranscriptView: NSViewRepresentable {
             // this used to restore the saved scroll offset here, and landing on
             // week-old messages read as "where am I?" rather than continuity.
             // The latest reply is what a tab switch is *for*; scrolling back is
-            // cheap, finding "latest" by hand was not. (The offset is still
-            // persisted below for possible future use.)
+            // cheap, finding "latest" by hand was not. The offset is no longer
+            // written out either — nothing ever read it back.
 
             // Follow the conversation only while the reader is not holding the
             // view somewhere else — and never mid-gesture, where a programmatic
@@ -424,10 +490,13 @@ struct TranscriptView: NSViewRepresentable {
                   previous[last].id == newRows[last].id
             else { return false }
             rows = newRows
-            if hasActiveSearch { recomputeSearchMatches(preserveCursor: true) }
             let difference = Self.difference(previous[last], newRows[last])
             guard difference.changed else { return true }
-            heightCache.removeValue(forKey: newRows[last].id)
+            // Only this row's text moved, so only this row can have joined or
+            // left the find bar's results. Re-running the search over every
+            // row here was a whole-transcript scan per streaming delta.
+            if hasActiveSearch { updateSearchMatch(at: last) }
+            invalidateHeight(at: last)
             pendingTextReload.insert(last)
             if difference.structural {
                 flushPendingReload()
@@ -435,6 +504,249 @@ struct TranscriptView: NSViewRepresentable {
                 scheduleTextFlush()
             }
             return true
+        }
+
+        /// Forgets one row's measured height, and pulls the idle sweep's cursor
+        /// back so the sweep still reaches it.
+        private func invalidateHeight(at index: Int) {
+            guard rows.indices.contains(index) else { return }
+            heightCache.removeValue(forKey: rows[index].id)
+            if index < nextUnmeasuredIndex { nextUnmeasuredIndex = index }
+        }
+
+        private func invalidateAllHeights() {
+            heightCache.removeAll()
+            nextUnmeasuredIndex = 0
+        }
+
+        /// Where this coordinator's heights live between coordinators. Nil
+        /// until the table has a real width, since heights measured at a
+        /// placeholder width are meaningless.
+        private var heightStoreKey: TranscriptHeightStore.Key? {
+            guard cachedWidth > 1 else { return nil }
+            return TranscriptHeightStore.Key(
+                chat: persistenceKey,
+                width: cachedWidth,
+                appearance: tableView?.effectiveAppearance.name.rawValue ?? "",
+                variant: agentHarness.map(String.init(describing:)) ?? ""
+            )
+        }
+
+        /// The identity a row's height is filed under. Everything that can move
+        /// the height and isn't in the row itself belongs here — see the store.
+        private func heightStoreRowKey(for row: TranscriptRow) -> String {
+            TranscriptHeightStore.rowKey(
+                id: row.id,
+                contentRevision: row.contentRevision,
+                isCollapsed: responseCollapse(for: row) == .collapsed,
+                hasTurnHeader: agentHeaderRowIDs.contains(row.id)
+            )
+        }
+
+        /// Hands the measured heights to the store so the next coordinator for
+        /// this chat starts from them. Throttled: the full dictionary is
+        /// rebuilt each time, and the sweep reaches its "nothing left" point
+        /// again on every appended row while an agent works.
+        func saveMeasuredHeights(force: Bool = false) {
+            let now = CACurrentMediaTime()
+            guard force || now - lastHeightSave > 2 else { return }
+            guard let key = heightStoreKey, !heightCache.isEmpty else { return }
+            lastHeightSave = now
+            var keyed: [String: CGFloat] = [:]
+            keyed.reserveCapacity(heightCache.count)
+            for row in rows {
+                guard let height = heightCache[row.id] else { continue }
+                keyed[heightStoreRowKey(for: row)] = height
+            }
+            TranscriptHeightStore.store(keyed, for: key)
+        }
+
+        /// Seeds the cache from the store, for the rows the store still
+        /// recognises. Whatever it misses is measured exactly as before, so the
+        /// worst case is the behaviour this replaces.
+        private func loadMeasuredHeights() {
+            guard heightCache.isEmpty, !rows.isEmpty, let key = heightStoreKey else { return }
+            let stored = TranscriptHeightStore.heights(for: key)
+            guard !stored.isEmpty else { return }
+            for row in rows {
+                guard let height = stored[heightStoreRowKey(for: row)] else { continue }
+                heightCache[row.id] = height
+            }
+        }
+
+        /// Rows that came and went between two transcripts, as removals in the
+        /// old indexing and insertions in the new — the order `NSTableView`
+        /// applies them in inside `beginUpdates`/`endUpdates`.
+        struct RowChanges: Equatable {
+            var removed: IndexSet
+            var inserted: IndexSet
+        }
+
+        /// Diffs two transcripts by row id. Nil when they are better treated as
+        /// unrelated: nothing in common, duplicate ids, or rows that moved
+        /// rather than came or went (nothing ORE does today).
+        ///
+        /// The shared head and foot are trimmed first, so a turn folding at the
+        /// end or a group opening mid-history costs what changed, not the
+        /// transcript.
+        nonisolated static func rowChanges(from old: [String], to new: [String]) -> RowChanges? {
+            guard !old.isEmpty, !new.isEmpty else { return nil }
+            let shorter = min(old.count, new.count)
+            var prefix = 0
+            while prefix < shorter, old[prefix] == new[prefix] { prefix += 1 }
+            var suffix = 0
+            while suffix < shorter - prefix,
+                  old[old.count - 1 - suffix] == new[new.count - 1 - suffix] {
+                suffix += 1
+            }
+            let oldMiddle = old[prefix..<(old.count - suffix)]
+            let newMiddle = new[prefix..<(new.count - suffix)]
+            let oldIDs = Set(oldMiddle)
+            let newIDs = Set(newMiddle)
+            // With a repeated id "the same row" is ambiguous; a reload is honest.
+            guard oldIDs.count == oldMiddle.count, newIDs.count == newMiddle.count else { return nil }
+            let survivingOld = oldMiddle.filter { newIDs.contains($0) }
+            let survivingNew = newMiddle.filter { oldIDs.contains($0) }
+            guard survivingOld == survivingNew,
+                  prefix + suffix + survivingOld.count > 0
+            else { return nil }
+            var changes = RowChanges(removed: [], inserted: [])
+            for (offset, id) in oldMiddle.enumerated() where !newIDs.contains(id) {
+                changes.removed.insert(prefix + offset)
+            }
+            for (offset, id) in newMiddle.enumerated() where !oldIDs.contains(id) {
+                changes.inserted.insert(prefix + offset)
+            }
+            return changes
+        }
+
+        /// Where old row indexes land once `changes` apply; removed rows drop
+        /// out. For the index-keyed work queued against the old rows.
+        nonisolated static func remap(_ indexes: IndexSet, through changes: RowChanges) -> IndexSet {
+            var result = IndexSet()
+            for index in indexes where !changes.removed.contains(index) {
+                // The row's rank among survivors, then past every insertion at
+                // or before where it would sit.
+                var position = index - changes.removed.count(in: 0..<index)
+                for inserted in changes.inserted {
+                    guard inserted <= position else { break }
+                    position += 1
+                }
+                result.insert(position)
+            }
+            return result
+        }
+
+        /// Applies a structural change — a turn folding into its activity
+        /// group, a group opening, a queued message leaving — as removals and
+        /// insertions rather than a reload.
+        ///
+        /// The reload this replaces threw away every measured height, so the
+        /// end of each turn re-measured the whole history with TextKit, and it
+        /// ran with no anchor, so the text a reader was on moved under them.
+        private func applyRowChanges(
+            _ changes: RowChanges,
+            previous: [TranscriptRow],
+            headerChanges: IndexSet
+        ) {
+            guard let tableView else { return }
+            // Survivors are the same rows in the same order on both sides, so
+            // walking them in step finds the ones whose content moved too.
+            var changed = headerChanges.filteredIndexSet { !changes.inserted.contains($0) }
+            var old = 0
+            var new = 0
+            while old < previous.count, new < rows.count {
+                if changes.removed.contains(old) { old += 1; continue }
+                if changes.inserted.contains(new) { new += 1; continue }
+                if Self.difference(previous[old], rows[new]).changed {
+                    invalidateHeight(at: new)
+                    changed.insert(new)
+                }
+                old += 1
+                new += 1
+            }
+            for index in changes.removed { heightCache.removeValue(forKey: previous[index].id) }
+            nextUnmeasuredIndex = min(
+                nextUnmeasuredIndex,
+                changes.removed.first ?? .max,
+                changes.inserted.first ?? .max
+            )
+            // Work queued against the old indexes follows its rows. Pending
+            // text reloads were already diffed away (`previous` holds their
+            // text), so they join this pass rather than waiting for the flush.
+            changed.formUnion(Self.remap(pendingTextReload, through: changes))
+            pendingTextReload.removeAll()
+            deferredRedraw = Self.remap(deferredRedraw, through: changes)
+            deferredHeight = Self.remap(deferredHeight, through: changes)
+
+            let refreshed = changed
+            let apply = {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0
+                    context.allowsImplicitAnimation = false
+                    tableView.beginUpdates()
+                    if !changes.removed.isEmpty {
+                        tableView.removeRows(at: changes.removed, withAnimation: [])
+                    }
+                    if !changes.inserted.isEmpty {
+                        tableView.insertRows(at: changes.inserted, withAnimation: [])
+                    }
+                    tableView.endUpdates()
+                    if !refreshed.isEmpty {
+                        tableView.noteHeightOfRows(withIndexesChanged: refreshed)
+                    }
+                }
+                if !refreshed.isEmpty {
+                    tableView.reloadData(forRowIndexes: refreshed, columnIndexes: IndexSet(integer: 0))
+                }
+            }
+
+            if let toggled = takeToggleAnchor() {
+                applyAnchored(onToggled: toggled, apply)
+            } else if policy.allowsAutoScroll {
+                apply()
+            } else {
+                preservingVisualAnchor(apply)
+            }
+        }
+
+        /// The reader clicked a fold. Whatever it changes is anchored on that
+        /// row, and following is re-judged from where the view then rests:
+        /// opening something at the foot means reading it, not being pulled
+        /// past it by the next line the agent writes.
+        private func applyAnchored(
+            onToggled rowID: String,
+            _ body: () -> Void
+        ) {
+            guard let tableView else { body(); return }
+            preservingVisualAnchor(on: rowID, body)
+            policy.didJump(toBottom: isScrolledToBottom(tableView))
+            reportFollowState()
+            if policy.allowsAutoScroll { scrollToBottom(tableView) }
+        }
+
+        fileprivate func noteToggle(_ rowID: String) {
+            toggleAnchor = (rowID, CACurrentMediaTime())
+        }
+
+        /// Forwards an activity fold to SwiftUI, noting which row the reader
+        /// clicked on the way out. The rows ChatState then adds or removes come
+        /// back through `update` as a structural change with no other clue as
+        /// to what caused it; this is what lets that change be anchored on the
+        /// thing under the pointer. Built once: configuring a cell must not
+        /// allocate a closure per row.
+        private lazy var toggleActivityForward: (String) -> Void = { [weak self] rowID in
+            guard let self else { return }
+            self.noteToggle(rowID)
+            self.onToggleActivity(rowID)
+        }
+
+        /// The pending fold click, if it is recent enough to be the cause of
+        /// the change being applied. Consumed either way.
+        private func takeToggleAnchor() -> String? {
+            defer { toggleAnchor = nil }
+            guard let toggleAnchor, CACurrentMediaTime() - toggleAnchor.time < 1 else { return nil }
+            return toggleAnchor.id
         }
 
         /// Whether the row at one index must be re-measured, and whether the
@@ -458,9 +770,13 @@ struct TranscriptView: NSViewRepresentable {
 
         func appearanceChanged() {
             guard let tableView else { return }
+            // Under the appearance that measured them, which is part of the key.
+            saveMeasuredHeights(force: true)
             pendingTextReload.removeAll()
             deferredRedraw.removeAll()
-            heightCache.removeAll()
+            deferredHeight.removeAll()
+            invalidateAllHeights()
+            loadMeasuredHeights()
             measureAroundViewport(in: tableView)
             scheduleIdleMeasurePass()
             tableView.reloadData()
@@ -471,10 +787,25 @@ struct TranscriptView: NSViewRepresentable {
         /// now at most every `textFlushInterval`.
         private func flushPendingReload() {
             guard let tableView else { return }
-            let indexes = pendingTextReload.filteredIndexSet { rows.indices.contains($0) }
+            var indexes = pendingTextReload.filteredIndexSet { rows.indices.contains($0) }
             pendingTextReload.removeAll()
             guard !indexes.isEmpty else { return }
             let visible = visibleRowRange(in: tableView)
+            // While the reader is scrolling somewhere else, a row growing below
+            // the viewport moves nothing they can see — and noting its height
+            // costs a full TextKit layout of a long reply, landing between the
+            // frames of their gesture. Hold the measure too, not just the draw;
+            // `didSettle` pays both back together.
+            if policy.defersOffscreenHeights {
+                let below = indexes.filteredIndexSet { $0 >= visible.upperBound }
+                if !below.isEmpty {
+                    deferredHeight.formUnion(below)
+                    deferredRedraw.formUnion(below)
+                    indexes.subtract(below)
+                }
+            }
+            guard !indexes.isEmpty else { return }
+            let changed = indexes
             let apply = {
                 // The growing last row must not animate its height change. The
                 // default row-height animation reflows the paragraph the reader
@@ -510,7 +841,7 @@ struct TranscriptView: NSViewRepresentable {
             } else {
                 // Not following: the reader is reading something further up, and
                 // a row growing below — or above — must not slide it.
-                preservingVisualAnchor(apply)
+                preservingVisualAnchor(changed: changed, apply)
             }
         }
 
@@ -550,8 +881,14 @@ struct TranscriptView: NSViewRepresentable {
             guard let tableView else { return }
             let width = tableView.bounds.width
             guard abs(width - cachedWidth) > 1 else { return }
+            // Still measured at the old width, and still worth keeping: the
+            // reader may drag the pane back, or reopen this chat in a window
+            // that width. Saved before `cachedWidth` moves, since that is what
+            // the store is keyed on.
+            saveMeasuredHeights(force: true)
             cachedWidth = width
-            heightCache.removeAll()
+            invalidateAllHeights()
+            loadMeasuredHeights()
             measureAroundViewport(in: tableView)
             scheduleIdleMeasurePass()
             // A width was just established; a restore that couldn't run on load
@@ -566,29 +903,49 @@ struct TranscriptView: NSViewRepresentable {
 
         @objc func liveScrollWillStart(_ notification: Notification) {
             policy.userDidBeginScroll()
-            settleWork?.cancel()
+            isSettleSuspended = true
+            lastScrollActivity = CACurrentMediaTime()
+            // A pin still gliding when the reader takes hold would fight the
+            // gesture for the offset; the gesture wins, from this frame on.
+            cancelAnimatedPin()
+            // Hover hit-testing during a flick queues mouseMoved ahead of clicks;
+            // pause it for the gesture and drop any open attachment preview.
+            pushHoverTracking(dismissPreview: true)
         }
 
         @objc func liveScrollDidEnd(_ notification: Notification) {
             // The fingers have left the trackpad but the momentum has not; the
             // offset going quiet is what actually marks the end of the gesture.
+            isSettleSuspended = false
             scheduleSettle()
         }
 
-        @objc func scrollDidChange(_ notification: Notification) {
-            guard let clip = notification.object as? NSClipView else { return }
-            let y = clip.bounds.origin.y
-            persistScrollWork?.cancel()
-            let work = DispatchWorkItem { [persistenceKey] in
-                UserDefaults.standard.set(y, forKey: persistenceKey)
+        /// Pushes `skipHoverTracking` onto every visible cell without a full
+        /// reconfigure. Busy turns and live scrolls both suppress TextKit
+        /// hit-testing; settling restores it.
+        private func pushHoverTracking(dismissPreview: Bool) {
+            guard let tableView else { return }
+            let skip = isBusy || policy.isUserScrolling
+            for row in visibleRowRange(in: tableView) {
+                guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
+                        as? TranscriptCell
+                else { continue }
+                cell.setSkipHoverTracking(skip, dismissPreview: dismissPreview)
             }
-            persistScrollWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        }
+
+        @objc func scrollDidChange(_ notification: Notification) {
+            // This used to persist the offset here, coalesced, on every tick.
+            // Nothing ever read the key back — a chat deliberately opens at its
+            // newest exchange — so the write was a preference-file hit per
+            // gesture for a value with no reader.
 
             // Anything that moved the offset and wasn't the transcript itself was
             // the reader — a gesture, its momentum, or a keyboard scroll, which
-            // posts no live-scroll notification at all.
-            if !isApplyingProgrammaticScroll, let tableView {
+            // posts no live-scroll notification at all. An animated pin is the
+            // transcript too: its frames land after `withProgrammaticScroll`
+            // has returned, so the flag alone cannot cover them.
+            if !isApplyingProgrammaticScroll, !isAnimatingPin, let tableView {
                 policy.userDidScroll(atBottom: isScrolledToBottom(tableView))
                 reportFollowState()
                 scheduleSettle()
@@ -596,27 +953,68 @@ struct TranscriptView: NSViewRepresentable {
             updateActiveTurn()
         }
 
-        /// Marks the view settled once the offset has been quiet for a moment,
-        /// then pays back the work held off during the gesture.
+        /// Notes that the offset just moved, and makes sure exactly one settle
+        /// check is in flight. The check re-arms itself while the offset keeps
+        /// moving, so a flick costs one closure every `settleInterval` instead
+        /// of a cancel-and-allocate pair on every frame of it.
         private func scheduleSettle() {
-            settleWork?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, let tableView = self.tableView else { return }
-                self.policy.userDidEndScroll(atBottom: self.isScrolledToBottom(tableView))
-                self.reportFollowState()
-                let deferred = self.deferredRedraw.filteredIndexSet { self.rows.indices.contains($0) }
-                self.deferredRedraw.removeAll()
-                if !deferred.isEmpty {
-                    tableView.reloadData(
-                        forRowIndexes: deferred,
-                        columnIndexes: IndexSet(integer: 0)
-                    )
+            lastScrollActivity = CACurrentMediaTime()
+            guard !isSettleCheckArmed else { return }
+            armSettleCheck(after: Self.settleInterval)
+        }
+
+        private func armSettleCheck(after delay: TimeInterval) {
+            isSettleCheckArmed = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.01)) { [weak self] in
+                guard let self else { return }
+                self.isSettleCheckArmed = false
+                // A finger resting on the trackpad posts nothing; check again
+                // in a whole interval rather than spinning on the stillness.
+                guard !self.isSettleSuspended else {
+                    self.armSettleCheck(after: Self.settleInterval)
+                    return
                 }
-                self.measureAroundViewport(in: tableView)
-                self.scheduleIdleMeasurePass()
+                // Still moving: wait out the remainder of the quiet period
+                // rather than declaring the gesture over early.
+                let quiet = CACurrentMediaTime() - self.lastScrollActivity
+                guard quiet >= Self.settleInterval - 0.005 else {
+                    self.armSettleCheck(after: Self.settleInterval - quiet)
+                    return
+                }
+                self.didSettle()
             }
-            settleWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleInterval, execute: work)
+        }
+
+        /// The view has come to rest. Pays back the work held off during the
+        /// gesture: heights nobody could see, redraws nobody could see, and the
+        /// speculative measuring that yields to any gesture in flight.
+        private func didSettle() {
+            guard let tableView else { return }
+            policy.userDidEndScroll(atBottom: isScrolledToBottom(tableView))
+            reportFollowState()
+            pushHoverTracking(dismissPreview: false)
+            var deferred = deferredRedraw.filteredIndexSet { rows.indices.contains($0) }
+            deferredRedraw.removeAll()
+            // Heights held back below the viewport (see `deferredHeight`) are
+            // noted first, so the document is its true length again before the
+            // rows that changed are drawn into it.
+            let heights = deferredHeight.filteredIndexSet { rows.indices.contains($0) }
+            deferredHeight.removeAll()
+            if !heights.isEmpty {
+                preservingVisualAnchor(changed: heights) { self.measure(heights, in: tableView) }
+                deferred.formUnion(heights)
+            }
+            if !deferred.isEmpty {
+                tableView.reloadData(
+                    forRowIndexes: deferred,
+                    columnIndexes: IndexSet(integer: 0)
+                )
+            }
+            measureAroundViewport(in: tableView)
+            scheduleIdleMeasurePass()
+            // The reader came to rest at the foot, so following resumed above:
+            // the rows whose growth was held back have to be caught up to.
+            if policy.allowsAutoScroll, !heights.isEmpty { scrollToBottom(tableView) }
         }
 
         // MARK: - Collapsible responses & turn headers
@@ -666,15 +1064,23 @@ struct TranscriptView: NSViewRepresentable {
             if !collapsedResponses.insert(rowID).inserted {
                 collapsedResponses.remove(rowID)
             }
-            heightCache.removeValue(forKey: rowID)
             guard let tableView,
                   let index = rows.firstIndex(where: { $0.id == rowID }) else { return }
+            invalidateHeight(at: index)
             let indexes = IndexSet(integer: index)
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2
-                tableView.noteHeightOfRows(withIndexesChanged: indexes)
+            // Zero duration, anchored on the row the reader just clicked. The
+            // height used to animate over 0.2 s while the text swapped
+            // instantly and nothing held their place: showing the full response
+            // of a row above the fold pushed everything they were reading down
+            // the view, sliding for a fifth of a second as it went.
+            applyAnchored(onToggled: rowID) {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0
+                    context.allowsImplicitAnimation = false
+                    tableView.noteHeightOfRows(withIndexesChanged: indexes)
+                }
+                tableView.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
             }
-            tableView.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
         }
 
         // MARK: - Data source
@@ -702,7 +1108,8 @@ struct TranscriptView: NSViewRepresentable {
                     width: width,
                     worktreePath: worktreePath,
                     responseCollapse: responseCollapse(for: item),
-                    turnHeader: turnHeader(for: item)
+                    turnHeader: turnHeader(for: item),
+                    turnHarness: agentHarness
                 )
             }
             heightCache[item.id] = height
@@ -723,13 +1130,14 @@ struct TranscriptView: NSViewRepresentable {
                 with: item,
                 worktreePath: worktreePath,
                 canFork: canFork,
-                skipHoverTracking: isBusy,
+                skipHoverTracking: isBusy || policy.isUserScrolling,
                 isSearchHighlighted: isSearchHighlighted(item),
                 responseCollapse: responseCollapse(for: item),
                 turnHeader: turnHeader(for: item),
+                turnHarness: agentHarness,
                 appearance: tableView.effectiveAppearance,
                 onRevert: onRevert,
-                onToggleActivity: onToggleActivity,
+                onToggleActivity: toggleActivityForward,
                 onOpenFile: onOpenFile,
                 onTurnAction: onTurnAction,
                 onToggleResponse: { [weak self] in self?.toggleResponse(item.id) }
@@ -806,14 +1214,21 @@ struct TranscriptView: NSViewRepresentable {
         /// gesture smooth, and the measured-height filter means the sweep usually
         /// invalidates nothing at all.
         private func scheduleIdleMeasurePass() {
-            guard idleMeasureWork == nil else { return }
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.idleMeasureWork = nil
-                self.runIdleMeasureChunk()
+            guard !isIdleMeasureScheduled else { return }
+            isIdleMeasureScheduled = true
+            let timer = Timer(timeInterval: 0.05, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.isIdleMeasureScheduled = false
+                    self.runIdleMeasureChunk()
+                }
             }
-            idleMeasureWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+            // Default mode, not `.common`, and not the main queue: the main
+            // queue is drained inside `.eventTracking` too, so a chunk
+            // scheduled that way could still land in the middle of the flick it
+            // exists to stay out of. A run-loop timer in `.default` simply
+            // waits for the gesture to end.
+            RunLoop.main.add(timer, forMode: .default)
         }
 
         private func runIdleMeasureChunk() {
@@ -825,17 +1240,50 @@ struct TranscriptView: NSViewRepresentable {
             // The unmeasured rows themselves, not the span they sit in: gaps
             // between them are already measured, and sweeping across those would
             // put the bound back on the span rather than on the work.
+            //
+            // The scan resumes at `nextUnmeasuredIndex` rather than at zero.
+            // Restarting from the top each chunk made the sweep quadratic in a
+            // long history, and the rescan itself — not the measuring — was
+            // most of the last chunks' cost.
             var chunk: [Int] = []
             var pending = false
-            for index in rows.indices where heightCache[rows[index].id] == nil {
-                if chunk.count >= Self.idleMeasureChunk { pending = true; break }
-                chunk.append(index)
+            var cursor = min(nextUnmeasuredIndex, rows.count)
+            let started = CACurrentMediaTime()
+            while cursor < rows.count {
+                if heightCache[rows[cursor].id] == nil {
+                    // Bounded by time as well as by count: fifty short rows are
+                    // nothing, fifty whole-file tool outputs are a dropped
+                    // frame. The time check is per measured row, since that is
+                    // what actually costs.
+                    if chunk.count >= Self.idleMeasureChunk
+                        || (!chunk.isEmpty
+                            && CACurrentMediaTime() - started > Self.idleMeasureBudget) {
+                        pending = true
+                        break
+                    }
+                    chunk.append(cursor)
+                    // Measured here rather than by `measure` below, so the
+                    // height is in the cache before the budget is read again.
+                    _ = self.tableView(tableView, heightOfRow: cursor)
+                    // A table too narrow to wrap text at hands back a
+                    // provisional height and caches nothing; the cursor must
+                    // not walk past a row it did not actually measure.
+                    if heightCache[rows[cursor].id] == nil { break }
+                }
+                cursor += 1
             }
-            guard !chunk.isEmpty else { return }
+            nextUnmeasuredIndex = cursor
+            guard !chunk.isEmpty else {
+                // Nothing left unmeasured: the set is as complete as it gets,
+                // and this is the quietest moment to copy it out.
+                saveMeasuredHeights()
+                return
+            }
+            let touched = IndexSet(chunk)
             if policy.allowsAutoScroll {
                 measure(chunk, in: tableView)
             } else {
-                preservingVisualAnchor { self.measure(chunk, in: tableView) }
+                preservingVisualAnchor(changed: touched) { self.measure(chunk, in: tableView) }
             }
             if pending { scheduleIdleMeasurePass() }
         }
@@ -862,6 +1310,48 @@ struct TranscriptView: NSViewRepresentable {
             body()
             tableView.layoutSubtreeIfNeeded()
             let after = tableView.rect(ofRow: anchor).minY - clip.bounds.origin.y
+            let drift = after - before
+            guard abs(drift) > 0.5 else { return }
+            withProgrammaticScroll {
+                clip.scroll(to: NSPoint(x: 0, y: max(0, clip.bounds.origin.y + drift)))
+                scrollView.reflectScrolledClipView(clip)
+            }
+        }
+
+        /// Anchoring only earns its cost when the change can move the reader's
+        /// place. A change entirely below the last visible row moves nothing
+        /// above it, so the forced `layoutSubtreeIfNeeded` — a whole-document
+        /// reflow, arriving between the frames of a gesture — is skipped
+        /// outright. That is the common case while an agent streams into the
+        /// foot of a transcript the reader has scrolled up from.
+        private func preservingVisualAnchor(changed: IndexSet, _ body: () -> Void) {
+            if let first = changed.first, let tableView {
+                let visible = tableView.rows(in: tableView.visibleRect)
+                if visible.location != NSNotFound,
+                   first >= visible.location + visible.length {
+                    body()
+                    return
+                }
+            }
+            preservingVisualAnchor(body)
+        }
+
+        /// Same as `preservingVisualAnchor`, pinned on a specific row id when
+        /// that row is still in the table (a fold the reader just clicked).
+        private func preservingVisualAnchor(on rowID: String, _ body: () -> Void) {
+            guard let tableView,
+                  let scrollView = tableView.enclosingScrollView,
+                  let index = rows.firstIndex(where: { $0.id == rowID })
+            else {
+                preservingVisualAnchor(body)
+                return
+            }
+            let clip = scrollView.contentView
+            let before = tableView.rect(ofRow: index).minY - clip.bounds.origin.y
+            body()
+            guard let newIndex = rows.firstIndex(where: { $0.id == rowID }) else { return }
+            tableView.layoutSubtreeIfNeeded()
+            let after = tableView.rect(ofRow: newIndex).minY - clip.bounds.origin.y
             let drift = after - before
             guard abs(drift) > 0.5 else { return }
             withProgrammaticScroll {
@@ -906,6 +1396,18 @@ struct TranscriptView: NSViewRepresentable {
         /// as rows stream in.
         private var searchHighlightID: String?
 
+        /// Whether two row arrays are the same buffer. Copy-on-write means
+        /// SwiftUI handing the same value back twice shares storage, and two
+        /// arrays that share storage cannot differ.
+        private static func sharesStorage(_ lhs: [TranscriptRow], _ rhs: [TranscriptRow]) -> Bool {
+            guard lhs.count == rhs.count else { return false }
+            return lhs.withUnsafeBufferPointer { left in
+                rhs.withUnsafeBufferPointer { right in
+                    left.baseAddress == right.baseAddress
+                }
+            }
+        }
+
         func setSearchQuery(_ query: String) {
             let trimmed = query.trimmingCharacters(in: .whitespaces)
             guard trimmed != searchQuery else { return }
@@ -947,6 +1449,52 @@ struct TranscriptView: NSViewRepresentable {
         }
 
         fileprivate var hasActiveSearch: Bool { !searchQuery.isEmpty }
+
+        /// Fast path for a streaming delta: only the last row can have joined
+        /// or left the find results, so re-test that one instead of scanning
+        /// the whole transcript.
+        private func updateSearchMatch(at index: Int) {
+            guard rows.indices.contains(index), !searchQuery.isEmpty else { return }
+            let updated = Self.applyingMatch(
+                searchMatches,
+                cursor: searchCursor,
+                row: index,
+                matches: rowMatchesSearch(rows[index])
+            )
+            // Only an insert or a remove changes the count, so this is the
+            // whole test for "did anything move" without walking the list.
+            guard updated.matches.count != searchMatches.count else { return }
+            searchMatches = updated.matches
+            searchCursor = updated.cursor
+            reportSearchState()
+        }
+
+        /// Adds or removes one row in an ascending list of matching rows,
+        /// carrying the cursor — which is an index *into* that list, not a row —
+        /// along with it. Pure, so the bookkeeping behind "3 of 7" can be
+        /// checked without a window.
+        nonisolated static func applyingMatch(
+            _ matches: [Int],
+            cursor: Int?,
+            row: Int,
+            matches isMatch: Bool
+        ) -> (matches: [Int], cursor: Int?) {
+            var matches = matches
+            var cursor = cursor
+            if let existing = matches.firstIndex(of: row) {
+                guard !isMatch else { return (matches, cursor) }
+                matches.remove(at: existing)
+                // The row the reader was standing on stopped matching; there is
+                // no honest place to put them, so the count loses its ordinal.
+                if cursor == existing { cursor = nil }
+                else if let current = cursor, current > existing { cursor = current - 1 }
+            } else if isMatch {
+                let insertAt = matches.firstIndex(where: { $0 > row }) ?? matches.endIndex
+                matches.insert(row, at: insertAt)
+                if let current = cursor, current >= insertAt { cursor = current + 1 }
+            }
+            return (matches, cursor)
+        }
 
         private func stepSearch(_ delta: Int) {
             guard !searchMatches.isEmpty else { return }
@@ -1008,7 +1556,12 @@ struct TranscriptView: NSViewRepresentable {
                     top: top, left: previous.left, bottom: bottom, right: previous.right
                 )
             }
-            if wasFollowing { scrollToBottom(tableView) }
+            if wasFollowing {
+                scrollToBottom(
+                    tableView,
+                    allowingGlide: Self.animatesDockInset ? true : nil
+                )
+            }
         }
 
         /// The reader asked to catch up. This resumes following, so the agent's
@@ -1038,7 +1591,7 @@ struct TranscriptView: NSViewRepresentable {
             return visible.maxY >= contentHeight - 40
         }
 
-        private func scrollToBottom(_ tableView: NSTableView) {
+        private func scrollToBottom(_ tableView: NSTableView, allowingGlide: Bool? = nil) {
             guard !rows.isEmpty, let scrollView = tableView.enclosingScrollView else { return }
             // Pin the document's bottom edge rather than `scrollRowToVisible`.
             // Once the streaming row grows taller than the viewport,
@@ -1060,11 +1613,60 @@ struct TranscriptView: NSViewRepresentable {
             )
             // Already there: scrolling anyway would still post a bounds change and
             // cancel any momentum the reader has in flight, for no movement.
-            guard abs(clip.bounds.origin.y - targetY) > 0.5 else { return }
+            let delta = targetY - clip.bounds.origin.y
+            guard abs(delta) > 0.5 else { return }
+            // Following a stream is a pin every 100 ms, and each pin is
+            // instant, so the text reads as stepping rather than moving. Gliding
+            // the short pins over a frame or two is the candidate fix; it is off
+            // until measured, because an animation on this path can also fight
+            // the reader for the offset.
+            if allowingGlide ?? Self.animatesFollowPins, !policy.isUserScrolling,
+               abs(delta) < clip.bounds.height / 2 {
+                animatePin(to: targetY, clip: clip, in: scrollView)
+                return
+            }
+            cancelAnimatedPin()
             withProgrammaticScroll {
                 clip.scroll(to: NSPoint(x: 0, y: targetY))
                 scrollView.reflectScrolledClipView(clip)
             }
+        }
+
+        /// Glides to `targetY` instead of jumping (see `animatesFollowPins`).
+        ///
+        /// The bounds changes this causes arrive over later frames, long after
+        /// `withProgrammaticScroll` would have cleared its flag, so the whole
+        /// flight is marked with `isAnimatingPin` — otherwise the transcript
+        /// reads its own animation back as the reader scrolling away and drops
+        /// following on the first frame.
+        private func animatePin(to targetY: CGFloat, clip: NSClipView, in scrollView: NSScrollView) {
+            pinGeneration &+= 1
+            let generation = pinGeneration
+            isAnimatingPin = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.1
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                context.allowsImplicitAnimation = true
+                clip.animator().setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: targetY))
+            } completionHandler: { [weak self] in
+                guard let self, generation == self.pinGeneration else { return }
+                self.isAnimatingPin = false
+                scrollView.reflectScrolledClipView(clip)
+            }
+        }
+
+        /// Disowns any pin in flight: its completion is generation-checked, so a
+        /// later pin — or a gesture — supersedes it without waiting it out.
+        ///
+        /// The frames already in the animation still land (0.1 s of them at
+        /// most). Reading them back as the transcript's own rather than the
+        /// reader's is the part that matters; cutting them short would mean
+        /// resolving the presentation offset, which is not worth it for a
+        /// debug-flagged experiment.
+        private func cancelAnimatedPin() {
+            guard isAnimatingPin else { return }
+            pinGeneration &+= 1
+            isAnimatingPin = false
         }
 
         func scroll(to row: Int) {
@@ -1103,12 +1705,91 @@ struct TranscriptView: NSViewRepresentable {
     }
 }
 
+/// Measured row heights that outlive the view that measured them.
+///
+/// The transcript's coordinator is rebuilt whenever its SwiftUI `.id` changes —
+/// a tab switch, a workspace switch — and it used to start with an empty cache.
+/// So every switch re-measured the whole history with TextKit, and the scroller
+/// knob kept resizing under the reader as the idle sweep landed its chunks. A
+/// height is a pure function of the row's content, the width it wraps at and
+/// the appearance it draws in, all of which the key below carries, so it is
+/// worth keeping across that boundary.
+///
+/// Correctness rests entirely on the key: a height found under a key is used
+/// without re-measuring, so anything that can change a row's height must be in
+/// it. A row whose content moved simply isn't found, and is measured as before.
+@MainActor
+enum TranscriptHeightStore {
+    struct Key: Hashable {
+        var chat: String
+        /// Whole points. Heights are measured at one exact width, and half a
+        /// point can be a different wrap.
+        var width: Int
+        var appearance: String
+        /// Anything else the chat bakes into its rows — today the harness whose
+        /// mark is drawn in each turn header.
+        var variant: String
+
+        init(chat: String, width: CGFloat, appearance: String, variant: String) {
+            self.chat = chat
+            self.width = Int(width.rounded())
+            self.appearance = appearance
+            self.variant = variant
+        }
+    }
+
+    /// Identity of one measured row. The revision covers streaming and edits;
+    /// the two flags cover the view state the height depends on but the row
+    /// itself knows nothing about.
+    static func rowKey(
+        id: String,
+        contentRevision: UInt64,
+        isCollapsed: Bool,
+        hasTurnHeader: Bool
+    ) -> String {
+        "\(id)\u{1}\(contentRevision)\u{1}\(isCollapsed ? 1 : 0)\(hasTurnHeader ? 1 : 0)"
+    }
+
+    /// Chats kept, coldest evicted first. Eight covers the tabs of a working
+    /// session without holding a whole fleet's transcripts in memory.
+    static let chatLimit = 8
+
+    private static var entries: [Key: [String: CGFloat]] = [:]
+    private static var order: [Key] = []
+
+    static func heights(for key: Key) -> [String: CGFloat] {
+        guard let heights = entries[key] else { return [:] }
+        touch(key)
+        return heights
+    }
+
+    static func store(_ heights: [String: CGFloat], for key: Key) {
+        guard !heights.isEmpty else { return }
+        entries[key] = heights
+        touch(key)
+        while order.count > chatLimit {
+            entries.removeValue(forKey: order.removeFirst())
+        }
+    }
+
+    /// For tests, and for anything that wants the next open to measure fresh.
+    static func removeAll() {
+        entries.removeAll()
+        order.removeAll()
+    }
+
+    private static func touch(_ key: Key) {
+        if let index = order.firstIndex(of: key) { order.remove(at: index) }
+        order.append(key)
+    }
+}
+
 /// Hosts the virtualized transcript and a compact turn minimap. Each marker is
 /// one user prompt, making long conversations directly navigable without
 /// replacing the native scrollbar or stealing its gestures.
 final class TranscriptContainerView: NSView {
     let scrollView: NSScrollView
-    let turnRail = TurnRailView()
+    let turnRail = TurnRailView(frame: .zero)
     var onAppearanceChange: (() -> Void)?
 
     override func viewDidChangeEffectiveAppearance() {
@@ -1128,7 +1809,15 @@ final class TranscriptContainerView: NSView {
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            turnRail.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            // Inboard of the overlay knob, which draws in the trailing
+            // `scrollerWidth` points of the same rect. The rail used to sit
+            // exactly on top of it, with no hit-testing of its own, so a press
+            // meant to drag the scrollbar was read as a marker click and jumped
+            // the reader to a turn instead of scrolling.
+            turnRail.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -(NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay) + 4)
+            ),
             turnRail.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             turnRail.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -50),
             turnRail.widthAnchor.constraint(equalToConstant: 18),
@@ -1147,25 +1836,49 @@ final class TurnRailView: NSView {
     var activeRow: Int? { didSet { if oldValue != activeRow { needsDisplay = true } } }
     var onSelectRow: ((Int) -> Void)?
     private var isHovering = false
+    /// How far from a marker's centre a click still counts as that marker.
+    private static let markerHitSlop: CGFloat = 5
+    /// Below this, a minimap is noise: two dots that say what the scrollbar
+    /// already says, in the strip beside it.
+    private static let minimumTurns = 3
 
     override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // Installed once, with `.inVisibleRect` so AppKit keeps it in step with
+        // the bounds. Rebuilding it on every `update` — which a streaming turn
+        // reaches whenever the row count moves — was tracking-area churn on the
+        // path that has to stay cheap.
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not supported") }
 
     func update(turnRows: [Int], totalRows: Int) {
         self.turnRows = turnRows
         self.totalRows = totalRows
         if activeRow == nil { activeRow = turnRows.last }
+        isHidden = turnRows.count < Self.minimumTurns
         needsDisplay = true
-        updateTrackingAreas()
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self
-        ))
+    /// Only the markers take the mouse. The rail spans the full height of the
+    /// transcript, and everything between its markers belongs to what is behind
+    /// it — the scroll view, and the overlay knob when the system widens it on
+    /// hover. Returning the rail for that empty space is what turned a scrollbar
+    /// drag into a jump to the nearest turn.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, !turnRows.isEmpty else { return nil }
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        let near = turnRows.contains { abs(y(for: $0) - local.y) <= Self.markerHitSlop }
+        return near ? self : nil
     }
 
     override func mouseEntered(with event: NSEvent) { isHovering = true; needsDisplay = true }
@@ -1219,7 +1932,7 @@ final class ClickThroughImageView: NSImageView {
 /// are involved, and that disagreement is the empty gap under a finished reply.
 @MainActor
 enum TranscriptHeightMeasurer {
-    private static let textView: NSTextView = {
+    private static func makeTextView() -> NSTextView {
         // The same TextKit 1 stack the cell's label draws with.
         let view = NSTextView(usingTextLayoutManager: false)
         view.isRichText = true
@@ -1231,7 +1944,70 @@ enum TranscriptHeightMeasurer {
         view.textContainer?.widthTracksTextView = false
         view.textContainer?.lineBreakMode = .byWordWrapping
         return view
-    }()
+    }
+
+    private static let textView: NSTextView = makeTextView()
+
+    /// A second stack, kept for the one row that is streaming.
+    ///
+    /// Measuring a row means laying its text out, and the shared stack above is
+    /// handed a different row's text between every two measures, so a growing
+    /// reply was laid out whole ten times a second — on top of the cell's own
+    /// label doing the same. This one holds the streaming row's storage between
+    /// flushes, so a flush replaces only the tail past the boundary the
+    /// renderer reused and TextKit invalidates layout from there rather than
+    /// from the first character.
+    private static let streamingTextView: NSTextView = makeTextView()
+    /// The render `streamingTextView` currently holds, and the width it was
+    /// last laid out at.
+    private static var streamingToken = 0
+    private static var streamingWidth: CGFloat = 0
+
+    /// Measures a streaming render, splicing onto the previous one when this is
+    /// the stack that laid that one out. Falls back to a whole-string measure
+    /// whenever the chain is broken, which is always safe.
+    static func streamingHeight(
+        of string: NSAttributedString,
+        width: CGFloat,
+        step: TranscriptCell.StreamingStep
+    ) -> CGFloat {
+        guard width > 1, string.length > 0 else { return 0 }
+        let view = streamingTextView
+        guard let container = view.textContainer,
+              let layoutManager = view.layoutManager,
+              let storage = view.textStorage
+        else { return height(of: string, width: width) }
+
+        // The same render again — a re-measure with nothing changed — and the
+        // same width: the layout on hand is already the answer.
+        if step.token == streamingToken, width == streamingWidth,
+           storage.length == string.length {
+            return ceil(layoutManager.usedRect(for: container).height)
+        }
+        if container.containerSize.width != width {
+            container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        }
+        // Only the render this one was spliced from may be spliced onto: the
+        // prefix is identical, character and attribute, exactly there.
+        let splice = min(step.stablePrefix, min(storage.length, string.length))
+        if step.previousToken != 0, step.previousToken == streamingToken, splice > 0 {
+            storage.beginEditing()
+            storage.replaceCharacters(
+                in: NSRange(location: splice, length: storage.length - splice),
+                with: string.attributedSubstring(
+                    from: NSRange(location: splice, length: string.length - splice)
+                )
+            )
+            storage.endEditing()
+        } else {
+            storage.setAttributedString(string)
+        }
+        assert(storage.length == string.length, "spliced measure diverged from the render")
+        streamingToken = step.token
+        streamingWidth = width
+        layoutManager.ensureLayout(for: container)
+        return ceil(layoutManager.usedRect(for: container).height)
+    }
 
     static func height(of string: NSAttributedString, width: CGFloat) -> CGFloat {
         guard width > 1, string.length > 0 else { return 0 }
@@ -1312,6 +2088,10 @@ final class TranscriptCell: NSTableCellView {
     private var configuredRowID: String?
     private var menuButtonCenterConstraint: NSLayoutConstraint!
     private var copyTrackingArea: NSTrackingArea?
+    /// The streaming render currently in the label's storage, or zero for
+    /// anything else. Cleared on every whole-string application, so a reused
+    /// cell can never mistake another row's text for a render it may splice on.
+    private var appliedStreamingToken = 0
     /// The turn a footer row's ⋯ menu acts on, and what it may offer.
     private var footerTurnID: TurnID?
     private var footerResponse = ""
@@ -1515,6 +2295,7 @@ final class TranscriptCell: NSTableCellView {
         isSearchHighlighted: Bool = false,
         responseCollapse: ResponseCollapse = .none,
         turnHeader: String? = nil,
+        turnHarness: HarnessKind? = nil,
         appearance: NSAppearance? = nil,
         onRevert: @escaping (TurnID) -> Void,
         onToggleActivity: @escaping (String) -> Void,
@@ -1611,11 +2392,12 @@ final class TranscriptCell: NSTableCellView {
                 for: row,
                 worktreePath: worktreePath,
                 responseCollapse: responseCollapse,
-                turnHeader: turnHeader
+                turnHeader: turnHeader,
+                turnHarness: turnHarness
             )
         }
         label.dismissAttachmentPreview()
-        label.textStorage?.setAttributedString(attributedText)
+        applyText(attributedText, row: row, responseCollapse: responseCollapse)
         if isFooter {
             menuButtonCenterConstraint.constant = Self.firstLineHeight(of: attributedText) / 2
         }
@@ -1672,6 +2454,51 @@ final class TranscriptCell: NSTableCellView {
         } else {
             toolTip = nil
         }
+    }
+
+    /// Puts `text` into the label, replacing only what changed when this cell
+    /// already holds the render the new one was spliced from.
+    ///
+    /// The draw side of the same problem the measurer has: a growing reply was
+    /// handed to `setAttributedString` whole on every flush, which throws away
+    /// the layout of everything above the paragraph that actually grew — the
+    /// reader's own selection with it.
+    private func applyText(
+        _ text: NSAttributedString,
+        row: TranscriptRow,
+        responseCollapse: ResponseCollapse
+    ) {
+        guard let storage = label.textStorage else { return }
+        let step = responseCollapse == .none ? Self.streamingStep : nil
+        guard let step, step.rowID == row.id, step.length == text.length else {
+            storage.setAttributedString(text)
+            appliedStreamingToken = 0
+            return
+        }
+        if step.token == appliedStreamingToken, storage.length == text.length { return }
+        let splice = min(step.stablePrefix, min(storage.length, text.length))
+        if step.previousToken != 0, step.previousToken == appliedStreamingToken, splice > 0 {
+            storage.beginEditing()
+            storage.replaceCharacters(
+                in: NSRange(location: splice, length: storage.length - splice),
+                with: text.attributedSubstring(
+                    from: NSRange(location: splice, length: text.length - splice)
+                )
+            )
+            storage.endEditing()
+        } else {
+            storage.setAttributedString(text)
+        }
+        assert(storage.length == text.length, "spliced draw diverged from the render")
+        appliedStreamingToken = step.token
+    }
+
+    /// Updates hover hit-testing without a full `configure`. Used when busy
+    /// state or a live scroll starts or settles, so already-visible rows pick
+    /// up the new policy without re-laying out their text.
+    func setSkipHoverTracking(_ skip: Bool, dismissPreview: Bool) {
+        label.skipHoverTracking = skip
+        if dismissPreview { label.dismissAttachmentPreview() }
     }
 
     /// Swaps the label between its three bottoms: pinned to the bubble
@@ -1773,9 +2600,12 @@ final class TranscriptCell: NSTableCellView {
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        if let copyTrackingArea { removeTrackingArea(copyTrackingArea) }
+        // `.inVisibleRect` keeps the area in step with the cell's bounds on its
+        // own, so rebuilding it here is work for an identical result — and this
+        // runs for every visible cell on every layout pass of a scroll.
+        guard copyTrackingArea == nil else { return }
         let area = NSTrackingArea(
-            rect: bounds,
+            rect: .zero,
             options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
             owner: self
         )
@@ -1933,7 +2763,8 @@ final class TranscriptCell: NSTableCellView {
         for row: TranscriptRow,
         worktreePath: String,
         responseCollapse: ResponseCollapse,
-        turnHeader: String?
+        turnHeader: String?,
+        turnHarness: HarnessKind? = nil
     ) -> NSAttributedString {
         let base = responseCollapse == .collapsed
             ? collapsedAttributedText(for: row)
@@ -1942,13 +2773,21 @@ final class TranscriptCell: NSTableCellView {
               let turnHeader, !turnHeader.isEmpty
         else { return base }
         let line = NSMutableAttributedString(attributedString: base)
+        let headerAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+        ]
+        line.append(NSAttributedString(string: "  ·  ", attributes: headerAttributes))
+        if let turnHarness, let image = HarnessBrandAssets.inlineMark(for: turnHarness) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -3, width: 14, height: 14)
+            line.append(NSAttributedString(attachment: attachment))
+            line.append(NSAttributedString(string: " ", attributes: headerAttributes))
+        }
         line.append(NSAttributedString(
-            // The fold's own separator spacing, so the three parts read as one line.
-            string: "  ·  " + turnHeader.replacingOccurrences(of: " · ", with: "  ·  "),
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
-                .foregroundColor: NSColor.tertiaryLabelColor,
-            ]
+            string: turnHeader.replacingOccurrences(of: " · ", with: "  ·  "),
+            attributes: headerAttributes
         ))
         return line
     }
@@ -1958,7 +2797,8 @@ final class TranscriptCell: NSTableCellView {
         width: CGFloat,
         worktreePath: String = "",
         responseCollapse: ResponseCollapse = .none,
-        turnHeader: String? = nil
+        turnHeader: String? = nil,
+        turnHarness: HarnessKind? = nil
     ) -> CGFloat {
         // Dividers are measured like every other row. They used to return a
         // flat 36pt, but the cell spends 16pt around the label plus the vertical
@@ -1971,7 +2811,8 @@ final class TranscriptCell: NSTableCellView {
             for: row,
             worktreePath: worktreePath,
             responseCollapse: responseCollapse,
-            turnHeader: turnHeader
+            turnHeader: turnHeader,
+            turnHarness: turnHarness
         )
         let indent = row.parentToolCallID != nil ? subagentIndent : 0
         let bubbleWidth = row.kind == .userMessage ? min(width * 0.72, 620) : width - indent
@@ -1981,7 +2822,17 @@ final class TranscriptCell: NSTableCellView {
         // than the text view actually draws — the empty gap between a reply and
         // its footer. Measuring through the same layout manager the cell uses
         // keeps those two numbers identical.
-        let textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
+        // A streaming reply is the one row measured over and over, and the only
+        // one whose successive renders share a prefix worth not re-laying out.
+        let textHeight: CGFloat
+        if responseCollapse == .none,
+           let step = streamingStep, step.rowID == row.id, step.length == attributed.length {
+            textHeight = TranscriptHeightMeasurer.streamingHeight(
+                of: attributed, width: textWidth, step: step
+            )
+        } else {
+            textHeight = TranscriptHeightMeasurer.height(of: attributed, width: textWidth)
+        }
         let toggleBand: CGFloat = responseCollapse == .none ? 0 : responseToggleBand
         let ownBadge = badgeText(for: row)
         let hasBadgeLine = !ownBadge.isEmpty
@@ -2038,6 +2889,30 @@ final class TranscriptCell: NSTableCellView {
     /// and showing it raw makes the reader parse formatting by eye in the one
     /// place they are trying to read quickly. Measuring and drawing both go
     /// through here so a row's cached height always matches what it draws.
+    /// How the newest streaming render relates to the one before it, for
+    /// consumers that already hold that one and can replace just its tail.
+    ///
+    /// Only one row streams at a time, so one step is enough. Tokens are
+    /// globally unique and never reused, which is what makes "the storage I
+    /// hold is exactly that render" a safe thing to conclude from an integer.
+    struct StreamingStep: Equatable {
+        var rowID: String
+        var token: Int
+        /// The render this one was spliced from; zero when nothing was reused,
+        /// or when another row rendered in between.
+        var previousToken: Int
+        /// UTF-16 length of the opening run shared with `previousToken`'s
+        /// render, character for character and attribute for attribute.
+        var stablePrefix: Int
+        var length: Int
+    }
+
+    private nonisolated(unsafe) static var lastStreamingStep: StreamingStep?
+    private nonisolated(unsafe) static var nextStreamingToken = 1
+
+    /// The step describing the most recent streaming render.
+    static var streamingStep: StreamingStep? { lastStreamingStep }
+
     static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let appearance = currentAppearance.name.rawValue
         let signature = renderSignature(for: row, appearance: appearance)
@@ -2067,6 +2942,22 @@ final class TranscriptCell: NSTableCellView {
                 )
                 rendered = streamed.rendered
                 streamingPrefix = streamed.prefix
+                // Published before the store below, so a consumer measuring
+                // this very string can see what it may splice onto.
+                let previous = lastStreamingStep
+                let token = nextStreamingToken
+                nextStreamingToken &+= 1
+                lastStreamingStep = StreamingStep(
+                    rowID: row.id,
+                    token: token,
+                    previousToken: previous?.rowID == row.id && streamed.reusedLength > 0
+                        ? previous?.token ?? 0
+                        : 0,
+                    // Trimming trailing newlines can leave either render
+                    // shorter than the head they share.
+                    stablePrefix: min(streamed.reusedLength, rendered.length),
+                    length: rendered.length
+                )
             }
 
         case .plan:

@@ -85,6 +85,37 @@ struct StreamingMarkdownRenderTests {
         #expect((prefix?.sourceLength ?? 0) > 0)
     }
 
+    /// The cell's label and the height measurer both keep the previous render
+    /// and replace only what follows `reusedLength`, so that run has to be
+    /// identical — characters *and* attributes — in both renders. If it ever
+    /// isn't, a streaming reply draws stale text or is measured at the wrong
+    /// height, with nothing on screen to say why.
+    @Test func theReusedRunIsIdenticalInBothRenders() {
+        let characters = Array(Self.reply)
+        var prefix: MarkdownRenderer.StreamingPrefix?
+        var previous: NSAttributedString?
+        var splicedSomething = false
+        var end = 0
+        while end < characters.count {
+            end = min(characters.count, end + 2)
+            let streamed = renderer.renderStreaming(String(characters[0..<end]), reusing: prefix)
+            if let previous, streamed.reusedLength > 0 {
+                let shared = min(streamed.reusedLength, min(previous.length, streamed.rendered.length))
+                #expect(shared > 0, "a reused head that shares nothing, at \(end)")
+                #expect(
+                    Array(fingerprint(previous).prefix(shared))
+                        == Array(fingerprint(streamed.rendered).prefix(shared)),
+                    "the reused run diverged at \(end)"
+                )
+                splicedSomething = true
+            }
+            previous = streamed.rendered
+            prefix = streamed.prefix
+        }
+        // Otherwise this proved nothing about splicing at all.
+        #expect(splicedSomething)
+    }
+
     @Test func aHeadIsNotReusedForTextThatReplacedIt() {
         let first = renderer.renderStreaming("One.\n\nTwo.", reusing: nil)
         #expect(first.prefix != nil)

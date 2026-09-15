@@ -45,6 +45,9 @@ public struct ClaudeCodeHarness: AgentHarness {
             arguments: ["--version"],
             timeout: .seconds(10)
         )
+        // Answered now, while the doctor is already asking the CLI things, so
+        // the first session doesn't pay for it.
+        _ = await ClaudeFlagSupport.shared.allowsBypassSwitch(executablePath: path)
 
         return HarnessProbeResult(
             kind: kind,
@@ -116,7 +119,8 @@ public struct ClaudeCodeHarness: AgentHarness {
             id: SessionID.generate(),
             executablePath: path,
             configuration: configuration,
-            capabilities: capabilities
+            capabilities: capabilities,
+            allowsBypassSwitch: await ClaudeFlagSupport.shared.allowsBypassSwitch(executablePath: path)
         )
     }
 

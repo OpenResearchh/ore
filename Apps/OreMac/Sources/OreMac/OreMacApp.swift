@@ -364,20 +364,12 @@ struct OreMacApp: App {
 
                 Divider()
 
-                Button("Allow Tool") { model.allowPendingPermission() }
-                    .keyboardShortcut("a", modifiers: [.command, .shift])
-                    .disabled(model.actionablePermission == nil)
-
-                Button("Deny Tool") { model.denyPendingPermission() }
-                    .keyboardShortcut("d", modifiers: [.command, .shift])
-                    .disabled(model.actionablePermission == nil)
+                PendingPermissionCommands().environment(model)
 
                 // ⇧⌘U walks everything in the fleet that is waiting on the
                 // user — blocked tabs first, then failed turns — so the
                 // sidebar's attention badge has a keyboard that answers it.
-                Button("Next Needs You") { model.focusNextNeedsYou() }
-                    .keyboardShortcut("u", modifiers: [.command, .shift])
-                    .disabled(!model.hasNeedsYouStops)
+                NextNeedsYouCommand().environment(model)
 
                 Divider()
 
@@ -428,6 +420,87 @@ struct OreMacApp: App {
     private func requestNotificationPermission() async {
         _ = try? await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound, .badge])
+    }
+}
+
+/// ⌃⌘A — Mail's archive chord. Stages a confirmation; archiving stops the
+/// agent and removes the checkout from disk.
+private struct ArchiveWorkspaceCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Archive Workspace") {
+            if let id = model.selectedWorkspaceID { model.requestArchive(id) }
+        }
+        .keyboardShortcut("a", modifiers: [.control, .command])
+        .disabled(model.selectedWorkspace == nil)
+    }
+}
+
+/// ⌥⌘G runs whatever the review pane is offering: open a PR, continue after a
+/// merge, and so on. Its enablement reads the selected workspace's cached diff
+/// and in-flight git ops, which move on every agent write.
+private struct NextGitStepCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Next Git Step") {
+            model.performSuggestedGitAction()
+        }
+        .keyboardShortcut("g", modifiers: [.command, .option])
+        .disabled(!model.canPerformSuggestedGitAction)
+    }
+}
+
+private struct MuteAssistantCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button(model.narration.isMuted ? "Unmute Assistant" : "Mute Assistant") {
+            model.narration.setMuted(!model.narration.isMuted)
+        }
+        .keyboardShortcut("s", modifiers: [.shift, .option, .command])
+    }
+}
+
+/// ⇧⌘A / ⇧⌘D answer the selected tab's oldest generic permission. Both read
+/// `actionablePermission`, which walks the selected chat's pending requests —
+/// so it lands here, where a permission arriving only re-evaluates two menu
+/// items.
+private struct PendingPermissionCommands: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let isActionable = model.actionablePermission != nil
+        Button("Allow Tool") { model.allowPendingPermission() }
+            .keyboardShortcut("a", modifiers: [.command, .shift])
+            .disabled(!isActionable)
+
+        Button("Deny Tool") { model.denyPendingPermission() }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+            .disabled(!isActionable)
+    }
+}
+
+private struct NextNeedsYouCommand: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button("Next Needs You") { model.focusNextNeedsYou() }
+            .keyboardShortcut("u", modifiers: [.command, .shift])
+            .disabled(!model.hasNeedsYouStops)
+    }
+}
+
+/// The status item's glyph. Its own view so the stored attention count is
+/// observed here and not by the whole `Scene`.
+private struct MenuBarStatusIcon: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Image(systemName: model.attentionCount > 0
+            ? "sparkles.square.filled.on.square"
+            : "sparkles")
     }
 }
 
@@ -643,7 +716,18 @@ struct RootView: View {
         .toolbar {
             if let workspace = model.selectedWorkspace {
                 ToolbarItem(placement: .primaryAction) {
-                    GitActionToolbar(workspace: workspace)
+                    HStack(spacing: 8) {
+                        WorkspaceReviewButton(workspace: workspace)
+                            // The toolbar packs this group hard against
+                            // whatever ends the title area, and two rounded
+                            // edges meeting with nothing between them read as
+                            // an overlap rather than as two controls. Wider
+                            // than the 8 pt between siblings on purpose: this
+                            // gap separates the group from the chrome, not one
+                            // button from the next.
+                            .padding(.leading, 12)
+                        GitActionToolbar(workspace: workspace)
+                    }
                 }
             }
             ToolbarItem(placement: .primaryAction) {

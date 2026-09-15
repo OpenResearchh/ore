@@ -92,7 +92,9 @@ final class AppModel {
     private(set) var assistantConfirmations: [AssistantConfirmation] = []
     /// Project tabs blocked on a permission or question, for the HUD / menu bar
     /// when the user is in another app.
-    private(set) var tabNeedsYou: [TabNeedsYou] = []
+    private(set) var tabNeedsYou: [TabNeedsYou] = [] {
+        didSet { recomputeNeedsYouStops() }
+    }
     private(set) var harnesses: [HarnessProbeResult] = []
     /// Whether the probe has reported at least once. Distinct from
     /// `harnesses.isEmpty`: "we have not looked yet" and "we looked and found
@@ -138,6 +140,7 @@ final class AppModel {
     /// Live transcript state is keyed by durable chat identity, never by
     /// workspace: several tabs in one worktree can stream concurrently.
     private(set) var chatStates: [ChatID: ChatState] = [:]
+    private(set) var workspaceAutoApprovals: [WorkspaceID: WorkspaceAutoApproval] = [:]
     /// Git dirt lives off the `workspaces` array so a file write does not
     /// invalidate every chrome view that read the fleet list.
     @ObservationIgnored
@@ -581,7 +584,9 @@ final class AppModel {
 
     /// Biometrics or the login password — whichever the Mac has. A machine
     /// with neither (or a denied prompt) simply doesn't mint standing grants.
-    private static func authenticateStandingGrant() async -> Bool {
+    private static func authenticateStandingGrant(
+        reason: String = "let the ORE assistant always perform this kind of action"
+    ) async -> Bool {
         let context = LAContext()
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
@@ -589,7 +594,7 @@ final class AppModel {
         }
         return (try? await context.evaluatePolicy(
             .deviceOwnerAuthentication,
-            localizedReason: "let the ORE assistant always perform this kind of action"
+            localizedReason: reason
         )) ?? false
     }
 
@@ -1487,6 +1492,82 @@ final class AppModel {
                 id, resolvedChatID, requestID, decision, automatic: automatic
             ))
         }
+    }
+
+    struct WorkspacePermissionGroup: Identifiable {
+        let chat: ChatSummary
+        let requests: [PermissionRequest]
+        let questions: [AgentQuestion]
+        let hasPlan: Bool
+        var id: ChatID { chat.id }
+        var pendingCount: Int { requests.count + questions.count + (hasPlan ? 1 : 0) }
+    }
+
+    func workspacePermissionGroups(for workspaceID: WorkspaceID) -> [WorkspacePermissionGroup] {
+        chats(for: workspaceID, includeClosed: true).compactMap { summary in
+            guard let state = chatStates[summary.id] else { return nil }
+            let hasPlan: Bool
+            if case .proposal = state.plan { hasPlan = true } else { hasPlan = false }
+            let questions = state.pendingQuestions
+            let requests = state.pendingPermissions.filter { permission in
+                // A dedicated question or plan owns its backing permission;
+                // show one item rather than two ways to answer the same gate.
+                if permission.toolName == "AskUserQuestion",
+                   questions.contains(where: { $0.toolCallID == permission.toolCallID }) { return false }
+                if permission.toolName == "ExitPlanMode", hasPlan { return false }
+                return true
+            }
+            guard !requests.isEmpty || !questions.isEmpty || hasPlan else { return nil }
+            return WorkspacePermissionGroup(chat: summary, requests: requests, questions: questions, hasPlan: hasPlan)
+        }
+    }
+
+    func approveWorkspaceRequests(for workspaceID: WorkspaceID) {
+        // Snapshot the set the user approved. Requests arriving later need a
+        // separate click or an explicitly enabled timed grant.
+        let groups = workspacePermissionGroups(for: workspaceID)
+        for group in groups {
+            for request in group.requests where WorkspacePermissionPolicy.isToolRequest(request) {
+                resolvePermission(request.id, decision: .allow, for: workspaceID, chatID: group.chat.id)
+            }
+        }
+    }
+
+    func enableWorkspaceAutoApproval(for workspaceID: WorkspaceID, minutes: Int) async -> Bool {
+        guard [5, 15, 30, 60].contains(minutes) else { return false }
+        guard await Self.authenticateStandingGrant(
+            reason: "automatically approve tool requests in this ORE workspace for \(minutes) minutes"
+        ) else { return false }
+        let grant = WorkspaceAutoApproval(
+            workspaceID: workspaceID,
+            expiresAt: Date().addingTimeInterval(Double(minutes) * 60)
+        )
+        workspaceAutoApprovals[workspaceID] = grant
+        for group in workspacePermissionGroups(for: workspaceID) {
+            for request in group.requests where grant.allows(request, in: workspaceID) {
+                approveTimedWorkspaceRequest(request, workspaceID: workspaceID, chatID: group.chat.id, grant: grant)
+            }
+        }
+        return true
+    }
+
+    func disableWorkspaceAutoApproval(for workspaceID: WorkspaceID) {
+        workspaceAutoApprovals.removeValue(forKey: workspaceID)
+    }
+
+    private func approveTimedWorkspaceRequest(
+        _ request: PermissionRequest, workspaceID: WorkspaceID, chatID: ChatID,
+        grant: WorkspaceAutoApproval
+    ) {
+        let content = PermissionPresentation(request: request)
+        resolvePermission(
+            request.id, decision: .allow, for: workspaceID, chatID: chatID,
+            automatic: AutomaticApproval(
+                toolCallID: request.toolCallID,
+                command: content.target ?? WorkspacePermissionPolicy.inputText(request.input),
+                reason: "is covered by your workspace auto-approval until \(grant.expiresAt.formatted(date: .omitted, time: .shortened))"
+            )
+        )
     }
 
     /// Drop every ask this permission was the gate for — see `NeedsYouPairing`.
@@ -3861,6 +3942,12 @@ final class AppModel {
 
     private func applyToChat(workspaceID: WorkspaceID, chatID: ChatID, event: AgentEvent) {
         chat(for: chatID).apply(event)
+        if case .permissionRequest(let request) = event,
+           let grant = workspaceAutoApprovals[workspaceID],
+           grant.allows(request, in: workspaceID) {
+            approveTimedWorkspaceRequest(request, workspaceID: workspaceID, chatID: chatID, grant: grant)
+            return
+        }
         if case .permissionRequest(let request) = event,
            UserDefaults.standard.bool(forKey: Self.automaticRoutinePermissionsKey),
            let workspace = workspaces.first(where: { $0.id == workspaceID })

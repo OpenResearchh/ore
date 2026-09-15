@@ -17,6 +17,10 @@ public actor ClaudeCodeSession: AgentSession {
     private nonisolated let continuation: AsyncStream<AgentEvent>.Continuation
     private let configuration: SessionConfiguration
     private let executablePath: String
+    /// Whether this CLI knows `--allow-dangerously-skip-permissions`. With it a
+    /// running session can be switched into Bypass; without it the CLI refuses
+    /// and the engine relaunches the session in the new mode instead.
+    private let allowsBypassSwitch: Bool
 
     private var translator: ClaudeCodeTranslator
     /// The current mode, which the control channel keeps in step with the
@@ -48,10 +52,12 @@ public actor ClaudeCodeSession: AgentSession {
         id: SessionID,
         executablePath: String,
         configuration: SessionConfiguration,
-        capabilities: HarnessCapabilities
+        capabilities: HarnessCapabilities,
+        allowsBypassSwitch: Bool = false
     ) {
         self.id = id
         self.executablePath = executablePath
+        self.allowsBypassSwitch = allowsBypassSwitch
         self.configuration = configuration
         self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
@@ -174,10 +180,37 @@ public actor ClaudeCodeSession: AgentSession {
         // carry the change and would otherwise come back on the stale mode.
         permissionMode = mode
         guard process != nil, !isStopping else { return }
-        try await sendControlRequest(
-            ClaudeControlPayload.setPermissionMode(mode),
-            timeout: .seconds(10)
-        )
+        do {
+            try await sendControlRequest(
+                ClaudeControlPayload.setPermissionMode(mode),
+                timeout: .seconds(10)
+            )
+        } catch let error where Self.isBypassLaunchRefusal(error) {
+            // A CLI without the allow flag, or a session launched before it:
+            // Bypass can only be entered at launch. Said that way, the engine
+            // relaunches an idle session on the stored mode rather than
+            // surfacing the CLI's refusal as a transport failure.
+            throw HarnessError.unsupportedCapability("switching a running session to Bypass")
+        }
+    }
+
+    /// The launch mode, plus the flag that lets a running session move into
+    /// Bypass later. The flag only *permits* bypassing: the session still
+    /// starts in `mode`, and only ORE's control channel changes it.
+    nonisolated static func permissionArguments(
+        mode: PermissionMode,
+        allowsBypassSwitch: Bool
+    ) -> [String] {
+        var arguments = ["--permission-mode", mode.rawValue]
+        if allowsBypassSwitch { arguments.append("--allow-dangerously-skip-permissions") }
+        return arguments
+    }
+
+    /// "Cannot set permission mode to bypassPermissions because the session was
+    /// not launched with --dangerously-skip-permissions."
+    nonisolated static func isBypassLaunchRefusal(_ error: any Error) -> Bool {
+        guard case HarnessError.transportFailure(let message) = error else { return false }
+        return message.contains("dangerously-skip-permissions")
     }
 
 
@@ -417,7 +450,10 @@ public actor ClaudeCodeSession: AgentSession {
         if let model = configuration.model {
             arguments += ["--model", model]
         }
-        arguments += ["--permission-mode", permissionMode.rawValue]
+        arguments += Self.permissionArguments(
+            mode: permissionMode,
+            allowsBypassSwitch: allowsBypassSwitch
+        )
 
         switch configuration.resume {
         case .fresh:

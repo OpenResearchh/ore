@@ -105,9 +105,6 @@ struct ReviewPane: View {
     @State private var turnCheckpoints: [TurnCheckpoint] = []
     @State private var stackParent: WorkspaceSummary?
     @State private var stackChildren: [WorkspaceSummary] = []
-    @State private var reviewSetup: ReviewSetup?
-    @State private var reviewInstructions = ""
-    @State private var reviewModel = ""
     /// Workspace and git generation of the last diff refresh, so the
     /// generation task doesn't repeat the read the workspace task just did.
     @State private var lastRefreshKey: String?
@@ -130,34 +127,29 @@ struct ReviewPane: View {
         }
     }
 
-    private struct ReviewSetup: Identifiable {
-        var id: String { "review-setup" }
-    }
-
-    private enum ReviewTab: Hashable { case allFiles, changes }
+    private enum ReviewTab: Hashable { case allFiles, changes, requests }
     private var isTreeLayout: Bool { changesLayoutRaw != "list" }
 
-        var body: some View {
+    var body: some View {
         VStack(spacing: 0) {
             tabRow
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
-            BaseSyncBanner(workspace: workspace)
+            if tab != .requests { BaseSyncBanner(workspace: workspace) }
             content
                 .frame(maxHeight: .infinity)
-            stackStrip
-            // The panel owns workspace-specific async results in @State. Give
-            // each workspace a distinct identity so checks from the previously
-            // selected branch cannot remain visible while the new branch loads.
-            ShipStatusPanel(workspace: workspace)
-                .id(workspace.id)
+            if tab != .requests {
+                stackStrip
+                // The panel owns workspace-specific async results in @State. Give
+                // each workspace a distinct identity so checks from the previously
+                // selected branch cannot remain visible while the new branch loads.
+                ShipStatusPanel(workspace: workspace)
+                    .id(workspace.id)
+            }
         }
         // No fill of its own: the pane is cut from Liquid Glass where it is
         // laid out (`RootView.workspaceMain` clips it to the card radius and
         // applies `oreGlassSurface`). A material here as well would stack
         // glass on glass, which Apple's guidance is explicit about avoiding.
-        .sheet(item: $reviewSetup) { _ in
-            reviewSetupSheet
-        }
         .task(id: workspace.id) {
             knownDiffFolders = []
             expandedDiffFolders = []
@@ -248,54 +240,19 @@ struct ReviewPane: View {
         }
     }
 
-    // File browsing and changes are destinations. Review is an action, so it is
-    // a labelled button here instead of an empty destination.
+    private var pendingRequestCount: Int {
+        model.workspacePermissionGroups(for: workspace.id).reduce(0) { $0 + $1.pendingCount }
+    }
+
+    // Workspace destinations; actions live in the window toolbar.
     private var tabRow: some View {
         HStack(spacing: OreTheme.Space.xs) {
             segment("All files", count: nil, target: .allFiles)
             segment("Changes", count: diffs.count, target: .changes)
 
-            Spacer(minLength: 2)
+            segment("Requests", count: pendingRequestCount > 0 ? pendingRequestCount : nil, target: .requests)
+            Spacer(minLength: 0)
 
-            if tab == .allFiles {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-
-            Button { startAIReview() } label: {
-                HStack(spacing: 5) {
-                    if model.chatCreationsInFlight.contains(workspace.id) {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "sparkles")
-                    }
-                    Text("Review")
-                    if !draftComments.isEmpty {
-                        Text("\(draftComments.count)")
-                            .font(.caption2.monospacedDigit())
-                    }
-                }
-                .font(.system(size: OreTheme.Font.body, weight: .medium))
-                .padding(.horizontal, 9)
-                .frame(height: 26)
-                .background(OreTheme.subduedFill, in: Capsule())
-                .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
-            }
-            .buttonStyle(OrePressableButtonStyle())
-            .disabled(model.chatCreationsInFlight.contains(workspace.id))
-            .fixedSize(horizontal: true, vertical: false)
-            .help("Open a dedicated agent review of the current diff")
-            .contextMenu {
-                ForEach(reviewModelChoices) { choice in
-                    Button(choice.displayName) { startAIReview(reviewerModel: choice.id) }
-                }
-                Divider()
-                Button("Custom instructions…") {
-                    reviewModel = ""
-                    reviewSetup = ReviewSetup()
-                }
-            }
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: OreTheme.RowHeight.bar)
@@ -312,7 +269,7 @@ struct ReviewPane: View {
                 if let count {
                     Text("\(count)")
                         .font(.system(size: OreTheme.Font.caption).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(target == .requests ? Color.orange : .secondary)
                 }
             }
             .padding(.horizontal, 9)
@@ -336,6 +293,9 @@ struct ReviewPane: View {
     @ViewBuilder
     private var content: some View {
         switch tab {
+        case .requests:
+            WorkspaceRequestsPane(workspace: workspace)
+                .id(workspace.id)
         case .allFiles:
             allFilesView
         case .changes:
@@ -665,18 +625,55 @@ struct ReviewPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private enum ViewedCountStyle { case words, compact, totalsOnly }
+
+    private func changeSummary(
+        _ style: ViewedCountStyle,
+        insertions: Int,
+        deletions: Int
+    ) -> some View {
+        HStack(spacing: OreTheme.Space.sm) {
+            switch style {
+            case .words:
+                Text("\(viewedPaths.count)/\(diffs.count) viewed")
+                    .foregroundStyle(.secondary)
+            case .compact:
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark.circle")
+                        .imageScale(.small)
+                    Text("\(viewedPaths.count)/\(diffs.count)")
+                }
+                .foregroundStyle(.secondary)
+            case .totalsOnly:
+                EmptyView()
+            }
+            Text("+\(insertions)")
+                .foregroundStyle(OreTheme.added)
+            Text("−\(deletions)")
+                .foregroundStyle(OreTheme.removed)
+        }
+        .lineLimit(1)
+        .fixedSize()
+    }
+
     private var fileList: some View {
         VStack(spacing: 0) {
+            let insertions = diffs.reduce(0) { $0 + $1.insertions }
+            let deletions = diffs.reduce(0) { $0 + $1.deletions }
             HStack(spacing: OreTheme.Space.sm) {
                 changesLayoutToggle
                 diffScopeMenu
-                Spacer()
-                Text("\(viewedPaths.count)/\(diffs.count) viewed")
-                    .foregroundStyle(.secondary)
-                Text("+\(diffs.reduce(0) { $0 + $1.insertions })")
-                    .foregroundStyle(OreTheme.added)
-                Text("−\(diffs.reduce(0) { $0 + $1.deletions })")
-                    .foregroundStyle(OreTheme.removed)
+                    .fixedSize()
+                Spacer(minLength: OreTheme.Space.sm)
+                // One line at any pane width. Squeezed, "0/138 viewed" wrapped
+                // into two stacked words beside the totals; now the count
+                // tightens to a tick and a fraction, then gives way entirely.
+                ViewThatFits(in: .horizontal) {
+                    changeSummary(.words, insertions: insertions, deletions: deletions)
+                    changeSummary(.compact, insertions: insertions, deletions: deletions)
+                    changeSummary(.totalsOnly, insertions: insertions, deletions: deletions)
+                }
+                .help("\(viewedPaths.count) of \(diffs.count) files viewed")
             }
             .font(.system(size: OreTheme.Font.caption).monospacedDigit())
             .padding(.horizontal, OreTheme.Space.sm)

@@ -34,6 +34,10 @@ struct BinaryFilePreview: View {
     /// regenerating `icon.png` in place — changes the file without changing
     /// its path, and a preview keyed on the path alone kept showing the old
     /// image until the reviewer clicked away and back.
+    ///
+    /// It moves for a write *anywhere* in the worktree, though, so it only
+    /// prompts a look at this file's stamp; the images are re-read when the
+    /// stamp says this file changed.
     var generation: UInt64
     /// Review has to work on files that have no lines to attach a comment to,
     /// so the hover chip lives on the preview itself.
@@ -42,16 +46,24 @@ struct BinaryFilePreview: View {
     @State private var before: Loaded?
     @State private var after: Loaded?
     @State private var isHovering = false
-    /// Which load the state on screen came from. An earlier read finishing
-    /// after a later one would otherwise put the previous image back.
-    @State private var loadedToken: String?
+    /// Which file the images on screen belong to. While it matches, a
+    /// revalidation keeps them up: blanking to a spinner collapsed the 420pt
+    /// image and regrew it, jumping the scroll under the reader.
+    @State private var loadedIdentity: String?
+    /// The worktree file's size and modification date when it was last read.
+    @State private var loadedStamp: WorktreeFileStamp?
 
     private var kind: BinaryFileKind { BinaryFileKind(path: path) }
+
+    /// The file and change being shown, without the worktree state.
+    private var identity: String {
+        "\(worktreePath)|\(path)|\(status?.rawValue ?? "")"
+    }
 
     /// One load per (file, change, worktree state). Also the token a finished
     /// read is checked against before it is allowed to draw.
     private var taskID: String {
-        "\(worktreePath)|\(path)|\(status?.rawValue ?? "")|\(generation)"
+        "\(identity)|\(generation)"
     }
 
     /// The version the header describes: the current file, or the removed one.
@@ -119,7 +131,7 @@ struct BinaryFilePreview: View {
 
     @ViewBuilder
     private var content: some View {
-        if loadedToken != taskID {
+        if loadedIdentity != identity {
             ProgressView().controlSize(.small)
         } else if let old = before?.image, let new = after?.image {
             HStack(alignment: .top, spacing: 16) {
@@ -194,13 +206,26 @@ struct BinaryFilePreview: View {
 
     private func load() async {
         let token = taskID
-        before = nil
-        after = nil
-        loadedToken = nil
-
+        let identity = self.identity
         let root = worktreePath
         let relative = path
         let kind = self.kind
+
+        // Stale-while-revalidate. A different file starts from a spinner; the
+        // same file keeps its images up while it is checked.
+        let isRevalidating = loadedIdentity == identity
+        if !isRevalidating {
+            before = nil
+            after = nil
+            loadedIdentity = nil
+            loadedStamp = nil
+        }
+        let stamp = await Task.detached(priority: .userInitiated) {
+            WorktreeFileStamp.read(root: root, relativePath: relative)
+        }.value
+        // The generation moved for a write somewhere else in the worktree.
+        if isRevalidating, stamp == loadedStamp { return }
+
         // An added file has no past, a deleted one no present, and a file
         // opened outside review only needs how it looks now.
         let wantsCurrent = status != .deleted
@@ -227,7 +252,8 @@ struct BinaryFilePreview: View {
         guard !Task.isCancelled, token == taskID else { return }
         after = current
         before = base
-        loadedToken = token
+        loadedStamp = stamp
+        loadedIdentity = identity
     }
 
     /// `@unchecked`: the image is created inside the read and handed over
@@ -240,7 +266,7 @@ struct BinaryFilePreview: View {
 
     /// The largest edge a preview is decoded to. The pane draws it at 480pt
     /// at most, so this covers a Retina display with room to spare.
-    static let thumbnailLimit = 960
+    nonisolated static let thumbnailLimit = 960
 
     /// Reads size, dimensions and a bounded thumbnail — off the main actor,
     /// and for real.
@@ -316,6 +342,32 @@ struct BinaryFilePreview: View {
             size: NSSize(width: thumbnail.width, height: thumbnail.height)
         )
         return Loaded(image: image, pixelSize: pixelSize ?? image.size, byteCount: byteCount)
+    }
+}
+
+/// Whether a worktree file changed since it was last read, without reading it.
+///
+/// The git generation moves for any write in the worktree, so previews that
+/// keyed on it reloaded — and reset — whenever an agent touched an unrelated
+/// file. Size and modification date answer "did *this* file change" with one
+/// `stat`.
+struct WorktreeFileStamp: Hashable, Sendable {
+    var size: Int?
+    var modified: Date?
+
+    /// Nil when the file isn't in the worktree, or the path escapes it.
+    nonisolated static func read(root: String, relativePath: String) -> WorktreeFileStamp? {
+        guard let url = try? AppModel.safeFileURL(root: root, relativePath: relativePath) else {
+            return nil
+        }
+        return read(url: url)
+    }
+
+    nonisolated static func read(url: URL) -> WorktreeFileStamp? {
+        guard let values = try? url.resourceValues(
+            forKeys: [.fileSizeKey, .contentModificationDateKey]
+        ) else { return nil }
+        return WorktreeFileStamp(size: values.fileSize, modified: values.contentModificationDate)
     }
 }
 

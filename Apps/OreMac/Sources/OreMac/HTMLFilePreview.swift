@@ -13,8 +13,10 @@ import WebKit
 struct HTMLFilePreview: NSViewRepresentable {
     let worktreePath: String
     let path: String
-    /// Bumped whenever the worktree changes, so an agent rewriting the file —
-    /// or the user saving it from the Source segment — reloads the page.
+    /// Bumped whenever *anything* in the worktree changes, so it is a prompt
+    /// to go and look at this file's stamp — not a reason to reload on its own.
+    /// Reloading on the generation alone threw the reader back to the top of
+    /// the page every time an agent touched an unrelated file.
     var generation: UInt64
     /// Rendered instead when the file is no longer in the worktree, such as
     /// a page deleted on this branch.
@@ -34,28 +36,69 @@ struct HTMLFilePreview: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        let key = "\(worktreePath)|\(path)|\(generation)|\(fallbackHTML?.hashValue ?? 0)"
-        // updateNSView fires for unrelated SwiftUI churn; reloading on each
-        // one would reset the page's scroll position while the user reads it.
-        guard context.coordinator.loadedKey != key else { return }
-        context.coordinator.loadedKey = key
+        let coordinator = context.coordinator
+        let key = "\(worktreePath)|\(path)|\(fallbackHTML?.hashValue ?? 0)"
+        // updateNSView fires for unrelated SwiftUI churn; reloading on each one
+        // would reset the page's scroll position while the user reads it. The
+        // generation is checked separately so an unchanged generation costs
+        // nothing, and a changed one costs one `stat` rather than a reload.
+        let isSameFile = coordinator.loadedKey == key
+        if isSameFile, coordinator.loadedGeneration == generation { return }
+        coordinator.loadedGeneration = generation
+
+        let stamp = WorktreeFileStamp.read(root: worktreePath, relativePath: path)
+        // The worktree moved, but not this file.
+        if isSameFile, stamp == coordinator.loadedStamp { return }
+        coordinator.loadedKey = key
+        coordinator.loadedStamp = stamp
 
         let root = URL(fileURLWithPath: worktreePath, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
-        context.coordinator.rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        coordinator.rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
 
-        if let url = try? AppModel.safeFileURL(root: worktreePath, relativePath: path),
-           FileManager.default.fileExists(atPath: url.path) {
-            webView.loadFileURL(url, allowingReadAccessTo: root)
-        } else {
-            webView.loadHTMLString(fallbackHTML ?? "", baseURL: nil)
+        let url = try? AppModel.safeFileURL(root: worktreePath, relativePath: path)
+        let exists = url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        let reload = { @MainActor in
+            if let url, exists {
+                webView.loadFileURL(url, allowingReadAccessTo: root)
+            } else {
+                webView.loadHTMLString(fallbackHTML ?? "", baseURL: nil)
+            }
+        }
+
+        guard isSameFile else {
+            coordinator.restoreScrollY = nil
+            reload()
+            return
+        }
+        // Same page, genuinely rewritten: put the reader back where they were
+        // instead of at the top. Reading the offset is async, so the reload
+        // waits a turn for it — the page is already a frame stale by then.
+        Task { @MainActor in
+            coordinator.restoreScrollY = (try? await webView.evaluateJavaScript("window.scrollY")) as? Double
+            reload()
         }
     }
 
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        /// Worktree, path and fallback — everything about *which* page this is.
         var loadedKey: String?
+        /// The git generation the stamp below was read at, so an unchanged
+        /// generation short-circuits before touching the filesystem.
+        var loadedGeneration: UInt64?
+        /// Size and modification date of the file as loaded, which is what
+        /// actually decides whether a reload is needed.
+        var loadedStamp: WorktreeFileStamp?
+        /// Scroll offset to put back once the reloaded page has laid out.
+        var restoreScrollY: Double?
         var rootPath = ""
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let y = restoreScrollY, y > 0 else { return }
+            restoreScrollY = nil
+            webView.evaluateJavaScript("window.scrollTo(0, \(y))")
+        }
 
         func webView(
             _ webView: WKWebView,

@@ -40,6 +40,22 @@ extension NSColor {
 /// The output is a plain attributed string rather than a view hierarchy, which
 /// is what lets the AppKit transcript keep one text view per row and measure a
 /// row's height by laying out its text once.
+///
+/// Rendering is safe off the main actor. Nothing here touches a live view, and
+/// the two pieces of AppKit that were main-thread-only have been replaced: font
+/// traits come from thread-safe CoreText rather than `NSFontManager`, and
+/// link-chip symbols come from `LinkSymbolStore` — a locked cache the main
+/// actor can fill ahead of time with `prewarmLinkSymbols`. Everything else it
+/// builds (fonts by size and weight, paragraph styles, text tables, semantic
+/// `NSColor`s, `NSRegularExpression`s) is either a value or immutable and
+/// shared read-only; dynamic colours stay unresolved until they are drawn.
+///
+/// Two things a background caller still owes it. Bind the room first —
+/// `appearance.performAsCurrentDrawingAppearance { … }` — because the symbol
+/// cache and `SyntaxHighlighter`'s cache both key on the current drawing
+/// appearance and `NSAppearance.currentDrawing()` has no window to ask for on
+/// a worker thread. And call `prewarmLinkSymbols` on the main actor inside that
+/// same appearance.
 struct MarkdownRenderer {
     var baseFont: NSFont
     var textColor: NSColor
@@ -129,6 +145,13 @@ struct MarkdownRenderer {
         /// Nil when the document has no settled head, or holds a construct that
         /// reaches across blank lines, so the next flush renders it whole.
         var prefix: StreamingPrefix?
+        /// UTF-16 length of `rendered`'s opening run copied unchanged from the
+        /// `previous` head this render reused — zero when nothing was reused.
+        /// Characters and attributes there are identical to the previous
+        /// render's, so a text storage already holding that render only needs
+        /// what follows replaced (clamped to both lengths: trimming a trailing
+        /// newline can leave either render shorter than the head).
+        var reusedLength = 0
     }
 
     /// Renders a document that is still growing, reusing `previous` when the
@@ -174,7 +197,11 @@ struct MarkdownRenderer {
         }
         let result = NSMutableAttributedString(attributedString: head.rendered)
         result.append(tail)
-        return StreamingRender(rendered: trimmingTrailingNewlines(result), prefix: head)
+        return StreamingRender(
+            rendered: trimmingTrailingNewlines(result),
+            prefix: head,
+            reusedLength: reusable?.renderedLength ?? 0
+        )
     }
 
     enum StreamingBoundary: Equatable {
@@ -425,10 +452,18 @@ struct MarkdownRenderer {
     /// label, tinted and filled like ORE's other inline tokens.
     static func urlChip(url: URL, label: String, baseFont: NSFont) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        if let icon = NSImage(systemSymbolName: linkSymbolName(for: url), accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: baseFont.pointSize * 0.92, weight: .medium))?
-            .withSymbolConfiguration(.init(paletteColors: [.oreInlineChipText])) {
-            icon.isTemplate = false
+        if let icon = LinkSymbolStore.shared.image(
+            for: LinkSymbolKey(
+                name: linkSymbolName(for: url),
+                basePointSize: baseFont.pointSize,
+                // The palette colour baked into the configuration is dynamic,
+                // so the same symbol is a different image on glass than on
+                // paper. Callers bind the room with
+                // `performAsCurrentDrawingAppearance`; keying on it reproduces
+                // exactly what building the image here used to pick up.
+                appearance: NSAppearance.currentDrawing().name.rawValue
+            )
+        ) {
             let attachment = NSTextAttachment()
             attachment.image = icon
             let side = baseFont.pointSize
@@ -488,6 +523,104 @@ struct MarkdownRenderer {
             return "magnifyingglass"
         default:
             return "globe"
+        }
+    }
+
+    /// Every symbol `linkSymbolName(for:)` can return.
+    ///
+    /// The set is closed on purpose: `prewarmLinkSymbols` can then build all of
+    /// them on the main actor before an off-main render starts, so no render
+    /// thread ever has to reach into AppKit's symbol catalogue itself.
+    /// `MarkdownRenderOffMainTests` keeps this list and that switch in step.
+    static let linkSymbolNames = [
+        "envelope.fill",
+        "chevron.left.forwardslash.chevron.right",
+        "play.rectangle.fill",
+        "bubble.left.and.bubble.right.fill",
+        "shippingbox.fill",
+        "book.fill",
+        "pencil.and.outline",
+        "note.text",
+        "magnifyingglass",
+        "globe",
+    ]
+
+    /// Builds every link-chip symbol for `baseFont` under the current drawing
+    /// appearance, so a subsequent render — on any thread — only reads them.
+    ///
+    /// Call this on the main actor immediately before handing a render to a
+    /// background task, inside the same appearance the render will use.
+    @MainActor
+    static func prewarmLinkSymbols(baseFont: NSFont) {
+        let appearance = NSAppearance.currentDrawing().name.rawValue
+        for name in linkSymbolNames {
+            _ = LinkSymbolStore.shared.image(
+                for: LinkSymbolKey(
+                    name: name, basePointSize: baseFont.pointSize, appearance: appearance
+                )
+            )
+        }
+    }
+
+    fileprivate struct LinkSymbolKey: Hashable {
+        var name: String
+        var basePointSize: CGFloat
+        var appearance: String
+    }
+
+    /// The link-chip symbol images, made once and shared.
+    ///
+    /// `NSImage(systemSymbolName:)` plus two `withSymbolConfiguration` passes
+    /// is a catalogue lookup and a template build — AppKit work that has no
+    /// documented thread contract — and a long README can ask for dozens of
+    /// them. Building each image once under a lock, keyed by symbol, base size
+    /// and appearance, means the off-main preview render normally finds every
+    /// icon already made (see `prewarmLinkSymbols`) and the main-actor
+    /// transcript stops re-making the same globe for every link it draws.
+    ///
+    /// A miss still builds in place rather than dropping the icon: a chip
+    /// without its symbol would be a visible change, and this is the same call
+    /// the renderer has always made. With the prewarm above it should not
+    /// happen off the main actor at all.
+    ///
+    /// Images are never mutated after `make` returns, so sharing one instance
+    /// across many attachments is safe; only the attachment's own `bounds`
+    /// differs, and that lives on the attachment.
+    ///
+    /// Unbounded, because the key space is: ten symbols, the handful of prose
+    /// sizes ORE renders at, and two appearances. It cannot grow with the
+    /// number of documents read.
+    fileprivate final class LinkSymbolStore: @unchecked Sendable {
+        static let shared = LinkSymbolStore()
+
+        private let lock = NSLock()
+        /// Optional values, so a symbol that does not resolve is remembered as
+        /// missing instead of being retried on every link.
+        private var images: [LinkSymbolKey: NSImage?] = [:]
+
+        /// The lock is held across the build, not just the lookup. Two renders
+        /// missing the same symbol at once would otherwise both be inside
+        /// AppKit's symbol catalogue at the same time, which is the one thing
+        /// this cache exists to prevent — and one of the two images would be
+        /// thrown away anyway.
+        func image(for key: LinkSymbolKey) -> NSImage? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let hit = images[key] { return hit }
+            let made = Self.make(key)
+            images[key] = made
+            return made
+        }
+
+        private static func make(_ key: LinkSymbolKey) -> NSImage? {
+            guard let icon = NSImage(systemSymbolName: key.name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: key.basePointSize * 0.92, weight: .medium))?
+                .withSymbolConfiguration(.init(paletteColors: [.oreInlineChipText]))
+            else { return nil }
+            // Not a template: the palette colour above is the whole point, and
+            // a template image would be re-tinted by the text view instead.
+            icon.isTemplate = false
+            return icon
         }
     }
 
@@ -865,10 +998,39 @@ struct MarkdownRenderer {
 
             result.enumerateAttribute(.font, in: whole) { value, range, _ in
                 let font = (value as? NSFont) ?? baseFont
-                let converted = NSFontManager.shared.convert(font, toHaveTrait: trait)
-                result.addAttribute(.font, value: converted, range: range)
+                result.addAttribute(.font, value: MarkdownRenderer.applying(trait, to: font), range: range)
             }
             return result
         }
+    }
+
+    // MARK: - Fonts
+
+    /// Adds a bold or italic trait to `font`, off the main actor as safely as
+    /// on it.
+    ///
+    /// This used to be `NSFontManager.shared.convert(_:toHaveTrait:)`.
+    /// `NSFontManager` is AppKit's shared, app-level object — it backs the font
+    /// panel and its state is main-thread-only — so a single call from a
+    /// background render is a real data race, and it is the one thing that kept
+    /// the document preview's markdown pass on the main actor.
+    ///
+    /// CoreText is the layer underneath it, it is thread-safe, and
+    /// `CTFontCreateCopyWithSymbolicTraits` is the same operation: copy this
+    /// exact font with one more trait bit set, keeping everything else —
+    /// including the numeric weight, which re-matching a descriptor by symbolic
+    /// traits alone silently drops (monospaced Medium plus italic lands on
+    /// RegularItalic that way). Verified face-for-face against the font manager
+    /// over a thousand combinations — system, monospaced and third-party
+    /// families, every weight, both traits, nested and repeated — in
+    /// `MarkdownFontTraitTests`.
+    ///
+    /// Nil means the family has no such face, which is when the font manager
+    /// hands the original back too.
+    static func applying(_ trait: NSFontTraitMask, to font: NSFont) -> NSFont {
+        let bit: CTFontSymbolicTraits = trait == .italicFontMask ? .traitItalic : .traitBold
+        guard let copy = CTFontCreateCopyWithSymbolicTraits(font as CTFont, font.pointSize, nil, bit, bit)
+        else { return font }
+        return copy as NSFont
     }
 }

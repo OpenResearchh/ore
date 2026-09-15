@@ -205,6 +205,11 @@ final class SyntaxHighlighter: @unchecked Sendable {
     }
 
     /// Highlights one line, for the diff viewer.
+    ///
+    /// Safe off the main actor, which is where the diff viewer calls it: no
+    /// cache, no tree-sitter, and the lexer and theme are immutable statics.
+    /// Keep it that way — a diff is highlighted in one detached pass per load
+    /// rather than per row inside SwiftUI's `body`.
     func highlightLine(
         _ line: String,
         language: String?,
@@ -302,15 +307,30 @@ enum SyntaxPainter {
             }
             switch token.kind {
             case .heading, .bold:
-                if bold == nil { bold = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+                if bold == nil { bold = converting(font, to: .boldFontMask) }
                 result.addAttribute(.font, value: bold ?? font, range: range)
             case .italic:
-                if italic == nil { italic = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+                if italic == nil { italic = converting(font, to: .italicFontMask) }
                 result.addAttribute(.font, value: italic ?? font, range: range)
             default:
                 break
             }
         }
+    }
+
+    /// `NSFontManager` is AppKit's shared, main-thread object, and the diff
+    /// viewer now paints its lines off the main actor. Off main the trait comes
+    /// from the font descriptor instead, which is immutable and safe on any
+    /// thread; on main the result stays exactly what it always was.
+    static func converting(_ font: NSFont, to trait: NSFontTraitMask) -> NSFont {
+        if Thread.isMainThread {
+            return NSFontManager.shared.convert(font, toHaveTrait: trait)
+        }
+        let symbolic: NSFontDescriptor.SymbolicTraits = trait == .italicFontMask ? .italic : .bold
+        let descriptor = font.fontDescriptor.withSymbolicTraits(
+            font.fontDescriptor.symbolicTraits.union(symbolic)
+        )
+        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
     }
 }
 

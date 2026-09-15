@@ -343,9 +343,9 @@ struct ReviewPane: View {
                 }
                 .listStyle(.sidebar)
                 .scrollContentBackground(.hidden)
-                .scrollIndicators(.hidden)
-                // List ignores the modifier above on macOS — see the probe.
-                .background(OreListScrollerOverlay())
+                // Overlay scrollers, not none: a file tree with no knob gives
+                // the reader no idea how far down a thousand paths they are.
+                .oreOverlayScrollers()
             }
         }
         // The list rides the inspector's glass; an opaque well here would punch
@@ -437,70 +437,6 @@ struct ReviewPane: View {
             return model.chat(for: inbox).draftComments
         }
         return []
-    }
-
-    private func startAIReview(reviewerModel: String? = nil, instructions: String? = nil) {
-        var prompt = """
-        Review the current workspace diff. Look for correctness, security, tests, and maintainability. \
-        Use GetWorkspaceDiff and GetDiffComments, then post each finding with PostDiffComment \
-        (filePath, startLine, endLine, body) so they land as numbered anchored comments — not as prose. \
-        After posting, list the findings as "1. … 2. …" so the user can say "fix 2 and 4".
-        """
-        if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            prompt += "\n\nAdditional instructions:\n\(instructions)"
-        }
-        model.createChat(
-            in: workspace.id,
-            initialMessage: prompt,
-            defaults: reviewDefaults,
-            model: reviewerModel,
-            isReview: true
-        )
-    }
-
-    /// The agent and model the Review button opens with, from Settings.
-    private var reviewDefaults: AppModel.ChatDefaults {
-        model.reviewDefaults(for: workspace.id)
-    }
-
-    /// Models to offer for a one-off review, drawn from the agent the review
-    /// will actually run on rather than the workspace's.
-    private var reviewModelChoices: [AgentModel] {
-        model.knownModels(for: reviewDefaults.harness ?? workspace.harness)
-    }
-
-    private var reviewSetupSheet: some View {
-        VStack(alignment: .leading, spacing: OreTheme.Space.md) {
-            Text("Review with agent")
-                .font(.system(size: 20, weight: .semibold))
-            Picker("Model", selection: $reviewModel) {
-                Text("Review default").tag("")
-                ForEach(reviewModelChoices) { choice in
-                    Text(choice.displayName).tag(choice.id)
-                }
-            }
-            Text("Custom instructions")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            TextEditor(text: $reviewInstructions)
-                .font(.body)
-                .frame(height: 120)
-            HStack {
-                Spacer()
-                Button("Cancel") { reviewSetup = nil }
-                    .buttonStyle(OreSecondaryButtonStyle())
-                Button("Start review") {
-                    startAIReview(
-                        reviewerModel: reviewModel.isEmpty ? nil : reviewModel,
-                        instructions: reviewInstructions
-                    )
-                    reviewSetup = nil
-                }
-                .buttonStyle(OrePrimaryButtonStyle())
-            }
-        }
-        .padding(OreTheme.Space.lg)
-        .frame(width: 480)
     }
 
     private var diffScopeMenu: some View {
@@ -681,33 +617,40 @@ struct ReviewPane: View {
 
             Divider()
 
+            // One bucketing pass for the whole list. The section builders used
+            // to call `diffs(in:)` six times over, and `diffs(in:)` rebuilt the
+            // staged and unstaged path Sets once per *file* it tested — an
+            // O(files²) sweep on every body pass of a live-updating pane.
+            let buckets = changeBuckets
             List {
-                if !conflictedDiffs.isEmpty {
+                if !buckets.conflicted.isEmpty {
                     Section {
-                        ForEach(conflictedDiffs, id: \.path) { file in
-                            fileRow(file, showFolder: true)
+                        ForEach(buckets.conflicted, id: \.path) { file in
+                            fileRow(file, isConflicted: true, showFolder: true)
                         }
                     } header: {
-                        changeSectionHeaderLabel("Conflicts", files: conflictedDiffs, tint: .orange)
+                        changeSectionHeaderLabel(
+                            "Conflicts", files: buckets.conflicted, tint: .orange
+                        )
                     }
                 }
-                if showsChangeBuckets {
-                    ForEach(ChangeBucket.allCases.filter { !diffs(in: $0).isEmpty }) { bucket in
+                if buckets.showsSections {
+                    ForEach(buckets.sections) { section in
                         Section {
-                            changeRows(for: diffs(in: bucket))
+                            changeRows(for: section.files)
                         } header: {
-                            changeSectionHeader(bucket, files: diffs(in: bucket))
+                            changeSectionHeaderLabel(section.bucket.title, files: section.files)
                         }
                     }
                 } else {
-                    changeRows(for: diffs.filter { !conflictedPaths.contains($0.path) })
+                    changeRows(for: buckets.unconflicted)
                 }
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
-            .scrollIndicators(.hidden)
-            // List ignores the modifier above on macOS — see the probe.
-            .background(OreListScrollerOverlay())
+            // See `allFilesView`: a knob that tells the reader where they are,
+            // drawn as an overlay so it never paints the legacy white track.
+            .oreOverlayScrollers()
         }
         // Rides the inspector's glass — see `allFilesView`.
     }
@@ -748,7 +691,12 @@ struct ReviewPane: View {
         .accessibilityLabel(help)
     }
 
-    private func fileRow(_ file: FileDiff, showFolder: Bool, depth: Int = 0) -> some View {
+    private func fileRow(
+        _ file: FileDiff,
+        isConflicted: Bool = false,
+        showFolder: Bool,
+        depth: Int = 0
+    ) -> some View {
         HStack(spacing: 8) {
             if !showFolder {
                 Color.clear.frame(width: 10, height: 1)
@@ -796,7 +744,7 @@ struct ReviewPane: View {
                     .foregroundStyle(OreTheme.removed)
             }
 
-            if conflictedPaths.contains(file.path) {
+            if isConflicted {
                 Button("Ours") {
                     model.resolveConflict(path: file.path, side: .ours, in: workspace.id)
                 }
@@ -832,7 +780,7 @@ struct ReviewPane: View {
         }
         .contextMenu {
             Button("Open") { model.openDiffFile(file.path, in: workspace.id) }
-            if conflictedPaths.contains(file.path) {
+            if isConflicted {
                 Button("Accept ours") {
                     model.resolveConflict(path: file.path, side: .ours, in: workspace.id)
                 }
@@ -846,53 +794,8 @@ struct ReviewPane: View {
         }
     }
 
-    private enum ChangeBucket: String, CaseIterable, Identifiable {
-        case unstaged, staged, committed
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .unstaged: "Unstaged"
-            case .staged: "Staged"
-            case .committed: "Committed"
-            }
-        }
-    }
-
-    private var unstagedPaths: Set<String> {
-        Set((workingTree?.files ?? []).filter(\.isUnstaged).map(\.path))
-    }
-
-    private var stagedPaths: Set<String> {
-        Set((workingTree?.files ?? []).filter(\.isStaged).map(\.path))
-    }
-
-    /// Staging already has a home on the Commits tab. Changes only splits into
-    /// Unstaged / Staged / Committed when more than one of those is present —
-    /// a lone "UNSTAGED" header just repeats the tab count and +/- totals.
-    private var showsChangeBuckets: Bool {
-        ChangeBucket.allCases.filter { !diffs(in: $0).isEmpty }.count > 1
-    }
-
-    private func bucket(for path: String) -> ChangeBucket {
-        if unstagedPaths.contains(path) { return .unstaged }
-        if stagedPaths.contains(path) { return .staged }
-        return .committed
-    }
-
-    private var conflictedPaths: Set<String> {
-        Set((workingTree?.files ?? []).filter { $0.status == .conflicted }.map(\.path))
-    }
-
-    private var conflictedDiffs: [FileDiff] {
-        diffs.filter { conflictedPaths.contains($0.path) }
-    }
-
-    private func diffs(in bucket: ChangeBucket) -> [FileDiff] {
-        diffs.filter { self.bucket(for: $0.path) == bucket && !conflictedPaths.contains($0.path) }
-    }
-
-    private func changeSectionHeader(_ bucket: ChangeBucket, files: [FileDiff]) -> some View {
-        changeSectionHeaderLabel(bucket.title, files: files)
+    private var changeBuckets: ReviewChangeBuckets {
+        ReviewChangeBuckets(diffs: diffs, workingTreeFiles: workingTree?.files ?? [])
     }
 
     private func changeSectionHeaderLabel(
@@ -1011,9 +914,13 @@ struct ReviewPane: View {
             workingTree = await tree
             let stored = await model.loadViewedFiles(for: workspace.id)
             diffs = loaded
-            viewedPaths = Set(loaded.compactMap { file in
-                stored[file.path] == contentHash(file) ? file.path : nil
-            })
+            // Fingerprinting every file walks every line of the whole diff.
+            // On the main actor, once per git generation, that was the review
+            // list's single largest hitch while an agent was writing.
+            let fingerprints = await Task.detached(priority: .userInitiated) {
+                loaded.map { ($0.path, DiffContentHash.of($0)) }
+            }.value
+            viewedPaths = Set(fingerprints.compactMap { stored[$0.0] == $0.1 ? $0.0 : nil })
             expandNewDiffFolders(in: loaded)
             loadError = nil
         } catch {
@@ -1062,18 +969,21 @@ struct ReviewPane: View {
         if viewedPaths.contains(path) {
             viewedPaths.remove(path)
             model.markViewed(path, hash: nil, for: workspace.id)
-        } else {
-            viewedPaths.insert(path)
-            let hash = diffs.first(where: { $0.path == path }).map(contentHash)
+            return
+        }
+        // The tick lands now; the fingerprint follows. Hashing a large file's
+        // diff on the main actor put a visible stall on the click.
+        viewedPaths.insert(path)
+        guard let file = diffs.first(where: { $0.path == path }) else {
+            model.markViewed(path, hash: nil, for: workspace.id)
+            return
+        }
+        Task {
+            let hash = await Task.detached(priority: .userInitiated) {
+                DiffContentHash.of(file)
+            }.value
             model.markViewed(path, hash: hash, for: workspace.id)
         }
-    }
-
-    private func contentHash(_ file: FileDiff) -> String {
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        let text = file.hunks.flatMap(\.lines).map { "\($0.kind):\($0.text)" }.joined(separator: "\n")
-        for byte in text.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
-        return String(hash, radix: 16)
     }
 
     private func color(for status: GitFileChange.Status) -> Color {
@@ -1082,6 +992,79 @@ struct ReviewPane: View {
         case .deleted: return .red
         case .conflicted: return .orange
         default: return .blue
+        }
+    }
+}
+
+/// The Changes list, split into its sections in one pass.
+///
+/// Pulled out of the view because it was three computed properties that each
+/// rebuilt a `Set<String>` from the worktree status, called from a `bucket(for:)`
+/// that ran once per file, called from a `diffs(in:)` that the body called six
+/// times. Building it once and passing it down is both faster and testable.
+struct ReviewChangeBuckets {
+    enum Bucket: String, CaseIterable, Identifiable {
+        case unstaged, staged, committed
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .unstaged: "Unstaged"
+            case .staged: "Staged"
+            case .committed: "Committed"
+            }
+        }
+    }
+
+    struct Section: Identifiable {
+        var bucket: Bucket
+        var files: [FileDiff]
+        var id: String { bucket.rawValue }
+    }
+
+    /// Conflicts come first and out of the staging split: resolving them is the
+    /// only thing the reviewer can usefully do next.
+    let conflicted: [FileDiff]
+    /// Everything else, in diff order — what the list shows when it isn't split.
+    let unconflicted: [FileDiff]
+    /// Non-empty buckets only, in `Bucket.allCases` order.
+    let sections: [Section]
+
+    /// Staging already has a home on the Commits tab. Changes only splits into
+    /// Unstaged / Staged / Committed when more than one of those is present —
+    /// a lone "UNSTAGED" header just repeats the tab count and +/- totals.
+    var showsSections: Bool { sections.count > 1 }
+
+    init(diffs: [FileDiff], workingTreeFiles: [GitFileChange]) {
+        var conflictedPaths: Set<String> = []
+        var unstagedPaths: Set<String> = []
+        var stagedPaths: Set<String> = []
+        for change in workingTreeFiles {
+            if change.status == .conflicted { conflictedPaths.insert(change.path) }
+            if change.isUnstaged { unstagedPaths.insert(change.path) }
+            if change.isStaged { stagedPaths.insert(change.path) }
+        }
+
+        var conflicted: [FileDiff] = []
+        var unconflicted: [FileDiff] = []
+        var byBucket: [Bucket: [FileDiff]] = [:]
+        for file in diffs {
+            if conflictedPaths.contains(file.path) {
+                conflicted.append(file)
+                continue
+            }
+            unconflicted.append(file)
+            // Unstaged wins over staged: `git add -p` leaves a file in both, and
+            // the half that still needs a decision is the one to surface.
+            let bucket: Bucket = unstagedPaths.contains(file.path) ? .unstaged
+                : stagedPaths.contains(file.path) ? .staged : .committed
+            byBucket[bucket, default: []].append(file)
+        }
+
+        self.conflicted = conflicted
+        self.unconflicted = unconflicted
+        self.sections = Bucket.allCases.compactMap { bucket in
+            guard let files = byBucket[bucket], !files.isEmpty else { return nil }
+            return Section(bucket: bucket, files: files)
         }
     }
 }
@@ -1110,21 +1093,221 @@ enum ReviewRefreshPolicy {
     }
 }
 
-/// Name of the diff document's scroll coordinate space, shared so a line row
-/// can report its frame in the same space the drag-select gesture reads.
+/// Name of the diff document's scroll coordinate space, so the gutter's
+/// drag-select reads y-positions in the row list's own frame.
 private let oreDiffSpaceName = "oreDiffDoc"
 
-/// One diff line's on-screen rectangle, collected so a drag over the gutter can
-/// map its y-position back to a specific line.
-private struct LineFrame: Equatable {
-    let ref: DiffDocumentView.LineRef
-    let rect: CGRect
+// MARK: - Flattened diff rows
+
+/// Which line of which hunk a selection or a comment points at.
+struct DiffLineRef: Hashable {
+    var hunk: Int
+    var line: Int
 }
 
-private struct LineFramesKey: PreferenceKey {
-    static let defaultValue: [LineFrame] = []
-    static func reduce(value: inout [LineFrame], nextValue: () -> [LineFrame]) {
-        value.append(contentsOf: nextValue())
+/// One row of a rendered diff: a hunk header, or one line of code.
+///
+/// Built once per load, off the main actor, and handed to the view finished.
+/// The renderer used to nest two `ForEach`es over `file.hunks` and re-derive
+/// each row's language and syntax colours inside `body`, so every materialised
+/// row re-lexed its line on every parent update — including on each step of a
+/// drag-select. Now `body` only draws what is already in the row.
+struct DiffDocumentRow: Identifiable, Equatable {
+    /// Offset in the flat array. An integer, where the old id was a string
+    /// rebuilt per row per pass. It is stable for the same reason that one was:
+    /// the whole set is rebuilt when the diff changes rather than patched, so a
+    /// row never has to survive a re-diff under the same id and carry a stale
+    /// cached height into whatever now sits at that offset.
+    let id: Int
+    /// Nil on a hunk header, which can't be selected or commented on.
+    let ref: DiffLineRef?
+    /// Nil on a hunk header.
+    let kind: DiffLine.Kind?
+    let oldNumber: String
+    let newNumber: String
+    /// The file line a comment on this row anchors to, when there is one.
+    let commentLine: Int?
+    /// Marker plus syntax-coloured code, or the `@@ … @@` text of a header.
+    let text: AttributedString
+    let height: CGFloat
+
+    var isHeader: Bool { kind == nil }
+}
+
+/// A whole file's diff, flattened and measured.
+struct DiffRowSet: Equatable {
+    static let empty = DiffRowSet(rows: [], offsets: [0], columns: 0)
+
+    let rows: [DiffDocumentRow]
+    /// Prefix sums of the row heights, `rows.count + 1` long: `offsets[i]` is
+    /// where row `i` starts. Rows have fixed heights, so a drag over the gutter
+    /// finds its row with a binary search — replacing a `GeometryReader` plus
+    /// `PreferenceKey` on every line, which rewrote `@State` (and re-ran the
+    /// document's `body`) as rows scrolled in and out.
+    let offsets: [CGFloat]
+    /// The longest row in monospaced character cells, which fixes the document
+    /// width. Sizing to the widest *materialised* row instead is what makes a
+    /// lazy stack's estimates jump as you scroll.
+    let columns: Int
+
+    var height: CGFloat { offsets.last ?? 0 }
+
+    /// The row containing `y` in the row list's own coordinate space.
+    func row(atY y: CGFloat) -> DiffDocumentRow? {
+        guard !rows.isEmpty, y >= 0, y < height else { return nil }
+        var low = 0
+        var high = rows.count - 1
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if offsets[mid] <= y { low = mid } else { high = mid - 1 }
+        }
+        return rows[low]
+    }
+}
+
+/// Turns a `FileDiff` into rows. Pure and free of the main actor, so a load can
+/// run the whole pass — flatten, lex, colour, measure — in `Task.detached`.
+enum DiffRowBuilder {
+    static let fontSize: CGFloat = 11
+    /// Fixed, and the same for every line. Wrapped lines gave the lazy stack
+    /// heights it could not predict, so its estimate — and the scroller knob —
+    /// jumped whenever the reader scrolled back up.
+    static let lineHeight: CGFloat = 18
+    static let headerHeight: CGFloat = 22
+    /// Old number, new number, comment slot.
+    static let gutterWidth: CGFloat = 38 + 38 + 26
+    /// Drag-select strip, matching the gutter minus part of the comment slot so
+    /// the "+" button still takes its own clicks.
+    static let dragWidth: CGFloat = 90
+    /// A tab lands on the next four-column stop, which is roughly how the text
+    /// system draws one at this size. Counting it as one cell made tab-indented
+    /// files measure far narrower than they draw, and clipped their ends.
+    static let tabStop = 4
+
+    static var font: NSFont { .monospacedSystemFont(ofSize: fontSize, weight: .regular) }
+
+    /// One character cell. Monospaced, so this is exact, and cached because
+    /// `documentWidth` is asked for it on every layout pass.
+    static let cellWidth: CGFloat = font.maximumAdvancement.width
+
+    /// Width the document needs so no line is clipped, given a viewport.
+    static func documentWidth(columns: Int, viewport: CGFloat) -> CGFloat {
+        // Two cells of slack: the column count approximates tabs and treats
+        // every scalar as one cell, so it can land a hair short.
+        max(viewport, gutterWidth + 4 + CGFloat(columns + 2) * cellWidth)
+    }
+
+    /// How many monospaced cells a line occupies, expanding tabs.
+    static func columns(in text: String) -> Int {
+        var count = 0
+        for scalar in text.unicodeScalars {
+            if scalar == "\t" { count += tabStop - (count % tabStop) } else { count += 1 }
+        }
+        return count
+    }
+
+    static func marker(for kind: DiffLine.Kind) -> String {
+        switch kind {
+        case .added: "+"
+        case .removed: "−"
+        case .context: " "
+        case .noNewline: "\\"
+        }
+    }
+
+    static func headerText(_ hunk: DiffHunk) -> String {
+        "@@ −\(hunk.oldStart),\(hunk.oldCount) +\(hunk.newStart),\(hunk.newCount) @@ \(hunk.header)"
+    }
+
+    static func build(_ file: FileDiff) -> DiffRowSet {
+        let font = self.font
+        // Hoisted out of the row loop: it was being looked up per line, per pass.
+        let language = SyntaxHighlighter.language(forPath: file.path)
+        var rows: [DiffDocumentRow] = []
+        var offsets: [CGFloat] = [0]
+        var y: CGFloat = 0
+        var widest = 0
+        rows.reserveCapacity(file.hunks.reduce(0) { $0 + $1.lines.count + 1 })
+
+        for (hunkIndex, hunk) in file.hunks.enumerated() {
+            let header = headerText(hunk)
+            widest = max(widest, columns(in: header))
+            rows.append(DiffDocumentRow(
+                id: rows.count, ref: nil, kind: nil, oldNumber: "", newNumber: "",
+                commentLine: nil, text: AttributedString(header), height: headerHeight
+            ))
+            y += headerHeight
+            offsets.append(y)
+
+            for (lineIndex, line) in hunk.lines.enumerated() {
+                let marker = marker(for: line.kind)
+                widest = max(widest, columns(in: marker) + columns(in: line.text))
+                rows.append(DiffDocumentRow(
+                    id: rows.count,
+                    ref: DiffLineRef(hunk: hunkIndex, line: lineIndex),
+                    kind: line.kind,
+                    oldNumber: line.oldLineNumber.map(String.init) ?? "",
+                    newNumber: line.newLineNumber.map(String.init) ?? "",
+                    commentLine: line.newLineNumber ?? line.oldLineNumber,
+                    text: AttributedString(paint(line, marker: marker, language: language, font: font)),
+                    height: lineHeight
+                ))
+                y += lineHeight
+                offsets.append(y)
+            }
+        }
+        return DiffRowSet(rows: rows, offsets: offsets, columns: widest)
+    }
+
+    /// Highlighted per line: a diff line is rarely a complete parse unit, so
+    /// this is the lexer pass rather than tree-sitter, which would report
+    /// errors more often than it would report colour.
+    private static func paint(
+        _ line: DiffLine,
+        marker: String,
+        language: String?,
+        font: NSFont
+    ) -> NSAttributedString {
+        guard line.kind != .noNewline else {
+            return NSAttributedString(
+                string: marker + line.text,
+                attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+            )
+        }
+        let result = NSMutableAttributedString(
+            string: marker,
+            attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]
+        )
+        result.append(SyntaxHighlighter.shared.highlightLine(line.text, language: language, font: font))
+        return result
+    }
+}
+
+/// The fingerprint a "viewed" tick is remembered against, so a file that
+/// changes after it was ticked comes back unticked.
+///
+/// Off the main actor and allocation-light on purpose: this runs over every
+/// file in the diff on each refresh, and it used to join every line of every
+/// hunk into one string first — on the main actor, mid-agent-turn.
+enum DiffContentHash {
+    static func of(_ file: FileDiff) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        func feed(_ text: String) {
+            for byte in text.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
+        }
+        var first = true
+        for hunk in file.hunks {
+            for line in hunk.lines {
+                if !first { feed("\n") }
+                first = false
+                // Byte-for-byte what the joined string used to be, so ticks
+                // stored by earlier builds still match.
+                feed(line.kind.rawValue)
+                feed(":")
+                feed(line.text)
+            }
+        }
+        return String(hash, radix: 16)
     }
 }
 
@@ -1137,6 +1320,37 @@ private struct LineFramesKey: PreferenceKey {
 private struct MarkdownPreview: NSViewRepresentable {
     let markdown: String
 
+    /// Everything the detached pass needs, gathered on the main actor and then
+    /// only read. `NSFont` and `NSAppearance` are immutable but not `Sendable`.
+    private struct Request: @unchecked Sendable {
+        let source: String
+        let baseFont: NSFont
+        let appearance: NSAppearance
+    }
+
+    /// A finished render on its way back to the main actor. `NSAttributedString`
+    /// is not `Sendable`, but this one is built by a single detached pass and
+    /// only read afterwards — the same bargain `SourceHighlightResult` makes.
+    private struct Rendered: @unchecked Sendable {
+        let value: NSAttributedString
+    }
+
+    /// The whole markdown pass: parse, highlight every fence, build the
+    /// attributed string. Off the main actor by design — see the note on
+    /// `MarkdownRenderer` for what makes that safe, and why the appearance has
+    /// to be made current first.
+    private nonisolated static func render(_ request: Request) -> Rendered {
+        var result = NSAttributedString()
+        request.appearance.performAsCurrentDrawingAppearance {
+            result = MarkdownRenderer(
+                baseFont: request.baseFont,
+                textColor: .labelColor,
+                highlighter: SyntaxHighlighter.shared
+            ).render(request.source, highlighting: .all)
+        }
+        return Rendered(value: result)
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NSTextView()
         textView.isEditable = false
@@ -1148,40 +1362,110 @@ private struct MarkdownPreview: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
+        // A rendered README can run to thousands of lines. Non-contiguous
+        // layout lets the text system lay out the viewport and leave the rest
+        // until it is asked for, instead of the whole document on first draw.
+        textView.layoutManager?.allowsNonContiguousLayout = true
 
-        let scroll = NSScrollView()
+        // OreOverlayScrollView, not NSScrollView: it clamps `scrollerStyle`
+        // to overlay for good, so flipping "always show scroll bars" system-wide
+        // can't bolt AppKit's opaque white ladder onto the glass mid-session.
+        let scroll = OreOverlayScrollView()
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
-        // Overlay, explicitly: with "always show scroll bars" set system-wide,
-        // AppKit's legacy scroller paints an opaque track — a white ladder
-        // bolted onto the glass. Every scroll surface in the window makes the
-        // same choice so the bars read as one family.
-        scroll.scrollerStyle = .overlay
-        // One knob family window-wide — see TranscriptView.
-        scroll.scrollerKnobStyle = .light
-        scroll.autohidesScrollers = true
         return scroll
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    @MainActor
     final class Coordinator {
-        var lastRendered: String?
+        /// What the text storage currently holds; nil until the first render
+        /// lands, which is what tells `updateNSView` there is no reader
+        /// position worth keeping.
+        var applied: String?
+        /// The source the newest render was asked for — in flight or already
+        /// applied. A result whose source is no longer this one is stale and
+        /// gets dropped rather than written over a newer document.
+        var requested: String?
+        var render: Task<Void, Never>?
+
+        deinit { render?.cancel() }
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let textView = scroll.documentView as? NSTextView else { return }
+        guard scroll.documentView is NSTextView else { return }
         // Re-render only when the text itself moved — updateNSView also fires
         // for unrelated SwiftUI churn, and markdown parsing isn't free.
-        guard context.coordinator.lastRendered != markdown else { return }
-        context.coordinator.lastRendered = markdown
-        let rendered = MarkdownRenderer(
-            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
-            textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
-        ).render(markdown, highlighting: .all)
-        textView.textStorage?.setAttributedString(rendered)
+        let coordinator = context.coordinator
+        guard coordinator.requested != markdown else { return }
+        coordinator.requested = markdown
+        coordinator.render?.cancel()
+
+        let source = markdown
+        let baseFont = NSFont.systemFont(ofSize: OreTheme.Font.prose)
+        // The room the render has to resolve against. A worker thread has no
+        // window to ask, and both the link-symbol cache and the highlighter's
+        // cache key on the current drawing appearance, so it is captured from
+        // the view here and made current inside the task.
+        let appearance = scroll.effectiveAppearance
+        let request = Request(source: source, baseFont: baseFont, appearance: appearance)
+        // The one piece of the render that wants the main actor: SF Symbol
+        // images for link chips. Built here, for this size and — note the
+        // wrapper — this room, because the cache keys on the appearance and the
+        // detached pass will look them up under the view's, not NSApp's.
+        appearance.performAsCurrentDrawingAppearance {
+            MarkdownRenderer.prewarmLinkSymbols(baseFont: baseFont)
+        }
+
+        // A README runs to thousands of lines, and parsing, highlighting every
+        // fence and building the attributed string for all of it used to happen
+        // on the main actor — a visible stall on open, and again on every save
+        // the agent made while the reader was scrolling.
+        coordinator.render = Task { [weak coordinator] in
+            let rendered = await Task.detached(priority: .userInitiated) {
+                Self.render(request)
+            }.value.value
+            guard !Task.isCancelled, let coordinator, coordinator.requested == source,
+                  let textView = scroll.documentView as? NSTextView
+            else { return }
+            let isRewrite = coordinator.applied != nil
+            coordinator.applied = source
+            // Read the reader's place *before* the storage goes, and read it
+            // now rather than when the render was queued: replacing it
+            // wholesale resets the scroll to the top, so an agent saving a long
+            // README mid-read used to yank them back to the first line.
+            let anchor = isRewrite ? Self.topCharacter(of: textView, in: scroll) : nil
+            textView.textStorage?.setAttributedString(rendered)
+            if let anchor { Self.restore(anchor, in: textView, scroll: scroll) }
+        }
+    }
+
+    /// The character at the top of the viewport, or nil when the reader is
+    /// already at the top and there is nothing to restore.
+    private static func topCharacter(of textView: NSTextView, in scroll: NSScrollView) -> Int? {
+        guard let layout = textView.layoutManager, let container = textView.textContainer else {
+            return nil
+        }
+        let top = scroll.contentView.bounds.minY
+        guard top > 0 else { return nil }
+        let point = NSPoint(x: textView.textContainerInset.width, y: top)
+        return layout.characterIndexForGlyph(at: layout.glyphIndex(for: point, in: container))
+    }
+
+    private static func restore(_ character: Int, in textView: NSTextView, scroll: NSScrollView) {
+        guard let layout = textView.layoutManager, let container = textView.textContainer,
+              character < (textView.textStorage?.length ?? 0) else { return }
+        let glyphs = layout.glyphRange(
+            forCharacterRange: NSRange(location: character, length: 1),
+            actualCharacterRange: nil
+        )
+        let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+        // The rewrite may have made the document shorter than the old offset.
+        let limit = max(0, textView.frame.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, rect.minY), limit)))
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 }
 
@@ -1198,7 +1482,11 @@ struct DiffDocumentView: View {
     // (hunkIndex, lineIndex) and normalised when a comment is composed.
     @State private var selectionAnchor: LineRef?
     @State private var selectionFocus: LineRef?
-    @State private var lineFrames: [LineFrame] = []
+    /// The diff, flattened and syntax-coloured once per load.
+    @State private var rowSet: DiffRowSet = .empty
+    /// The loaded diff's fingerprint, computed off main with the rows rather
+    /// than re-derived on the main actor every time "Viewed" is touched.
+    @State private var contentFingerprint = ""
     @State private var sourceText = ""
     @State private var savedSourceText = ""
     @State private var sourceError: String?
@@ -1209,7 +1497,7 @@ struct DiffDocumentView: View {
     @State private var isSaving = false
     @State private var conflictHunks: [ConflictHunk] = []
 
-    struct LineRef: Equatable { var hunk: Int; var line: Int }
+    typealias LineRef = DiffLineRef
 
     private struct CommentTarget: Identifiable {
         var id: String { "\(filePath):\(startLine)-\(endLine)" }
@@ -1253,12 +1541,17 @@ struct DiffDocumentView: View {
         // and a one-line message never shrinks the document to its own size.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // Code wants paper, not weather: syntax colour on drifting wallpaper
-        // light is where translucency stops being worth it. Nearly opaque, with
-        // just enough of the glass base bleeding through to stay in the same
-        // window as everything else.
-        .background(OreTheme.Surface.content.opacity(0.85))
+        // light is where translucency stops being worth it. One opaque sheet,
+        // not the two stacked translucent fills this used to be (0.85 here and
+        // 0.6 again under the diff, the same colour twice) — that cost a blend
+        // per frame across the whole document for a difference nobody could see.
+        .background(OreTheme.Surface.content)
         .task(id: path) { await load() }
-        .task(id: model.gitGeneration(for: workspace.id)) { await load() }
+        // Debounced: the generation moves on every write in the worktree, so a
+        // working agent would otherwise have this file re-read, re-flattened
+        // and re-hashed many times a second. One pass per burst, the same
+        // policy the review list uses.
+        .task(id: model.gitGeneration(for: workspace.id)) { await load(debounced: true) }
         .onChange(of: model.fileFocus[workspace.id]?[path]) { _, focus in
             // A `file:line` click on an already-open file must show source, not
             // the diff, so the line reveal lands somewhere visible.
@@ -1338,7 +1631,7 @@ struct DiffDocumentView: View {
             Toggle(isOn: $isViewed) { Text("Viewed").font(.system(size: OreTheme.Font.body)) }
                 .toggleStyle(.checkbox)
                 .onChange(of: isViewed) { _, viewed in
-                    model.markViewed(path, hash: viewed ? contentHash() : nil, for: workspace.id)
+                    model.markViewed(path, hash: viewed ? contentFingerprint : nil, for: workspace.id)
                 }
 
             Button { model.closeDiffFile(path, in: workspace.id) } label: {
@@ -1394,7 +1687,7 @@ struct DiffDocumentView: View {
                     onComment: { commentOnWholeFile() }
                 )
             }
-            .scrollIndicators(.hidden)
+            .oreOverlayScrollers()
         case .html:
             if isLoading && sourceText.isEmpty && baseText == nil {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1459,72 +1752,87 @@ struct DiffDocumentView: View {
     }
 
     private func diffScroll(_ file: FileDiff) -> some View {
-        // Indicators off here and on every glass-riding scroll surface — with
-        // "always show scroll bars" set system-wide these drew the legacy
-        // white track, one pane at a time.
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(file.hunks.enumerated()), id: \.element.diffRowID) { hunkIndex, hunk in
-                    HunkHeader(hunk: hunk)
-                    ForEach(Array(hunk.lines.enumerated()), id: \.element.diffRowID) { lineIndex, line in
+        // One GeometryReader for the document — not one per line, which is what
+        // the old frame-reporting rows amounted to. It only supplies the
+        // viewport width the rows are stretched to.
+        GeometryReader { geo in
+            let width = DiffRowBuilder.documentWidth(
+                columns: rowSet.columns, viewport: geo.size.width
+            )
+            ScrollView([.vertical, .horizontal]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(rowSet.rows) { row in
                         DiffLineRow(
-                            line: line,
-                            language: SyntaxHighlighter.language(forPath: file.path),
-                            ref: LineRef(hunk: hunkIndex, line: lineIndex),
-                            isSelected: isSelected(hunk: hunkIndex, line: lineIndex),
-                            onComment: { commentSingle(line, in: hunk) }
+                            row: row,
+                            width: width,
+                            isSelected: isSelected(row),
+                            onComment: commentSingle
+                        )
+                        .equatable()
+                    }
+                    if file.isBinary {
+                        // An icon or a screenshot is precisely the change a
+                        // reviewer most needs to *see*, and it was the one case
+                        // showing the least: git reduces it to "Binary files
+                        // differ" and this pane printed that as "Binary file".
+                        BinaryFilePreview(
+                            path: file.path,
+                            status: file.status,
+                            originalPath: file.originalPath,
+                            workspaceID: workspace.id,
+                            worktreePath: workspace.worktreePath,
+                            generation: model.gitGeneration(for: workspace.id),
+                            onComment: { commentOnWholeFile() }
                         )
                     }
+                    if file.isTruncated {
+                        Text("This diff is too large to display.")
+                            .foregroundStyle(.secondary).padding()
+                    }
                 }
-                if file.isBinary {
-                    // An icon or a screenshot is precisely the change a
-                    // reviewer most needs to *see*, and it was the one case
-                    // showing the least: git reduces it to "Binary files
-                    // differ" and this pane printed that as "Binary file".
-                    BinaryFilePreview(
-                        path: file.path,
-                        status: file.status,
-                        originalPath: file.originalPath,
-                        workspaceID: workspace.id,
-                        worktreePath: workspace.worktreePath,
-                        generation: model.gitGeneration(for: workspace.id),
-                        onComment: { commentOnWholeFile() }
-                    )
+                // Fixed width for every row, from the longest line in the whole
+                // diff rather than from whichever rows happen to be on screen.
+                .frame(width: width, alignment: .leading)
+                .coordinateSpace(name: oreDiffSpaceName)
+                .overlay(alignment: .topLeading) {
+                    // Drag within the gutter strip to select a line range.
+                    // Confining the gesture to the ~90pt gutter keeps it from
+                    // fighting the scroll view, which still owns vertical drags
+                    // over the code.
+                    Color.clear
+                        .frame(width: DiffRowBuilder.dragWidth)
+                        .frame(maxHeight: .infinity, alignment: .top)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 4, coordinateSpace: .named(oreDiffSpaceName))
+                                .onChanged { value in
+                                    // Fixed row heights make this arithmetic —
+                                    // a binary search over precomputed offsets
+                                    // — instead of a scan of live frames.
+                                    if let ref = rowSet.row(atY: value.location.y)?.ref {
+                                        updateSelection(to: ref)
+                                    }
+                                }
+                                .onEnded { _ in commentSelection(in: file) }
+                        )
                 }
-                if file.isTruncated {
-                    Text("This diff is too large to display.")
-                        .foregroundStyle(.secondary).padding()
-                }
+                // Outside the coordinate space, so row offsets stay measured
+                // from the first row rather than from the padding.
+                .padding(.vertical, 6)
             }
-            .padding(.vertical, 6)
-            .coordinateSpace(name: oreDiffSpaceName)
-            .onPreferenceChange(LineFramesKey.self) { lineFrames = $0 }
-            .overlay(alignment: .topLeading) {
-                // Drag within the gutter strip to select a line range. Confining
-                // the gesture to the ~90pt gutter keeps it from fighting the
-                // scroll view, which still owns vertical drags over the code.
-                Color.clear
-                    .frame(width: 90)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 4, coordinateSpace: .named(oreDiffSpaceName))
-                            .onChanged { value in
-                                if let ref = lineAt(value.location.y) { updateSelection(to: ref) }
-                            }
-                            .onEnded { _ in commentSelection(in: file) }
-                    )
-            }
+            .oreOverlayScrollers()
         }
-        .scrollIndicators(.hidden)
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
-    }
-
-    private func lineAt(_ y: CGFloat) -> LineRef? {
-        lineFrames.first { $0.rect.minY <= y && y <= $0.rect.maxY }?.ref
+        // No fill: the document already lays one opaque sheet of paper down
+        // (see `body`). Two stacked translucent fills of the same colour cost a
+        // blend per frame over the whole diff and looked identical.
     }
 
     // MARK: - Selection
+
+    private func isSelected(_ row: DiffDocumentRow) -> Bool {
+        guard let ref = row.ref else { return false }
+        return isSelected(hunk: ref.hunk, line: ref.line)
+    }
 
     private func isSelected(hunk: Int, line: Int) -> Bool {
         guard let a = selectionAnchor, let b = selectionFocus, a.hunk == b.hunk, hunk == a.hunk else { return false }
@@ -1556,7 +1864,14 @@ struct DiffDocumentView: View {
         )
     }
 
-    private func commentSingle(_ line: DiffLine, in hunk: DiffHunk) {
+    /// Looked up from the current `file` rather than captured per row: the row
+    /// carries only what it draws, and the closure it hands out survives an
+    /// `.equatable()` skip without going stale.
+    private func commentSingle(_ row: DiffDocumentRow) {
+        guard let ref = row.ref, let file, file.hunks.indices.contains(ref.hunk) else { return }
+        let hunk = file.hunks[ref.hunk]
+        guard hunk.lines.indices.contains(ref.line) else { return }
+        let line = hunk.lines[ref.line]
         guard let number = line.newLineNumber ?? line.oldLineNumber else { return }
         commentTarget = CommentTarget(
             filePath: path, startLine: number, endLine: number,
@@ -1581,7 +1896,14 @@ struct DiffDocumentView: View {
 
     // MARK: - Data
 
-    private func load() async {
+    /// Every assignment here re-runs `body`, and on a debounced pass almost
+    /// nothing has usually changed — so each one is guarded on being a real
+    /// change rather than written unconditionally.
+    private func load(debounced: Bool = false) async {
+        if debounced {
+            try? await Task.sleep(for: ReviewRefreshPolicy.gitDebounce)
+            guard !Task.isCancelled else { return }
+        }
         let showLoader = file == nil && sourceText.isEmpty
         if showLoader { isLoading = true }
         defer { isLoading = false }
@@ -1597,26 +1919,46 @@ struct DiffDocumentView: View {
             }
             : nil
         let diffs = (try? await model.loadDiff(for: workspace.id)) ?? []
-        file = diffs.first { $0.path == path }
-        let isDeleted = file?.status == .deleted
+        let loaded = diffs.first { $0.path == path }
+        let isDeleted = loaded?.status == .deleted
+
+        if loaded != file {
+            // Flatten, lex, colour and fingerprint the whole diff away from the
+            // main actor. Both passes walk every line, and both used to run on
+            // the main actor once per git generation.
+            let built = await Task.detached(priority: .userInitiated) { () -> (DiffRowSet, String) in
+                guard let loaded else { return (.empty, "") }
+                return (DiffRowBuilder.build(loaded), DiffContentHash.of(loaded))
+            }.value
+            guard !Task.isCancelled else { return }
+            // All three together, and only once the rows exist: publishing
+            // `file` first and then bailing on cancellation would leave rows
+            // that no longer match it, and the next load would see no change
+            // and never rebuild them.
+            file = loaded
+            rowSet = built.0
+            contentFingerprint = built.1
+        }
 
         switch await sourceRead?.value {
         case .success(let text):
-            sourceText = text
-            savedSourceText = text
-            sourceError = nil
+            if sourceText != text { sourceText = text }
+            if savedSourceText != text { savedSourceText = text }
+            if sourceError != nil { sourceError = nil }
         case .failure(let error):
-            sourceError = Self.sourceErrorMessage(error, isDeleted: isDeleted)
+            let message = Self.sourceErrorMessage(error, isDeleted: isDeleted)
+            if sourceError != message { sourceError = message }
         case nil:
-            sourceError = nil
+            if sourceError != nil { sourceError = nil }
         }
 
         // A deleted document still has a preview: the version it had at the base.
         let previewKind = FilePresentationMode.previewKind(path: path)
         if isDeleted, sourceError != nil, previewKind == .markdown || previewKind == .html {
             let data = await model.baseFileData(path: file?.originalPath ?? path, in: workspace.id)
-            baseText = data.flatMap { String(data: $0, encoding: .utf8) }
-        } else {
+            let text = data.flatMap { String(data: $0, encoding: .utf8) }
+            if baseText != text { baseText = text }
+        } else if baseText != nil {
             baseText = nil
         }
 
@@ -1628,10 +1970,14 @@ struct DiffDocumentView: View {
         if resolved == .source, !readsSource {
             resolved = supportsPreview ? .preview : .diff
         }
-        mode = resolved
+        if mode != resolved { mode = resolved }
         let stored = await model.loadViewedFiles(for: workspace.id)
-        if let file { isViewed = stored[path] == contentHash(file) }
-        conflictHunks = await model.loadConflictHunks(path: path, for: workspace.id)
+        if file != nil {
+            let viewed = stored[path] == contentFingerprint
+            if isViewed != viewed { isViewed = viewed }
+        }
+        let hunks = await model.loadConflictHunks(path: path, for: workspace.id)
+        if conflictHunks != hunks { conflictHunks = hunks }
     }
 
     /// Why the editor can't show this file, in terms of this file.
@@ -1708,14 +2054,6 @@ struct DiffDocumentView: View {
         }
     }
 
-    private func contentHash(_ explicit: FileDiff? = nil) -> String {
-        guard let file = explicit ?? file else { return "" }
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        let text = file.hunks.flatMap(\.lines).map { "\($0.kind):\($0.text)" }.joined(separator: "\n")
-        for byte in text.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
-        return String(hash, radix: 16)
-    }
-
     private func contextAround(lines: [DiffLine], in hunk: DiffHunk) -> String {
         guard let first = lines.first,
               let index = hunk.lines.firstIndex(where: {
@@ -1730,113 +2068,118 @@ struct DiffDocumentView: View {
     }
 }
 
-private struct HunkHeader: View {
-    let hunk: DiffHunk
+/// One row of a diff — a hunk header or a line — drawn from a finished
+/// `DiffDocumentRow`.
+///
+/// `Equatable`, and applied through `.equatable()`. Rows slide under the
+/// pointer constantly while scrolling and the document's own state changes on
+/// every drag-select step; without this, every materialised row re-ran `body`
+/// each time, and `body` used to re-lex the line.
+private struct DiffLineRow: View, Equatable {
+    let row: DiffDocumentRow
+    /// The document width, so every row's tint spans the full line even when
+    /// the code is shorter than the viewport.
+    let width: CGFloat
+    let isSelected: Bool
+    /// Deliberately left out of `==`: the parent rebuilds this closure on every
+    /// pass, but it always does the same thing — look the row's ref up in the
+    /// parent's current state. Closures can't be compared, and treating a fresh
+    /// one as a change would defeat the point of being Equatable at all.
+    let onComment: (DiffDocumentRow) -> Void
 
-    var body: some View {
-        Text("@@ −\(hunk.oldStart),\(hunk.oldCount) +\(hunk.newStart),\(hunk.newCount) @@ \(hunk.header)")
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(OreTheme.subduedFill)
+    /// `nonisolated` because `Equatable` is: SwiftUI compares view values
+    /// without promising the main actor, and every field read here is a plain
+    /// `let` of a Sendable type.
+    nonisolated static func == (lhs: DiffLineRow, rhs: DiffLineRow) -> Bool {
+        lhs.isSelected == rhs.isSelected && lhs.width == rhs.width && lhs.row == rhs.row
     }
-}
-
-private struct DiffLineRow: View {
-    let line: DiffLine
-    let language: String?
-    let ref: DiffDocumentView.LineRef
-    var isSelected: Bool = false
-    let onComment: () -> Void
-    @State private var isHovering = false
 
     var body: some View {
         HStack(spacing: 0) {
-            Text(line.oldLineNumber.map(String.init) ?? "")
-                .frame(width: 38, alignment: .trailing)
-            Text(line.newLineNumber.map(String.init) ?? "")
-                .frame(width: 38, alignment: .trailing)
-
-            // Commenting is the point of this view, so the affordance lives in
-            // the gutter, one click from any line — and it's always shown for a
-            // selected range, which is where the "+" from the reference appears.
-            Button(action: onComment) {
-                Image(systemName: "plus.bubble")
-                    .font(.system(size: 9))
+            if row.isHeader {
+                Text(row.text)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+            } else {
+                Text(row.oldNumber)
+                    .frame(width: 38, alignment: .trailing)
+                Text(row.newNumber)
+                    .frame(width: 38, alignment: .trailing)
+                // The comment slot, held open by the overlay below.
+                Color.clear.frame(width: 26)
+                // One line, at its natural width: wrapping is what made row
+                // heights unpredictable. The document scrolls sideways instead.
+                Text(row.text)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.leading, 4)
             }
-            .buttonStyle(.plain)
-            .frame(width: 26, height: 26)
-            .opacity(isHovering || isSelected ? 1 : 0)
-            .disabled(line.kind == .noNewline)
-
-            // Highlighted per line: a diff line is rarely a complete parse
-            // unit, so this is the regex pass rather than tree-sitter, which
-            // would report errors more often than colour.
-            Text(AttributedString(highlighted))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 4)
+            Spacer(minLength: 0)
         }
-        .font(.system(size: 11, design: .monospaced))
+        .font(.system(size: DiffRowBuilder.fontSize, design: .monospaced))
         .foregroundStyle(textColor)
-        .padding(.vertical, 1.5)
-        .background(isSelected ? Color.accentColor.opacity(0.20) : background)
+        .frame(width: width, height: row.height, alignment: .leading)
+        .background(background)
+        .overlay(alignment: .leading) {
+            if !row.isHeader {
+                DiffRowCommentButton(row: row, isSelected: isSelected) { onComment(row) }
+            }
+        }
         .overlay(alignment: .leading) {
             if isSelected { Rectangle().fill(Color.accentColor).frame(width: 2) }
-        }
-        .onHover { isHovering = $0 }
-        .contentShape(Rectangle())
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(
-                    key: LineFramesKey.self,
-                    value: [LineFrame(ref: ref, rect: geo.frame(in: .named(oreDiffSpaceName)))]
-                )
-            }
-        )
-    }
-
-    private var highlighted: NSAttributedString {
-        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        guard line.kind != .noNewline else {
-            return NSAttributedString(
-                string: marker + line.text,
-                attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
-            )
-        }
-        let result = NSMutableAttributedString(
-            string: marker,
-            attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]
-        )
-        result.append(SyntaxHighlighter.shared.highlightLine(
-            line.text, language: language, font: font
-        ))
-        return result
-    }
-
-    private var marker: String {
-        switch line.kind {
-        case .added: return "+"
-        case .removed: return "−"
-        case .context: return " "
-        case .noNewline: return "\\"
         }
     }
 
     private var textColor: Color {
-        switch line.kind {
-        case .noNewline: return .secondary
-        default: return .primary
-        }
+        row.kind == .noNewline ? .secondary : .primary
     }
 
     private var background: Color {
-        switch line.kind {
+        if isSelected { return Color.accentColor.opacity(0.20) }
+        switch row.kind {
+        case nil: return OreTheme.subduedFill
         case .added: return .green.opacity(0.13)
         case .removed: return .red.opacity(0.13)
         default: return .clear
         }
+    }
+}
+
+/// The gutter's "+", and the hover state that reveals it.
+///
+/// Commenting is the point of the diff view, so the affordance is one click
+/// from any line — and it is always shown for a selected range, which is where
+/// the "+" from the reference appears.
+///
+/// Its own view purely so `isHovering` lives here. Rows pass under a still
+/// pointer on every scroll, and hover state held on the row itself re-ran the
+/// row's `body` each time — which, before the rows were precomputed, meant
+/// re-lexing the line. The transparent backing keeps the target the whole row,
+/// which is the reach it has always had; only the state moved.
+private struct DiffRowCommentButton: View {
+    let row: DiffDocumentRow
+    let isSelected: Bool
+    let onComment: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+            .overlay(alignment: .leading) {
+                Button(action: onComment) {
+                    Image(systemName: "plus.bubble")
+                        .font(.system(size: 9))
+                }
+                .buttonStyle(.plain)
+                .frame(width: 26, height: row.height)
+                // Past the two number columns, into the gutter's third slot.
+                .padding(.leading, 76)
+                .opacity(isHovering || isSelected ? 1 : 0)
+                .disabled(row.commentLine == nil)
+            }
     }
 }
 
@@ -2118,7 +2461,7 @@ private struct ShipStatusPanel: View {
                     }
                     .padding(.vertical, 6)
                 }
-                .scrollIndicators(.hidden)
+                .oreOverlayScrollers()
             }
         }
     }
@@ -2281,7 +2624,7 @@ private struct ShipStatusPanel: View {
                     }
                     .padding(.vertical, 3)
                 }
-                .scrollIndicators(.hidden)
+                .oreOverlayScrollers()
             } else if pullRequest != nil {
                 shipEmpty(icon: "checklist", text: "No checks reported")
             } else {
@@ -2351,7 +2694,7 @@ private struct ShipStatusPanel: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .scrollIndicators(.hidden)
+                    .oreOverlayScrollers()
                     .frame(maxHeight: 160)
                     .padding(6)
                     .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 6))
@@ -2974,17 +3317,3 @@ private struct BaseSyncBanner: View {
     }
 }
 
-private extension DiffHunk {
-    /// A hunk keeps its identity as long as it covers the same range. Keying the
-    /// diff list on array offset instead let LazyVStack carry a previous hunk's
-    /// cached height into whatever hunk now sits at that offset after a re-diff —
-    /// the phantom vertical gaps.
-    var diffRowID: String { "h\(oldStart)-\(oldCount)-\(newStart)-\(newCount)" }
-}
-
-private extension DiffLine {
-    /// Stable within a hunk: every line has a distinct (old, new) pair —
-    /// additions differ by new number, deletions by old, context by both — and
-    /// `kind` disambiguates the rare no-newline markers.
-    var diffRowID: String { "\(oldLineNumber ?? -1):\(newLineNumber ?? -1):\(kind.rawValue)" }
-}

@@ -629,6 +629,7 @@ public struct QueuedMessageRecord: Codable, FetchableRecord, MutablePersistableR
     public static let databaseTableName = "queuedMessage"
 
     public var id: Int64?
+    public var sortIndex: Int64 = 0
     public var workspaceID: String
     public var chatID: String?
     public var text: String

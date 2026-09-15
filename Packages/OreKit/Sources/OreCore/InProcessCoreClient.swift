@@ -1504,6 +1504,10 @@ public actor InProcessCoreClient: CoreClient {
         try await store.deleteQueuedMessage(id: id)
     }
 
+    public func moveQueuedMessage(id: Int64, direction: Int) async throws {
+        try await store.moveQueuedMessage(id: id, direction: direction)
+    }
+
     public func forwardFailingChecks(workspaceID: WorkspaceID) async throws {
         try await engine(for: workspaceID).forwardFailingChecks()
     }

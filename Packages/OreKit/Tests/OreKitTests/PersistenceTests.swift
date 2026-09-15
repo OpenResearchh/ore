@@ -490,6 +490,60 @@ struct PersistenceTests {
         #expect(try await store.queuedMessages(workspaceID: workspace.workspaceID).isEmpty)
     }
 
+    @Test func reorderedQueueDrainsInVisibleOrderAndKeepsMessageIdentity() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store)
+        let chat = try await store.ensureDefaultChat(for: workspace)
+        for text in ["first", "second", "third"] {
+            try await store.enqueueMessage(QueuedMessageRecord(
+                workspaceID: workspace.workspaceID, chatID: chat.chatID, text: text,
+                attachmentPaths: ["\(text).png"], submissionID: text
+            ))
+        }
+        let original = try await store.queuedMessages(chatID: chat.chatID)
+        let thirdID = try #require(original.last?.id)
+        try await store.moveQueuedMessage(id: thirdID, direction: -1)
+        try await store.moveQueuedMessage(id: thirdID, direction: -1)
+        // Moving past the front is a no-op; a new prompt still joins the end.
+        try await store.moveQueuedMessage(id: thirdID, direction: -1)
+        try await store.enqueueMessage(QueuedMessageRecord(
+            workspaceID: workspace.workspaceID, chatID: chat.chatID, text: "fourth"
+        ))
+        #expect(try await store.queuedMessages(chatID: chat.chatID).map(\.text)
+            == ["third", "first", "second", "fourth"])
+        let sent = try #require(try await store.dequeueMessage(chatID: chat.chatID))
+        #expect(sent.id == thirdID)
+        #expect(sent.submissionID == "third")
+        #expect(sent.paths == ["third.png"])
+        #expect(sent.createdAt == original.last?.createdAt)
+        // A stale UI action cannot resurrect a prompt that already dispatched.
+        try await store.moveQueuedMessage(id: thirdID, direction: 1)
+        #expect(try await store.dequeueMessage(chatID: chat.chatID)?.text == "first")
+        #expect(try await store.dequeueMessage(chatID: chat.chatID)?.text == "second")
+        #expect(try await store.dequeueMessage(chatID: chat.chatID)?.text == "fourth")
+        #expect(try await store.dequeueMessage(chatID: chat.chatID) == nil)
+    }
+
+    @Test func reorderingCannotCrossChatBoundaries() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store)
+        let first = try await store.ensureDefaultChat(for: workspace)
+        let second = ChatRecord(
+            id: ChatID(rawValue: "other"), workspaceID: workspace.workspaceID,
+            title: "Other", harness: .codex, sortIndex: 1
+        )
+        try await store.saveChat(second)
+        for (chat, text) in [(first, "a"), (second, "other"), (first, "b")] {
+            try await store.enqueueMessage(QueuedMessageRecord(
+                workspaceID: workspace.workspaceID, chatID: chat.chatID, text: text
+            ))
+        }
+        let records = try await store.queuedMessages(chatID: first.chatID)
+        try await store.moveQueuedMessage(id: #require(records.first?.id), direction: 1)
+        #expect(try await store.queuedMessages(chatID: first.chatID).map(\.text) == ["b", "a"])
+        #expect(try await store.queuedMessages(chatID: second.chatID).map(\.text) == ["other"])
+    }
+
     @Test func queuedAttachmentsRoundTrip() async throws {
         let store = try makeStore()
         let workspace = try await seedWorkspace(store)

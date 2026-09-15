@@ -865,6 +865,7 @@ public actor OreStore {
     public func enqueueMessage(_ record: QueuedMessageRecord) throws {
         try writer.write { db in
             var record = record
+            record.sortIndex = (try Int64.fetchOne(db, sql: "SELECT MAX(sortIndex) FROM queuedMessage") ?? 0) + 1
             try record.insert(db)
         }
     }
@@ -873,7 +874,7 @@ public actor OreStore {
         try await writer.read { db in
             try QueuedMessageRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchAll(db)
         }
     }
@@ -882,18 +883,18 @@ public actor OreStore {
         try await writer.read { db in
             try QueuedMessageRecord
                 .filter(Column("chatID") == chatID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchAll(db)
         }
     }
 
-    /// Takes the oldest queued message, removing it in the same transaction so
+    /// Takes the first queued message in the user's order, removing it in the same transaction so
     /// two drains can't deliver the same message twice.
     public func dequeueMessage(workspaceID: WorkspaceID) throws -> QueuedMessageRecord? {
         try writer.write { db in
             guard let record = try QueuedMessageRecord
                 .filter(Column("workspaceID") == workspaceID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchOne(db)
             else { return nil }
             try record.delete(db)
@@ -905,7 +906,7 @@ public actor OreStore {
         try writer.write { db in
             guard let record = try QueuedMessageRecord
                 .filter(Column("chatID") == chatID.rawValue)
-                .order(Column("id"))
+                .order(Column("sortIndex"), Column("id"))
                 .fetchOne(db)
             else { return nil }
             try record.delete(db)
@@ -940,6 +941,27 @@ public actor OreStore {
     public func deleteQueuedMessage(id: Int64) throws {
         _ = try writer.write { db in
             try QueuedMessageRecord.deleteOne(db, key: id)
+        }
+    }
+
+    /// Move within the current queue in one transaction. A message that has
+    /// already drained is ignored; identity, attachments and timestamps stay intact.
+    public func moveQueuedMessage(id: Int64, direction: Int) throws {
+        guard direction == -1 || direction == 1 else { return }
+        try writer.write { db in
+            guard let record = try QueuedMessageRecord.fetchOne(db, key: id) else { return }
+            let records = try QueuedMessageRecord
+                .filter(Column("workspaceID") == record.workspaceID)
+                .filter(Column("chatID") == record.chatID)
+                .order(Column("sortIndex"), Column("id"))
+                .fetchAll(db)
+            guard let index = records.firstIndex(where: { $0.id == id }),
+                  records.indices.contains(index + direction) else { return }
+            let neighbor = records[index + direction]
+            try QueuedMessageRecord.filter(Column("id") == id)
+                .updateAll(db, Column("sortIndex").set(to: neighbor.sortIndex))
+            try QueuedMessageRecord.filter(Column("id") == neighbor.id)
+                .updateAll(db, Column("sortIndex").set(to: record.sortIndex))
         }
     }
 

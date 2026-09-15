@@ -572,15 +572,11 @@ struct ChatPane: View {
                 .id(requestID?.rawValue ?? markdown)
             }
 
-            if !queuedMessages.isEmpty {
-                MessageQueueCard(messages: $queuedMessages) { record, text in
-                    await model.updateQueuedMessage(record, text: text)
-                } onDelete: { record in
-                    await model.deleteQueuedMessage(record)
-                    queuedMessages.removeAll { $0.id == record.id }
-                }
-                .frame(maxWidth: OreTheme.contentMaxWidth)
-                .padding(.horizontal, OreTheme.Space.md)
+            if !queuedMessages.isEmpty && (reviewingPlan || chat.pendingQuestion != nil) {
+                queueShelf
+                    .oreCard(padding: 10, radius: 14)
+                    .frame(maxWidth: OreTheme.contentMaxWidth)
+                    .padding(.horizontal, OreTheme.Space.md)
             }
 
             if !chat.draftComments.isEmpty && !reviewingPlan {
@@ -708,7 +704,9 @@ struct ChatPane: View {
         }
         .task(id: queuedMessagesTaskID(chatSummary)) {
             guard let id = chatSummary?.id else { queuedMessages = []; return }
-            queuedMessages = await model.queuedMessages(for: id)
+            let records = await model.queuedMessages(for: id)
+            guard !Task.isCancelled, chatSummary?.id == id else { return }
+            queuedMessages = records
         }
         .onChange(of: draft) { _, value in
             // The guard keeps a tab switch from writing the previous tab's text
@@ -1259,10 +1257,37 @@ struct ChatPane: View {
 
     // MARK: - Composer
 
+    private var queueShelf: some View {
+        MessageQueueShelf(messages: queuedMessages) { record, text in
+            try await model.updateQueuedMessage(record, text: text)
+            await reloadQueue(for: record)
+        } onDelete: { record in
+            try await model.deleteQueuedMessage(record)
+            await reloadQueue(for: record)
+        } onMove: { record, direction in
+            try await model.moveQueuedMessage(record, direction: direction)
+            await reloadQueue(for: record)
+        }
+        .id(chatSummary?.id)
+    }
+
+    private func reloadQueue(for record: QueuedMessageRecord) async {
+        guard let rawID = record.chatID else { return }
+        let id = ChatID(rawValue: rawID)
+        let records = await model.queuedMessages(for: id)
+        guard chatSummary?.id == id else { return }
+        queuedMessages = records
+    }
+
     private func composer(paneHeight: CGFloat, chat: ChatState, chatSummary: ChatSummary?) -> some View {
         let external = externalAttachments(chat)
         let mentions = mentionSuggestions(chat)
         return VStack(spacing: OreTheme.Space.sm) {
+            if !queuedMessages.isEmpty {
+                queueShelf
+                Divider().overlay(OreTheme.hairline)
+            }
+
             if chat.isBusy {
                 // Handed the state, not its values: the status row reads
                 // `lastEventAt` and friends itself, so a streaming event
@@ -4796,69 +4821,6 @@ private struct PlanApprovalCard: View {
                     .help("Open this plan in a new tab so you can run it with another agent")
             }
         }
-        .oreCard(padding: 12)
-        .overlay {
-            RoundedRectangle(cornerRadius: OreTheme.cardRadius, style: .continuous)
-                .fill(Color.purple.opacity(0.08))
-                .allowsHitTesting(false)
-        }
-    }
-
-    private var displayMarkdown: String {
-        PlanProposalPolicy.normalizedMarkdown(markdown) ?? ""
-    }
-
-    private var planBody: AttributedString {
-        let source = displayMarkdown
-        guard !source.isEmpty else { return AttributedString("Plan body is still being written.") }
-        let rendered = MarkdownRenderer(
-            baseFont: .systemFont(ofSize: OreTheme.Font.prose),
-            textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
-        ).render(source, highlighting: .all)
-        return AttributedString(rendered)
-    }
-}
-
-private struct MessageQueueCard: View {
-    @Binding var messages: [QueuedMessageRecord]
-    let onSave: (QueuedMessageRecord, String) async -> Void
-    let onDelete: (QueuedMessageRecord) async -> Void
-    @State private var isExpanded = false
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            VStack(spacing: 6) {
-                ForEach(messages.indices, id: \.self) { index in
-                    HStack {
-                        TextField("Queued message", text: $messages[index].text)
-                            .onSubmit {
-                                let record = messages[index]
-                                Task { await onSave(record, record.text) }
-                            }
-                        Button(role: .destructive) {
-                            let record = messages[index]
-                            Task { await onDelete(record) }
-                        } label: { Image(systemName: "trash") }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            // The whole bar toggles, not just the chevron: a macOS disclosure
-            // label is inert text unless it is made a button.
-            Button {
-                withAnimation(.easeOut(duration: 0.15)) { isExpanded.toggle() }
-            } label: {
-                Text("Queued messages (\(messages.count))")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(isExpanded ? "Hide queued messages" : "Show queued messages")
-        }
-        .oreCard(padding: 12, radius: 14)
     }
 }
 

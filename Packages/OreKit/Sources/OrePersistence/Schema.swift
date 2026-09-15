@@ -484,6 +484,13 @@ public enum OreSchema {
             }
         }
 
+        migrator.registerMigration("v13.queueOrder") { db in
+            try db.alter(table: "queuedMessage") { table in
+                table.add(column: "sortIndex", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: "UPDATE queuedMessage SET sortIndex = id")
+        }
+
         return migrator
     }
 }

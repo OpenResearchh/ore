@@ -3122,28 +3122,34 @@ final class AppModel {
     /// The row is the same message — it was drawn the moment the user pressed
     /// send — so leaving it on the original text means the transcript shows
     /// one thing and the agent is handed another.
-    func updateQueuedMessage(_ record: QueuedMessageRecord, text: String) async {
+    func updateQueuedMessage(_ record: QueuedMessageRecord, text: String) async throws {
         guard let id = record.id else { return }
-        try? await client.updateQueuedMessage(id: id, text: text)
+        try await client.updateQueuedMessage(id: id, text: text)
         guard !record.submissionID.isEmpty, let chatID = record.chatID else { return }
         chat(for: ChatID(rawValue: chatID))
             .updateQueuedRow(submissionID: record.submissionID, text: text)
     }
 
-    func deleteQueuedMessage(_ record: QueuedMessageRecord) async {
+    func deleteQueuedMessage(_ record: QueuedMessageRecord) async throws {
         guard let id = record.id else { return }
-        try? await client.deleteQueuedMessage(id: id)
+        try await client.deleteQueuedMessage(id: id)
         // Retire the row too. A deleted message that stays in the transcript
         // marked "queued" is not just cosmetic: it is what the next turn to
         // start would otherwise claim as the message that was sent.
         if !record.submissionID.isEmpty, let chatID = record.chatID {
             chat(for: ChatID(rawValue: chatID)).removeQueuedRow(submissionID: record.submissionID)
         }
-        if let chat = selectedChatSummary {
+        if let chat = chats(for: WorkspaceID(rawValue: record.workspaceID), includeClosed: true)
+            .first(where: { $0.id.rawValue == record.chatID }) {
             var updated = chat
             updated.queuedMessageCount = max(0, updated.queuedMessageCount - 1)
             upsertChat(updated)
         }
+    }
+
+    func moveQueuedMessage(_ record: QueuedMessageRecord, direction: Int) async throws {
+        guard let id = record.id else { return }
+        try await client.moveQueuedMessage(id: id, direction: direction)
     }
 
     func search(_ query: String) async -> [SearchResult] {

@@ -267,8 +267,13 @@ public final class ChildProcess: @unchecked Sendable {
                     // Thread's own pool only drains when its body returns — at
                     // EOF. Without a pool per read, every 16 KB chunk a
                     // harness ever wrote stayed resident for as long as the
-                    // session ran: hundreds of MB after a few hours.
+                    // session ran: hundreds of MB after a few hours. Linux has
+                    // no autorelease pools, and nothing there to drain.
+                    #if canImport(Darwin)
                     let chunk = autoreleasepool { handle.availableData }
+                    #else
+                    let chunk = handle.availableData
+                    #endif
                     if chunk.isEmpty { break }  // EOF
                     continuation.yield(chunk)
                 }

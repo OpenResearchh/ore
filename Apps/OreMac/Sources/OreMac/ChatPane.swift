@@ -1764,8 +1764,7 @@ struct ChatPane: View {
         .popover(isPresented: $showEffortChooser, arrowEdge: .bottom) {
             EffortChooser(
                 selection: $reasoningEffort,
-                efforts: efforts,
-                harness: tab.harness
+                efforts: efforts
             )
         }
         .help(efforts.count == 1
@@ -4152,61 +4151,6 @@ private struct ModelChooser: View {
         if name.contains("codex") { return "Optimized for agentic coding" }
         if harness == .cursorAgent { return "Available through Cursor" }
         return "General-purpose model"
-    }
-}
-
-private struct EffortChooser: View {
-    @Binding var selection: ReasoningEffort
-    let efforts: [ReasoningEffort]
-    let harness: HarnessKind
-
-    var body: some View {
-        let scale = EffortPickerScale(efforts: efforts)
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("Reasoning effort", systemImage: "chart.bar.fill")
-                    .font(.headline)
-                Spacer()
-                Text(selection.displayName).foregroundStyle(.secondary)
-            }
-            if let range = scale.sliderRange {
-                Slider(value: indexBinding, in: range, step: 1)
-                HStack {
-                    Text("Faster")
-                    Spacer()
-                    Text("Deeper")
-                }
-                .font(.caption).foregroundStyle(.secondary)
-            } else if let only = efforts.first {
-                Label(
-                    "\(only.displayName) is selected automatically for this model.",
-                    systemImage: "checkmark.circle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            } else {
-                Text("This model does not expose a reasoning-effort control.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Text(harness == .claudeCode
-                ? "Applied through your Claude Code session. Scroll the chip to adjust."
-                : "Applied to the next Codex turn. Scroll the chip to adjust.")
-                .font(.caption).foregroundStyle(.secondary)
-        }
-        .padding(14)
-        .frame(width: 300)
-    }
-
-    private var indexBinding: Binding<Double> {
-        let scale = EffortPickerScale(efforts: efforts)
-        return Binding(
-            get: { scale.value(for: selection) },
-            set: {
-                guard let resolved = scale.selection(at: $0) else { return }
-                selection = resolved
-            }
-        )
     }
 }
 

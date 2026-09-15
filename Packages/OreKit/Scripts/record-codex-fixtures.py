@@ -15,6 +15,7 @@ and are covered by their own tests.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -144,12 +145,14 @@ SCENARIOS = {
 
 
 # Recordings are committed to a public repository, so the recording machine's
-# home directory is replaced before the file is written.
+# home directory and the account's plan tier are replaced before the file is
+# written.
 HOME = os.path.expanduser("~")
+PLAN_TYPE = re.compile(r'"planType":"[^"]*"')
 
 
 def scrub(line):
-    return line.replace(HOME, "/Users/user")
+    return PLAN_TYPE.sub('"planType":"free"', line.replace(HOME, "/Users/user"))
 
 
 def main():

@@ -4,12 +4,20 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 # Once the repository is public, anyone can open a pull request that runs this
 # workflow. The token it gets should only ever read, whatever the repository
 # default is set to later; nothing here needs to write.
 permissions:
   contents: read
+
+# A new push to a pull request makes its running checks obsolete, and two of
+# the three jobs hold macOS runners, so the older run is cancelled. Pushes to
+# master are left to finish: each merge should get its own result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   core:
@@ -80,8 +88,14 @@ jobs:
       - name: Build the app bundle
         run: ./Scripts/bundle.sh release
 
+      # A pull request still has to build the bundle, but its app is built
+      # from code nobody has reviewed yet, so it isn't published as a
+      # downloadable artifact. Only master builds are, and not for long:
+      # releases are the way to get ORE.
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: ORE.app
           path: Apps/OreMac/.build/ORE.app
           if-no-files-found: error
+          retention-days: 7

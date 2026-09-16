@@ -82,6 +82,20 @@ public enum ShellEnvironment {
         cache.resolve { augmented(probeLoginShell() ?? ProcessInfo.processInfo.environment) }
     }
 
+    /// Forgets the probed login-shell environment so the next read re-runs it.
+    ///
+    /// The cache is what makes `childEnvironment()` cheap, but it also meant
+    /// the PATH ORE saw was frozen at launch: a user who followed ORE's own
+    /// advice — copy the install command, run it in Terminal, come back —
+    /// could not be told they had succeeded without quitting the app, because
+    /// the new CLI's directory had not existed when the probe ran.
+    ///
+    /// `Cache.invalidate()` has existed all along; nothing outside the tests
+    /// could reach it.
+    public static func invalidateCache() {
+        cache.invalidate()
+    }
+
     /// Fires the login-shell probe off the caller's path so the first harness
     /// launch never pays the up-to-5s shell startup cost.
     public static func warm() {

@@ -15,17 +15,17 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.7.2</string>
+	<string>0.8.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2026 Jupiter Innovations Lab Inc. Licensed under the Apache License 2.0.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Jupiter Innovations Lab Inc. Licensed under the Apache License 2.0.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>ORE uses the microphone to dictate prompts into the composer. macOS transcribes it on this Mac when an on-device model is available, otherwise with Apple’s speech service. Audio is never sent to your agent provider.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

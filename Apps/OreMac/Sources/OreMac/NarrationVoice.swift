@@ -321,14 +321,18 @@ final class NeuralNarrationVoice: NarrationVoice {
 
     /// FluidAudio's on-disk root for TTS weights on macOS.
     ///
-    /// A vendor detail we do not control, and read in one direction only
-    /// because only one direction is sound. The root being absent proves
-    /// nothing is cached; the root being present proves nothing at all, since
-    /// Pocket TTS's layout underneath it is undocumented (the published
-    /// `Models/kokoro/` path is a different backend). So a missing root
-    /// clears the install flag and a present one changes nothing. Guessing
-    /// wrong that way costs one unnecessary press of a button that already
-    /// exists; guessing wrong the other way costs 940 MB nobody asked for.
+    /// Verified against FluidAudio at the revision `Package.resolved` pins
+    /// (0.15.5, 19600a4): `ModelHub.clearAllCaches` names this as the shared
+    /// TTS root for every backend on macOS, with the Application Support
+    /// variant on the `#else` iOS branch that this app never takes. Pocket
+    /// TTS puts its language packs somewhere beneath it.
+    ///
+    /// Still read in one direction only, because only one direction is sound.
+    /// A missing root proves nothing is cached and clears the install flag; a
+    /// present root proves only that *some* backend has downloaded something,
+    /// not that this language pack is complete, so it changes nothing. Being
+    /// wrong that way costs one press of a button that already exists. Being
+    /// wrong the other way costs 940 MB nobody asked for.
     private static let vendorCacheRoot = ".cache/fluidaudio"
 
     /// The exact language pack this voice fetches and loads.

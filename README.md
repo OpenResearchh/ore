@@ -43,7 +43,7 @@ ORE never handles API keys.
 ## Install
 
 ```sh
-brew install --cask openresearchh/tap/ore
+brew install openresearchh/tap/ore
 ```
 
 Or use `curl -fsSL https://openresearchh.com/ore/install.sh | sh`, or download

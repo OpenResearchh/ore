@@ -15,21 +15,23 @@ name: Release
 # which releases master's head.
 #
 # Repository secrets it needs:
-#   ORE_POSTHOG_KEY  the PostHog project key (phc_…), stamped into the app
-#   RELEASE_TOKEN    a fine-grained token from a repository admin, with
-#                    Contents: read and write on OpenResearchh/ore and
-#                    OpenResearchh/homebrew-tap. master requires pull requests
-#                    and only admins may push past that, so the version bump is
-#                    pushed with this token rather than GITHUB_TOKEN, which a
-#                    ruleset can't exempt. It also publishes the cask.
+#   ORE_POSTHOG_KEY   the PostHog project key (phc_…), stamped into the app
+#   RELEASE_SSH_KEY   private half of this repository's "ORE release (CI)"
+#                     deploy key. master requires pull requests, and a ruleset
+#                     can't exempt GITHUB_TOKEN, so the version bump and the
+#                     tag are pushed with this key, which the ruleset does
+#                     exempt. A deploy key reaches this repository and nothing
+#                     else.
+#   TAP_SSH_KEY       the same, for OpenResearchh/homebrew-tap, to publish the
+#                     cask.
 #
 # Users verify a download with:
 #   gh attestation verify ORE-<version>.zip -R OpenResearchh/ore
 #
 # Order matters. Nothing is pushed until the tests pass and the artifacts
 # exist, so a failed build never leaves master carrying a release commit for a
-# version that was never published. `[skip ci]` on the bump keeps it from
-# starting CI or this workflow again.
+# version that was never published. A deploy key's pushes do start workflows,
+# so `[skip ci]` on the bump is what keeps this from running again.
 on:
   push:
     branches: [master]
@@ -117,23 +119,26 @@ jobs:
       - name: Check the secrets are set
         env:
           ORE_POSTHOG_KEY: ${{ secrets.ORE_POSTHOG_KEY }}
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_SSH_KEY: ${{ secrets.RELEASE_SSH_KEY }}
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
         run: |
           missing=""
           [ -n "$ORE_POSTHOG_KEY" ] || missing="$missing ORE_POSTHOG_KEY"
-          [ -n "$RELEASE_TOKEN" ] || missing="$missing RELEASE_TOKEN"
+          [ -n "$RELEASE_SSH_KEY" ] || missing="$missing RELEASE_SSH_KEY"
+          [ -n "$TAP_SSH_KEY" ] || missing="$missing TAP_SSH_KEY"
           if [ -n "$missing" ]; then
             echo "::error::Missing repository secrets:$missing. See the top of release.yml."
             exit 1
           fi
 
       # The merge that asked for this release, not whatever master has moved
-      # on to by the time the job starts. The token is kept for the push below.
+      # on to by the time the job starts. The deploy key stays configured for
+      # the push below.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && 'master' || github.sha }}
-          token: ${{ secrets.RELEASE_TOKEN }}
+          ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
 
       - name: Record the toolchain
         run: |
@@ -312,13 +317,17 @@ jobs:
       # older build.
       - name: Update the Homebrew cask
         env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -eu
           sha="$(shasum -a 256 "Apps/OreMac/.build/dist/ORE-$VERSION.zip" | cut -d' ' -f1)"
+          key="$(mktemp)"
+          printf '%s\n' "$TAP_SSH_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           tap="$(mktemp -d)"
-          git clone -q "https://x-access-token:$RELEASE_TOKEN@github.com/OpenResearchh/homebrew-tap.git" "$tap"
+          git clone -q git@github.com:OpenResearchh/homebrew-tap.git "$tap"
           mkdir -p "$tap/Casks"
           sed -e "s/^  version \".*\"/  version \"$VERSION\"/" \
               -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" \
@@ -335,3 +344,4 @@ jobs:
           git add Casks/ore.rb
           git commit -qm "ore $VERSION"
           git push -q origin HEAD
+          rm -f "$key"

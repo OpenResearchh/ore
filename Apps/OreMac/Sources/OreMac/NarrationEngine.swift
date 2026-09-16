@@ -2,6 +2,16 @@ import Foundation
 import Observation
 import OreProtocol
 
+/// One sentence explaining why the chosen narration voice isn't the one
+/// speaking, plus the affordance that could change that.
+struct NeuralVoiceNotice: Equatable, Sendable {
+    var message: String
+    /// The title of the button that could fix it, or nil when nothing a retry
+    /// does would change the outcome — which is the whole reason this carries
+    /// a title rather than a Bool.
+    var retryTitle: String?
+}
+
 /// Speaks what agents are doing, for tabs whose speaker toggle is on.
 ///
 /// One engine app-wide: a single voice naturally serializes every chat's
@@ -181,8 +191,58 @@ final class NarrationEngine {
         guard !neuralLoadRequested, voiceKind == .neural,
               !neuralVoice.isReady, neuralVoice.wasInstalledPreviously
         else { return }
-        // Once per session: a load that failed shows its error in Settings,
-        // which offers the retry, rather than being re-attempted per line.
+        // Once per session: a load that failed is re-attempted only when a
+        // person asks for it (`retryNeuralVoice`), never once per line.
+        neuralLoadRequested = true
+        neuralVoice.install()
+    }
+
+    /// Why narration is not using the voice the user picked, in one sentence,
+    /// or nil when it is.
+    ///
+    /// This used to exist only as a `readiness` case rendered in Settings.
+    /// The load is attempted once per session and never retried, so a user who
+    /// chose the neural voice and then never reopened Settings heard the
+    /// system voice indefinitely with nothing anywhere saying why. Narration
+    /// is heard in the HUD and the sidebar, so the explanation belongs there
+    /// too.
+    var neuralVoiceNotice: NeuralVoiceNotice? {
+        Self.neuralVoiceNotice(for: voiceKind, readiness: neuralVoice.readiness)
+    }
+
+    static func neuralVoiceNotice(
+        for voiceKind: NarrationVoiceKind,
+        readiness: NeuralNarrationVoice.Readiness
+    ) -> NeuralVoiceNotice? {
+        guard voiceKind == .neural else { return nil }
+        switch readiness {
+        case .ready, .installing:
+            // Nothing is wrong: it is either speaking or on its way. The
+            // fetch reports itself in Settings, which is where it was asked
+            // for.
+            return nil
+        case .notInstalled:
+            return NeuralVoiceNotice(
+                message: "The neural voice isn't downloaded, so narration is using the system voice.",
+                retryTitle: "Download"
+            )
+        case .failed(let detail):
+            return NeuralVoiceNotice(
+                message: "The neural voice couldn't be installed, so narration is using the system voice. \(detail)",
+                retryTitle: "Try again"
+            )
+        case .unsupported(let detail):
+            return NeuralVoiceNotice(
+                message: "This Mac can't run the neural voice, so narration will use the system voice. \(detail)",
+                retryTitle: nil
+            )
+        }
+    }
+
+    /// Acts on `neuralVoiceNotice`. A person pressing a button is not the
+    /// per-line retry the once-a-session guard exists to prevent, so it is
+    /// lifted here.
+    func retryNeuralVoice() {
         neuralLoadRequested = true
         neuralVoice.install()
     }

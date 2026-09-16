@@ -32,9 +32,48 @@ struct HarnessRepairTests {
         #expect(!repair.script.contains("npm"))
     }
 
+    /// A cask's files live under `Caskroom`, never `Cellar`. The repair used
+    /// to `chown` a `Cellar` directory that does not exist for one, so its
+    /// first line failed with "No such file or directory" — latent until
+    /// `brewToken` started resolving cask tokens like `claude-code@latest`.
+    @Test func aCaskIsRepairedInTheCaskroomNotTheCellar() throws {
+        let repair = try #require(HarnessRepair.forPermissionFailure(
+            kind: .claudeCode,
+            method: .homebrew,
+            executablePath: "/opt/homebrew/Caskroom/claude-code@latest/2.1.154/claude",
+            brewPrefix: "/opt/homebrew",
+            brewToken: "claude-code@latest"
+        ))
+
+        #expect(repair.script.contains("/opt/homebrew/Caskroom/claude-code@latest"))
+        #expect(!repair.script.contains("/opt/homebrew/Cellar"))
+        // And the token the install actually names, not the stable cask the
+        // user does not have.
+        #expect(repair.script.contains("brew upgrade 'claude-code@latest'"))
+    }
+
+    /// A bare `bin` symlink names neither, and `Cellar` is what this always
+    /// assumed — the formula case is the common one.
+    @Test func aHomebrewPathThatNamesNeitherKeepsTheCellar() {
+        #expect(
+            HarnessRepair.brewKegDirectory(
+                prefix: "/opt/homebrew", token: "codex",
+                executablePath: "/opt/homebrew/bin/codex"
+            ) == "/opt/homebrew/Cellar/codex"
+        )
+        #expect(
+            HarnessRepair.brewKegDirectory(
+                prefix: "/usr/local", token: "codex", executablePath: nil
+            ) == "/usr/local/Cellar/codex"
+        )
+    }
+
     /// A path under a Homebrew prefix on a machine where `brew` is gone —
     /// a migrated Mac, or an Intel prefix on Apple Silicon. Telling that user
     /// to run `brew upgrade` is telling them to run a command they do not have.
+    ///
+    /// Nor is npm an answer: that machine has no more reason to have node than
+    /// it has to have Homebrew. The vendor's script needs neither.
     @Test func aHomebrewPathWithoutHomebrewFallsBackToSomethingRunnable() throws {
         let repair = try #require(HarnessRepair.forPermissionFailure(
             kind: .codex,
@@ -44,7 +83,8 @@ struct HarnessRepairTests {
         ))
 
         #expect(!repair.script.contains("brew upgrade"))
-        #expect(repair.script.contains("npm install -g '@openai/codex'@latest"))
+        #expect(!repair.script.contains("npm"))
+        #expect(repair.script.contains("curl -fsSL https://chatgpt.com/codex/install.sh | bash"))
         #expect(!repair.needsRoot, "the fallback installs under the user's own account")
     }
 
@@ -113,6 +153,11 @@ struct HarnessRepairTests {
     /// With no idea what is on disk, the advice must not run anything as
     /// root: a privileged command aimed at a directory we guessed is the one
     /// mistake here with consequences.
+    ///
+    /// And it must not need a toolchain either. This used to open with
+    /// `npm config set prefix ~/.npm-global`, which is the first line of a
+    /// repair that fails immediately for the user who installed the way ORE's
+    /// own onboarding tells them to.
     @Test func anUnclassifiedInstallIsRepairedWithoutRoot() throws {
         let repair = try #require(HarnessRepair.forPermissionFailure(
             kind: .claudeCode, method: .unknown, executablePath: nil
@@ -120,27 +165,29 @@ struct HarnessRepairTests {
 
         #expect(!repair.needsRoot)
         #expect(!repair.script.contains("sudo"))
-        #expect(repair.script.contains("npm config set prefix ~/.npm-global"))
+        #expect(!repair.script.contains("npm"))
+        #expect(repair.script.contains("curl -fsSL https://claude.ai/install.sh | bash"))
     }
 
-    /// The old copy is still on `PATH`, usually earlier, so a repair that
-    /// installs a working binary somewhere the shell will not look has fixed
-    /// nothing the user can see.
-    @Test func aUserPrefixRepairAlsoPutsItselfOnThePath() throws {
-        let repair = try #require(HarnessRepair.forPermissionFailure(
-            kind: .codex, method: .unknown, executablePath: nil
-        ))
-
-        #expect(repair.script.contains("$HOME/.npm-global/bin:$PATH"))
-    }
-
-    @Test func cursorIsRepairedThroughItsOwnInstaller() throws {
-        let repair = try #require(HarnessRepair.forPermissionFailure(
-            kind: .cursorAgent, method: .unknown, executablePath: nil
-        ))
-
-        #expect(repair.script.contains("https://cursor.com/install"))
-        #expect(!repair.needsRoot)
+    /// Each CLI's own installer, never another's. The harness whose update
+    /// plan ended in Cursor's install script was one edit away from doing this
+    /// too.
+    @Test func eachHarnessIsRepairedThroughItsOwnInstaller() throws {
+        let expected: [HarnessKind: String] = [
+            .claudeCode: "https://claude.ai/install.sh",
+            .codex: "https://chatgpt.com/codex/install.sh",
+            .cursorAgent: "https://cursor.com/install",
+        ]
+        for (kind, url) in expected {
+            let repair = try #require(HarnessRepair.forPermissionFailure(
+                kind: kind, method: .unknown, executablePath: nil
+            ))
+            #expect(repair.script.contains(url), "\(kind)")
+            #expect(!repair.needsRoot, "\(kind)")
+            for other in expected.values where other != url {
+                #expect(!repair.script.contains(other), "\(kind) must not install another CLI")
+            }
+        }
     }
 
     // MARK: - Every repair
@@ -202,6 +249,100 @@ struct HarnessRepairTests {
         // because it is the only thing that says what to fix.
         #expect(result.diagnostic?.contains("/opt/homebrew/bin/claude") == true)
         #expect(result.diagnostic?.contains("libnode") == true)
+
+        // And the path is on the result, not only in the prose. Withholding it
+        // made `isInstalled` false, so the readiness ladder told this user to
+        // install an agent that is sitting right there — the one thing that
+        // cannot help. `isUnlaunchable` is what keeps them off the "sign in"
+        // rung instead.
+        #expect(result.executablePath == "/opt/homebrew/bin/claude")
+        #expect(result.isUnlaunchable == true)
+        #expect(result.isInstalled)
+    }
+
+    /// The field is optional so an older serialized probe still decodes, and
+    /// nil has to keep meaning what it meant before it existed.
+    @Test func aProbeFromBeforeTheFieldExistedStillDecodes() throws {
+        let legacy = Data(#"""
+        {"kind":"claudeCode","executablePath":"/usr/local/bin/claude","authState":"authenticated"}
+        """#.utf8)
+        let decoded = try JSONDecoder().decode(HarnessProbeResult.self, from: legacy)
+        #expect(decoded.isUnlaunchable == nil)
+        #expect(decoded.shadowedPaths == nil)
+        #expect(decoded.isReady)
+    }
+
+    // MARK: - Two copies on PATH
+
+    /// "I updated it and ORE still shows the old version" is usually two
+    /// copies from two channels: the updater upgrades the one the probe found,
+    /// and PATH goes on running the other.
+    @Test func everyOtherCopyOnPathIsRecorded() {
+        let copies = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "/Users/me/.local/bin/claude",
+        ]
+        #expect(
+            HarnessPathScan.shadowed(among: copies, winner: "/opt/homebrew/bin/claude")
+                == ["/usr/local/bin/claude", "/Users/me/.local/bin/claude"]
+        )
+        // One install is the ordinary case, and nil rather than [] keeps
+        // "nothing to report" spelled exactly one way.
+        #expect(HarnessPathScan.shadowed(among: ["/usr/local/bin/claude"],
+                                         winner: "/usr/local/bin/claude") == nil)
+        #expect(HarnessPathScan.shadowed(among: [], winner: "/usr/local/bin/claude") == nil)
+    }
+
+    /// `executablePathOverride` points ORE at a copy that is deliberately not
+    /// on PATH. Reporting every PATH copy as "shadowed" states the
+    /// relationship backwards — those are the ones a shell reaches.
+    @Test func anOffPathWinnerReportsNothingAsShadowed() {
+        let copies = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        #expect(
+            HarnessPathScan.shadowed(among: copies, winner: "/Users/me/custom/claude") == nil
+        )
+    }
+
+    /// The walk itself, against a PATH built for the test: real directories,
+    /// no agent CLI required.
+    @Test func thePathWalkFindsEveryCopyInSearchOrder() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ore-path-scan-\(UUID().uuidString)")
+        let first = root.appendingPathComponent("first")
+        let second = root.appendingPathComponent("second")
+        let empty = root.appendingPathComponent("empty")
+        for directory in [first, second, empty] {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for directory in [first, second] {
+            #expect(FileManager.default.createFile(
+                atPath: directory.appendingPathComponent("codex").path,
+                contents: Data("#!/bin/sh\n".utf8),
+                attributes: [.posixPermissions: 0o755]
+            ))
+        }
+        // A directory that happens to be named like the executable is not one.
+        try FileManager.default.createDirectory(
+            at: empty.appendingPathComponent("codex"), withIntermediateDirectories: true
+        )
+
+        let environment = ["PATH": "\(first.path):\(empty.path):\(second.path)"]
+        let found = HarnessPathScan.copies(of: ["codex"], in: environment)
+        #expect(found == [
+            first.appendingPathComponent("codex").path,
+            second.appendingPathComponent("codex").path,
+        ])
+        #expect(
+            HarnessPathScan.shadowed(
+                of: ["codex"], winner: first.appendingPathComponent("codex").path,
+                in: environment
+            ) == [second.appendingPathComponent("codex").path]
+        )
     }
 
     /// The other two outcomes keep their old meanings. A CLI that exits

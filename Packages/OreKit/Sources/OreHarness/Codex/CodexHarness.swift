@@ -48,6 +48,12 @@ public struct CodexHarness: AgentHarness {
             )
         }
 
+        // See `ClaudeCodeHarness.probe`: every other copy on PATH, because the
+        // one ORE updates and the one the shell runs need not be the same file.
+        let shadowed = HarnessPathScan.shadowed(
+            of: [kind.defaultExecutableName], winner: path
+        )
+
         let versionProbe = await CommandProbe.run(
             executablePath: path,
             arguments: ["--version"],
@@ -55,14 +61,17 @@ public struct CodexHarness: AgentHarness {
             allowAPIKeyFallback: allowAPIKeyFallback
         )
         if case .couldNotLaunch(let reason) = versionProbe {
-            return HarnessDiagnostic.unlaunchable(kind: kind, path: path, reason: reason)
+            return HarnessDiagnostic.unlaunchable(
+                kind: kind, path: path, reason: reason, shadowedPaths: shadowed
+            )
         }
 
         return HarnessProbeResult(
             kind: kind,
             executablePath: path,
             version: versionProbe.firstLine,
-            authState: await probeAuthState(executablePath: path)
+            authState: await probeAuthState(executablePath: path),
+            shadowedPaths: shadowed
         )
     }
 

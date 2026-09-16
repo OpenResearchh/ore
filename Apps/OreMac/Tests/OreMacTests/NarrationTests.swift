@@ -762,7 +762,253 @@ struct NeuralVoiceInstallActionTests {
         #expect(NeuralNarrationVoice.Readiness.failed("no network").installActionTitle == "Try again")
         // Nothing to offer while it is already running, or already done —
         // a second press would either be a no-op or start a needless fetch.
-        #expect(NeuralNarrationVoice.Readiness.installing.installActionTitle == nil)
+        #expect(NeuralNarrationVoice.Readiness.installing(.preparing).installActionTitle == nil)
         #expect(NeuralNarrationVoice.Readiness.ready.installActionTitle == nil)
+    }
+
+    /// A machine that cannot load the model will not load it on the second
+    /// press either. Offering "Try again" there is a button that can only
+    /// ever disappoint.
+    @Test func hardwareThatCannotLoadTheModelIsNotOfferedARetry() {
+        let unsupported = NeuralNarrationVoice.Readiness.unsupported("no Metal device")
+        #expect(unsupported.installActionTitle == nil)
+    }
+
+    /// The fetch had no stop at all: `installTask` was never cancelled by any
+    /// control in the app.
+    @Test func onlyAFetchInFlightOffersACancel() {
+        #expect(NeuralNarrationVoice.Readiness.installing(.preparing).cancelActionTitle == "Cancel")
+        #expect(
+            NeuralNarrationVoice.Readiness.installing(.downloading(fraction: 0.5))
+                .cancelActionTitle == "Cancel"
+        )
+        let settled: [NeuralNarrationVoice.Readiness] = [
+            .notInstalled, .ready, .failed("no network"), .unsupported("no Metal device"),
+        ]
+        for readiness in settled {
+            #expect(readiness.cancelActionTitle == nil)
+        }
+    }
+}
+
+/// Unit 20: a model deleted from disk — a cache cleaner, Migration Assistant,
+/// someone reclaiming space — left the "installed" flag saying yes, and the
+/// next narration line silently re-spent 940 MB.
+@MainActor
+struct NeuralVoiceInstallFlagTests {
+    @Test func aMissingVendorCacheRootRetiresTheInstalledFlag() {
+        // Nothing can be cached under a root that isn't there, so this is the
+        // one direction the inference is sound in.
+        #expect(NeuralNarrationVoice.installFlagIsStale(vendorCacheRootExists: false))
+    }
+
+    @Test func aPresentVendorCacheRootIsNotTakenAsProofOfAnything() {
+        // Pocket TTS's layout under the root is undocumented, so a root that
+        // exists says nothing about these weights. Believing the flag costs at
+        // worst one press of the Download button; disbelieving it wrongly
+        // would cost 940 MB unasked, which is the bug.
+        #expect(!NeuralNarrationVoice.installFlagIsStale(vendorCacheRootExists: true))
+    }
+}
+
+/// Unit 20: the fetch used to die at 900 MB with whatever the vendor's file
+/// writer threw, which told the user nothing about what to do.
+@MainActor
+struct NeuralVoiceDiskSpaceTests {
+    @Test func aVolumeWithRoomRefusesNothing() {
+        #expect(
+            NeuralNarrationVoice.diskShortfall(
+                freeBytes: NeuralNarrationVoice.requiredFreeBytes
+            ) == nil
+        )
+        #expect(NeuralNarrationVoice.diskShortfall(freeBytes: 500_000_000_000) == nil)
+    }
+
+    @Test func theShortfallIsTheDifference() {
+        let required: Int64 = 1_000
+        #expect(
+            NeuralNarrationVoice.diskShortfall(freeBytes: 400, required: required) == 600
+        )
+    }
+
+    /// Unknowable is not the same as too small. A volume that declines to
+    /// report its free space must not block a download that would have worked.
+    @Test func unreadableFreeSpaceBlocksNothing() {
+        #expect(NeuralNarrationVoice.diskShortfall(freeBytes: nil) == nil)
+    }
+
+    /// The pack settles at 940 MB, but every file streams through a `.partial`
+    /// beside its destination first, so the peak is higher than the result.
+    @Test func theCheckAsksForMoreThanTheFinishedSize() {
+        #expect(NeuralNarrationVoice.requiredFreeBytes > 940_000_000)
+    }
+
+    @Test func theRefusalNamesTheShortfallRatherThanTheFailure() {
+        let small = NeuralNarrationVoice.notEnoughSpaceMessage(shortfall: 300_000_000)
+        let large = NeuralNarrationVoice.notEnoughSpaceMessage(shortfall: 900_000_000)
+        #expect(small.contains("disk space"))
+        // The figure in it is this Mac's shortfall, not a fixed sentence: a
+        // user 300 MB short and one 900 MB short are not told the same thing.
+        #expect(small != large)
+    }
+}
+
+/// Unit 20: 940 MB arrived behind a spinner that looked identical at second
+/// one and minute six.
+@MainActor
+struct NeuralVoiceInstallProgressTests {
+    @Test func theDownloadReportsTheFractionFluidAudioActuallyGives() {
+        let line = NeuralNarrationVoice.installStatus(
+            stage: .downloading(fraction: 0.42), elapsed: 75
+        )
+        #expect(line.contains("42%"))
+        // The size is stated up front rather than left for the user to
+        // discover from their disk filling up.
+        #expect(line.contains("940 MB"))
+        #expect(line.contains("1:15"))
+    }
+
+    @Test func anOutOfRangeFractionIsClamped() {
+        #expect(
+            NeuralNarrationVoice.installStatus(stage: .downloading(fraction: 1.4), elapsed: 0)
+                .contains("100%")
+        )
+        #expect(
+            NeuralNarrationVoice.installStatus(stage: .downloading(fraction: -0.2), elapsed: 0)
+                .contains("0%")
+        )
+    }
+
+    /// Listing the repository and the CoreML load report nothing at all.
+    /// Elapsed time is the only honest thing that moves there — and a spinner
+    /// with nothing beside it is exactly what read as hung.
+    @Test func thePhasesWithoutProgressStillShowTimePassing() {
+        #expect(NeuralNarrationVoice.installStatus(stage: .preparing, elapsed: 4).contains("4s"))
+        #expect(NeuralNarrationVoice.installStatus(stage: .loading, elapsed: 9).contains("9s"))
+        // No invented percentage in either.
+        #expect(!NeuralNarrationVoice.installStatus(stage: .loading, elapsed: 9).contains("%"))
+    }
+
+    /// A progress callback that hops to the main actor after its phase ended
+    /// used to be able to put "Downloading 100%" back under "Loading the
+    /// voice…", which reads as the fetch starting over.
+    @Test func theStageOnlyEverMovesForward() {
+        #expect(NeuralNarrationVoice.stageAdvances(from: .preparing, to: .loading))
+        #expect(
+            NeuralNarrationVoice.stageAdvances(
+                from: .preparing, to: .downloading(fraction: 0.1)
+            )
+        )
+        #expect(
+            NeuralNarrationVoice.stageAdvances(
+                from: .downloading(fraction: 0.1), to: .downloading(fraction: 0.9)
+            )
+        )
+        #expect(!NeuralNarrationVoice.stageAdvances(from: .loading, to: .preparing))
+        #expect(
+            !NeuralNarrationVoice.stageAdvances(from: .loading, to: .downloading(fraction: 1))
+        )
+        #expect(
+            !NeuralNarrationVoice.stageAdvances(
+                from: .downloading(fraction: 0.9), to: .downloading(fraction: 0.2)
+            )
+        )
+    }
+
+    @Test func elapsedTimeReadsAsSecondsThenMinutes() {
+        #expect(NeuralNarrationVoice.elapsedDescription(0) == "0s")
+        #expect(NeuralNarrationVoice.elapsedDescription(59) == "59s")
+        #expect(NeuralNarrationVoice.elapsedDescription(60) == "1:00")
+        #expect(NeuralNarrationVoice.elapsedDescription(605) == "10:05")
+    }
+}
+
+/// Unit 20: on a VM or a headless session the model load throws and the user
+/// got a raw vendor error behind a "Try again" that could only fail again.
+@MainActor
+struct NeuralVoiceFailureClassificationTests {
+    private var coreMLFailure: Error {
+        NSError(
+            domain: "com.apple.CoreML", code: 0,
+            userInfo: [NSLocalizedDescriptionKey: "Error in declaring network."]
+        )
+    }
+
+    /// A fetch breaks for reasons that change: the network, the mirror, the
+    /// disk. That one is worth pressing again.
+    @Test func aBrokenFetchStaysRetryable() {
+        let readiness = NeuralNarrationVoice.fetchFailure(URLError(.notConnectedToInternet))
+        #expect(readiness.installActionTitle == "Try again")
+    }
+
+    /// A load breaks with the weights already on disk, so the retry would feed
+    /// the same files to the same runtime on the same machine.
+    @Test func aBrokenLoadIsThisMacSayingNo() {
+        let readiness = NeuralNarrationVoice.loadFailure(coreMLFailure)
+        #expect(readiness == .unsupported("Error in declaring network."))
+        #expect(readiness.installActionTitle == nil)
+    }
+
+    /// Pressing Cancel is not a failure to report back at the user.
+    @Test func cancellationIsNotAFailure() {
+        #expect(NeuralNarrationVoice.fetchFailure(CancellationError()) == .notInstalled)
+        #expect(NeuralNarrationVoice.loadFailure(CancellationError()) == .notInstalled)
+        // URLSession reports the torn-down task its own way.
+        #expect(NeuralNarrationVoice.fetchFailure(URLError(.cancelled)) == .notInstalled)
+    }
+
+    @Test func aRealNetworkErrorIsNotMistakenForCancellation() {
+        #expect(!NeuralNarrationVoice.wasCancelled(URLError(.timedOut)))
+        #expect(NeuralNarrationVoice.wasCancelled(URLError(.cancelled)))
+        #expect(NeuralNarrationVoice.wasCancelled(CancellationError()))
+    }
+}
+
+/// Unit 20: a neural voice that never loaded was only ever explained in
+/// Settings, which is the one place a user who picked it and moved on will
+/// not look again.
+@MainActor
+struct NeuralVoiceNoticeTests {
+    @Test func theSystemVoiceHasNothingToExplain() {
+        let every: [NeuralNarrationVoice.Readiness] = [
+            .notInstalled, .installing(.preparing), .ready, .failed("no network"),
+            .unsupported("no Metal device"),
+        ]
+        for readiness in every {
+            #expect(NarrationEngine.neuralVoiceNotice(for: .system, readiness: readiness) == nil)
+        }
+    }
+
+    @Test func aVoiceThatIsSpeakingOrOnItsWaySaysNothing() {
+        #expect(NarrationEngine.neuralVoiceNotice(for: .neural, readiness: .ready) == nil)
+        #expect(
+            NarrationEngine.neuralVoiceNotice(
+                for: .neural, readiness: .installing(.downloading(fraction: 0.3))
+            ) == nil
+        )
+    }
+
+    @Test func aFailedInstallExplainsItselfAndOffersTheRetry() {
+        let notice = NarrationEngine.neuralVoiceNotice(
+            for: .neural, readiness: .failed("no network")
+        )
+        #expect(notice?.retryTitle == "Try again")
+        // Which voice is actually talking is the part the user can hear and
+        // cannot otherwise account for.
+        #expect(notice?.message.contains("system voice") == true)
+        #expect(notice?.message.contains("no network") == true)
+    }
+
+    @Test func aMacThatCannotRunItIsToldSoWithoutAButton() {
+        let notice = NarrationEngine.neuralVoiceNotice(
+            for: .neural, readiness: .unsupported("no Metal device")
+        )
+        #expect(notice?.retryTitle == nil)
+        #expect(notice?.message.contains("system voice") == true)
+    }
+
+    @Test func anUndownloadedVoiceOffersTheDownload() {
+        let notice = NarrationEngine.neuralVoiceNotice(for: .neural, readiness: .notInstalled)
+        #expect(notice?.retryTitle == "Download")
     }
 }

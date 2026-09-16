@@ -513,7 +513,11 @@ public actor InProcessCoreClient: CoreClient {
            Date().timeIntervalSince(last) < Self.harnessUpdateCheckInterval {
             return
         }
-        let installed = harnessProbes.filter(\.isInstalled)
+        // `isLaunchable`, not `isInstalled`: a quarantined or broken binary
+        // keeps its path on the probe now, and asking a registry for the
+        // latest version of a CLI ORE could not run stores a "did not report a
+        // version" failure against it on every window that opens.
+        let installed = harnessProbes.filter(\.isLaunchable)
         guard !installed.isEmpty else { return }
 
         harnessUpdateCheckInFlight = true
@@ -1992,7 +1996,10 @@ struct HarnessDiscoveryCache: Codable, Sendable, Equatable {
               now.timeIntervalSince(lastUpdateCheck) < InProcessCoreClient.harnessUpdateCheckInterval,
               !updates.isEmpty
         else { return nil }
-        let installed = probes.filter(\.isInstalled)
+        // The same filter `checkHarnessUpdates` applies when it decides what
+        // to ask about. If these two ever disagree the cached set can never
+        // match the probed one, and the throttle silently stops throttling.
+        let installed = probes.filter(\.isLaunchable)
         guard Set(installed.map(\.kind)) == Set(updates.map(\.kind)) else { return nil }
         for probe in installed {
             guard let status = updates.first(where: { $0.kind == probe.kind }),

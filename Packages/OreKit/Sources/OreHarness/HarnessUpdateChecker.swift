@@ -32,7 +32,11 @@ public enum HarnessUpdateChecker {
             case .npm(let package):
                 return URL(string: "https://registry.npmjs.org/\(package)/latest")
             case .cursorInstallScript:
-                return URL(string: "https://cursor.com/install")
+                // The same URL the update itself would fetch — read from the
+                // one list rather than written out again here, so the oracle
+                // cannot end up reporting a version from a different script
+                // than the one `nativeInstaller` runs.
+                return URL(string: HarnessKind.cursorAgent.nativeInstallerURL)
             case .unknown:
                 return nil
             }
@@ -50,9 +54,21 @@ public enum HarnessUpdateChecker {
     /// Fetches a URL's body, or nil for anything that isn't a 2xx.
     public typealias Fetcher = @Sendable (URL) async -> Data?
 
-    public static func source(for kind: HarnessKind, executablePath: String?) -> Source {
-        switch HarnessCLIUpdater.plan(for: kind, executablePath: executablePath) {
+    /// - Parameter isBrewAvailable: passed straight through to the plan, so
+    ///   the oracle and the upgrade can never disagree about whether this
+    ///   machine has Homebrew.
+    public static func source(
+        for kind: HarnessKind,
+        executablePath: String?,
+        isBrewAvailable: Bool = HarnessCLIUpdater.brewIsAvailable()
+    ) -> Source {
+        switch HarnessCLIUpdater.plan(
+            for: kind, executablePath: executablePath, isBrewAvailable: isBrewAvailable
+        ) {
         case .brew(let formula):
+            // Whatever token the plan resolved, including `claude-code@latest`:
+            // reading the stable cask for a user on the @latest one reports a
+            // release a week behind what their own `brew upgrade` would fetch.
             return .homebrew(token: formula)
         case .npm(let package):
             return .npm(package: package)
@@ -68,7 +84,13 @@ public enum HarnessUpdateChecker {
             // second copy in front of the brew one, so say ORE can't tell where
             // it came from — the honest answer, and the one that suppresses the
             // card rather than offering the wrong channel.
-            if let executablePath, HarnessCLIUpdater.isHomebrewPath(executablePath) {
+            //
+            // Only while Homebrew is actually installed, though: once it is
+            // gone the vendor's script is not a rival to a maintained copy,
+            // it is the only channel left — and suppressing the card there
+            // strands the user on whatever version the migration left behind.
+            if let executablePath, HarnessCLIUpdater.isHomebrewPath(executablePath),
+               isBrewAvailable {
                 return .unknown
             }
             if kind == .cursorAgent { return .cursorInstallScript }
@@ -81,12 +103,17 @@ public enum HarnessUpdateChecker {
         kind: HarnessKind,
         installedVersion: String?,
         executablePath: String?,
-        fetch: Fetcher = Self.fetch
+        fetch: Fetcher = Self.fetch,
+        isBrewAvailable: Bool = HarnessCLIUpdater.brewIsAvailable()
     ) async -> HarnessUpdateStatus {
         let installed = HarnessVersion.normalize(installedVersion)
-        let source = source(for: kind, executablePath: executablePath)
+        let source = source(
+            for: kind, executablePath: executablePath, isBrewAvailable: isBrewAvailable
+        )
         let command = HarnessCLIUpdater.script(
-            for: HarnessCLIUpdater.plan(for: kind, executablePath: executablePath)
+            for: HarnessCLIUpdater.plan(
+                for: kind, executablePath: executablePath, isBrewAvailable: isBrewAvailable
+            )
         )
 
         guard installed != nil else {

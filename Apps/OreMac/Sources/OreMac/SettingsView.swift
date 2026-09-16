@@ -647,15 +647,30 @@ private struct SettingsPanes: View {
                     // `isInstalled != true`: offering to install something the
                     // user may already have, because the probe is still in
                     // flight, is the retraction the ladder is careful to avoid.
-                    if let installProbe = probe(for: selectedHarness), !installProbe.isInstalled {
+                    //
+                    // An unlaunchable CLI takes the same button under a
+                    // different name. The probe now keeps its path for one, so
+                    // `isInstalled` is true and this stopped offering anything
+                    // at all — while the sign-in block below started offering
+                    // `claude auth login` against a binary that cannot be
+                    // launched. Reinstalling is the one action that fixes
+                    // every cause of it, which is the rung the welcome card
+                    // gives these users too.
+                    if let installProbe = probe(for: selectedHarness),
+                       !installProbe.isInstalled || installProbe.isUnlaunchable == true {
                         Button {
                             copyInstallCommand()
                         } label: {
-                            Label("Copy install command", systemImage: "doc.on.doc")
+                            Label(
+                                installProbe.isUnlaunchable == true
+                                    ? "Copy reinstall command" : "Copy install command",
+                                systemImage: "doc.on.doc"
+                            )
                         }
                         .buttonStyle(.borderedProminent)
                     }
                     if probe(for: selectedHarness)?.isInstalled == true,
+                       probe(for: selectedHarness)?.isUnlaunchable != true,
                        probe(for: selectedHarness)?.authState == .notAuthenticated {
                         if authenticatingHarness == selectedHarness {
                             // "Waiting for browser…" used to be the whole story
@@ -679,6 +694,20 @@ private struct SettingsPanes: View {
                             .disabled(authenticatingHarness != nil)
                         }
                     }
+                }
+
+                // "I updated it and ORE still shows the old version" is
+                // usually two copies from two channels: the updater upgrades
+                // the one the probe found, and PATH goes on running the other.
+                // Named here as well as on the welcome card because the
+                // welcome card is only reachable with no workspace selected,
+                // and this is the screen somebody investigating a stuck
+                // version actually opens.
+                if let shadowedNote {
+                    Text(shadowedNote)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
 
                 if let authenticationNotice {
@@ -1043,6 +1072,12 @@ private struct SettingsPanes: View {
         if !probe.isInstalled { return "CLI not found" }
         if probe.isEnabled == false { return "Installed · enable to use" }
         if probe.isReady { return "Connected and ready" }
+        // Before "Sign-in required", because a binary that will not start
+        // reports itself signed out and the probe now keeps its path — so this
+        // fell through to offering `claude auth login` against the very binary
+        // that cannot launch. `agentStatusDetail` below renders the probe's
+        // diagnostic, which names the path and the CLI's own reason.
+        if probe.isUnlaunchable == true { return "Installed · won't launch" }
         return "Sign-in required"
     }
     private var agentStatusDetail: String {
@@ -1057,6 +1092,22 @@ private struct SettingsPanes: View {
                 ? "Available to new and existing chats."
                 : "Install or authenticate the CLI, then refresh.")
     }
+    /// The duplicate-install sentence, or nil when there is one copy.
+    ///
+    /// Both paths get named because the fix is manual — ORE will not delete a
+    /// binary for somebody — and the user cannot remove the right copy without
+    /// knowing which one is currently winning.
+    private var shadowedNote: String? {
+        guard let probe = probe(for: selectedHarness),
+              let winner = probe.executablePath,
+              let shadowed = probe.shadowedPaths, !shadowed.isEmpty
+        else { return nil }
+        let others = shadowed.joined(separator: ", ")
+        let copies = shadowed.count == 1 ? "Another copy is" : "Other copies are"
+        return "ORE runs \(winner). \(copies) installed at \(others), which PATH never "
+            + "reaches — so an update can land on a copy that isn't the one running."
+    }
+
     private var loginMethod: String {
         switch probe(for: selectedHarness)?.authState {
         case .authenticated: "CLI subscription"

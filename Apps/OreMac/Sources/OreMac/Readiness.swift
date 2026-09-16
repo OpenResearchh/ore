@@ -111,6 +111,7 @@ extension Readiness {
             workspaceStep(workspaceCount: workspaceCount, repositoryCount: repositoryCount),
             gitIdentityStep(hasGitIdentity: hasGitIdentity),
             githubStep(github: github),
+            shadowedHarnessStep(harnesses: harnesses, hasProbed: hasProbedHarnesses),
         ])
     }
 
@@ -139,8 +140,21 @@ extension Readiness {
         }
 
         // Installed but signed out is the better problem to have: it is one
-        // command away, so say which one.
-        if let installed = harnesses.first(where: { $0.isInstalled && $0.authState == .notAuthenticated }) {
+        // command away, so say which one. A CLI that will not launch is
+        // excluded here even when it reports itself signed out, because
+        // `claude auth login` fails the same way every other launch of it
+        // does — the rung below is the one that can actually fix it.
+        //
+        // And a gated-off integration is excluded the same way `isReady` and
+        // the two rungs around this one exclude it. `probeAll` marks
+        // cursor-agent `isEnabled == false` on every machine that has not
+        // opted into the experiment, so a user whose only agent is a
+        // signed-out cursor-agent was being sent to `cursor-agent login` for
+        // an integration ORE will not run whatever they do — where the
+        // "install a coding agent" rung below would have got them working.
+        if let installed = harnesses.first(where: {
+            $0.isEnabled != false && $0.isLaunchable && $0.authState == .notAuthenticated
+        }) {
             return ReadinessStep(
                 id: "agent",
                 title: "Sign in to \(installed.kind.displayName)",
@@ -148,6 +162,51 @@ extension Readiness {
                 status: .unmet,
                 action: .copyCommand(HarnessSetup.signInCommand(for: installed.kind)),
                 actionTitle: "Copy sign-in command",
+                isBlocking: true
+            )
+        }
+
+        // Present but unrunnable — quarantined, not marked executable, a
+        // broken symlink, a home on an unmounted volume. The probe reports it
+        // as no usable agent, so it used to land on "Install a coding agent":
+        // ORE telling somebody to install software it can see on their disk,
+        // at a path it can name. Reinstalling is the fix that fits every one
+        // of those causes, and the probe's `diagnostic` already says which one
+        // it is, so hand both over instead of guessing on the user's behalf.
+        //
+        // Gated-off integrations are excluded the same way `isReady` excludes
+        // them. `probeAll` marks cursor-agent `isEnabled == false` on every
+        // machine that has not opted into it, so without this a quarantined
+        // cursor-agent would outrank "install a coding agent" and hand the user
+        // a reinstall that leaves ORE exactly as unable to run it as before.
+        if let stuck = harnesses.first(where: {
+            $0.isEnabled != false && $0.isUnlaunchable == true
+        }) {
+            let located = stuck.executablePath.map { "It's installed at \($0)" } ?? "It's installed"
+            let explanation: String
+            if let diagnostic = stuck.diagnostic, !diagnostic.isEmpty {
+                // The probe's own sentence wins once it names the path. Every
+                // producer writes "Found at <path> but could not be launched:
+                // <reason>", so leading with ORE's version of the same thing
+                // gave the user the path twice and the failure twice in one
+                // three-sentence paragraph. ORE's sentence is what fills in
+                // for a diagnostic that does not name the path, not a preamble
+                // to one that does.
+                if let path = stuck.executablePath, diagnostic.contains(path) {
+                    explanation = diagnostic
+                } else {
+                    explanation = "\(located), but ORE can't launch it. \(diagnostic)"
+                }
+            } else {
+                explanation = "\(located), but ORE can't launch it."
+            }
+            return ReadinessStep(
+                id: "agent",
+                title: "\(stuck.kind.displayName) won't run",
+                detail: "\(explanation) Reinstalling replaces the copy that won't start.",
+                status: .unmet,
+                action: .copyCommand(HarnessSetup.installCommand(for: stuck.kind)),
+                actionTitle: "Copy reinstall command",
                 isBlocking: true
             )
         }
@@ -309,6 +368,56 @@ extension Readiness {
             actionTitle: "Copy command", isBlocking: false
         )
     }
+
+    /// Last rung, and never blocking: when a CLI is installed twice from two
+    /// channels the copy PATH picks usually works fine, so this must never
+    /// stand between a new user and their first turn. It sits below even
+    /// `github` because it is not a setup step at all — it is the explanation
+    /// for "I updated it but ORE still shows the old version", which is a
+    /// problem you can only have after you have been working for a while.
+    ///
+    /// Silent rather than `.satisfied` when nothing is shadowed, the same way
+    /// `workspaceStep` stays quiet before there is a project: a checklist that
+    /// hands out a tick for not having a pathological install teaches the user
+    /// nothing, and the row would appear on every machine for no reason.
+    ///
+    /// Both paths get named because the fix is manual — ORE will not delete a
+    /// binary for somebody — and the user cannot remove the right copy without
+    /// knowing which one is currently winning.
+    private static func shadowedHarnessStep(harnesses: [HarnessProbeResult], hasProbed: Bool) -> ReadinessStep {
+        let quiet = ReadinessStep(
+            id: "harness-shadowed", title: "Duplicate agent installs", detail: "",
+            status: .unknown, action: .none, actionTitle: nil, isBlocking: false
+        )
+        // A gated-off integration is skipped for the same reason `isReady`
+        // ignores one: ORE runs neither copy, so which of them PATH reaches is
+        // not a problem the user has.
+        guard hasProbed,
+            let duplicated = harnesses.first(where: {
+                $0.isEnabled != false && $0.executablePath != nil
+                    && !($0.shadowedPaths ?? []).isEmpty
+            }),
+            let winner = duplicated.executablePath
+        else { return quiet }
+
+        let others = (duplicated.shadowedPaths ?? []).joined(separator: ", ")
+        let executable = URL(fileURLWithPath: winner).lastPathComponent
+        return ReadinessStep(
+            id: "harness-shadowed",
+            // Not "two copies": PATH can carry more than one loser, and a
+            // headline that miscounts them is the kind of small wrongness that
+            // makes a user stop trusting the rest of the card.
+            title: "Duplicate \(duplicated.kind.displayName) installs",
+            detail:
+                "ORE runs \(winner). The same CLI is also installed at \(others), where PATH never "
+                + "reaches it — so an update can land on the copy that isn't the one running. "
+                + "Remove whichever you don't want.",
+            status: .unmet,
+            action: .copyCommand("which -a \(executable)"),
+            actionTitle: "Copy command to list them",
+            isBlocking: false
+        )
+    }
 }
 
 // MARK: - Probes
@@ -366,11 +475,16 @@ enum HarnessSetup {
     /// npm route is not worth keeping even as a fallback: it trades a
     /// guaranteed-working command for one that needs a prerequisite ORE would
     /// then also have to explain.
+    ///
+    /// Built from `HarnessKind.nativeInstallerURL` rather than spelled out
+    /// again. The two lists had already drifted — this one piped Codex's
+    /// script to `sh` while `HarnessCLIUpdater` and `HarnessRepair` both piped
+    /// the same URL to `bash`, and wrote Cursor's curl flags in a different
+    /// order — so a user could be handed three cosmetically different commands
+    /// for one install depending on which screen they were looking at. One
+    /// source of truth means a URL that changes cannot change in only two of
+    /// the three places that state it.
     static func installCommand(for kind: HarnessKind) -> String {
-        switch kind {
-        case .claudeCode: "curl -fsSL https://claude.ai/install.sh | bash"
-        case .codex: "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
-        case .cursorAgent: "curl https://cursor.com/install -fsS | bash"
-        }
+        "curl -fsSL \(kind.nativeInstallerURL) | bash"
     }
 }

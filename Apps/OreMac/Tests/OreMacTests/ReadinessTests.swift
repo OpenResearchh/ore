@@ -12,13 +12,21 @@ struct ReadinessTests {
     private func probe(
         _ kind: HarnessKind,
         installed: Bool = true,
-        auth: HarnessProbeResult.AuthState = .authenticated
+        auth: HarnessProbeResult.AuthState = .authenticated,
+        diagnostic: String? = nil,
+        unlaunchable: Bool? = nil,
+        shadowed: [String]? = nil,
+        enabled: Bool? = nil
     ) -> HarnessProbeResult {
         HarnessProbeResult(
             kind: kind,
             executablePath: installed ? "/usr/local/bin/\(kind.defaultExecutableName)" : nil,
             version: installed ? "1.0.0" : nil,
-            authState: auth
+            authState: auth,
+            isEnabled: enabled,
+            diagnostic: diagnostic,
+            isUnlaunchable: unlaunchable,
+            shadowedPaths: shadowed
         )
     }
 
@@ -61,6 +69,20 @@ struct ReadinessTests {
             #expect(!command.contains("npm"), "\(kind) install command requires npm: \(command)")
             #expect(!command.contains("brew"), "\(kind) install command requires Homebrew: \(command)")
             #expect(command.hasPrefix("curl "), "\(kind) install command is not self-bootstrapping: \(command)")
+        }
+    }
+
+    /// One source of truth for each vendor's installer. These were written
+    /// out twice — here and as `HarnessKind.nativeInstallerURL` in OreProtocol
+    /// — and had already drifted, so the same install could be handed to a
+    /// user in three cosmetically different forms depending on the screen.
+    @Test("Install commands are built from the one list of installer URLs")
+    func installCommandsUseTheSharedInstallerURLs() {
+        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+            #expect(
+                HarnessSetup.installCommand(for: kind).contains(kind.nativeInstallerURL),
+                "\(kind) install command does not use its installer URL"
+            )
         }
     }
 
@@ -215,6 +237,173 @@ struct ReadinessTests {
         #expect(!first.title.isEmpty)
 
         #expect(NextStepCard.fallbackStep(for: readiness) == first)
+    }
+
+    /// The bug: a quarantined or non-executable CLI probes as "no usable
+    /// agent", so the ladder told the user to install something ORE could see
+    /// on their disk. The fix has to name the path and offer a reinstall.
+    @Test("A CLI that won't launch is never described as missing")
+    func unlaunchableAgentIsNotCalledMissing() throws {
+        let readiness = evaluate(harnesses: [
+            probe(
+                .claudeCode,
+                auth: .unknown,
+                diagnostic: "macOS blocked it: “claude” cannot be opened because it is from an unidentified developer.",
+                unlaunchable: true
+            )
+        ])
+
+        let step = try #require(readiness.nextStep)
+        #expect(step.id == "agent")
+        #expect(step.title != "Install a coding agent")
+        #expect(step.detail.contains("/usr/local/bin/claude"), "the path ORE can name must be named")
+        #expect(step.detail.contains("unidentified developer"), "the probe's diagnostic carries the reason")
+        // Reinstalling is the one action that fixes every cause of this.
+        #expect(step.action == .copyCommand(HarnessSetup.installCommand(for: .claudeCode)))
+        #expect(!readiness.isReady)
+    }
+
+    /// The shape every real producer writes: `HarnessDiagnostic.unlaunchable`
+    /// says "Found at <path> but could not be launched: <reason>". The card
+    /// used to open with its own version of that same sentence, so the user
+    /// read the path twice and the failure twice.
+    @Test("The card does not restate a diagnostic that already names the path")
+    func unlaunchableDetailDoesNotRepeatItself() throws {
+        let readiness = evaluate(harnesses: [
+            probe(
+                .claudeCode,
+                auth: .notAuthenticated,
+                diagnostic: "Found at /usr/local/bin/claude but could not be launched: "
+                    + "dyld: Library not loaded: libnode.dylib",
+                unlaunchable: true
+            )
+        ])
+
+        let step = try #require(readiness.nextStep)
+        let occurrences = step.detail.components(separatedBy: "/usr/local/bin/claude").count - 1
+        #expect(occurrences == 1, "the path is named once: \(step.detail)")
+        #expect(step.detail.contains("libnode"), "the CLI's own reason survives")
+        #expect(step.detail.hasSuffix("Reinstalling replaces the copy that won't start."))
+    }
+
+    /// Sign-in is normally the better problem to have, but not for a binary
+    /// that cannot start: `codex login` would fail the same way every other
+    /// launch of it does.
+    @Test("An unlaunchable CLI is never handed a sign-in command")
+    func unlaunchableAgentSkipsSignIn() {
+        let readiness = evaluate(harnesses: [
+            probe(.codex, auth: .notAuthenticated, unlaunchable: true)
+        ])
+        #expect(readiness.nextStep?.action != .copyCommand("codex login"))
+        #expect(readiness.nextStep?.action == .copyCommand(HarnessSetup.installCommand(for: .codex)))
+    }
+
+    /// A working agent one command away beats a broken one that needs a
+    /// reinstall, so the launchable harness still wins the rung.
+    @Test("A signed-out but runnable agent outranks an unlaunchable one")
+    func runnableSignedOutWinsOverUnlaunchable() {
+        let readiness = evaluate(harnesses: [
+            probe(.claudeCode, auth: .unknown, unlaunchable: true),
+            probe(.codex, auth: .notAuthenticated),
+        ])
+        #expect(readiness.nextStep?.title == "Sign in to Codex")
+    }
+
+    /// The winning copy usually works, so this warning must never be the
+    /// thing standing between a new user and their first turn.
+    @Test("A shadowed second copy never outranks getting started")
+    func shadowedCopyIsNotBlocking() throws {
+        let readiness = evaluate(harnesses: [
+            probe(.claudeCode, shadowed: ["/opt/homebrew/bin/claude"])
+        ])
+        #expect(readiness.nextStep?.id == "project", "setup still comes first")
+
+        let shadowed = try #require(readiness.steps.first { $0.id == "harness-shadowed" })
+        #expect(!shadowed.isBlocking)
+        #expect(shadowed.status == .unmet)
+        #expect(readiness.isReady == false, "blocked by the project rung, not by this one")
+    }
+
+    /// Named paths are the whole point: the user cannot remove the right copy
+    /// without knowing which one PATH is currently reaching.
+    @Test("The shadowed-copy warning names both installs")
+    func shadowedCopyNamesBothPaths() throws {
+        let readiness = evaluate(
+            harnesses: [probe(.claudeCode, shadowed: ["/opt/homebrew/bin/claude"])],
+            repositories: 1,
+            workspaces: 1
+        )
+        // Only reached once nothing else is open — and it never blocks.
+        #expect(readiness.isReady)
+        let step = try #require(readiness.nextStep)
+        #expect(step.id == "harness-shadowed")
+        #expect(step.detail.contains("/usr/local/bin/claude"))
+        #expect(step.detail.contains("/opt/homebrew/bin/claude"))
+    }
+
+    /// `HarnessRegistry.probeAll` marks cursor-agent disabled on every machine
+    /// that has not opted into it, so this is the ordinary shape of the probe,
+    /// not an exotic one. Reinstalling a CLI ORE still refuses to run leaves
+    /// the user exactly as stuck, with a fresh copy of the same binary.
+    @Test("A gated-off integration that won't launch is not offered a reinstall")
+    func disabledUnlaunchableAgentFallsBackToInstall() {
+        let readiness = evaluate(harnesses: [
+            probe(.cursorAgent, auth: .notAuthenticated, unlaunchable: true, enabled: false)
+        ])
+        #expect(readiness.nextStep?.title == "Install a coding agent")
+        #expect(
+            readiness.nextStep?.action == .copyCommand(HarnessSetup.installCommand(for: .claudeCode))
+        )
+    }
+
+    /// The last agent-rung predicate that disagreed with `isReady`. Signing
+    /// into an integration ORE refuses to run leaves the user exactly where
+    /// they started, while the install rung below would have got them working.
+    @Test("A signed-out gated-off integration is not offered a sign-in")
+    func disabledSignedOutAgentFallsBackToInstall() {
+        let readiness = evaluate(harnesses: [
+            probe(.cursorAgent, auth: .notAuthenticated, enabled: false)
+        ])
+        #expect(readiness.nextStep?.title == "Install a coding agent")
+        #expect(readiness.nextStep?.action != .copyCommand("cursor-agent login"))
+    }
+
+    /// Same rule for the duplicate-install warning: ORE runs neither copy of a
+    /// gated-off CLI, so which one PATH reaches is not a problem the user has.
+    @Test("Duplicate copies of a gated-off integration stay unmentioned")
+    func disabledHarnessKeepsShadowRungSilent() {
+        let readiness = evaluate(
+            harnesses: [
+                probe(.claudeCode),
+                probe(.cursorAgent, shadowed: ["/opt/homebrew/bin/agent"], enabled: false),
+            ],
+            repositories: 1,
+            workspaces: 1
+        )
+        let shadowed = readiness.steps.first { $0.id == "harness-shadowed" }
+        #expect(shadowed?.status == .unknown)
+        #expect(readiness.nextStep == nil)
+    }
+
+    /// Nothing shadowed is not an achievement, so the rung stays out of the
+    /// checklist rather than handing out a tick on every machine.
+    @Test("With one copy installed the shadow rung says nothing at all")
+    func singleCopyKeepsShadowRungSilent() {
+        let readiness = evaluate(
+            harnesses: [probe(.claudeCode)], repositories: 1, workspaces: 1
+        )
+        let shadowed = readiness.steps.first { $0.id == "harness-shadowed" }
+        #expect(shadowed?.status == .unknown)
+        #expect(!readiness.relevantSteps.contains { $0.id == "harness-shadowed" })
+        #expect(readiness.nextStep == nil)
+    }
+
+    /// Same rule as every other rung: an answer we do not have yet is not an
+    /// answer to act on.
+    @Test("Nothing is claimed about duplicate installs before the probe returns")
+    func quietBeforeProbeForShadowedCopies() {
+        let readiness = evaluate(harnesses: [], hasProbed: false)
+        #expect(!readiness.relevantSteps.contains { $0.id == "harness-shadowed" })
     }
 
     @Test("A fully set-up machine has nothing to say")

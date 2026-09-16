@@ -51,6 +51,13 @@ public struct ClaudeCodeHarness: AgentHarness {
             )
         }
 
+        // The same PATH walk that found `path`, carried on past the winner:
+        // a second copy from a second channel is why an update can look like
+        // it did nothing.
+        let shadowed = HarnessPathScan.shadowed(
+            of: [kind.defaultExecutableName], winner: path
+        )
+
         let versionProbe = await CommandProbe.run(
             executablePath: path,
             arguments: ["--version"],
@@ -60,7 +67,9 @@ public struct ClaudeCodeHarness: AgentHarness {
         // The first thing ORE asks the binary is also the proof that it can be
         // asked anything at all.
         if case .couldNotLaunch(let reason) = versionProbe {
-            return HarnessDiagnostic.unlaunchable(kind: kind, path: path, reason: reason)
+            return HarnessDiagnostic.unlaunchable(
+                kind: kind, path: path, reason: reason, shadowedPaths: shadowed
+            )
         }
         let version = versionProbe.firstLine
         // Answered now, while the doctor is already asking the CLI things, so
@@ -72,7 +81,8 @@ public struct ClaudeCodeHarness: AgentHarness {
             executablePath: path,
             version: version,
             authState: await probeAuthState(executablePath: path),
-            diagnostic: nil
+            diagnostic: nil,
+            shadowedPaths: shadowed
         )
     }
 
@@ -386,18 +396,20 @@ enum HarnessDiagnostic {
 
     /// A binary ORE found on disk and could not start.
     ///
-    /// No `executablePath` on the result, though the text names the path:
-    /// `isInstalled` is what puts the readiness ladder on its "installed but
-    /// not signed in" rung, and sending this user to `claude auth login` —
-    /// a command that has to launch the very binary that will not launch —
-    /// is the dead end this exists to remove. Reinstalling is the real fix,
-    /// which is the rung they get instead. `.notAuthenticated` keeps
-    /// `isReady` false for anything reading the state rather than the rung;
-    /// the landed `agent`-impostor guard makes the same call.
+    /// The path *is* on the result, and `isUnlaunchable` says why it is not
+    /// usable. Withholding the path was how this was first fixed — dropping it
+    /// made `isInstalled` false, which kept the user off the "signed in?" rung
+    /// and its dead-end `claude auth login`, a command that has to launch the
+    /// very binary that will not launch. But it also made the ladder say
+    /// "install an agent" about a CLI sitting right there, at a path ORE can
+    /// name. `isReady` reads `isUnlaunchable` now, so the state can be honest:
+    /// installed, at this path, and broken. `.notAuthenticated` stays for
+    /// anything still reading auth alone.
     static func unlaunchable(
         kind: HarnessKind,
         path: String,
-        reason: String
+        reason: String,
+        shadowedPaths: [String]? = nil
     ) -> HarnessProbeResult {
         // One bounded line: this is rendered as a caption in Settings, and a
         // CLI that dies on launch can print a whole stack trace at us.
@@ -410,11 +422,76 @@ enum HarnessDiagnostic {
             : firstLine
         return HarnessProbeResult(
             kind: kind,
+            executablePath: path,
             authState: .notAuthenticated,
             diagnostic: condensed.isEmpty
                 ? "Found at \(path) but could not be launched."
-                : "Found at \(path) but could not be launched: \(condensed)"
+                : "Found at \(path) but could not be launched: \(condensed)",
+            isUnlaunchable: true,
+            shadowedPaths: shadowedPaths
         )
+    }
+}
+
+/// Every copy of an agent CLI the user's `PATH` can reach.
+///
+/// Two copies from two install channels is the usual shape of "I updated it
+/// and ORE still shows the old version": `HarnessCLIUpdater` upgrades the one
+/// the probe found, and `PATH` goes on running a different one. Nothing here
+/// decides anything — it records what is there, and the app says so.
+///
+/// `ShellEnvironment.locate` answers with the winner and stops; this is the
+/// same walk, carried on to the end.
+enum HarnessPathScan {
+    /// Every executable named one of `names` on the resolved `PATH`, in the
+    /// order the shell would try them.
+    static func copies(of names: [String], in environment: [String: String]? = nil) -> [String] {
+        let environment = environment ?? ShellEnvironment.loginShellEnvironment()
+        let searchPath = environment["PATH"] ?? ""
+        var found: [String] = []
+        var seen: Set<String> = []
+        for directory in searchPath.split(separator: ":", omittingEmptySubsequences: true) {
+            for name in names {
+                let candidate = URL(fileURLWithPath: String(directory))
+                    .appendingPathComponent(name).path
+                guard isExecutable(candidate), seen.insert(candidate).inserted else { continue }
+                found.append(candidate)
+            }
+        }
+        return found
+    }
+
+    /// The copies that lose to `winner`.
+    ///
+    /// nil rather than `[]` for the ordinary case of one install: the field is
+    /// optional so an older serialized probe stays decodable, and an empty
+    /// array would be a second way of spelling "nothing to report".
+    static func shadowed(
+        of names: [String], winner: String, in environment: [String: String]? = nil
+    ) -> [String]? {
+        shadowed(among: copies(of: names, in: environment), winner: winner)
+    }
+
+    /// Pure, so the rule can be checked without a `PATH` full of decoys.
+    ///
+    /// A winner that is not itself on `PATH` reports nothing. That is the
+    /// `executablePathOverride` case: the user has pointed ORE at a copy
+    /// outside `PATH` on purpose, and calling every copy that *is* on `PATH`
+    /// "shadowed" states the relationship backwards — those are the ones a
+    /// shell reaches, and the override is the one it never would. The honest
+    /// answer about a walk the winner did not take part in is silence.
+    static func shadowed(among copies: [String], winner: String) -> [String]? {
+        guard copies.contains(winner) else { return nil }
+        let losers = copies.filter { $0 != winner }
+        return losers.isEmpty ? nil : losers
+    }
+
+    private static func isExecutable(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else { return false }
+        return FileManager.default.isExecutableFile(atPath: path)
     }
 }
 

@@ -77,6 +77,13 @@ public struct CursorAgentHarness: AgentHarness {
             )
         }
         let path = resolved.path
+        // Only the name this install actually answered to. Scanning for both
+        // would report any unrelated program called `agent` as a second copy
+        // of cursor-agent — the same impostor problem the version check below
+        // exists for, in a place where it would read as a scary warning.
+        let shadowed = HarnessPathScan.shadowed(
+            of: [(path as NSString).lastPathComponent], winner: path
+        )
 
         let versionProbe = await CommandProbe.run(
             executablePath: path,
@@ -85,7 +92,9 @@ public struct CursorAgentHarness: AgentHarness {
             allowAPIKeyFallback: allowAPIKeyFallback
         )
         if case .couldNotLaunch(let reason) = versionProbe {
-            return HarnessDiagnostic.unlaunchable(kind: kind, path: path, reason: reason)
+            return HarnessDiagnostic.unlaunchable(
+                kind: kind, path: path, reason: reason, shadowedPaths: shadowed
+            )
         }
         let version = versionProbe.firstLine
 
@@ -128,7 +137,8 @@ public struct CursorAgentHarness: AgentHarness {
             authState: authState,
             diagnostic: "Experimental: this CLI has no approval channel. Tool "
                 + "calls are decided by Cursor's auto-review classifier"
-                + (allowUnprompted ? ", or run unprompted in Bypass mode." : ".")
+                + (allowUnprompted ? ", or run unprompted in Bypass mode." : "."),
+            shadowedPaths: shadowed
         )
     }
 

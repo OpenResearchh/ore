@@ -174,10 +174,29 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
     public var isEnabled: Bool?
     /// Set when the CLI is present but something is wrong we can explain.
     public var diagnostic: String?
+    /// The CLI was found on PATH but could not be executed — quarantined, not
+    /// marked executable, a broken symlink, an unmounted network volume.
+    ///
+    /// Distinct from "not installed", and the distinction is the whole point:
+    /// telling somebody to install a CLI that is sitting right there, at a path
+    /// ORE can name, sends them to do the one thing that will not help.
+    ///
+    /// Optional for the same reason as `isEnabled`: synthesized `Codable`
+    /// throws on a missing key for a non-optional, so an older serialized
+    /// probe snapshot would fail to decode. nil means "not assessed".
+    public var isUnlaunchable: Bool?
+    /// Other copies of this CLI found on PATH, in search order, excluding the
+    /// one at `executablePath` that actually wins.
+    ///
+    /// Two copies from two install channels is the usual shape of "I updated
+    /// it but ORE still reports the old version": the updater upgrades the one
+    /// it can see, and PATH keeps running the other.
+    public var shadowedPaths: [String]?
 
     public var isInstalled: Bool { executablePath != nil }
     public var isReady: Bool {
         isEnabled != false && isInstalled && authState != .notAuthenticated
+            && isUnlaunchable != true
     }
 
     public init(
@@ -186,7 +205,9 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         version: String? = nil,
         authState: AuthState = .unknown,
         isEnabled: Bool? = nil,
-        diagnostic: String? = nil
+        diagnostic: String? = nil,
+        isUnlaunchable: Bool? = nil,
+        shadowedPaths: [String]? = nil
     ) {
         self.kind = kind
         self.executablePath = executablePath
@@ -194,6 +215,8 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         self.authState = authState
         self.isEnabled = isEnabled
         self.diagnostic = diagnostic
+        self.isUnlaunchable = isUnlaunchable
+        self.shadowedPaths = shadowedPaths
     }
 }
 

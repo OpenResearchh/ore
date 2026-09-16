@@ -48,12 +48,18 @@ struct ChildProcessLifecycleTests {
         for _ in 0..<60 {
             pipeEnds += try await runToCompletion()
         }
-        // Stdin closes on the write queue; give it a beat.
-        try await Task.sleep(for: .milliseconds(200))
-
         // Three pipes, two ends each, per process.
         #expect(pipeEnds.count == 60 * 6)
-        let leaked = pipeEnds.filter(\.isStillOpen)
+
+        // Stdin closes on the write queue, which a busy CI runner can take
+        // well over 200 ms to reach. A real leak stays open however long this
+        // waits, so wait for the last close instead of guessing a delay.
+        var leaked = pipeEnds.filter(\.isStillOpen)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !leaked.isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+            leaked = leaked.filter(\.isStillOpen)
+        }
         #expect(leaked.count == 0, "\(leaked.count) pipe ends are still open")
     }
 

@@ -756,3 +756,42 @@ struct VoiceAssistantPermissionPromptTests {
         #expect(item.id == "permission-permission-42")
     }
 }
+
+/// Unit 14: the hands-free watcher used to read the recognizer's error, drop
+/// it, and return to `.idle` — so a denied microphone made the HUD blink and
+/// vanish with nothing said anywhere.
+@MainActor
+struct VoiceSessionFailureTests {
+    @Test func handsFreeFailureIsRetainedForTheHUD() {
+        let report = VoiceSessionFailure.report(
+            status: .error(VoiceAvailability.microphoneDenied.message),
+            settingsLink: .microphone,
+            heard: ""
+        )
+        #expect(report?.message == VoiceAvailability.microphoneDenied.message)
+        #expect(report?.settingsLink == .microphone)
+
+        // The recognizer's reason beats the generic one even when it did
+        // manage to hear something before it fell over.
+        let partial = VoiceSessionFailure.report(
+            status: .error("Speech recognition is busy. Try again in a moment."),
+            settingsLink: nil,
+            heard: "run the"
+        )
+        #expect(partial?.message.contains("busy") == true)
+        #expect(partial?.settingsLink == nil)
+    }
+
+    @Test func anEmptyReleaseStillSaysSomethingAndAHeardOneDoesNot() {
+        #expect(
+            VoiceSessionFailure.report(status: .idle, settingsLink: nil, heard: "   \n")?.message
+                == VoiceSessionFailure.nothingHeard
+        )
+        // Words were heard and the session is about to send them: nothing to
+        // report, and no pill left over to explain.
+        #expect(
+            VoiceSessionFailure.report(status: .idle, settingsLink: nil, heard: "run the tests")
+                == nil
+        )
+    }
+}

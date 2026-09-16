@@ -599,6 +599,25 @@ struct TranscriptDisplayTests {
         #expect(state.prominentError?.needsCLIUpgrade == false)
         #expect(state.prominentError?.resetsAt != nil)
     }
+
+    @Test func missingCLIErrorAsksForInstallNotSignIn() {
+        let error = ChatState.ProminentError(
+            message: "Claude Code CLI (`claude`) was not found on PATH: /usr/bin:/bin",
+            isUsageLimit: false,
+            resetsAt: nil
+        )
+        #expect(error.needsInstall)
+        #expect(!error.needsSignIn)
+        #expect(!error.needsCLIUpgrade)
+        #expect(!error.isUsageLimit)
+    }
+
+    @Test func aMissingGitIsNotTheAgentToInstall() {
+        let error = ChatState.ProminentError(
+            message: "git was not found on PATH.", isUsageLimit: false, resetsAt: nil
+        )
+        #expect(!error.needsInstall)
+    }
 }
 
 struct ComposerBusyCopyTests {

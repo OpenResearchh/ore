@@ -78,6 +78,38 @@ struct HarnessUpdateCheckerTests {
         )
     }
 
+    /// cursor-agent is the one harness with no Homebrew formula ORE knows, so
+    /// a brew-prefix install of it fell through to the vendor's install script
+    /// — a channel that would land a second copy in front of the brew one. No
+    /// channel is the honest answer, and it is what suppresses the card.
+    @Test func brewInstallWithNoFormulaIsNotOfferedTheVendorScript() {
+        #expect(HarnessKind.cursorAgent.brewFormula == nil)
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .cursorAgent, executablePath: "/opt/homebrew/bin/cursor-agent"
+            ) == .unknown
+        )
+        // A vendor install is still upgradable through the vendor.
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .cursorAgent, executablePath: "/Users/me/.local/bin/cursor-agent"
+            ) == .cursorInstallScript
+        )
+    }
+
+    /// And the card it produces says so rather than advertising a version.
+    @Test func anUnknownChannelReportsThatItCannotTell() async {
+        let status = await HarnessUpdateChecker.check(
+            kind: .cursorAgent,
+            installedVersion: "2026.09.02-c22c1a3",
+            executablePath: "/opt/homebrew/bin/cursor-agent",
+            fetch: { _ in Issue.record("an unknown channel must not be fetched"); return nil }
+        )
+        #expect(status.latestVersion == nil)
+        #expect(!status.isUpdateAvailable)
+        #expect(status.failure?.contains("can't tell") == true)
+    }
+
     @Test func homebrewFallsBackToTheFormulaNamespace() {
         let cask = HarnessUpdateChecker.Source.homebrew(token: "codex")
         #expect(cask.url?.absoluteString.contains("/api/cask/codex.json") == true)

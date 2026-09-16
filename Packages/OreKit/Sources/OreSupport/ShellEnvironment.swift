@@ -27,6 +27,16 @@ public enum ShellEnvironment {
 
     private static let cache = Cache()
 
+    /// Whether the most recent probe came back with nothing.
+    ///
+    /// A shell that never answers is not a rare event — a profile that waits
+    /// on input, or a `$SHELL` that rejects our flags, both land here — and
+    /// the fallback PATH is the *app's* environment, not the user's. Without
+    /// this the harness diagnostic printed that reduced PATH as though the
+    /// user had chosen it, so "not found on PATH" read as "you didn't install
+    /// it" when the truth was "ORE never got to look in the right places".
+    private static let probeDidFail = Lockbox(false)
+
     /// Computes a value once, without holding its lock while computing.
     ///
     /// The login-shell probe can take seconds; holding a lock across it made
@@ -79,7 +89,11 @@ public enum ShellEnvironment {
     /// a degraded `PATH` beats a hung launch. Either way the result is
     /// augmented with the directories and variables child CLIs assume exist.
     public static func loginShellEnvironment() -> [String: String] {
-        cache.resolve { augmented(probeLoginShell() ?? ProcessInfo.processInfo.environment) }
+        cache.resolve {
+            let probed = probeLoginShell()
+            probeDidFail.set(probed == nil)
+            return augmented(probed ?? ProcessInfo.processInfo.environment)
+        }
     }
 
     /// Forgets the probed login-shell environment so the next read re-runs it.
@@ -177,7 +191,20 @@ public enum ShellEnvironment {
     }
 
     public static var searchPathDescription: String {
-        loginShellEnvironment()["PATH"] ?? "(no PATH)"
+        // Resolve first: the probe is what sets `probeDidFail`.
+        let path = loginShellEnvironment()["PATH"] ?? "(no PATH)"
+        return describeSearchPath(path, probeFailed: probeDidFail.get())
+    }
+
+    /// The PATH as a diagnostic should present it: with an admission attached
+    /// when it is the fallback rather than the login shell's own.
+    ///
+    /// Every caller inlines this into "Not found on PATH (…)", so the excuse
+    /// has to be one clause and not a paragraph.
+    static func describeSearchPath(_ path: String, probeFailed: Bool) -> String {
+        guard probeFailed else { return path }
+        return "\(path) \u{2014} your login shell did not answer, so this is a reduced "
+            + "PATH and anything nvm, mise or asdf puts on it is missing"
     }
 
     /// Backfills what a broken or minimal environment leaves out: the common
@@ -224,14 +251,32 @@ public enum ShellEnvironment {
     /// notices and update nags, and parsing that noise as environment
     /// variables produces a corrupt environment rather than an obvious failure.
     private static func probeLoginShell() -> [String: String]? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        // `loginShellPath`, not `$SHELL` directly: this file already worked out
+        // once that `$SHELL` can be absent or point at something that isn't
+        // there, and the probe was the one caller still guessing on its own.
+        let shell = loginShellPath
         guard isExecutable(shell) else { return nil }
 
-        // Interactive as well as login first: nvm and mise are commonly
-        // initialized in .zshrc / .bashrc rather than the profile. If that
-        // hangs or fails (a profile waiting on input), retry login-only, which
-        // skips the interactive rc files entirely.
-        return probe(shell: shell, flags: "-ilc") ?? probe(shell: shell, flags: "-lc")
+        for flags in probeFlagAttempts(for: shell) {
+            if let environment = probe(shell: shell, flags: flags) { return environment }
+        }
+        return nil
+    }
+
+    /// The flag sets to try when probing `shell`, most informative first.
+    ///
+    /// Interactive as well as login first: nvm and mise are commonly
+    /// initialized in .zshrc / .bashrc rather than the profile. If that hangs
+    /// or fails (a profile waiting on input), login-only skips the interactive
+    /// rc files entirely.
+    ///
+    /// Both of those are bash/zsh spellings, though, and fish or nu reject the
+    /// bundle outright — so a user with an exotic login shell got no probe at
+    /// all, which is precisely the user whose PATH ORE cannot guess. They get
+    /// the one form every shell understands.
+    static func probeFlagAttempts(for shell: String) -> [String] {
+        let name = (shell as NSString).lastPathComponent
+        return (name == "zsh" || name == "bash") ? ["-ilc", "-lc"] : ["-c"]
     }
 
     private static func probe(shell: String, flags: String) -> [String: String]? {

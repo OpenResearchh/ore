@@ -1391,6 +1391,15 @@ struct ChatPane: View {
                 .oreGlassSurface(.rect(cornerRadius: 12), elevation: .popover)
             }
 
+            // Dictation failures used to live in the placeholder, which only
+            // shows while the draft is empty — and the commonest failure of
+            // all is the one where the user typed first and then reached for
+            // the mic. The error got a row of its own so it cannot be hidden
+            // by the very text it was raised about.
+            if case .error(let message) = voice.status {
+                voiceErrorRow(message)
+            }
+
             // The editor stays mounted under the voice transcript instead of
             // being swapped out for it. The swap tore down the scroll view and
             // text stack at every dictation and rebuilt both, with a fresh
@@ -2079,6 +2088,33 @@ struct ChatPane: View {
         }
     }
 
+    /// A dictation failure, with the way out of it when macOS is the reason.
+    ///
+    /// The pane comes from the controller rather than from reading the message
+    /// back: it is the only thing that knows whether Settings can undo this
+    /// failure, and a button onto a pane with nothing to change in it is the
+    /// same dead end as no button at all.
+    @ViewBuilder
+    private func voiceErrorRow(_ message: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: OreTheme.Space.xs) {
+            Image(systemName: "mic.slash")
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            Text(message)
+                .font(.system(size: OreTheme.Font.caption))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if let link = voice.errorSettingsLink {
+                Button("Open Privacy Settings") { _ = SystemSettingsLink.open(link) }
+                    .buttonStyle(.link)
+                    .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                    .help("Opens System Settings ▸ \(link.paneName)")
+            }
+        }
+        .foregroundStyle(OreTheme.warning)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transition(.opacity)
+    }
+
     private func toggleVoice() {
         // Pressing again during the hold means "go now": send the pending turn
         // rather than opening a second dictation on top of it.
@@ -2110,7 +2146,7 @@ struct ChatPane: View {
 
     /// The recognizer failing flips `isActive` off before `finishVoice` can
     /// run, which would silently drop everything already spoken. Park the words
-    /// in the draft and let the placeholder surface the error.
+    /// in the draft; the composer's error row surfaces the failure itself.
     private func handleVoiceStatusChange(_ status: VoiceInputController.Status) {
         guard case .error = status else { return }
         let spoken = voice.transcript
@@ -2491,7 +2527,6 @@ struct ChatPane: View {
     private func placeholder(_ chat: ChatState) -> String {
         if case .preparing = voice.status { return "Starting dictation…" }
         if case .downloadingModel = voice.status { return "Downloading speech model…" }
-        if case .error(let message) = voice.status { return message }
         return chat.draftComments.isEmpty
             ? "Ask the agent to do something…"
             : "\(chat.draftComments.count) review comment"
@@ -2856,6 +2891,7 @@ struct ChatPane: View {
             error: error,
             harnessName: harness.displayName,
             signInCommand: HarnessSetup.signInCommand(for: harness),
+            installCommand: HarnessSetup.installCommand(for: harness),
             scheduled: model.scheduledContinuation(for: chatSummary?.id),
             cliUpdate: matchingUpdate,
             onContinueWhenAvailable: scheduleContinuation,
@@ -2866,6 +2902,12 @@ struct ChatPane: View {
                 model.updateHarnessCLI(for: chatSummary)
             },
             onCopySignIn: {
+                model.refreshHarnesses()
+            },
+            onCopyInstall: {
+                // Re-probe on the way out: by the time the user comes back the
+                // CLI they just installed should be on the ladder, so Retry
+                // stops being the only button that ever worked here.
                 model.refreshHarnesses()
             },
             onDismiss: { chat.dismissProminentError() }
@@ -4291,6 +4333,7 @@ private struct ProminentErrorBanner: View {
     let error: ChatState.ProminentError
     var harnessName: String = "CLI"
     var signInCommand: String = "claude auth login"
+    var installCommand: String = HarnessSetup.installCommand(for: .claudeCode)
     var scheduled: ScheduledContinuation?
     var cliUpdate: AppModel.HarnessCLIUpdate?
     var onContinueWhenAvailable: () -> Void
@@ -4298,21 +4341,30 @@ private struct ProminentErrorBanner: View {
     var onRetry: () -> Void
     var onUpdateCLI: () -> Void
     var onCopySignIn: (() -> Void)?
+    var onCopyInstall: (() -> Void)?
     let onDismiss: () -> Void
 
     private var tint: Color {
-        if error.needsCLIUpgrade || error.needsSignIn { return OreTheme.warning }
+        if error.needsInstall || error.needsCLIUpgrade || error.needsSignIn { return OreTheme.warning }
         return error.isUsageLimit ? OreTheme.warning : .red
     }
     private var icon: String {
+        if error.needsInstall { return "arrow.down.circle.fill" }
         if error.needsSignIn { return "person.crop.circle.badge.exclamationmark" }
         if error.needsCLIUpgrade { return "arrow.down.app.fill" }
         return error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
     }
     private var title: String {
+        if error.needsInstall { return "\(harnessName) isn't installed" }
         if error.needsSignIn { return "\(harnessName) needs you to sign in" }
         if error.needsCLIUpgrade { return "\(harnessName) needs an update" }
         return error.isUsageLimit ? "Usage limit reached" : "The agent hit an error"
+    }
+    /// The searched PATH is diagnostics, not an instruction: on a Mac with no
+    /// agent it is the whole body of the banner, and it reads as a fault the
+    /// user made rather than something to install.
+    private var detail: String {
+        error.needsInstall ? "ORE couldn't find its CLI on your PATH." : error.message
     }
     private var resetDate: Date? { scheduled?.resumeAt ?? error.resetsAt }
     private var isUpdatingCLI: Bool { cliUpdate?.isRunning == true }
@@ -4327,7 +4379,7 @@ private struct ProminentErrorBanner: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(title)
                     .font(.system(size: OreTheme.Font.body, weight: .semibold))
-                Text(.init(error.message))
+                Text(.init(detail))
                     .font(.system(size: OreTheme.Font.caption))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -4342,7 +4394,28 @@ private struct ProminentErrorBanner: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if error.needsSignIn {
+                if error.needsInstall {
+                    // Retry stays, but second: the only thing that can change
+                    // the outcome is installing the CLI, and before this the
+                    // banner offered nothing but the button that cannot.
+                    HStack(spacing: OreTheme.Space.xs) {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(installCommand, forType: .string)
+                            onCopyInstall?()
+                        } label: {
+                            Label("Copy install command", systemImage: "doc.on.doc")
+                                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(tint.opacity(0.18), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copies `\(installCommand)` — run it in Terminal, then retry")
+
+                        retryButton
+                    }
+                } else if error.needsSignIn {
                     Button {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(signInCommand, forType: .string)
@@ -4365,15 +4438,7 @@ private struct ProminentErrorBanner: View {
                         continueButton
                     }
                 } else {
-                    Button(action: onRetry) {
-                        Label("Retry", systemImage: "arrow.clockwise")
-                            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(tint.opacity(0.18), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Send the last prompt again")
+                    retryButton
                 }
             }
 
@@ -4393,6 +4458,18 @@ private struct ProminentErrorBanner: View {
             RoundedRectangle(cornerRadius: OreTheme.controlRadius)
                 .stroke(tint.opacity(0.35), lineWidth: 1)
         }
+    }
+
+    private var retryButton: some View {
+        Button(action: onRetry) {
+            Label("Retry", systemImage: "arrow.clockwise")
+                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(tint.opacity(0.18), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Send the last prompt again")
     }
 
     private var updateCLIButton: some View {

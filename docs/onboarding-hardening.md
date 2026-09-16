@@ -18,7 +18,7 @@ are in priority order and are meant to be picked up as written.
 | Unit | What changed |
 |---|---|
 | 15 | `install.sh`: interrupt-safe rollback, Rosetta false-negative, duplicate-copy warning, telemetry disclosed on every install |
-| 18 | Install commands no longer require npm — a fresh Mac has no Node, and rung 1 is the fatal one. Settings offers a per-harness install command |
+| 18 | Install commands no longer require npm — a fresh Mac has no Node, and rung 1 is the fatal one. Settings offers a per-harness install command. Note this supersedes the unit's own `hasNPM` step: all three vendors ship a self-bootstrapping installer, so there is nothing left to branch on |
 | 8 | A **git** rung on the ladder, above "add a project". Detects the Xcode CLT stub *without launching it* (launching it is what pops the system install modal). Both git probes moved into `OreGit` so they resolve through the login-shell PATH |
 | 5 | `addRepository` rejects a non-repository folder, and a repository with no commits, at add time instead of at first workspace |
 | 9 | A binary found under the generic name `agent` must identify itself as cursor-agent; Codex's auth-file fallback reports `.unknown` rather than `.authenticated` |

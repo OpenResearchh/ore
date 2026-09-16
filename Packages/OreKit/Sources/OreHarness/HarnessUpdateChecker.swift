@@ -62,6 +62,15 @@ public enum HarnessUpdateChecker {
             // even when the upgrade itself goes through the CLI.
             return kind.npmPackage.map(Source.npm(package:)) ?? .unknown
         case .nativeInstaller:
+            // A Homebrew install ORE has no formula for (today: cursor-agent)
+            // falls through `plan` to the vendor's install script. Reading the
+            // version from that script would advertise an upgrade that lands a
+            // second copy in front of the brew one, so say ORE can't tell where
+            // it came from — the honest answer, and the one that suppresses the
+            // card rather than offering the wrong channel.
+            if let executablePath, HarnessCLIUpdater.isHomebrewPath(executablePath) {
+                return .unknown
+            }
             if kind == .cursorAgent { return .cursorInstallScript }
             return kind.npmPackage.map(Source.npm(package:)) ?? .unknown
         }

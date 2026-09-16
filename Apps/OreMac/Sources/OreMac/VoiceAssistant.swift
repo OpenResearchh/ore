@@ -492,6 +492,35 @@ struct VoiceSpokenTurn: Equatable {
     }
 }
 
+/// What the HUD should say when a voice session ends without sending anything.
+///
+/// Both endings used to be silent. The recognizer's own error wins, because a
+/// denied microphone has to name the pane that can undo it; otherwise an empty
+/// release gets a line of its own, since "nothing happened" and "the hotkey
+/// never fired" look identical from the outside. A session that actually heard
+/// words has nothing to report.
+enum VoiceSessionFailure {
+    static let nothingHeard = "Didn't catch that — nothing was heard."
+
+    struct Report: Equatable {
+        let message: String
+        let settingsLink: SystemSettingsLink?
+    }
+
+    @MainActor
+    static func report(
+        status: VoiceInputController.Status,
+        settingsLink: SystemSettingsLink?,
+        heard: String
+    ) -> Report? {
+        if case .error(let message) = status {
+            return Report(message: message, settingsLink: settingsLink)
+        }
+        guard heard.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return Report(message: nothingHeard, settingsLink: nil)
+    }
+}
+
 /// The global voice mode: hold ⇧⌥ anywhere, talk to the assistant, hear it
 /// answer. App-level and headless — it never steals focus, never opens a
 /// window, and works the same whether the user is in ORE, Safari, or a
@@ -535,6 +564,23 @@ final class VoiceAssistantController {
     var liveTranscript: String { voice.transcript }
     var audioLevel: Double { voice.audioLevel }
     private(set) var answerPlaceholder = "Yes or no?"
+    /// The last voice failure, held for the HUD to say.
+    ///
+    /// The hands-free watcher used to read `.error` off the recognizer, drop
+    /// it, and go back to `.idle`: hold the hotkey with the microphone denied
+    /// and the pill blinked once and vanished, with no cue and no text
+    /// anywhere in the app — forever after. The assistant has no window to put
+    /// a banner in, so the pill stays up for `failureDisplay` instead.
+    /// The message alone, not the `SystemSettingsLink` behind it: the pill
+    /// has no buttons to hang an action on, and the message already names the
+    /// pane in words. A stored link nothing reads is just a second place for
+    /// the two to disagree.
+    private(set) var failure: String?
+    private var failureClearTask: Task<Void, Never>?
+
+    /// Long enough to read a sentence naming a System Settings pane, short
+    /// enough that a pill floating over somebody else's app moves on.
+    private static let failureDisplay: Duration = .seconds(6)
     /// How much of the utterance being spoken has actually been voiced, for the
     /// HUD to stream.
     var spokenSoFar: String {
@@ -762,6 +808,7 @@ final class VoiceAssistantController {
 
     private func openMic() {
         guard let model, phase == .armed, !voice.isActive else { return }
+        clearFailure()
         // The phrase model is read once per session, so tuning mid-session
         // can't change the rules under an open microphone.
         let phraseModel = FinishPhraseStore.load() ?? .standard
@@ -784,6 +831,24 @@ final class VoiceAssistantController {
         if usesFinishPhrase { watchHandsFreeSession() }
     }
 
+    /// Puts a failed session's reason on the HUD and starts its countdown.
+    private func noteFailure(_ report: VoiceSessionFailure.Report) {
+        failure = report.message
+        failureClearTask?.cancel()
+        failureClearTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.failureDisplay)
+            guard !Task.isCancelled else { return }
+            self?.clearFailure()
+        }
+    }
+
+    private func clearFailure() {
+        failureClearTask?.cancel()
+        failureClearTask = nil
+        guard failure != nil else { return }
+        failure = nil
+    }
+
     private func watchHandsFreeSession() {
         handsFreeTask?.cancel()
         handsFreeTask = Task { @MainActor [weak self] in
@@ -793,7 +858,18 @@ final class VoiceAssistantController {
                 guard !Task.isCancelled, let self, self.phase == .listening else { return }
                 if case .error = self.voice.status {
                     self.flushFinishLog(outcome: "error")
-                    self.closeListeningWithoutSending(playCue: false)
+                    // Carry the recognizer's reason out of the session that is
+                    // about to end, and make the end audible: a silent return
+                    // to idle is indistinguishable from the hotkey never
+                    // having fired.
+                    if let report = VoiceSessionFailure.report(
+                        status: self.voice.status,
+                        settingsLink: self.voice.errorSettingsLink,
+                        heard: self.voice.transcript
+                    ) {
+                        self.noteFailure(report)
+                    }
+                    self.closeListeningWithoutSending(playCue: true)
                     return
                 }
                 let now = ContinuousClock.now
@@ -930,6 +1006,13 @@ final class VoiceAssistantController {
         model?.narration.setMicActive(false)
 
         guard let model, !spoken.isEmpty else {
+            // A hold-to-talk release with nothing heard ended here in silence.
+            // Say which it was — a denied microphone, or simply no words.
+            if let report = VoiceSessionFailure.report(
+                status: voice.status, settingsLink: voice.errorSettingsLink, heard: spoken
+            ) {
+                noteFailure(report)
+            }
             phase = .idle
             return
         }

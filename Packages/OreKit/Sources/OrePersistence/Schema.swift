@@ -9,6 +9,19 @@ import OreProtocol
 /// index to keep in sync, and none of it is Apple-only — the same store compiles
 /// and runs on Linux, which is what keeps a hosted ORE possible.
 public enum OreSchema {
+    /// The store format this build understands, stamped into the file as
+    /// `PRAGMA user_version`. Bump it with every migration added below.
+    ///
+    /// GRDB already records which migrations have run, but only the ones it has
+    /// been told about: a database written by a newer ORE looks *fully
+    /// migrated* to an older one, which then reads columns that mean something
+    /// else and writes rows the newer build will choke on. This number is the
+    /// one check an older build can actually make, and `install.sh` takes an
+    /// `ORE_VERSION`, so downgrading is a single command away.
+    ///
+    /// Matches the highest `vN.` prefix on the migrations below.
+    public static let userVersion = 14
+
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
 

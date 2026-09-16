@@ -23,9 +23,9 @@ struct NextStepCard: View {
     @State private var copied = false
 
     var body: some View {
-        // Nothing to say before the probes land, and nothing to say once the
-        // user can work. Both silences are deliberate.
-        if let step = readiness.nextStep {
+        // Nothing to say once the user can work — that silence is deliberate.
+        // The other one was not: see `fallbackStep`.
+        if let step = readiness.nextStep ?? Self.fallbackStep(for: readiness) {
             VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
                 header(step)
                 if !step.detail.isEmpty {
@@ -34,7 +34,14 @@ struct NextStepCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                actionRow(step)
+                if step.status == .unknown {
+                    // There is no action to offer for a rung that has not
+                    // answered yet, and inventing one is what the ladder
+                    // refuses to do. A spinner says the same thing honestly.
+                    ProgressView().controlSize(.small)
+                } else {
+                    actionRow(step)
+                }
                 if readiness.relevantSteps.count > 1 {
                     Divider().opacity(0.5)
                     checklistToggle
@@ -46,10 +53,33 @@ struct NextStepCard: View {
         }
     }
 
+    /// The step to show when `nextStep` has nothing.
+    ///
+    /// `Readiness.nextStep` returns nil while a *blocking* rung is still
+    /// `.unknown`, so the ladder never advises something it may have to retract
+    /// a moment later. The welcome screen read that nil as "nothing to say" and
+    /// drew nothing at all — and when a probe hung, or core start threw before
+    /// any probe was spawned, the emptiness was permanent: no card, no button,
+    /// no error, on the one screen a brand-new user has. The copy for this
+    /// state ("Checking for coding agents…") was already written in
+    /// `Readiness`; it had simply never been reachable.
+    ///
+    /// A `nonisolated static func` rather than a computed property so the
+    /// choice can be tested without a window — and without a main-actor hop,
+    /// since `View` conformance makes everything else on this type
+    /// `@MainActor`.
+    nonisolated static func fallbackStep(for readiness: Readiness) -> ReadinessStep? {
+        readiness.steps.first { $0.isBlocking && $0.status == .unknown }
+    }
+
     private func header(_ step: ReadinessStep) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: step.isBlocking ? "exclamationmark.circle.fill" : "circle.dashed")
-                .foregroundStyle(step.isBlocking ? OreTheme.brand : Color.secondary)
+        // A rung that has not answered yet is not a warning: an alarm icon
+        // over "Checking for coding agents…" reads as a failure that has not
+        // happened.
+        let isAlarming = step.isBlocking && step.status != .unknown
+        return HStack(spacing: 8) {
+            Image(systemName: isAlarming ? "exclamationmark.circle.fill" : "circle.dashed")
+                .foregroundStyle(isAlarming ? OreTheme.brand : Color.secondary)
             Text(step.title)
                 .font(.system(size: 15, weight: .semibold))
                 .fixedSize(horizontal: false, vertical: true)

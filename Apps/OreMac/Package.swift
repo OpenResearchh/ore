@@ -38,6 +38,11 @@ let package = Package(
                 .product(name: "OreCore", package: "OreKit"),
                 .product(name: "OreGit", package: "OreKit"),
                 .product(name: "OreProtocol", package: "OreKit"),
+                // The login-shell environment. The app spawns exactly one child
+                // of its own — the provider sign-in — and it has to see the
+                // same PATH the harnesses do, or it fails on a machine where
+                // node lives under a version manager.
+                .product(name: "OreSupport", package: "OreKit"),
                 // Anonymous usage analytics. The app is the only thing that
                 // links this: nothing inside OreKit depends on it, which is
                 // what makes it impossible for the headless core to report.

@@ -1,3 +1,6 @@
+import AVFoundation
+import Foundation
+import Speech
 import Testing
 import OreProtocol
 @testable import OreMac
@@ -703,5 +706,65 @@ struct VoiceDictationFormatterTests {
     @Test func aSingleFirstDoesNotBecomeAList() {
         let formatted = VoiceDictationFormatter.format("First look at ChatPane")
         #expect(formatted == "First look at ChatPane")
+    }
+}
+
+/// Unit 14 / Unit 20: a dictation that cannot start has to say why, and say it
+/// in a way the user can act on.
+@MainActor
+struct VoiceAvailabilityTests {
+    @Test func deniedMicrophoneProducesASettingsLink() {
+        let denied = VoiceAvailability.microphoneFailure(authorization: .denied)
+        #expect(denied?.settingsLink == .microphone)
+        #expect(denied?.message.contains("System Settings") == true)
+        // macOS never re-prompts, so `.restricted` is just as final.
+        #expect(VoiceAvailability.microphoneFailure(authorization: .restricted) == denied)
+
+        // Nothing to escape from yet: these two go on to the real prompt.
+        #expect(VoiceAvailability.microphoneFailure(authorization: .notDetermined) == nil)
+        #expect(VoiceAvailability.microphoneFailure(authorization: .authorized) == nil)
+
+        let speech = VoiceAvailability.speechFailure(authorization: .denied)
+        #expect(speech?.settingsLink == .speechRecognition)
+        #expect(VoiceAvailability.speechFailure(authorization: .authorized) == nil)
+    }
+
+    @Test func transientUnavailabilityIsNotReportedAsUnsupportedHardware() {
+        let offline = VoiceAvailability.recognizerFailure(exists: true, isAvailable: false)
+        #expect(offline?.message.contains("temporarily unavailable") == true)
+        #expect(offline?.message.contains("this Mac") == false)
+        // Nothing in System Settings fixes a dropped connection.
+        #expect(offline?.settingsLink == nil)
+
+        let unsupported = VoiceAvailability.recognizerFailure(exists: false, isAvailable: false)
+        #expect(unsupported?.message.contains("this Mac") == true)
+
+        #expect(VoiceAvailability.recognizerFailure(exists: true, isAvailable: true) == nil)
+    }
+
+    @Test func aFailedLocaleReservationIsRetriedOnTheNextAttempt() async {
+        struct Refused: Error {}
+        final class Attempts { var count = 0 }
+
+        let locale = Locale(identifier: "en_US")
+        let reservation = SpeechAssetReservation()
+        let attempts = Attempts()
+
+        await reservation.ensure(locale) {
+            attempts.count += 1
+            throw Refused()
+        }
+        // The attempt is not the outcome: recording it regardless is what
+        // pinned a failed reservation for the whole process.
+        #expect(!reservation.isReserved)
+        #expect(attempts.count == 1)
+
+        await reservation.ensure(locale) { attempts.count += 1 }
+        #expect(attempts.count == 2)
+        #expect(reservation.reserved == locale)
+
+        // Once it has actually succeeded, later presses cost nothing.
+        await reservation.ensure(locale) { attempts.count += 1 }
+        #expect(attempts.count == 2)
     }
 }

@@ -257,6 +257,22 @@ final class NeuralNarrationVoice: NarrationVoice {
         case installing
         case ready
         case failed(String)
+
+        /// The button that starts — or restarts — the fetch, and `nil` when
+        /// there is nothing to start.
+        ///
+        /// `.notInstalled` is reachable with the neural voice already chosen:
+        /// a download interrupted by a quit, or a relaunch where
+        /// `loadNeuralVoiceIfNeeded` rightly declines to spend 940 MB unasked.
+        /// That state had no affordance at all, so the only way back to the
+        /// download was to switch the picker away and back again.
+        var installActionTitle: String? {
+            switch self {
+            case .notInstalled: "Download"
+            case .failed: "Try again"
+            case .installing, .ready: nil
+            }
+        }
     }
 
     /// Set once the model has been fetched, so later launches can load it
@@ -846,12 +862,18 @@ struct NarrationVoicePicker: View {
     private var status: some View {
         switch voice.readiness {
         case .notInstalled:
-            // Measured, not quoted: the English pack lands at 939 MB on disk
-            // because it ships both FlowLM variants and the MLState pipeline
-            // alongside the models actually loaded.
-            Text("A one-time download of about 940 MB. Runs entirely on this Mac once installed.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                // Measured, not quoted: the English pack lands at 939 MB on
+                // disk because it ships both FlowLM variants and the MLState
+                // pipeline alongside the models actually loaded.
+                Text("A one-time download of about 940 MB. Runs entirely on this Mac once installed.")
+                    .foregroundStyle(.secondary)
+                if let title = voice.readiness.installActionTitle {
+                    Button(title) { voice.install() }
+                        .buttonStyle(.link)
+                }
+            }
+            .font(.caption)
         case .installing:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
@@ -868,8 +890,10 @@ struct NarrationVoicePicker: View {
                 Label("Download failed — using the system voice", systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
                 Text(message).foregroundStyle(.secondary)
-                Button("Try again") { voice.install() }
-                    .buttonStyle(.link)
+                if let title = voice.readiness.installActionTitle {
+                    Button(title) { voice.install() }
+                        .buttonStyle(.link)
+                }
             }
             .font(.caption)
         }

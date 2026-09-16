@@ -7,6 +7,35 @@ import Testing
 struct LaunchBriefingTests {
     private let now = Date(timeIntervalSince1970: 2_000_000_000)
 
+    /// The spoken half of the briefing asked "how long were you away?" and
+    /// answered "forever" when it had never been told — so the one launch that
+    /// must stay quiet, a first run with a restored `~/ore`, was the one that
+    /// spoke.
+    @Test func missingLastSeenIsNotALongAbsence() {
+        #expect(!AppModel.isLongAbsence(lastSeenAt: nil, now: now))
+        #expect(!AppModel.isLongAbsence(
+            lastSeenAt: now.addingTimeInterval(-60), now: now
+        ))
+        #expect(AppModel.isLongAbsence(
+            lastSeenAt: now.addingTimeInterval(-LaunchBriefing.spokenAwayThreshold - 1),
+            now: now
+        ))
+    }
+
+    /// `compose` is happy to brief on nothing — it has a line for it — which is
+    /// why `AppModel.prepareLaunchBriefing` guards on an empty fleet before
+    /// calling it rather than after. That guard is one line inside a
+    /// `@MainActor` model with a live core behind it and is not reachable from
+    /// here; this pins the behaviour it exists to suppress, so the guard cannot
+    /// be deleted as redundant.
+    @Test func firstLaunchWithEmptyFleetProducesNoBriefing() {
+        let briefing = LaunchBriefing.compose(
+            workspaces: [], lastSeenAt: nil, now: now, userName: "Ada"
+        )
+        #expect(briefing.lines.map(\.id) == ["quiet"])
+        #expect(!briefing.spoken.isEmpty)
+    }
+
     @Test func greetingUsesFirstNameAndDaypart() {
         let morning = date(hour: 9)
         let briefing = LaunchBriefing.compose(

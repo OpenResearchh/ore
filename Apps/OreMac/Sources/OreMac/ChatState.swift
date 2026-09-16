@@ -98,6 +98,9 @@ final class ChatState {
         var needsCLIUpgrade: Bool
         /// Sign back into the agent CLI — OAuth expired, logged out, etc.
         var needsSignIn: Bool
+        /// The CLI is not on the machine at all. Retry is the one thing that
+        /// cannot help here, and it was all the banner used to offer.
+        var needsInstall: Bool
         var resetsAt: Date?
 
         init(
@@ -109,11 +112,30 @@ final class ChatState {
         ) {
             let unwrapped = ProviderErrorCopy.unwrap(message)
             self.message = unwrapped
-            self.needsCLIUpgrade = needsCLIUpgrade || ProviderErrorCopy.needsCLIUpgrade(unwrapped)
-            self.needsSignIn = !self.needsCLIUpgrade
+            // Missing beats every other reading of the same text: a CLI that
+            // is not installed cannot be out of date, signed out or rate
+            // limited, and each of those banners sends the user somewhere
+            // that cannot work.
+            self.needsInstall = Self.looksLikeMissingCLI(unwrapped)
+            self.needsCLIUpgrade = !self.needsInstall
+                && (needsCLIUpgrade || ProviderErrorCopy.needsCLIUpgrade(unwrapped))
+            self.needsSignIn = !self.needsInstall && !self.needsCLIUpgrade
                 && (needsSignIn || Self.looksLikeSignInNeeded(unwrapped))
-            self.isUsageLimit = !self.needsCLIUpgrade && !self.needsSignIn && isUsageLimit
+            self.isUsageLimit = !self.needsInstall && !self.needsCLIUpgrade
+                && !self.needsSignIn && isUsageLimit
             self.resetsAt = resetsAt
+        }
+
+        /// `HarnessError.executableNotFound` as the user sees it — the harness
+        /// renders it as "<name> CLI (`<exe>`) was not found on PATH: …".
+        ///
+        /// git says almost the same sentence when it is the missing one, and
+        /// answering that with "install Claude Code" would be its own dead
+        /// end; the git rung on the readiness ladder owns that case.
+        private static func looksLikeMissingCLI(_ text: String) -> Bool {
+            let value = text.lowercased()
+            return value.contains("was not found on path")
+                && !value.contains("git was not found on path")
         }
 
         private static func looksLikeSignInNeeded(_ text: String) -> Bool {

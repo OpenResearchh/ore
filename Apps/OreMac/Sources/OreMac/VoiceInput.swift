@@ -259,6 +259,80 @@ enum VoiceDictationFormatter {
     }
 }
 
+/// What to tell somebody whose dictation is not going to work, and where to
+/// send them to fix it.
+///
+/// macOS grants microphone and speech-recognition access exactly once. After a
+/// denial the request APIs return the old answer without showing anything, so
+/// an app that only ever *asks* leaves the user holding a hotkey that silently
+/// does nothing. Reading the status first is the only way to tell "said no"
+/// from "hasn't been asked" — and the only way to hand back the System
+/// Settings pane that can change it.
+///
+/// Pure and framework-typed so the messages can be tested without a
+/// microphone, a network, or a real desktop.
+enum VoiceAvailability {
+    struct Failure: Equatable {
+        let message: String
+        /// The pane that would undo this, when the user has that option.
+        let settingsLink: SystemSettingsLink?
+    }
+
+    static let microphoneDenied = Failure(
+        message: "Microphone access is off for ORE. Turn it on in System Settings ▸ "
+            + "Privacy & Security ▸ Microphone.",
+        settingsLink: .microphone
+    )
+
+    static let speechDenied = Failure(
+        message: "Speech recognition access is off for ORE. Turn it on in System Settings ▸ "
+            + "Privacy & Security ▸ Speech Recognition.",
+        settingsLink: .speechRecognition
+    )
+
+    // Statement form, not a switch expression: `@unknown default` is required
+    // over an imported ObjC enum, and it has no precedent in an expression
+    // anywhere in this codebase. A future status ORE has never heard of is not
+    // evidence of a denial, so it reads as "nothing to say".
+    static func microphoneFailure(authorization: AVAuthorizationStatus) -> Failure? {
+        switch authorization {
+        case .denied, .restricted: return microphoneDenied
+        case .notDetermined, .authorized: return nil
+        @unknown default: return nil
+        }
+    }
+
+    static func speechFailure(authorization: SFSpeechRecognizerAuthorizationStatus) -> Failure? {
+        switch authorization {
+        case .denied, .restricted: return speechDenied
+        case .notDetermined, .authorized: return nil
+        @unknown default: return nil
+        }
+    }
+
+    /// Splits "this Mac can't" from "not right now". `SFSpeechRecognizer`
+    /// reports `isAvailable == false` whenever the service is out of reach —
+    /// most often because the Mac is offline — and the single guard that used
+    /// to cover both told those users their hardware was unsupported, which is
+    /// permanent-sounding and false.
+    static func recognizerFailure(exists: Bool, isAvailable: Bool) -> Failure? {
+        guard exists else {
+            return Failure(
+                message: "English speech recognition isn’t available on this Mac.",
+                settingsLink: nil
+            )
+        }
+        guard isAvailable else {
+            return Failure(
+                message: "Speech recognition is temporarily unavailable — check your "
+                    + "connection and try again.",
+                settingsLink: nil
+            )
+        }
+        return nil
+    }
+}
+
 /// Live microphone dictation for the composer. Stays in OreMac: the core still
 /// only ever receives the resulting string.
 @MainActor
@@ -281,6 +355,11 @@ final class VoiceInputController {
     }
 
     private(set) var status: Status = .idle
+    /// The System Settings pane that would undo the denial behind the current
+    /// `.error`, if one would. Kept beside `status` rather than inside it:
+    /// `.error(String)` is pattern-matched in several views, and widening its
+    /// payload would break every one of them.
+    private(set) var errorSettingsLink: SystemSettingsLink?
     private(set) var transcript: String = ""
     private(set) var recognizerRoute: RecognizerRoute?
     private(set) var contextualBiasApplied = false
@@ -334,7 +413,7 @@ final class VoiceInputController {
         guard !isActive else { return }
         let owner = ObjectIdentifier(self)
         guard Self.activeOwner == nil || Self.activeOwner == owner else {
-            status = .error("Another voice session is already using the microphone.")
+            fail("Another voice session is already using the microphone.")
             return
         }
         Self.activeOwner = owner
@@ -343,6 +422,7 @@ final class VoiceInputController {
         recognizerRoute = nil
         contextualBiasApplied = false
         audioLevel = 0
+        errorSettingsLink = nil
         status = .requestingPermission
         runTask = Task { await run() }
     }
@@ -372,9 +452,18 @@ final class VoiceInputController {
     private func run() async {
         defer { releaseMicrophoneLease() }
         do {
+            // Ask the status before asking the user: after a "Don't Allow"
+            // `requestRecordPermission()` returns false without showing
+            // anything, so this is the only place that can tell a denial apart
+            // from a first run and name the pane that undoes it.
+            let microphone = AVCaptureDevice.authorizationStatus(for: .audio)
+            if let denied = VoiceAvailability.microphoneFailure(authorization: microphone) {
+                fail(denied)
+                return
+            }
             let allowed = await AVAudioApplication.requestRecordPermission()
             guard allowed else {
-                status = .error("Microphone access is required for dictation.")
+                fail(VoiceAvailability.microphoneDenied)
                 return
             }
             guard !Task.isCancelled else { return }
@@ -404,7 +493,7 @@ final class VoiceInputController {
         } catch is CancellationError {
             status = .idle
         } catch {
-            status = .error(Self.userFacingMessage(for: error))
+            fail(Self.userFacingMessage(for: error))
         }
         await tearDownCapture()
     }
@@ -412,6 +501,17 @@ final class VoiceInputController {
     private func releaseMicrophoneLease() {
         let owner = ObjectIdentifier(self)
         if Self.activeOwner == owner { Self.activeOwner = nil }
+    }
+
+    /// The one way into `.error`, so `errorSettingsLink` can never describe a
+    /// failure other than the one on screen.
+    private func fail(_ message: String, settingsLink: SystemSettingsLink? = nil) {
+        errorSettingsLink = settingsLink
+        status = .error(message)
+    }
+
+    private func fail(_ failure: VoiceAvailability.Failure) {
+        fail(failure.message, settingsLink: failure.settingsLink)
     }
 
     @available(macOS 26.0, *)
@@ -500,7 +600,7 @@ final class VoiceInputController {
                 return
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.status = .error(Self.userFacingMessage(for: error))
+                    self?.fail(Self.userFacingMessage(for: error))
                 }
             }
         }
@@ -514,6 +614,13 @@ final class VoiceInputController {
 
     private func runSpeechRecognizer() async throws {
         recognizerRoute = .speechRecognizer
+        // Same one-shot rule as the microphone: once denied, TCC answers
+        // `requestAuthorization` from its record without showing a prompt.
+        let speech = SFSpeechRecognizer.authorizationStatus()
+        if let denied = VoiceAvailability.speechFailure(authorization: speech) {
+            fail(denied)
+            return
+        }
         // `@Sendable` is load-bearing: without it the closure inherits this
         // class's MainActor isolation, and TCC delivers it on a background
         // queue — the runtime isolation check then kills the app (SIGTRAP in
@@ -524,16 +631,19 @@ final class VoiceInputController {
             }
         }
         guard authorized else {
-            status = .error("Speech recognition access is required for dictation.")
+            fail(VoiceAvailability.speechDenied)
             return
         }
 
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en_US")),
-              recognizer.isAvailable
-        else {
-            status = .error("English speech recognition isn’t available on this Mac.")
+        let available = SFSpeechRecognizer(locale: Locale(identifier: "en_US"))
+        if let unavailable = VoiceAvailability.recognizerFailure(
+            exists: available != nil,
+            isAvailable: available?.isAvailable ?? false
+        ) {
+            fail(unavailable)
             return
         }
+        guard let recognizer = available else { return }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -636,6 +746,14 @@ final class VoiceInputController {
 /// (a finished analyzer is not reusable), and the session's teardown warms
 /// the next. Only the model is warmed — never the microphone: no capture
 /// runs until the person asks for it.
+///
+/// And only a model that is *already on disk*. Warming used to call
+/// `ensureInstalled`, which meant three construction sites each kicked off an
+/// unbounded asset download from `init()` at launch, with nothing on screen
+/// saying so — the opposite of the rule the app states for the neural
+/// narration voice ("the download is deliberately not automatic"). If the
+/// asset is missing, warming steps aside and the first mic press downloads it
+/// under a visible "Downloading speech model…".
 @available(macOS 26.0, *)
 @MainActor
 enum DictationPrewarm {
@@ -661,8 +779,20 @@ enum DictationPrewarm {
                 let transcriber = DictationTranscriber(
                     locale: locale, preset: .progressiveLongDictation
                 )
-                // Downloads quietly if the asset is missing — better at app
-                // start than labeled "Downloading…" under a pressed mic button.
+                // A non-nil install request means the asset is not on disk.
+                // Nobody has asked for dictation yet, so leave it there: the
+                // query is local, and the next press does the fetch with
+                // "Downloading speech model…" on screen to explain the wait.
+                let pending = try await AssetInventory.assetInstallationRequest(
+                    supporting: [transcriber]
+                )
+                guard pending == nil else { return }
+                // Already on disk, so this reserves and returns without
+                // downloading anything. Skipping it entirely was the tempting
+                // shape and the wrong one: a prewarmed session never reaches
+                // `ensureInstalled` on the press path either, so the locale
+                // would go unreserved for the whole process — which is exactly
+                // what `SpeechAssetKeeper` exists to prevent.
                 try await SpeechAssetKeeper.ensureInstalled(
                     transcriber: transcriber, locale: locale
                 ) {}
@@ -685,6 +815,38 @@ enum DictationPrewarm {
     }
 }
 
+/// Remembers which dictation locale this process has actually reserved.
+///
+/// The record used to be written *outside* the `do`, so an
+/// `AssetInventory.reserve` that threw was filed as a success: every later mic
+/// press skipped the reserve it still needed, and one bad moment became
+/// permanent for the life of the process. Only a call that returns counts.
+///
+/// A type of its own, ungated by availability, so that rule can be tested
+/// without macOS 26 and without a speech asset.
+@MainActor
+final class SpeechAssetReservation {
+    private(set) var reserved: Locale?
+
+    var isReserved: Bool { reserved != nil }
+
+    /// Runs `reserve` once — and again on the next call if it threw.
+    ///
+    /// The error stays swallowed: the common case is the system already
+    /// holding the locale, which is not something the user can act on.
+    /// Anything that genuinely blocks dictation surfaces from the install
+    /// request that follows.
+    func ensure(_ locale: Locale, reserve: () async throws -> Void) async {
+        guard reserved == nil else { return }
+        do {
+            try await reserve()
+            reserved = locale
+        } catch {
+            // Left unreserved so the next press tries again.
+        }
+    }
+}
+
 /// Holds the on-device English dictation locale for the process lifetime.
 ///
 /// Releasing it at the end of every mic session made the next tab look like a
@@ -693,7 +855,7 @@ enum DictationPrewarm {
 @available(macOS 26.0, *)
 @MainActor
 enum SpeechAssetKeeper {
-    private static var reservedLocale: Locale?
+    private static let reservation = SpeechAssetReservation()
     private static var assetsReady = false
 
     static func ensureInstalled(
@@ -701,13 +863,8 @@ enum SpeechAssetKeeper {
         locale: Locale,
         downloading: () -> Void
     ) async throws {
-        if reservedLocale == nil {
-            do {
-                try await AssetInventory.reserve(locale: locale)
-            } catch {
-                // Already reserved in this process, or the system is holding it.
-            }
-            reservedLocale = locale
+        await reservation.ensure(locale) {
+            try await AssetInventory.reserve(locale: locale)
         }
         guard !assetsReady else { return }
         if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {

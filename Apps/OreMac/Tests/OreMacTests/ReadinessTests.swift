@@ -201,6 +201,22 @@ struct ReadinessTests {
         #expect(!readiness.relevantSteps.contains { $0.id == "git" })
     }
 
+    /// The welcome screen's only content comes from `nextStep`, which is nil
+    /// while a blocking rung is still `.unknown` — so before the probe answers
+    /// there was nothing on screen at all, permanently if the probe hung.
+    @Test("The pre-probe rung is renderable, so the welcome screen is never empty")
+    func unknownBlockingStepIsRenderableBeforeProbe() throws {
+        let readiness = evaluate(harnesses: [], hasProbed: false)
+        #expect(readiness.nextStep == nil)
+
+        let first = try #require(readiness.steps.first)
+        #expect(first.status == .unknown)
+        #expect(first.isBlocking)
+        #expect(!first.title.isEmpty)
+
+        #expect(NextStepCard.fallbackStep(for: readiness) == first)
+    }
+
     @Test("A fully set-up machine has nothing to say")
     func everythingDone() {
         let readiness = evaluate(

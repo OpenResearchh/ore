@@ -5,6 +5,7 @@ import OreProtocol
 import OreTelemetry
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 /// The Settings scene's root: a shell with no inputs of its own.
 ///
@@ -85,6 +86,13 @@ private struct SettingsPanes: View {
     /// Mirrors the login-item state. See `refreshLaunchAtLogin` for why this is
     /// cached rather than read live.
     @State private var launchesAtLogin = false
+    /// Set when macOS has accepted the login item but is waiting for the user
+    /// to approve it. Read from the same `status` call as `launchesAtLogin`.
+    @State private var loginItemNeedsApproval = false
+    /// Whether macOS will deliver ORE's notifications at all. An app
+    /// preference and a system grant are different questions and this pane only
+    /// ever asked the first one.
+    @State private var notificationsBlocked = false
     @State private var showsPhraseTuning = false
     /// Cached: `FinishPhraseStore.currentSpoken` decodes JSON, and this body
     /// re-runs every display cycle. Refreshed when the tuning sheet closes.
@@ -271,7 +279,13 @@ private struct SettingsPanes: View {
     /// and keystroke in the entire app queued behind it, whether or not the
     /// Settings window was even visible.
     private func refreshLaunchAtLogin() {
-        launchesAtLogin = SMAppService.mainApp.status == .enabled
+        let status = SMAppService.mainApp.status
+        launchesAtLogin = status == .enabled
+        // `register()` returns success while the service sits at
+        // `.requiresApproval` — macOS wants the user to tick ORE under Login
+        // Items first. The read-back below then found "not enabled" and the
+        // toggle flipped itself off, which reads as broken rather than pending.
+        loginItemNeedsApproval = status == .requiresApproval
     }
 
     private var launchAtLogin: Binding<Bool> {
@@ -325,6 +339,14 @@ private struct SettingsPanes: View {
             }
             SettingsCard(title: "Always on", icon: "menubar.arrow.up.rectangle") {
                 Toggle("Start ORE at login", isOn: launchAtLogin)
+                if loginItemNeedsApproval {
+                    Text("macOS needs you to approve ORE under Login Items before this takes effect.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Login Items") {
+                        SMAppService.openSystemSettingsLoginItems()
+                    }
+                }
                 Text("ORE lives in the menu bar: agents keep running and the assistant keeps answering ⇧⌥ with every window closed. Starting at login makes that permanent.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -335,12 +357,24 @@ private struct SettingsPanes: View {
                     .foregroundStyle(.secondary)
             }
             SettingsCard(title: "Notifications", icon: "bell") {
-                Toggle("Allow notifications", isOn: $notifications)
+                // "Allow notifications" read like the system grant and was not
+                // one — it is ORE's own preference, and it stayed on while
+                // macOS quietly dropped every banner.
+                Toggle("Notify me in ORE", isOn: $notifications)
                 Toggle("Notify when a turn completes", isOn: $turnComplete)
                     .disabled(!notifications)
                 Toggle("Play completion sounds", isOn: $sound)
                     .disabled(!notifications)
+                if notificationsBlocked {
+                    Text("macOS is blocking ORE's notifications, so none of these can be delivered. The permission prompt only appears once, on first launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Notification Settings") {
+                        SystemSettingsLink.open(.notifications)
+                    }
+                }
             }
+            .task { notificationsBlocked = await Self.notificationsAreBlocked() }
             SettingsCard(title: "Launch briefing", icon: "sunrise") {
                 Toggle("Greet me at launch", isOn: $greetingEnabled)
                 Toggle("Speak the briefing aloud", isOn: $greetingVoice)
@@ -401,7 +435,13 @@ private struct SettingsPanes: View {
                             .labelStyle(.titleAndIcon)
                     } else {
                         Button("Allow…") {
-                            hotkey.requestAccessibility()
+                            // The system prompt fires once per app, ever.
+                            // `requestAccessibility` returns false immediately
+                            // for anyone who dismissed it — so this button was a
+                            // no-op for precisely the people who needed it.
+                            if !hotkey.requestAccessibility() {
+                                SystemSettingsLink.open(.accessibility)
+                            }
                         }
                     }
                 }
@@ -569,10 +609,22 @@ private struct SettingsPanes: View {
                     .buttonStyle(OrePressableButtonStyle())
                 }
                 Spacer()
+                // A probe is a login shell per harness and the update check
+                // goes to the network: this can take half a minute. With no
+                // busy state it looked inert and people pressed it again.
+                // Same treatment as the update button below.
                 Button { appModel.refreshHarnesses() } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
+                    if appModel.isRefreshingHarnesses {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Refreshing…")
+                        }
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
                 }
                 .buttonStyle(.borderless)
+                .disabled(appModel.isRefreshingHarnesses)
             }
 
             SettingsCard(title: selectedHarness.displayName, harness: selectedHarness) {
@@ -605,23 +657,27 @@ private struct SettingsPanes: View {
                     }
                     if probe(for: selectedHarness)?.isInstalled == true,
                        probe(for: selectedHarness)?.authState == .notAuthenticated {
-                        Button {
-                            beginHarnessAuthentication()
-                        } label: {
-                            if authenticatingHarness == selectedHarness {
-                                HStack(spacing: 6) {
-                                    ProgressView().controlSize(.small)
-                                    Text("Waiting for browser…")
-                                }
-                            } else {
+                        if authenticatingHarness == selectedHarness {
+                            // "Waiting for browser…" used to be the whole story
+                            // for as long as the process lived, with no way out
+                            // of it short of quitting ORE.
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Waiting for browser…")
+                                Button("Cancel") { appModel.cancelHarnessAuthentication() }
+                            }
+                        } else {
+                            Button {
+                                beginHarnessAuthentication()
+                            } label: {
                                 Label(
                                     selectedHarness == .claudeCode ? "Copy sign-in command" : "Sign in…",
                                     systemImage: selectedHarness == .claudeCode ? "doc.on.doc" : "person.crop.circle.badge.checkmark"
                                 )
                             }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(authenticatingHarness != nil)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(authenticatingHarness != nil)
                     }
                 }
 
@@ -630,6 +686,24 @@ private struct SettingsPanes: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                }
+
+                // The link the CLI printed. When the browser does not open by
+                // itself — a headless session, a default browser that refused —
+                // this is the only way through, and it was going to /dev/null.
+                if let url = appModel.harnessAuthenticationURL {
+                    HStack(spacing: 8) {
+                        Text(url)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button("Copy link") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(url, forType: .string)
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
 
                 Divider()
@@ -648,7 +722,10 @@ private struct SettingsPanes: View {
                 .foregroundStyle(authenticationStatusColor)
                 Text("ORE launches your installed CLI and leaves authentication with that provider. It never extracts your OAuth credentials.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("Allow API-key fallback", isOn: $apiKeyFallback)
+                // Read once, at core construction (`OreMacApp.swift`), so
+                // flipping it mid-session changes nothing until relaunch —
+                // exactly like the Cursor toggle two rows down.
+                Toggle("Allow API-key fallback (restart required)", isOn: $apiKeyFallback)
                 if selectedHarness == .cursorAgent {
                     Toggle("Run tools unprompted in Bypass mode (restart required)", isOn: $cursorAllowUnprompted)
                     Label("Cursor Agent support is experimental", systemImage: "flask")
@@ -1001,6 +1078,21 @@ private struct SettingsPanes: View {
         guard let probe = probe(for: selectedHarness) else { return .secondary }
         if probe.isEnabled == false { return .secondary }
         return probe.isReady ? .green : .orange
+    }
+
+    /// Whether macOS has been told not to deliver ORE's notifications.
+    ///
+    /// Asked at all because nothing did: the pane offered three switches, all
+    /// of them ORE's own, and a denial at first launch left every one of them
+    /// on while not a single banner arrived. `UNNotificationSettings` is an
+    /// ObjC class and not `Sendable`, so the one answer wanted is read out of
+    /// it inside the callback and nothing else crosses back.
+    private static func notificationsAreBlocked() async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus == .denied)
+            }
+        }
     }
 
     /// Hands over the command rather than running it: installing a CLI writes
@@ -1463,6 +1555,10 @@ private struct ProjectsSettings: View {
         guard !unsaved.isEmpty else { return }
         let writes = unsaved
         unsaved = [:]
+        // `[agent] harness` is now read back when a workspace is started, from
+        // a per-path cache. This is the one place in the process that rewrites
+        // the file it was read from.
+        appModel.forgetRepositoryDefaults()
         Task.detached(priority: .utility) {
             for (repo, config) in writes {
                 Self.persist(repo, config)

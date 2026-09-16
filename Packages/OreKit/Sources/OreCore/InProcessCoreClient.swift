@@ -42,6 +42,9 @@ public actor InProcessCoreClient: CoreClient {
     /// launch and a Refresh click can otherwise overlap on the same registries.
     private var harnessUpdateCheckInFlight = false
     var modelCatalog: [HarnessKind: [AgentModel]] = [:]
+    /// First messages parked while their repository's `ore.toml` setup script
+    /// waits to be allowed. See `createWorkspace`.
+    private var promptsHeldForScriptApproval: [WorkspaceID: HeldPrompt] = [:]
     /// Most recent provider quota signal seen on any tab for each harness.
     /// Providers emit these during sessions rather than through discovery, so
     /// the MCP inventory also reports when no observation exists.
@@ -135,6 +138,9 @@ public actor InProcessCoreClient: CoreClient {
 
         case .approveRepositoryScripts(let approval):
             try await approveRepositoryScripts(approval)
+
+        case .declineRepositoryScripts(let approval):
+            declineRepositoryScripts(approval)
 
         case .renameWorkspace(let id, let name, let userInitiated):
             try await engine(for: id).rename(name, userInitiated: userInitiated)
@@ -302,6 +308,12 @@ public actor InProcessCoreClient: CoreClient {
             try await publishDreamInbox()
 
         case .probeHarnesses:
+            // The login-shell PATH is cached for the life of the process, and
+            // an explicit probe is almost always someone coming back from a
+            // Terminal window where they just ran ORE's own install command.
+            // Without this the answer was frozen at launch, so the one action
+            // ORE told them to take could not be seen to have worked.
+            ShellEnvironment.invalidateCache()
             async let probes = harnessRegistry.probeAll()
             async let catalogs = harnessRegistry.discoverAllModels()
             harnessProbes = await probes
@@ -822,6 +834,8 @@ public actor InProcessCoreClient: CoreClient {
         // `ore.toml` is repository content — after a clone, someone else's —
         // so its scripts wait for the user to read and allow them once.
         let scripts = configuration.scripts
+        let prompt = initialPrompt.flatMap { $0.isEmpty ? nil : $0 }
+        var promptIsHeld = false
         if scripts.setup != nil || scripts.run != nil || scripts.archive != nil {
             let approved = (try? await store.repositoryScriptsApproved(
                 repositoryPath: record.repositoryPath,
@@ -830,6 +844,19 @@ public actor InProcessCoreClient: CoreClient {
                 archive: scripts.archive
             )) == true
             if !approved {
+                // The approval dialog stays up for as long as the user takes to
+                // read it, and the setup script behind it is what makes the
+                // worktree buildable. Sending the first turn here meant the
+                // agent ran its first build against a worktree with no
+                // dependencies installed, and then reported that as the
+                // repository's own failure. The message waits for the script.
+                if let prompt, scripts.setup != nil {
+                    promptsHeldForScriptApproval[record.workspaceID] = HeldPrompt(
+                        text: prompt,
+                        origin: request.promptOrigin
+                    )
+                    promptIsHeld = true
+                }
                 continuation.yield(.repositoryScriptsNeedApproval(RepositoryScriptsApproval(
                     workspaceID: record.workspaceID,
                     repositoryPath: record.repositoryPath,
@@ -841,10 +868,10 @@ public actor InProcessCoreClient: CoreClient {
                 await runScript(setup, in: worktree.path, workspaceID: record.workspaceID)
             }
         }
-        if let initialPrompt, !initialPrompt.isEmpty {
+        if let prompt, !promptIsHeld {
             _ = try? await engine.send(SendMessageRequest(
                 workspaceID: record.workspaceID,
-                text: initialPrompt,
+                text: prompt,
                 queueIfBusy: false,
                 origin: request.promptOrigin
             ))
@@ -852,10 +879,76 @@ public actor InProcessCoreClient: CoreClient {
         return record
     }
 
+    /// A first message parked until its worktree is actually prepared.
+    private struct HeldPrompt {
+        var text: String
+        var origin: MessageOrigin
+    }
+
+    /// Sends the first message held back for a setup script, now that the
+    /// script has had its chance to run.
+    private func sendPromptHeldForScriptApproval(_ id: WorkspaceID) async {
+        guard let held = promptsHeldForScriptApproval.removeValue(forKey: id),
+              let workspaceEngine = try? await engine(for: id)
+        else { return }
+        _ = try? await workspaceEngine.send(SendMessageRequest(
+            workspaceID: id,
+            text: held.text,
+            queueIfBusy: false,
+            origin: held.origin
+        ))
+    }
+
+    /// The user read a repository's `ore.toml` and said no.
+    ///
+    /// Nothing runs — and, the part that was silent, the first message held
+    /// back for the setup script is never going to be sent. Declining used to
+    /// produce an app-layer banner about the scripts and no word at all about
+    /// the turn that quietly evaporated, so the text comes back with it.
+    func declineRepositoryScripts(_ approval: RepositoryScriptsApproval) {
+        returnPromptHeldForScriptApproval(
+            approval.workspaceID,
+            because: "This project's ore.toml setup script wasn't allowed to run, so the "
+                + "worktree isn't prepared and the message was held back rather than "
+                + "sent into it."
+        )
+    }
+
+    /// Give a held first message back to the user rather than dropping it, for
+    /// every way the setup it was waiting for can fail to happen. A dropped
+    /// prompt is worse than an early one: the early one at least still exists.
+    private func returnPromptHeldForScriptApproval(
+        _ id: WorkspaceID,
+        because reason: String
+    ) {
+        guard let held = promptsHeldForScriptApproval.removeValue(forKey: id) else { return }
+        continuation.yield(.commandFailed(CommandFailure(
+            workspaceID: id,
+            message: "Your first message wasn't sent.",
+            detail: reason + " Here it is to send when you're ready:\n\n\(held.text)"
+        )))
+    }
+
     /// The user read a repository's `ore.toml` scripts and allowed them. Only
     /// the text they were shown is approved: if the file changed while the
     /// prompt was open, the new text is asked about and nothing runs.
     private func approveRepositoryScripts(_ approval: RepositoryScriptsApproval) async throws {
+        do {
+            try await runRepositoryScriptApproval(approval)
+        } catch {
+            // Only on a throw. The "ore.toml changed while the dialog was open"
+            // path returns instead, and has to keep the message held for the
+            // re-ask it is about to yield.
+            returnPromptHeldForScriptApproval(
+                approval.workspaceID,
+                because: "ORE couldn't prepare this workspace, so the message was held back "
+                    + "rather than sent into an unprepared worktree."
+            )
+            throw error
+        }
+    }
+
+    private func runRepositoryScriptApproval(_ approval: RepositoryScriptsApproval) async throws {
         guard let record = try await store.workspace(approval.workspaceID) else {
             throw OreCoreError.workspaceNotFound(approval.workspaceID)
         }
@@ -889,6 +982,10 @@ public actor InProcessCoreClient: CoreClient {
                 workspaceID: approval.workspaceID
             )
         }
+        // After the script, never before: this is the whole reason the first
+        // message was held. Unconditional, so a ⌘R approval (which does not
+        // re-run setup) releases a parked message rather than stranding it.
+        await sendPromptHeldForScriptApproval(approval.workspaceID)
     }
 
     func archiveWorkspace(_ id: WorkspaceID) async throws {
@@ -1960,7 +2057,8 @@ private extension CoreCommand {
             return id
         case .resync(let id):
             return id
-        case .approveRepositoryScripts(let approval):
+        case .approveRepositoryScripts(let approval),
+             .declineRepositoryScripts(let approval):
             return approval.workspaceID
         case .addRepository, .createProject, .createWorkspace, .probeHarnesses,
              .checkHarnessUpdates,
@@ -1969,5 +2067,30 @@ private extension CoreCommand {
              .resolveDreamFinding, .listDreamFindings:
             return nil
         }
+    }
+}
+
+/// Whether a pinned model id has been outlived by the catalog that names it.
+///
+/// A provider retiring a model leaves the pin behind: the id keeps being sent
+/// to the CLI, which rejects it, while Settings shows "Agent default" because
+/// it cannot find the id to display. Clearing it needs a catalog that was
+/// actually answered — discovery returns nothing whenever the CLI could not be
+/// asked at all (not installed, not signed in, offline), and an empty list is
+/// not evidence that anything is gone.
+///
+/// That is also why this is not folded into the app's `defaultModelID`: that
+/// runs on every cold start, before the first discovery, when the catalog is
+/// empty by definition. Checking there would silently unpin a perfectly good
+/// model on every launch. It belongs with a freshly discovered catalog, which
+/// is what `recordModels` publishes as `.modelCatalogUpdated`.
+///
+/// The verdict is reached here, where the catalog is known, and applied by the
+/// app: the pin itself is client state (`UserDefaults`), which never crosses
+/// the core boundary.
+public enum StaleModelPin {
+    public static func isStale(_ pinnedID: String?, in catalog: [AgentModel]) -> Bool {
+        guard let pinnedID, !pinnedID.isEmpty, !catalog.isEmpty else { return false }
+        return !catalog.contains { $0.id == pinnedID }
     }
 }

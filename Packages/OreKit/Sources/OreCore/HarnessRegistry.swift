@@ -26,19 +26,28 @@ public struct HarnessRegistry: Sendable {
 
     /// Everything shipping today.
     ///
-    /// `cursorAllowUnprompted` is passed rather than read from defaults so the
-    /// core stays free of UI storage; only the app knows the user answered yes.
+    /// `cursorAllowUnprompted` and `allowAPIKeyFallback` are passed rather than
+    /// read from defaults so the core stays free of UI storage; only the app
+    /// knows the user answered yes. `allowAPIKeyFallback` reaches the
+    /// harnesses' *probes*, which strip provider credentials by default and so
+    /// kept telling an API-key user to sign in to a CLI that is already
+    /// authenticated; sessions have always taken it from
+    /// `SessionConfiguration`.
     public static func standard(
         enabledExperimental: Set<HarnessKind> = [.cursorAgent],
-        cursorAllowUnprompted: Bool = false
+        cursorAllowUnprompted: Bool = false,
+        allowAPIKeyFallback: Bool = false
     ) -> HarnessRegistry {
         // Experimental harnesses are always registered so Settings can detect
         // an installed CLI. `harness(for:)` and `available` still honor an
         // explicitly restricted policy supplied by an embedding host.
         let harnesses: [any AgentHarness] = [
-            ClaudeCodeHarness(),
-            CodexHarness(),
-            CursorAgentHarness(allowUnprompted: cursorAllowUnprompted),
+            ClaudeCodeHarness(allowAPIKeyFallback: allowAPIKeyFallback),
+            CodexHarness(allowAPIKeyFallback: allowAPIKeyFallback),
+            CursorAgentHarness(
+                allowUnprompted: cursorAllowUnprompted,
+                allowAPIKeyFallback: allowAPIKeyFallback
+            ),
         ]
         return HarnessRegistry(
             harnesses: harnesses,

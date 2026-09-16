@@ -32,7 +32,8 @@ struct WorkspaceLaunchPlanTests {
         modelOverride: String? = nil,
         repositoryOverride: String? = nil,
         wantsNewProject: Bool = false,
-        explicitBranch: String? = nil
+        explicitBranch: String? = nil,
+        repositoryDefaultHarness: @escaping (String) -> HarnessKind? = { _ in nil }
     ) -> WorkspaceLaunchPlan.Inputs {
         let catalogue = claudeModels
         let codex = codexModels
@@ -54,8 +55,53 @@ struct WorkspaceLaunchPlanTests {
             modelOverride: modelOverride,
             repositoryOverride: repositoryOverride,
             wantsNewProject: wantsNewProject,
-            explicitBranch: explicitBranch
+            explicitBranch: explicitBranch,
+            repositoryDefaultHarness: repositoryDefaultHarness
         )
+    }
+
+    // MARK: - ore.toml's [agent] harness
+
+    /// `ore.toml`'s `[agent] harness` was written by Settings, parsed by the
+    /// loader, and applied nowhere. Where it belongs is the one place an
+    /// explicit pick is still distinguishable from a default: by the time a
+    /// `CreateWorkspaceRequest` exists its `harness` is non-optional, so
+    /// resolving the config there would silently overrule the user.
+    @Test func repoDefaultHarnessLosesToAnExplicitRequest() {
+        let repoWantsCodex: (String) -> HarnessKind? = { _ in .codex }
+
+        // Nobody said otherwise: the repository's preference wins over
+        // "whatever is installed first".
+        let unopinionated = WorkspaceLaunchPlan.resolve(inputs(
+            "fix the importer",
+            current: ore,
+            repositoryDefaultHarness: repoWantsCodex
+        ))
+        #expect(unopinionated.harness == .codex)
+
+        // A click in the sheet.
+        let picked = WorkspaceLaunchPlan.resolve(inputs(
+            "fix the importer",
+            current: ore,
+            harnessOverride: .claudeCode,
+            repositoryDefaultHarness: repoWantsCodex
+        ))
+        #expect(picked.harness == .claudeCode)
+
+        // And an agent named in the sentence itself.
+        let spoken = WorkspaceLaunchPlan.resolve(inputs(
+            "use claude code to fix the importer",
+            current: ore,
+            repositoryDefaultHarness: repoWantsCodex
+        ))
+        #expect(spoken.harness == .claudeCode)
+    }
+
+    /// A repository with no `[agent] harness` resolves exactly as it did
+    /// before the config existed.
+    @Test func noRepoDefaultLeavesTheReadyOrderInCharge() {
+        let plan = WorkspaceLaunchPlan.resolve(inputs("fix the importer", current: ore))
+        #expect(plan.harness == .claudeCode)
     }
 
     // MARK: - Agent before model

@@ -51,9 +51,17 @@ public struct CursorAgentHarness: AgentHarness {
     /// only the user can make.
     public var allowUnprompted: Bool
 
-    public init(executablePathOverride: String? = nil, allowUnprompted: Bool = false) {
+    /// See `ClaudeCodeHarness.allowAPIKeyFallback`.
+    public var allowAPIKeyFallback: Bool
+
+    public init(
+        executablePathOverride: String? = nil,
+        allowUnprompted: Bool = false,
+        allowAPIKeyFallback: Bool = false
+    ) {
         self.executablePathOverride = executablePathOverride
         self.allowUnprompted = allowUnprompted
+        self.allowAPIKeyFallback = allowAPIKeyFallback
     }
 
     public func probe() async -> HarnessProbeResult {
@@ -61,14 +69,25 @@ public struct CursorAgentHarness: AgentHarness {
             return HarnessProbeResult(
                 kind: kind,
                 authState: .notAuthenticated,
-                diagnostic: "Not found on PATH (\(ShellEnvironment.searchPathDescription))"
+                // The unambiguous name, not `agent`: an alias called `agent`
+                // could be anyone's, so only `cursor-agent` is worth naming.
+                diagnostic: await HarnessDiagnostic.notFound(
+                    executableName: Self.executableNames[0]
+                )
             )
         }
         let path = resolved.path
 
-        let version = await CommandProbe.firstLine(
-            executablePath: path, arguments: ["--version"], timeout: .seconds(10)
+        let versionProbe = await CommandProbe.run(
+            executablePath: path,
+            arguments: ["--version"],
+            timeout: .seconds(10),
+            allowAPIKeyFallback: allowAPIKeyFallback
         )
+        if case .couldNotLaunch(let reason) = versionProbe {
+            return HarnessDiagnostic.unlaunchable(kind: kind, path: path, reason: reason)
+        }
+        let version = versionProbe.firstLine
 
         // `agent` is a name anything can have. Cursor renamed its command to
         // it, so it has to be searched for — but adopting whatever answers to
@@ -88,12 +107,15 @@ public struct CursorAgentHarness: AgentHarness {
             )
         }
 
-        let status = await CommandProbe.output(
-            executablePath: path, arguments: ["status"], timeout: .seconds(15)
+        let status = await CommandProbe.run(
+            executablePath: path,
+            arguments: ["status"],
+            timeout: .seconds(15),
+            allowAPIKeyFallback: allowAPIKeyFallback
         )
 
         let authState: HarnessProbeResult.AuthState
-        switch status?.lowercased() {
+        switch status.spokenText?.lowercased() {
         case let text? where text.contains("not logged in"): authState = .notAuthenticated
         case let text? where text.contains("logged in"): authState = .authenticated
         default: authState = .unknown
@@ -118,7 +140,10 @@ public struct CursorAgentHarness: AgentHarness {
     public func discoverModels() async -> [AgentModel] {
         guard let path = resolveExecutablePath() else { return [] }
         guard let output = await CommandProbe.output(
-            executablePath: path, arguments: ["--list-models"], timeout: .seconds(15)
+            executablePath: path,
+            arguments: ["--list-models"],
+            timeout: .seconds(15),
+            allowAPIKeyFallback: allowAPIKeyFallback
         ) else { return [] }
 
         var models: [AgentModel] = []

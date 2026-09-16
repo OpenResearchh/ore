@@ -752,3 +752,17 @@ struct SpokenPrefixTests {
         #expect(NarrationEngine.spokenProgressWouldRevealNewWords(of: line, from: 8, to: 14))
     }
 }
+
+/// Unit 20: an interrupted 940 MB fetch left the settings row saying "not
+/// installed" with no way back to it.
+@MainActor
+struct NeuralVoiceInstallActionTests {
+    @Test func notInstalledOffersADownloadAction() {
+        #expect(NeuralNarrationVoice.Readiness.notInstalled.installActionTitle == "Download")
+        #expect(NeuralNarrationVoice.Readiness.failed("no network").installActionTitle == "Try again")
+        // Nothing to offer while it is already running, or already done —
+        // a second press would either be a no-op or start a needless fetch.
+        #expect(NeuralNarrationVoice.Readiness.installing.installActionTitle == nil)
+        #expect(NeuralNarrationVoice.Readiness.ready.installActionTitle == nil)
+    }
+}

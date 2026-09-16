@@ -574,5 +574,13 @@ enum CodexApprovalDecision {
 }
 
 public enum OreVersion {
-    public static let current = "0.1.0"
+    /// What ORE calls itself in a CLI handshake.
+    ///
+    /// Hard-coding it meant every build since the first told Codex it was
+    /// 0.1.0, so the one place a version-skew bug would show up reported a
+    /// version that had not been true for releases. The literal stays as the
+    /// fallback: `ore-cli` and the tests have no bundle to read, and the
+    /// handshake still needs an answer.
+    public static let current = Bundle.main
+        .infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
 }

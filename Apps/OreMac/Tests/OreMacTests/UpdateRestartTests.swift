@@ -95,7 +95,6 @@ struct UpdateRestartTests {
     @Test func theSwapScriptNeverDeletesTheAppItIsReplacing() {
         let script = swapScript()
 
-        #expect(!script.contains("/bin/rm -rf \"$DST\""))
         #expect(!script.contains("/bin/rm -rf '/Applications/ORE.app'"))
         // Copy, then check, then swap — in that order.
         let copy = try? #require(script.range(of: "ditto \"$SRC\" \"$INCOMING\""))
@@ -104,6 +103,14 @@ struct UpdateRestartTests {
         if let copy, let verify, let swap {
             #expect(copy.upperBound < verify.lowerBound)
             #expect(verify.upperBound < swap.lowerBound)
+        }
+        // The one `rm -rf "$DST"` in the script is the rollback, which cannot
+        // run until the swap has already happened and the new app refused to
+        // open. Before that point the destination is never removed at all.
+        #expect(script.components(separatedBy: "/bin/rm -rf \"$DST\"").count == 2)
+        let removeDestination = try? #require(script.range(of: "/bin/rm -rf \"$DST\""))
+        if let swap, let removeDestination {
+            #expect(swap.upperBound < removeDestination.lowerBound)
         }
         #expect(script.contains("mv \"$DST\" \"$PREVIOUS\""), "the old app is kept, not deleted")
     }
@@ -116,16 +123,21 @@ struct UpdateRestartTests {
     private func runSwap(
         newApp: URL,
         destination: URL,
-        logPath: String
+        logPath: String,
+        origin: String? = nil,
+        open: String = "/usr/bin/true"
     ) throws -> Int32 {
         var script = GitHubUpdater.relaunchScript(
             // A pid we cannot signal reads as "already gone", which is the
             // state the script is written to wait for.
             newApp: newApp, destination: destination, pid: 1,
             scriptPath: "/dev/null", label: "dev.ore.relaunch.test",
+            origin: origin,
             logPath: logPath
         )
-        script = script.replacingOccurrences(of: "/usr/bin/open", with: "/usr/bin/true")
+        // `/usr/bin/true` accepts the launch; `/usr/bin/false` is a Mac that
+        // refuses to run what was just installed.
+        script = script.replacingOccurrences(of: "/usr/bin/open", with: open)
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("ore-swap-\(UUID().uuidString).sh")
         try script.write(to: path, atomically: true, encoding: .utf8)
@@ -383,6 +395,241 @@ struct UpdateRestartTests {
         #expect(gate.hasReplied)
     }
 
+    // MARK: - Pre-flight
+
+    @Test func anUnwritableDestinationFailsBeforeAnyQuitIsRequested() throws {
+        let scratch = try Scratch()
+        let readOnly = scratch.root.appendingPathComponent("ReadOnly", isDirectory: true)
+        try FileManager.default.createDirectory(at: readOnly, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: readOnly.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: readOnly.path
+            )
+        }
+        let probe = HookProbe()
+        let updater = makeUpdater(
+            probe: probe,
+            version: "0.7.0",
+            bundle: readOnly.appendingPathComponent("ORE.app")
+        )
+        updater.applyCheckResult(release("v0.8.0"))
+
+        updater.install()
+
+        // The point of the whole check: nothing downloaded and nothing asked
+        // to quit, so no agent lost its turn to an update that never could
+        // have landed.
+        #expect(probe.downloaded.isEmpty)
+        #expect(probe.quitRequests == 0)
+        #expect(probe.forceQuits == 0)
+        #expect(updater.isFailed)
+        if case .failed(let detail) = updater.phase {
+            #expect(detail.contains(readOnly.path), "and it names the folder")
+        }
+    }
+
+    @Test func aWritableDestinationIsNotBlocked() throws {
+        let scratch = try Scratch()
+        #expect(
+            GitHubUpdater.installBlocker(
+                currentBundle: scratch.root.appendingPathComponent("ORE.app")
+            ) == nil
+        )
+    }
+
+    @Test func translocatedBundlesAreRefusedRatherThanRedirected() {
+        // Gatekeeper's read-only copy of an app opened from a downloaded DMG.
+        // Quietly installing to /Applications from here leaves two copies and
+        // keeps the user running the old one — "the update did nothing".
+        let translocated = URL(
+            fileURLWithPath: "/private/var/folders/xy/AppTranslocation/0B1C/d/ORE.app"
+        )
+        let probe = HookProbe()
+        let updater = makeUpdater(probe: probe, version: "0.7.0", bundle: translocated)
+        updater.applyCheckResult(release("v0.8.0"))
+
+        updater.install()
+
+        #expect(probe.downloaded.isEmpty)
+        #expect(probe.quitRequests == 0)
+        #expect(updater.isFailed)
+        if case .failed(let detail) = updater.phase {
+            #expect(detail.contains("Applications folder"))
+        }
+        #expect(GitHubUpdater.isTranslocated(translocated))
+        #expect(
+            GitHubUpdater.isTranslocated(URL(fileURLWithPath: "/Applications/ORE.app")) == false
+        )
+    }
+
+    // MARK: - "Later"
+
+    @Test func dismissSurvivesRelaunchButNotANewerVersion() {
+        let defaults = makeDefaults()
+        let updater = makeUpdater(probe: HookProbe(), defaults: defaults, version: "0.7.0")
+        updater.applyCheckResult(release("v0.8.0"))
+
+        updater.dismiss()
+        #expect(updater.showsPrompt == false)
+
+        // The modal used to come back on the next launch, and every launch
+        // after it, for a release the user had already waved off.
+        let relaunched = makeUpdater(probe: HookProbe(), defaults: defaults, version: "0.7.0")
+        relaunched.applyCheckResult(release("v0.8.0"))
+        #expect(relaunched.dismissed)
+        #expect(relaunched.showsPrompt == false)
+
+        // A newer release is a different question and gets asked again.
+        let newer = makeUpdater(probe: HookProbe(), defaults: defaults, version: "0.7.0")
+        newer.applyCheckResult(release("v0.9.0"))
+        #expect(newer.dismissed == false)
+        #expect(newer.showsPrompt)
+    }
+
+    // MARK: - Rollback when the new app won't open
+
+    @Test func relaunchScriptRestoresThePreviousBundleWhenOpenFails() throws {
+        let scratch = try Scratch()
+        let staged = try scratch.app(named: "ORE.app", in: "staging", version: "2.0", signed: true)
+        let installed = try scratch.app(
+            named: "ORE.app", in: "Applications", version: "1.0", signed: true
+        )
+
+        // The swap works; it is Launch Services that refuses what came out of
+        // it. The old script had already deleted the only other copy by here.
+        _ = try runSwap(
+            newApp: staged,
+            destination: installed,
+            logPath: scratch.log.path,
+            open: "/usr/bin/false"
+        )
+
+        #expect(scratch.version(of: installed) == "1.0", "the user still has a working ORE")
+        #expect(scratch.leftovers(in: "Applications").isEmpty)
+        #expect(scratch.logContents().contains("rolled back"))
+    }
+
+    @Test func thePreviousBundleIsOnlyDiscardedOnceTheNewOneOpened() {
+        let script = swapScript()
+        let tail = script.components(separatedBy: "log \"installed; reopening\"").last ?? ""
+
+        // Exactly one `rm -rf "$PREVIOUS"` after the swap, and it sits inside
+        // the branch that only runs when `open` reported success.
+        #expect(tail.components(separatedBy: "/bin/rm -rf \"$PREVIOUS\"").count == 2)
+        let success = tail
+            .components(separatedBy: "if [ \"$OPENED\" = 1 ]; then").last?
+            .components(separatedBy: "else").first ?? ""
+        #expect(success.contains("/bin/rm -rf \"$PREVIOUS\""))
+    }
+
+    @Test func givingUpFallsBackToTheBundleThatWasRunning() {
+        let script = GitHubUpdater.relaunchScript(
+            newApp: URL(fileURLWithPath: "/tmp/stage/ORE.app"),
+            destination: URL(fileURLWithPath: "/Applications/ORE.app"),
+            pid: 4_242,
+            scriptPath: "/tmp/relaunch.sh",
+            label: "dev.ore.relaunch.test",
+            origin: "/Volumes/ORE/ORE.app"
+        )
+        let giveUp = script
+            .components(separatedBy: "give_up() {").last?
+            .components(separatedBy: "\n}").first ?? ""
+
+        #expect(script.contains("ORIGIN='/Volumes/ORE/ORE.app'"))
+        // A first install that fails has nothing at "$DST" to reopen, so the
+        // bundle the user actually launched is all that is left to go back to.
+        #expect(giveUp.contains("/usr/bin/open \"$ORIGIN\""))
+    }
+
+    // MARK: - Permissions the update took with it
+
+    @Test func anUpdateThatDroppedAccessibilitySaysHowToGetItBack() {
+        // Every release is ad-hoc signed, so the cdhash the Accessibility
+        // grant was keyed to is gone. The System Settings row still shows a
+        // tick, which is why nobody works this out unaided.
+        let defaults = makeDefaults()
+        stage("v0.8.0", in: defaults, hotkeyWasTrusted: true)
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.8.0", accessibilityTrust: false
+        )
+
+        updater.reconcilePendingRestart()
+
+        #expect(updater.completedVersion == "0.8.0")
+        let note = updater.completionNote ?? ""
+        #expect(note.contains("Accessibility"))
+        #expect(note.contains("remove ORE"), "re-ticking the row is the thing that doesn't work")
+    }
+
+    @Test func anUpdateThatKeptAccessibilityAddsNothingToTheCard() {
+        let defaults = makeDefaults()
+        stage("v0.8.0", in: defaults, hotkeyWasTrusted: true)
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.8.0", accessibilityTrust: true
+        )
+
+        updater.reconcilePendingRestart()
+
+        #expect(updater.completionNote == nil)
+    }
+
+    @Test func someoneWhoNeverGrantedAccessibilityIsNotToldItBroke() {
+        let defaults = makeDefaults()
+        stage("v0.8.0", in: defaults, hotkeyWasTrusted: false)
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.8.0", accessibilityTrust: false
+        )
+
+        updater.reconcilePendingRestart()
+
+        #expect(updater.completedVersion == "0.8.0")
+        #expect(updater.completionNote == nil)
+    }
+
+    @Test func aRecordWrittenBeforeTrustWasTrackedReadsAsNotTrusted() {
+        // Records staged by an older build have no `hotkeyWasTrusted` at all;
+        // absent must not be mistaken for "was trusted".
+        let defaults = makeDefaults()
+        stage("v0.8.0", in: defaults)
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.8.0", accessibilityTrust: false
+        )
+
+        updater.reconcilePendingRestart()
+
+        #expect(updater.completionNote == nil)
+    }
+
+    @Test func trustIsRecordedBeforeTheSwapNotAfterIt() async throws {
+        let defaults = makeDefaults()
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.7.0", accessibilityTrust: true
+        )
+
+        await updater.runInstall(release("v0.8.0"))
+
+        let data = try #require(defaults.data(forKey: GitHubUpdater.pendingRestartKey))
+        let pending = try JSONDecoder().decode(GitHubUpdater.PendingRestart.self, from: data)
+        #expect(pending.hotkeyWasTrusted == true)
+    }
+
+    @Test func acknowledgingTheConfirmationClearsTheNoteWithIt() {
+        let defaults = makeDefaults()
+        stage("v0.8.0", in: defaults, hotkeyWasTrusted: true)
+        let updater = makeUpdater(
+            probe: HookProbe(), defaults: defaults, version: "0.8.0", accessibilityTrust: false
+        )
+        updater.reconcilePendingRestart()
+
+        updater.acknowledgeCompletion()
+
+        #expect(updater.completionNote == nil)
+        #expect(updater.showsPrompt == false)
+    }
+
     // MARK: - Helpers
 
     private func swapScript() -> String {
@@ -403,12 +650,19 @@ struct UpdateRestartTests {
     private func makeUpdater(
         probe: HookProbe,
         defaults: UserDefaults? = nil,
-        version: String
+        version: String,
+        bundle: URL = URL(fileURLWithPath: "/Applications/ORE.app"),
+        accessibilityTrust: Bool = false
     ) -> GitHubUpdater {
         GitHubUpdater(
             hooks: probe.hooks,
             defaults: defaults ?? makeDefaults(),
-            version: { version }
+            version: { version },
+            bundleURL: { bundle },
+            // Never the real `AXIsProcessTrusted()`: whether the machine
+            // running the tests happens to trust the test runner is not what
+            // any of these are about.
+            accessibilityTrust: { accessibilityTrust }
         )
     }
 
@@ -423,11 +677,14 @@ struct UpdateRestartTests {
         )
     }
 
-    private func stage(_ version: String, in defaults: UserDefaults) {
+    private func stage(
+        _ version: String, in defaults: UserDefaults, hotkeyWasTrusted: Bool? = nil
+    ) {
         let pending = GitHubUpdater.PendingRestart(
             version: version,
             title: "ORE \(version)",
-            releaseURL: URL(string: "https://example.invalid/\(version)")!
+            releaseURL: URL(string: "https://example.invalid/\(version)")!,
+            hotkeyWasTrusted: hotkeyWasTrusted
         )
         defaults.set(try! JSONEncoder().encode(pending), forKey: GitHubUpdater.pendingRestartKey)
     }

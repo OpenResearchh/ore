@@ -61,6 +61,9 @@ final class GitHubUpdater {
         var version: String
         var title: String
         var releaseURL: URL
+        /// Whether ORE was trusted for Accessibility *before* the swap.
+        /// Optional so a record written by an older build still decodes.
+        var hotkeyWasTrusted: Bool?
     }
 
     /// The side effects of installing, injected so the lifecycle above them —
@@ -127,6 +130,9 @@ final class GitHubUpdater {
     /// Set on the first launch after an update landed, so the restart ends in
     /// a confirmation the user dismisses rather than in silence.
     private(set) var completedVersion: String?
+    /// An extra line on that confirmation for damage the update itself did —
+    /// today only the Accessibility grant an ad-hoc re-sign throws away.
+    private(set) var completionNote: String?
     /// The in-flight install, kept so Cancel can actually stop the download
     /// rather than leaving the user trapped behind a disabled modal.
     private var installTask: Task<Void, Never>?
@@ -134,6 +140,12 @@ final class GitHubUpdater {
     private let hooks: Hooks
     private let defaults: UserDefaults
     private let version: @Sendable () -> String
+    /// Where this build is running from. Injected so the pre-flight checks —
+    /// which decide whether an install can happen at all — can be driven
+    /// against a scratch directory instead of the real app bundle.
+    private let bundleURL: @Sendable () -> URL
+    /// Whether macOS currently trusts ORE for Accessibility.
+    private let accessibilityTrust: @Sendable () -> Bool
 
     /// How long the app gets to quit on its own before the update stops being
     /// polite about it. Longer than `AppDelegate`'s shutdown deadline, so the
@@ -141,6 +153,10 @@ final class GitHubUpdater {
     static let quitDeadline: Duration = .seconds(12)
 
     static let pendingRestartKey = "ore.update.pendingRestart"
+    /// The release the user last waved off. `dismissed` alone lives for one
+    /// process, so "Later" meant "until you next open ORE" and the same modal
+    /// came back on every launch. Mirrors `AppModel.dismissHarnessUpdate`.
+    static let dismissedVersionKey = "ore.update.dismissedVersion"
 
     /// `owner/repo` this build updates from.
     nonisolated static let repository = "OpenResearchh/ore"
@@ -151,11 +167,19 @@ final class GitHubUpdater {
         version: @escaping @Sendable () -> String = {
             Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
                 ?? "0.0.0"
+        },
+        bundleURL: @escaping @Sendable () -> URL = { Bundle.main.bundleURL },
+        // `assumeIsolated`: every caller is already on the main actor, which
+        // is where `VoiceHotkeyMonitor` lives.
+        accessibilityTrust: @escaping @Sendable () -> Bool = {
+            MainActor.assumeIsolated { VoiceHotkeyMonitor.shared.refreshTrust() }
         }
     ) {
         self.hooks = hooks
         self.defaults = defaults
         self.version = version
+        self.bundleURL = bundleURL
+        self.accessibilityTrust = accessibilityTrust
     }
 
     var currentVersion: String { version() }
@@ -207,17 +231,28 @@ final class GitHubUpdater {
             phase = .idle
         }
         available = release
+        // A "Later" from a previous launch still counts. The comparison above
+        // is what un-dismisses it: a stored version only ever matches the
+        // release it was recorded for, so a newer one prompts again.
+        if defaults.string(forKey: Self.dismissedVersionKey) == release.version {
+            dismissed = true
+        }
     }
 
     func dismiss() {
         dismissed = true
         completedVersion = nil
+        completionNote = nil
+        if let available {
+            defaults.set(available.version, forKey: Self.dismissedVersionKey)
+        }
         if case .failed = phase { phase = .idle }
     }
 
     /// Clears the "you're now on vX" confirmation shown after a restart.
     func acknowledgeCompletion() {
         completedVersion = nil
+        completionNote = nil
     }
 
     /// Downloads the release, replaces this app bundle, and relaunches.
@@ -228,8 +263,20 @@ final class GitHubUpdater {
             NSWorkspace.shared.open(available.releaseURL)
             return
         }
+        // Before the download, and so before the quit. Finishing an install
+        // terminates the app and every agent running under it; discovering
+        // only then that the bundle cannot be replaced cost the user their
+        // work *and* left them on the old version.
+        if let blocker = Self.installBlocker(currentBundle: bundleURL()) {
+            dismissed = false
+            completedVersion = nil
+            completionNote = nil
+            phase = .failed(blocker)
+            return
+        }
         dismissed = false
         completedVersion = nil
+        completionNote = nil
         phase = .downloading
         installTask = Task { await runInstall(available) }
     }
@@ -289,7 +336,10 @@ final class GitHubUpdater {
 
     private func recordPendingRestart(for release: Available) {
         let pending = PendingRestart(
-            version: release.version, title: release.title, releaseURL: release.releaseURL
+            version: release.version, title: release.title, releaseURL: release.releaseURL,
+            // Captured now because after the swap there is no way to tell a
+            // grant macOS revoked from one the user never gave.
+            hotkeyWasTrusted: accessibilityTrust()
         )
         guard let data = try? JSONEncoder().encode(pending) else { return }
         defaults.set(data, forKey: Self.pendingRestartKey)
@@ -314,6 +364,10 @@ final class GitHubUpdater {
             // normal case, and where they don't, what's actually running is
             // the honest thing to report.
             completedVersion = currentVersion
+            completionNote = Self.accessibilityResetNote(
+                wasTrusted: pending.hotkeyWasTrusted ?? false,
+                isTrusted: accessibilityTrust()
+            )
             available = nil
             phase = .idle
             return
@@ -327,6 +381,20 @@ final class GitHubUpdater {
             "ORE downloaded \(Self.displayVersion(pending.version)) but the install "
                 + "didn't finish. Try again."
         )
+    }
+
+    /// Every release is ad-hoc signed (`bundle.sh` sets `IDENTITY="-"`), so
+    /// each update ships a new cdhash and macOS drops the TCC records keyed
+    /// to the old one. Accessibility is the trap: its System Settings row
+    /// stays ticked while the process is untrusted, so the one thing users
+    /// try — checking the box again — cannot work. Notifications are keyed to
+    /// the bundle identifier and survive; the microphone simply re-prompts.
+    /// Notarizing releases retires this.
+    nonisolated static func accessibilityResetNote(wasTrusted: Bool, isTrusted: Bool) -> String? {
+        guard wasTrusted, !isTrusted else { return nil }
+        return "This update reset ORE's Accessibility permission, so the voice hotkey "
+            + "won't work outside ORE until you remove ORE from System Settings ▸ Privacy "
+            + "& Security ▸ Accessibility and add it back."
     }
 
     // MARK: - Version comparison
@@ -541,10 +609,39 @@ final class GitHubUpdater {
     /// A build running off a mounted disk image can't replace itself there;
     /// land the new copy in Applications instead.
     nonisolated static func installDestination(currentBundle: URL) -> URL {
-        if currentBundle.path.hasPrefix("/Volumes/") {
+        if currentBundle.path.hasPrefix("/Volumes/") || isTranslocated(currentBundle) {
             return URL(fileURLWithPath: "/Applications/ORE.app")
         }
         return currentBundle
+    }
+
+    /// Gatekeeper runs an app opened straight out of a downloaded disk image
+    /// from a randomised read-only copy under `AppTranslocation`.
+    nonisolated static func isTranslocated(_ bundle: URL) -> Bool {
+        bundle.path.contains("/AppTranslocation/")
+    }
+
+    /// Why this build cannot update itself, or `nil` when it can.
+    ///
+    /// Both cases used to be found out the hard way. A read-only destination
+    /// was discovered after the app had already quit — the swap is a rename,
+    /// so the parent directory's writability is the whole question. And a
+    /// translocated launch was quietly redirected to `/Applications`, which
+    /// installs a second copy the user never asked for while leaving them
+    /// running the old one; refusing and saying why is the honest answer.
+    nonisolated static func installBlocker(currentBundle: URL) -> String? {
+        if isTranslocated(currentBundle) {
+            return "Move ORE to your Applications folder to update — it's currently "
+                + "running from a read-only copy macOS made of the disk image."
+        }
+        let parent = installDestination(currentBundle: currentBundle)
+            .deletingLastPathComponent()
+        guard FileManager.default.isWritableFile(atPath: parent.path) else {
+            return "ORE can't replace itself in \(parent.path) — that folder isn't writable "
+                + "by you. Move ORE to your Applications folder, or reinstall it from "
+                + "https://github.com/\(repository)/releases/latest."
+        }
+        return nil
     }
 
     /// Hands off to a script running as its own launchd job so the swap
@@ -565,7 +662,8 @@ final class GitHubUpdater {
             destination: dest,
             pid: ProcessInfo.processInfo.processIdentifier,
             scriptPath: scriptURL.path,
-            label: String(label)
+            label: String(label),
+            origin: Bundle.main.bundleURL.path
         )
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
 
@@ -606,10 +704,14 @@ final class GitHubUpdater {
         pid: Int32,
         scriptPath: String,
         label: String,
+        // Where the app that scheduled this swap was running from — the last
+        // resort when the destination has nothing openable left.
+        origin: String? = nil,
         logPath: String = defaultLogPath
     ) -> String {
         let src = shellQuote(newApp.path)
         let dst = shellQuote(destination.path)
+        let originPath = shellQuote(origin ?? destination.path)
         let destinationDirectory = shellQuote(destination.deletingLastPathComponent().path)
         let staging = shellQuote(newApp.deletingLastPathComponent().path)
         return """
@@ -619,6 +721,7 @@ final class GitHubUpdater {
         DST=\(dst)
         DEST_DIR=\(destinationDirectory)
         STAGING=\(staging)
+        ORIGIN=\(originPath)
         LOG=\(shellQuote(logPath))
         INCOMING="$DEST_DIR/.ORE.app.incoming.$$"
         PREVIOUS="$DEST_DIR/.ORE.app.previous.$$"
@@ -636,7 +739,9 @@ final class GitHubUpdater {
             /bin/mv "$PREVIOUS" "$DST" && log "restored the previous ORE.app"
           fi
           /bin/rm -rf "$PREVIOUS"
-          [ -e "$DST" ] && /usr/bin/open "$DST"
+          # Something has to come back up. The destination if it survived,
+          # otherwise whatever the user actually launched.
+          { [ -e "$DST" ] && /usr/bin/open "$DST"; } || /usr/bin/open "$ORIGIN"
           /bin/rm -rf "$STAGING"
           /bin/rm -f \(shellQuote(scriptPath))
           /bin/launchctl remove \(shellQuote(label))
@@ -692,8 +797,23 @@ final class GitHubUpdater {
         fi
 
         log "installed; reopening"
-        /usr/bin/open "$DST" || log "could not reopen $DST"
-        /bin/rm -rf "$PREVIOUS"
+
+        # The app we replaced is only discarded once the new one has actually
+        # opened. Deleting it unconditionally made a refused launch — wrong
+        # architecture, a bundle Gatekeeper won't run — terminal: the old
+        # bundle was already gone, so the Mac was left with no working ORE.
+        OPENED=0
+        /usr/bin/open "$DST" && OPENED=1
+        if [ "$OPENED" = 1 ]; then
+          /bin/rm -rf "$PREVIOUS"
+        else
+          log "could not reopen $DST"
+          if [ -d "$PREVIOUS" ]; then
+            /bin/rm -rf "$DST"
+            /bin/mv "$PREVIOUS" "$DST" && log "rolled back to the previous ORE.app"
+            /usr/bin/open "$DST"
+          fi
+        fi
         /bin/rm -rf "$STAGING"
         /bin/rm -f \(shellQuote(scriptPath))
         /bin/launchctl remove \(shellQuote(label))
@@ -882,6 +1002,13 @@ struct GitHubUpdatePrompt: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            if let note = updater.completionNote {
+                Text(note)
+                    .font(.system(size: OreTheme.Font.body))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Spacer()
                 Button("Done") { updater.acknowledgeCompletion() }
@@ -917,6 +1044,17 @@ struct GitHubUpdatePrompt: View {
 
             HStack(spacing: OreTheme.Space.sm) {
                 Spacer()
+                // The swap script logs what it did because by the time it
+                // runs there is no app left to report to. Nothing ever
+                // pointed at that log, so a failed update was a dead end.
+                if updater.isFailed {
+                    Button("Show Log") {
+                        _ = NSWorkspace.shared.selectFile(
+                            GitHubUpdater.defaultLogPath, inFileViewerRootedAtPath: ""
+                        )
+                    }
+                    .buttonStyle(OreSecondaryButtonStyle())
+                }
                 // A download must stay escapable: this was the modal
                 // that trapped the whole app when an install wedged.
                 // Only the brief final swap disables the way out.

@@ -68,3 +68,58 @@ struct HarnessUpdatePromptingTests {
         #expect(HarnessUpdatePrompting.pending(statuses: statuses, dismissed: [:]).isEmpty)
     }
 }
+
+/// What happens after the button is pressed.
+///
+/// For a self-updating CLI, ORE asks one oracle what is published (npm, a
+/// vendor endpoint) and a different one to install it (the CLI's own `update`
+/// subcommand). When those two disagree the update exits zero, the version does
+/// not move, and the card used to be cleared on the strength of the exit code —
+/// then came back unchanged on the next check, with nothing to do about it but
+/// press the same button again.
+struct HarnessNoOpUpdateTests {
+    private func status(installed: String?, latest: String?) -> HarnessUpdateStatus {
+        HarnessUpdateStatus(kind: .codex, installedVersion: installed, latestVersion: latest)
+    }
+
+    @Test func aNoOpUpdateKeepsTheCardWithAnExplanation() throws {
+        let explanation = try #require(AppModel.noOpUpdateExplanation(
+            kind: .codex,
+            before: "0.148.0",
+            after: status(installed: "0.148.0", latest: "0.153.4")
+        ))
+        // Naming the version is the whole point: it is what tells the user the
+        // upgrade did not happen, rather than that they misread the card.
+        #expect(explanation.contains("0.148.0"))
+        #expect(explanation.contains("Codex"))
+    }
+
+    @Test func anUpgradeThatMovedClearsTheCard() {
+        #expect(AppModel.noOpUpdateExplanation(
+            kind: .codex,
+            before: "0.148.0",
+            after: status(installed: "0.153.4", latest: "0.153.4")
+        ) == nil)
+    }
+
+    /// Unchanged, but the channel is no longer advertising anything newer —
+    /// the check that was wrong, not the CLI. Nothing to explain.
+    @Test func aChannelThatStoppedOfferingIsNotAFailure() {
+        #expect(AppModel.noOpUpdateExplanation(
+            kind: .codex,
+            before: "0.153.4",
+            after: status(installed: "0.153.4", latest: "0.153.4")
+        ) == nil)
+    }
+
+    /// No version to compare — a CLI that will not report one. Accusing its
+    /// updater of lagging would be a guess.
+    @Test func anUnknownInstalledVersionSaysNothing() {
+        #expect(AppModel.noOpUpdateExplanation(
+            kind: .codex,
+            before: nil,
+            after: status(installed: nil, latest: "0.153.4")
+        ) == nil)
+        #expect(AppModel.noOpUpdateExplanation(kind: .codex, before: "0.148.0", after: nil) == nil)
+    }
+}

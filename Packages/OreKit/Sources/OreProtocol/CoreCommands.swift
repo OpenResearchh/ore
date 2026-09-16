@@ -97,6 +97,10 @@ public enum CoreCommand: Sendable, Codable {
     /// the setup the workspace skipped. If the file changed since, nothing runs
     /// and the new text is asked about instead.
     case approveRepositoryScripts(RepositoryScriptsApproval)
+    /// Refuse them. Nothing runs — and the core hands back the first message it
+    /// was holding for the setup script, which otherwise evaporated with no
+    /// event, no banner and no transcript entry.
+    case declineRepositoryScripts(RepositoryScriptsApproval)
 
     // Dream Mode
     case updateDreamSettings(DreamSettings)

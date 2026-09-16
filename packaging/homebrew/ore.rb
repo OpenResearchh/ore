@@ -51,6 +51,18 @@ cask "ore" do
     File.write(File.join(ore_home, "install-channel"), "homebrew")
   end
 
+  # Homebrew prints this after `brew install`, and it is the only place this
+  # channel can say anything to the user. Analytics default to on, and until
+  # now install.sh was the only route that disclosed them — a user who came
+  # via `brew install` was never told at all.
+  caveats <<~EOS
+    ORE reports a few anonymous usage events, and never your code or prompts.
+
+    Turn it off in Settings -> Privacy, or set ORE_TELEMETRY=0 in the
+    environment. Exactly what is reported:
+      https://github.com/OpenResearchh/ore/blob/master/PRIVACY.md
+  EOS
+
   uninstall quit: "dev.ore.OreMac"
 
   # Never "~/ore" as a whole: ~/ore/workspaces holds the user's worktrees,

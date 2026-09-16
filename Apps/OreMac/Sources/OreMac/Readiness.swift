@@ -101,10 +101,12 @@ extension Readiness {
         repositoryCount: Int,
         workspaceCount: Int,
         github: GitHubClient.Status?,
+        git: GitAvailability?,
         hasGitIdentity: Bool?
     ) -> Readiness {
         Readiness(steps: [
             agentStep(harnesses: harnesses, hasProbed: hasProbedHarnesses),
+            gitStep(git: git),
             projectStep(repositoryCount: repositoryCount),
             workspaceStep(workspaceCount: workspaceCount, repositoryCount: repositoryCount),
             gitIdentityStep(hasGitIdentity: hasGitIdentity),
@@ -159,6 +161,69 @@ extension Readiness {
             actionTitle: "Copy install command",
             isBlocking: true
         )
+    }
+
+    /// Rung 2, and blocking for the same reason as rung 1: ORE drives git
+    /// directly for every worktree, diff and commit, so a Mac where git does
+    /// not run cannot do anything the product is for.
+    ///
+    /// It was missing from the ladder entirely. The rung below asks whether
+    /// git has a *name and email*, which presumes git runs — so a user with
+    /// no working git was told to configure their identity, ran a `git config`
+    /// that also failed, and only found the real problem when their first
+    /// workspace died on a raw git error.
+    ///
+    /// Above `projectStep` because adding a repository is itself a git
+    /// operation: sending somebody to pick a folder first only moves the
+    /// failure later.
+    private static func gitStep(git: GitAvailability?) -> ReadinessStep {
+        guard let git else {
+            return ReadinessStep(
+                id: "git-available", title: "Checking git…",
+                detail: "ORE runs git directly for worktrees, diffs and commits.",
+                status: .unknown, action: .none, actionTitle: nil, isBlocking: true
+            )
+        }
+        switch git {
+        case .ready:
+            return ReadinessStep(
+                id: "git-available", title: "git is ready",
+                detail: "ORE runs git directly for worktrees, diffs and commits.",
+                status: .satisfied, action: .none, actionTitle: nil, isBlocking: true
+            )
+        case .commandLineToolsMissing:
+            // The most common shape of this on a new Mac, and the one with a
+            // one-command fix. Said plainly, because "git" being present but
+            // non-functional is the opposite of what the user will assume.
+            return ReadinessStep(
+                id: "git-available",
+                title: "Install Apple's command line tools",
+                detail: "macOS ships a placeholder `git` until the developer tools are installed. ORE needs the real one.",
+                status: .unmet,
+                action: .copyCommand("xcode-select --install"),
+                actionTitle: "Copy command",
+                isBlocking: true
+            )
+        case .notFound:
+            return ReadinessStep(
+                id: "git-available",
+                title: "Install git",
+                detail: "ORE couldn't find git on your PATH. The command line tools include it.",
+                status: .unmet,
+                action: .copyCommand("xcode-select --install"),
+                actionTitle: "Copy command",
+                isBlocking: true
+            )
+        case .unknown:
+            // Found, but would not answer. Saying "install git" to somebody
+            // who has it would be the retraction this ladder exists to avoid,
+            // so the rung goes quiet and lets the next one through.
+            return ReadinessStep(
+                id: "git-available", title: "git",
+                detail: "", status: .unknown,
+                action: .none, actionTitle: nil, isBlocking: false
+            )
+        }
     }
 
     private static func projectStep(repositoryCount: Int) -> ReadinessStep {
@@ -249,41 +314,23 @@ extension Readiness {
 // MARK: - Probes
 
 extension Readiness {
-    /// Whether git has a name and an email to commit with.
+    /// Both git questions, answered together off the main actor.
     ///
-    /// Checked without `--global` on purpose: a repository-local identity,
-    /// or one supplied by an includeIf in the user's gitconfig, is just as
-    /// valid, and telling somebody to set a global identity they have
-    /// deliberately avoided setting would be wrong.
-    static func probeGitIdentity() async -> Bool {
-        // Sequential rather than `async let`: `&&` takes an autoclosure, so
-        // an `async let` cannot be read across it, and two local `git config`
-        // reads are not worth the concurrency anyway.
-        let name = await gitConfig("user.name")
-        let email = await gitConfig("user.email")
-        return !(name ?? "").isEmpty && !(email ?? "").isEmpty
-    }
-
-    private static func gitConfig(_ key: String) async -> String? {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["git", "config", "--get", key]
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = FileHandle.nullDevice
-                guard (try? process.run()) != nil else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                let value = String(decoding: data, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                continuation.resume(returning: value.isEmpty ? nil : value)
-            }
-        }
+    /// The implementations live in `OreGit` beside every other git launch in
+    /// the product, so they resolve git through the probed login-shell PATH.
+    /// The app's own copy used `/usr/bin/env git` and was the single launch
+    /// that did not — on a Mac whose git comes from Homebrew or a version
+    /// manager it answered about a different git than the one ORE commits
+    /// with, and on a Mac with no developer tools it was what tripped the
+    /// system install dialog.
+    static func probeGit() async -> (GitAvailability, Bool?) {
+        let availability = await GitAvailability.probe()
+        // Only worth asking once git is known to run: `git config` on a
+        // machine without git fails the same way an unset identity does, and
+        // reporting that as "set your git identity" sends the user to fix the
+        // wrong thing.
+        guard availability.isReady else { return (availability, nil) }
+        return (availability, await GitAvailability.probeIdentity())
     }
 }
 
@@ -305,10 +352,24 @@ enum HarnessSetup {
         }
     }
 
+    /// Each vendor's installer that assumes nothing is already on the machine.
+    ///
+    /// These used to be `npm install -g …` for Claude Code and Codex, which is
+    /// the one thing a first-run install command must not be: rung 1 of the
+    /// ladder is the only truly fatal one, and a Mac that has never been set
+    /// up for development has no Node. The user copied the command ORE handed
+    /// them, pasted it into Terminal, and got `command not found: npm` — a
+    /// dead end produced by ORE's own advice, at the exact moment it claims to
+    /// be helping.
+    ///
+    /// All three vendors ship a shell installer that bootstraps itself, so the
+    /// npm route is not worth keeping even as a fallback: it trades a
+    /// guaranteed-working command for one that needs a prerequisite ORE would
+    /// then also have to explain.
     static func installCommand(for kind: HarnessKind) -> String {
         switch kind {
-        case .claudeCode: "npm install -g @anthropic-ai/claude-code"
-        case .codex: "npm install -g @openai/codex"
+        case .claudeCode: "curl -fsSL https://claude.ai/install.sh | bash"
+        case .codex: "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
         case .cursorAgent: "curl https://cursor.com/install -fsS | bash"
         }
     }

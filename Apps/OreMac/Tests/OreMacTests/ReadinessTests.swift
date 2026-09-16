@@ -28,6 +28,7 @@ struct ReadinessTests {
         repositories: Int = 0,
         workspaces: Int = 0,
         github: GitHubClient.Status? = GitHubClient.Status(isInstalled: true, isAuthenticated: true),
+        git: GitAvailability? = .ready(version: "git version 2.39.5"),
         gitIdentity: Bool? = true
     ) -> Readiness {
         Readiness.evaluate(
@@ -36,6 +37,7 @@ struct ReadinessTests {
             repositoryCount: repositories,
             workspaceCount: workspaces,
             github: github,
+            git: git,
             hasGitIdentity: gitIdentity
         )
     }
@@ -44,8 +46,22 @@ struct ReadinessTests {
     func freshMachine() {
         let readiness = evaluate(harnesses: [probe(.claudeCode, installed: false, auth: .unknown)])
         #expect(readiness.nextStep?.id == "agent")
-        #expect(readiness.nextStep?.action == .copyCommand("npm install -g @anthropic-ai/claude-code"))
+        #expect(readiness.nextStep?.action == .copyCommand("curl -fsSL https://claude.ai/install.sh | bash"))
         #expect(!readiness.isReady)
+    }
+
+    /// Rung 1 is the only fatal one, and a Mac that has never been set up for
+    /// development has no Node — so an `npm install -g` here is a command that
+    /// fails for exactly the user it exists to help. Asserted for every
+    /// harness, because the ladder is not the only caller.
+    @Test("No install command depends on a toolchain the user may not have")
+    func installCommandsBootstrapThemselves() {
+        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+            let command = HarnessSetup.installCommand(for: kind)
+            #expect(!command.contains("npm"), "\(kind) install command requires npm: \(command)")
+            #expect(!command.contains("brew"), "\(kind) install command requires Homebrew: \(command)")
+            #expect(command.hasPrefix("curl "), "\(kind) install command is not self-bootstrapping: \(command)")
+        }
     }
 
     /// The two ways of having no usable agent need different fixes, and
@@ -129,6 +145,62 @@ struct ReadinessTests {
         #expect(readiness.steps.first?.status == .unknown)
     }
 
+    /// The rung that was missing. ORE drives git directly for every worktree,
+    /// diff and commit, so this is blocking — and it has to outrank "add a
+    /// project", because adding one is itself a git operation.
+    @Test("A Mac with only the developer-tools stub is blocked on git, not on a project")
+    func commandLineToolsMissingBlocksFirst() {
+        let readiness = evaluate(
+            harnesses: [probe(.claudeCode)],
+            git: .commandLineToolsMissing
+        )
+        #expect(readiness.nextStep?.id == "git-available")
+        #expect(readiness.nextStep?.action == .copyCommand("xcode-select --install"))
+        #expect(!readiness.isReady)
+    }
+
+    @Test("No git on PATH is blocking too")
+    func gitNotFoundBlocks() {
+        let readiness = evaluate(harnesses: [probe(.claudeCode)], git: .notFound)
+        #expect(readiness.nextStep?.id == "git-available")
+        #expect(!readiness.isReady)
+    }
+
+    /// Same rule as rung 1: an answer we do not have yet is not an answer to
+    /// act on. The ladder stays quiet rather than retracting itself a moment
+    /// later.
+    @Test("Nothing is claimed about git before its probe returns")
+    func quietBeforeGitProbe() {
+        let readiness = evaluate(harnesses: [probe(.claudeCode)], git: nil)
+        #expect(readiness.nextStep == nil)
+        #expect(!readiness.relevantSteps.contains { $0.id == "git-available" })
+    }
+
+    /// git found but refusing to answer is not evidence that it is missing,
+    /// and "install git" to somebody who has it is exactly the retraction the
+    /// ladder is built to avoid. It goes quiet and lets the next rung through.
+    @Test("An unreadable git never tells the user to install one")
+    func unknownGitDoesNotAccuse() {
+        let readiness = evaluate(harnesses: [probe(.claudeCode)], git: .unknown)
+        #expect(readiness.nextStep?.id == "project")
+        #expect(!readiness.relevantSteps.contains { $0.id == "git-available" })
+    }
+
+    /// The identity rung presumes git runs. When it does not, the probe hands
+    /// back nil and this rung must stay silent rather than send the user to
+    /// fix the wrong thing.
+    @Test("An unknown identity keeps the identity rung silent")
+    func unknownIdentityIsSilent() {
+        let readiness = evaluate(
+            harnesses: [probe(.claudeCode)],
+            git: .commandLineToolsMissing,
+            gitIdentity: nil
+        )
+        let identity = readiness.steps.first { $0.id == "git" }
+        #expect(identity?.status == .unknown)
+        #expect(!readiness.relevantSteps.contains { $0.id == "git" })
+    }
+
     @Test("A fully set-up machine has nothing to say")
     func everythingDone() {
         let readiness = evaluate(
@@ -136,6 +208,6 @@ struct ReadinessTests {
         )
         #expect(readiness.isReady)
         #expect(readiness.nextStep == nil)
-        #expect(readiness.satisfiedCount == 5)
+        #expect(readiness.satisfiedCount == 6)
     }
 }

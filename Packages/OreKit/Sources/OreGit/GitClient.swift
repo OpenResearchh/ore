@@ -763,6 +763,9 @@ public enum GitError: Error, Sendable, CustomStringConvertible {
     case gitNotFound
     case commandFailed(arguments: [String], exitCode: Int32, message: String)
     case notARepository(path: String)
+    /// A real repository that has never been committed to. It has no HEAD, so
+    /// there is nothing for a worktree to branch from.
+    case repositoryHasNoCommits(path: String)
     case worktreeExists(path: String)
     case branchExists(name: String)
     case dirtyWorktree(path: String)
@@ -775,11 +778,25 @@ public enum GitError: Error, Sendable, CustomStringConvertible {
             return "git was not found on PATH."
         case .commandFailed(let arguments, let exitCode, let message):
             let command = "git " + arguments.joined(separator: " ")
-            return message.isEmpty
+            let rendered = message.isEmpty
                 ? "`\(command)` failed with status \(exitCode)."
                 : "`\(command)` failed: \(message)"
+            // One site reaches every caller, so the hint is added here rather
+            // than at the dozen places a git command can fail.
+            //
+            // "Operation not permitted" on a path the user can plainly see in
+            // Finder is macOS privacy, not file permissions — ORE has not been
+            // granted access to Documents, Desktop, Downloads or a removable
+            // volume. Without this the user reads a raw git command line and
+            // has no reason to connect it to a consent prompt they dismissed.
+            return rendered.contains("Operation not permitted")
+                ? rendered + "\n\nmacOS may be blocking ORE's access to this folder. "
+                    + "Check System Settings → Privacy & Security → Files and Folders."
+                : rendered
         case .notARepository(let path):
             return "\(path) is not a git repository."
+        case .repositoryHasNoCommits(let path):
+            return "\(path) has no commits yet. Make an initial commit in it, then add it again."
         case .worktreeExists(let path):
             return "A worktree already exists at \(path)."
         case .branchExists(let name):

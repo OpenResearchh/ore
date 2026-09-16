@@ -585,6 +585,24 @@ private struct SettingsPanes: View {
                         Text(agentStatusDetail).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
+                    // "CLI not found" used to be a dead end here: the pane
+                    // named the PATH it had searched and stopped, while the
+                    // one install command in the app lived on the welcome
+                    // card and was always Claude Code's. This is the screen
+                    // somebody opens to set up a *specific* agent.
+                    //
+                    // Bound on a probe that has actually returned, rather than
+                    // `isInstalled != true`: offering to install something the
+                    // user may already have, because the probe is still in
+                    // flight, is the retraction the ladder is careful to avoid.
+                    if let installProbe = probe(for: selectedHarness), !installProbe.isInstalled {
+                        Button {
+                            copyInstallCommand()
+                        } label: {
+                            Label("Copy install command", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                     if probe(for: selectedHarness)?.isInstalled == true,
                        probe(for: selectedHarness)?.authState == .notAuthenticated {
                         Button {
@@ -983,6 +1001,18 @@ private struct SettingsPanes: View {
         guard let probe = probe(for: selectedHarness) else { return .secondary }
         if probe.isEnabled == false { return .secondary }
         return probe.isReady ? .green : .orange
+    }
+
+    /// Hands over the command rather than running it: installing a CLI writes
+    /// to the user's PATH and, for two of the three vendors, pipes a script
+    /// into a shell. That is their decision to take in their own terminal,
+    /// where they can read it first.
+    private func copyInstallCommand() {
+        let command = HarnessSetup.installCommand(for: selectedHarness)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        authenticationNotice =
+            "Copied `\(command)`. Run it in Terminal, then press Refresh."
     }
 
     private func beginHarnessAuthentication() {

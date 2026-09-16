@@ -1,4 +1,5 @@
 import Foundation
+import OreGit
 import OrePersistence
 import OreProtocol
 import OreSupport
@@ -189,19 +190,39 @@ public enum AssistantManager {
 
         """)
 
-        if !files.fileExists(atPath: home.appendingPathComponent(".git").path) {
+        let isRepository = files.fileExists(atPath: home.appendingPathComponent(".git").path)
+        // The steady state — a home that already exists with a commit — is
+        // every start after the first, and it leaves before spawning anything
+        // else.
+        if isRepository, await hasHead(in: home) { return }
+
+        // Past here there is git work to do, and on macOS attempting it had a
+        // cost: `runGit` fell back to `/usr/bin/git`, which until the Command
+        // Line Tools are installed is a stub that exists only to ask `xcrun`
+        // for the real binary. Launching it is what pops the system "install
+        // the developer tools" dialog — unexplained, credited to no app in
+        // particular, seconds after a brand-new user opened ORE.
+        //
+        // The readiness ladder asks this question properly now. Here we only
+        // have to not make it worse: a git that cannot run already left this
+        // repository uncreated, so returning changes nothing except who gets
+        // to tell the user about it.
+        //
+        // Checked after the filesystem check, not before, so a normal start
+        // does not pay for a probe whose answer it has no use for.
+        guard await GitAvailability.probe().isReady else { return }
+
+        if !isRepository {
             await runGit(["init", "--initial-branch", "main"], in: home)
         }
         // An initial commit gives the repo a HEAD, which the diff and status
         // machinery assume. Committed with a local identity so this works on a
         // machine with no global git config.
-        if !(await hasHead(in: home)) {
-            await runGit(["add", "-A"], in: home)
-            await runGit([
-                "-c", "user.name=ORE", "-c", "user.email=assistant@ore.local",
-                "commit", "-m", "Assistant home",
-            ], in: home)
-        }
+        await runGit(["add", "-A"], in: home)
+        await runGit([
+            "-c", "user.name=ORE", "-c", "user.email=assistant@ore.local",
+            "commit", "-m", "Assistant home",
+        ], in: home)
     }
 
     private static func seedIfMissing(_ url: URL, contents: String) {
@@ -218,13 +239,18 @@ public enum AssistantManager {
     /// beside every other test's git spawn.
     @discardableResult
     private static func runGit(_ arguments: [String], in directory: URL) async -> Int32 {
-        let git = ShellEnvironment.locate("git", in: ProcessInfo.processInfo.environment)
-            ?? "/usr/bin/git"
+        // The login-shell environment, like every other git launch in ORE.
+        // This one read `ProcessInfo.processInfo.environment` — a GUI app's
+        // PATH, which contains none of the version managers developers install
+        // their tools with — and then fell back to the `/usr/bin/git` stub
+        // when that came up empty.
+        let environment = ShellEnvironment.childEnvironment()
+        guard let git = ShellEnvironment.locate("git", in: environment) else { return 1 }
         guard let process = try? ChildProcess(
             executablePath: git,
             arguments: arguments,
             workingDirectory: directory,
-            environment: ProcessInfo.processInfo.environment
+            environment: environment
         ) else { return 1 }
         process.closeStandardInput()
         async let stdout = process.stdoutChunks.collectText()

@@ -26,6 +26,22 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Jupiter Innovations Lab Inc. Licensed under the Apache License 2.0.</string>
+	<!--
+	  A repository is wherever the user keeps it, and on a Mac that is very
+	  often ~/Documents, ~/Desktop or an external drive. Those are TCC-guarded
+	  for every app, sandboxed or not, so without these strings macOS shows the
+	  consent prompt with no explanation of what is asking or why — and a user
+	  who declines gets "Operation not permitted" from git with nothing
+	  connecting it to a decision they made.
+	-->
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>ORE reads and writes the git repositories you add as projects. Grant access if you keep your code in Documents.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>ORE reads and writes the git repositories you add as projects. Grant access if you keep your code on the Desktop.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>ORE reads and writes the git repositories you add as projects. Grant access if you keep your code in Downloads.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>ORE reads and writes the git repositories you add as projects. Grant access if you keep your code on an external drive.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>ORE uses the microphone to dictate prompts into the composer. macOS transcribes it on this Mac when an on-device model is available, otherwise with Apple’s speech service. Audio is never sent to your agent provider.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

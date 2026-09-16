@@ -160,6 +160,60 @@ run_installer "$DEST" ORE_VERSION=1.8.0 >/dev/null 2>&1
 check "installs what was asked for, not the latest" \
   test "$(installed_version "$DEST")" = "1.8.0"
 
+echo "==> An interrupt between the two renames still leaves a working install"
+# install_app moves the existing bundle to .ORE.app.previous.$$ and then
+# renames the new one into place. An exit in between — Ctrl-C, a closed
+# terminal — used to leave the destination empty and the working copy stranded
+# under a name Finder hides, which no later run would reclaim because each run
+# picks a new $$.
+#
+# That window is two adjacent rename(2) calls, so it cannot be hit by timing a
+# signal. Instead the real cleanup() is lifted out of install.sh and driven
+# against the state install_app would have left behind, which is the thing the
+# guard actually has to get right.
+cleanup_in_state() {
+  local dest="$1" previous="$2"
+  ( eval "$(sed -n '/^cleanup() {/,/^}/p' "$INSTALLER")"
+    TMP="" STAGED="" PREVIOUS="$previous" dest="$dest"
+    cleanup )
+}
+
+STRANDED="$WORK/Stranded"
+mkdir -p "$STRANDED"
+make_app "$STRANDED/.ORE.app.previous.999" "0.9.0"
+cleanup_in_state "$STRANDED/ORE.app" "$STRANDED/.ORE.app.previous.999"
+check "puts the stranded bundle back" test -d "$STRANDED/ORE.app"
+check "restores the version the user had" test "$(installed_version "$STRANDED")" = "0.9.0"
+check "leaves no staging directories" no_leftovers "$STRANDED"
+
+# The mirror case: once the swap has completed, $dest holds the *new* app and
+# putting the old one back would be a silent downgrade.
+SWAPPED="$WORK/Swapped"
+mkdir -p "$SWAPPED"
+make_app "$SWAPPED/ORE.app" "2.0.0"
+make_app "$SWAPPED/.ORE.app.previous.999" "1.0.0"
+cleanup_in_state "$SWAPPED/ORE.app" "$SWAPPED/.ORE.app.previous.999"
+check "never downgrades an install that completed" \
+  test "$(installed_version "$SWAPPED")" = "2.0.0"
+
+echo "==> A second copy in the other Applications folder is called out"
+# finish() looks in the two places an ORE can end up: /Applications, where
+# Homebrew and this script both prefer to install, and ~/Applications, where
+# this script falls back when /Applications is not writable. HOME is pointed
+# at the work directory so the second of those is one of the installs the
+# earlier cases made, rather than the tester's real home.
+make_release 2.0.0
+run_installer "$SPACED" HOME="$WORK" > "$WORK/dup.log" 2>&1
+check "warns about the other copy" \
+  grep -q "another copy of ORE is at $WORK/Applications/ORE.app" "$WORK/dup.log"
+refute "does not warn about the one it just installed" \
+  grep -q "another copy of ORE is at $SPACED/ORE.app" "$WORK/dup.log"
+
+echo "==> Telemetry is disclosed on every install"
+run_installer "$DEST" > "$WORK/privacy.log" 2>&1
+check "names PRIVACY.md even with ORE_INSTALL_DIR set" \
+  grep -q "PRIVACY.md" "$WORK/privacy.log"
+
 echo "==> A truncated download of the script itself does nothing"
 head -c 2000 "$INSTALLER" > "$WORK/partial.sh"
 BEFORE="$(installed_version "$DEST")"

@@ -103,6 +103,72 @@ struct CoreClientTests {
         )
     }
 
+    /// A folder that is not a repository used to be accepted: the sidebar got
+    /// an entry that looked like every other project, and the mistake only
+    /// surfaced as a raw git command line when the first workspace was
+    /// attempted, several screens later.
+    @Test func addingAFolderThatIsNotARepositoryFailsImmediately() async throws {
+        let fixture = try await GitFixture.initialized()
+        let plain = fixture.root.appendingPathComponent("just-a-folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+
+        let store = try OreStore()
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: plain.path))
+
+        guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
+            if case .commandFailed = $0 { return true }
+            return false
+        }) else {
+            Issue.record("adding a non-repository must be reported")
+            return
+        }
+        #expect(failure.detail?.contains("not a git repository") == true)
+        #expect(try await store.repositories().isEmpty, "nothing may be registered")
+
+        await client.shutdown()
+    }
+
+    /// `git init` with no commit yet. It is a real repository, so the
+    /// not-a-repository check passes — but it has no HEAD, and `git worktree
+    /// add` fails on it with "invalid reference: HEAD", which tells the user
+    /// nothing about what to do.
+    @Test func addingARepositoryWithNoCommitsSaysSoInsteadOfFailingLater() async throws {
+        let fixture = try await GitFixture.initialized()
+        let empty = fixture.root.appendingPathComponent("unborn", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let git = try GitClient(repositoryURL: empty)
+        try await git.run(["init", "-q", "-b", "main"], in: empty)
+
+        let store = try OreStore()
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: empty.path))
+
+        guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
+            if case .commandFailed = $0 { return true }
+            return false
+        }) else {
+            Issue.record("an unborn repository must be reported")
+            return
+        }
+        #expect(failure.detail?.contains("no commits yet") == true)
+        #expect(try await store.repositories().isEmpty)
+
+        await client.shutdown()
+    }
+
     @Test func addingARepositoryAndCreatingAWorkspaceEmitsASnapshot() async throws {
         let fixture = try await GitFixture.initialized()
         let client = try makeClient(fixture)

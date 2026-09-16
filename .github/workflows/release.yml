@@ -258,6 +258,52 @@ jobs:
           (cd "$work" && shasum -a 256 -c SHA256SUMS)
           grep -qx "version=$VERSION" "$work/RELEASE"
 
+      # The DMG below this fold is the one advertised install route with a
+      # Gatekeeper problem. Every build here is signed ad-hoc — ORE has no
+      # Apple Developer ID yet — so a browser download carries
+      # com.apple.quarantine, and macOS 15+ refuses to open it outright with
+      # no right-click escape hatch. certify-release.sh has said so since it
+      # existed, but that path only cuts local builds; this workflow, which
+      # cuts every real release, published `--generate-notes` and nothing
+      # else. Telemetry was the same story: install.sh discloses it and the two
+      # GUI channels never did.
+      #
+      # Prepended to the generated notes rather than replacing them, so the
+      # changelog is untouched.
+      - name: Lead the release notes with install guidance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          notes="$(mktemp)"
+          cat > "$notes" <<'GUIDANCE'
+          ## Install
+
+          ```sh
+          brew install openresearchh/tap/ore
+          ```
+
+          ```sh
+          curl -fsSL https://openresearchh.com/ore/install.sh | sh
+          ```
+
+          **If you download the DMG below, macOS will refuse to open it.** ORE is
+          signed ad-hoc rather than with an Apple Developer ID, so a browser
+          download is quarantined and Gatekeeper blocks it. Allow it once under
+          **System Settings → Privacy & Security**, or use either command above —
+          neither sets the quarantine attribute.
+
+          ORE reports a few anonymous usage events, and never your code or your
+          prompts. Exactly what, and how to switch it off:
+          [PRIVACY.md](https://github.com/OpenResearchh/ore/blob/master/PRIVACY.md).
+
+          ---
+
+          GUIDANCE
+          gh release view "v$VERSION" --json body -q .body >> "$notes"
+          gh release edit "v$VERSION" --notes-file "$notes"
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

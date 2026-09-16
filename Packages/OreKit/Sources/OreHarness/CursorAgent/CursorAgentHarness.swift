@@ -57,17 +57,37 @@ public struct CursorAgentHarness: AgentHarness {
     }
 
     public func probe() async -> HarnessProbeResult {
-        guard let path = resolveExecutablePath() else {
+        guard let resolved = resolveExecutable() else {
             return HarnessProbeResult(
                 kind: kind,
                 authState: .notAuthenticated,
                 diagnostic: "Not found on PATH (\(ShellEnvironment.searchPathDescription))"
             )
         }
+        let path = resolved.path
 
         let version = await CommandProbe.firstLine(
             executablePath: path, arguments: ["--version"], timeout: .seconds(10)
         )
+
+        // `agent` is a name anything can have. Cursor renamed its command to
+        // it, so it has to be searched for — but adopting whatever answers to
+        // it means ORE reports an agent as installed, offers it in the
+        // picker, and then fails the user's first turn with output from a
+        // program that has nothing to do with Cursor.
+        //
+        // The unambiguous name is trusted as found. The generic one has to say
+        // who it is.
+        if !Self.identifiesAsCursorAgent(isAmbiguousName: resolved.isAmbiguousName, version: version) {
+            return HarnessProbeResult(
+                kind: kind,
+                authState: .notAuthenticated,
+                diagnostic: "Not found on PATH (\(ShellEnvironment.searchPathDescription)). "
+                    + "A program named `agent` is installed at \(path), but it does not "
+                    + "identify itself as cursor-agent."
+            )
+        }
+
         let status = await CommandProbe.output(
             executablePath: path, arguments: ["status"], timeout: .seconds(15)
         )
@@ -138,14 +158,34 @@ public struct CursorAgentHarness: AgentHarness {
         )
     }
 
-    private func resolveExecutablePath() -> String? {
-        if let executablePathOverride { return executablePathOverride }
+    /// Whether a binary ORE found is one it should drive as cursor-agent.
+    ///
+    /// Pure, so the rule can be tested without a PATH full of decoys. A binary
+    /// found under the unambiguous `cursor-agent` name is accepted whatever it
+    /// prints — including nothing, since a CLI that will not answer
+    /// `--version` is a different problem and not this check's to diagnose.
+    static func identifiesAsCursorAgent(isAmbiguousName: Bool, version: String?) -> Bool {
+        guard isAmbiguousName else { return true }
+        return version?.localizedCaseInsensitiveContains("cursor") == true
+    }
+
+    private func resolveExecutablePath() -> String? { resolveExecutable()?.path }
+
+    /// The resolved binary, and whether it was found under a name that only
+    /// Cursor could plausibly own.
+    private func resolveExecutable() -> (path: String, isAmbiguousName: Bool)? {
+        if let executablePathOverride {
+            // An explicit override is the user's own answer to this question.
+            return (executablePathOverride, false)
+        }
         // Cursor renamed the primary command from `cursor-agent` to `agent`.
         // Current installs commonly provide both symlinks, while older and
         // minimal installs may provide only one. Prefer the unambiguous legacy
         // name, then accept the current documented command.
         for name in Self.executableNames {
-            if let path = ShellEnvironment.locate(name) { return path }
+            if let path = ShellEnvironment.locate(name) {
+                return (path, name == "agent")
+            }
         }
         return nil
     }

@@ -142,10 +142,17 @@ public struct CodexHarness: AgentHarness {
             executablePath: executablePath, arguments: ["login", "status"], timeout: .seconds(15)
         ) else {
             // Fall back to the credentials file the CLI writes on login.
+            //
+            // Its *absence* is real evidence: the CLI has never logged in on
+            // this machine. Its presence is not — the file survives an expired
+            // or revoked token, and reading it as `.authenticated` told the
+            // user "CLI subscription connected" right up until their first
+            // turn failed on auth. `.unknown` is what we actually know, and
+            // the UI already has wording for it ("Managed by CLI").
             let authFile = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".codex/auth.json")
             return FileManager.default.fileExists(atPath: authFile.path)
-                ? .authenticated
+                ? .unknown
                 : .notAuthenticated
         }
 

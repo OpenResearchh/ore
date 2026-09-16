@@ -557,6 +557,7 @@ struct RootView: View {
     // meaning "not checked", which `Readiness` treats as "say nothing yet"
     // rather than "missing".
     @State private var githubStatus: GitHubClient.Status?
+    @State private var gitAvailability: GitAvailability?
     @State private var hasGitIdentity: Bool?
 
     /// What the user still needs before ORE is useful to them. Recomputed
@@ -570,6 +571,7 @@ struct RootView: View {
             repositoryCount: model.repositories.count,
             workspaceCount: model.workspaces.count,
             github: githubStatus,
+            git: gitAvailability,
             hasGitIdentity: hasGitIdentity
         )
     }
@@ -1038,9 +1040,11 @@ struct RootView: View {
         // workspaces never pays for them.
         .task {
             async let github = model.githubStatus()
-            async let git = Readiness.probeGitIdentity()
+            async let git = Readiness.probeGit()
             githubStatus = await github
-            hasGitIdentity = await git
+            let (availability, identity) = await git
+            gitAvailability = availability
+            hasGitIdentity = identity
         }
         // No fill: the welcome floats directly on the window's glass base.
     }

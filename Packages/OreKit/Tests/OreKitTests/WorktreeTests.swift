@@ -111,6 +111,40 @@ struct WorktreeTests {
         #expect(!status.contains(".context"))
     }
 
+    /// Deleting a worktree's folder in Finder leaves git's own record of it
+    /// behind under `.git/worktrees`. The next attempt at the same slug then
+    /// failed with "already exists", naming a directory the user could see was
+    /// not there — and `uniquePath` was no help, because the filesystem agreed
+    /// the path was free.
+    @Test func aWorktreeWhoseFolderWasDeletedCanBeRecreatedAtTheSameSlug() async throws {
+        let fixture = try await GitFixture.initialized()
+        let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)
+
+        let first = try await manager.create(WorktreeManager.CreateRequest(
+            name: "recycled", baseRevision: "main", baseBranch: "main"
+        ))
+        let slug = first.path.lastPathComponent
+
+        // What Finder does: the directory goes, the registration stays. git
+        // marks it "prunable" and refuses to reuse the path —
+        //   fatal: '…' is a missing but already registered worktree
+        // — while `uniquePath` sees a free path and hands back the same slug.
+        try FileManager.default.removeItem(at: first.path)
+        #expect(
+            try await fixture.run(["worktree", "list"]).standardOutput.contains(slug),
+            "the stale registration is the precondition this test exists for"
+        )
+
+        let second = try await manager.create(WorktreeManager.CreateRequest(
+            name: "recycled", baseRevision: "main", baseBranch: "main"
+        ))
+        #expect(second.path.lastPathComponent == slug, "the freed slug is reused")
+        #expect(FileManager.default.fileExists(atPath: second.path.path))
+        // The branch is not reused: the first one still exists, so
+        // `uniqueBranch` moves on. Only the path had to be reclaimed.
+        #expect(second.branch != first.branch)
+    }
+
     @Test func removingAWorktreeRefusesToDiscardUncommittedWork() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

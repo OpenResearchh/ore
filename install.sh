@@ -37,10 +37,13 @@ main() {
 
   TMP=""
   STAGED=""
+  PREVIOUS=""
   # An interrupt has to stop the script, not just run cleanup and carry on
   # with a staged app that cleanup has already deleted. Exiting fires EXIT.
   trap cleanup EXIT
-  trap 'exit 130' INT TERM
+  # SIGHUP too: closing the terminal window mid-install is exactly the moment
+  # the destination is a rename away from holding nothing.
+  trap 'exit 130' INT TERM HUP
 
   check_platform
   resolve_release
@@ -56,6 +59,17 @@ say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
+  # First, because it is the only step that can put back something the user
+  # had. install_app moves the existing bundle aside and then renames the new
+  # one into place; an exit between those two renames — an interrupt, a closed
+  # terminal — leaves the destination empty and the working install stranded
+  # under a dot-prefixed name Finder hides. The next run picks a new $$, so
+  # nothing would ever reclaim it. Guarded on the destination still being
+  # empty: if the swap did complete, $PREVIOUS is the old version and putting
+  # it back would be a downgrade.
+  if [ -n "${PREVIOUS:-}" ] && [ -d "$PREVIOUS" ] && [ ! -e "${dest:-}" ]; then
+    mv "$PREVIOUS" "$dest" 2>/dev/null || true
+  fi
   [ -n "${TMP:-}" ] && rm -rf "$TMP"
   # A staging copy left inside /Applications is confusing rubbish; the real
   # install is either in place by now or was never touched.
@@ -77,8 +91,15 @@ check_platform() {
   # ORE currently ships an arm64-only build. Installing it on an Intel Mac
   # produces an app that cannot launch at all, which is a far worse outcome
   # than refusing here with an explanation.
+  #
+  # `uname -m` alone is not the machine: under Rosetta 2 it reports x86_64 on
+  # an Apple Silicon Mac, so a translated shell — an x86_64 copy of Terminal,
+  # `arch -x86_64 zsh`, a session inherited from an Intel toolchain — got told
+  # its M-series Mac was an Intel one and was left with no route in but the
+  # DMG, the one channel with the Gatekeeper problem. sysctl.proc_translated
+  # is the signal that survives translation; hw.optional.arm64 is masked by it.
   arch="$(uname -m)"
-  if [ "$arch" != "arm64" ]; then
+  if [ "$arch" != "arm64" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" != "1" ]; then
     die "ORE currently requires Apple Silicon (M1 or later); this Mac is $arch.
     Intel support is not built yet. Follow https://github.com/$REPO for news."
   fi
@@ -237,21 +258,30 @@ install_app() {
   codesign --verify --deep --strict "$STAGED" 2>/dev/null \
     || die "the copied app fails signature verification — leaving the existing install alone."
 
-  previous=""
+  # PREVIOUS rather than a function-scoped name: POSIX sh has no `local`, but
+  # the point is that `cleanup` reads it, so it is declared in main() with the
+  # other two and named like them.
   if [ -e "$dest" ]; then
-    previous="$dest_dir/.ORE.app.previous.$$"
-    rm -rf "$previous"
-    mv "$dest" "$previous" || die "could not move the existing ORE.app aside."
+    PREVIOUS="$dest_dir/.ORE.app.previous.$$"
+    rm -rf "$PREVIOUS"
+    mv "$dest" "$PREVIOUS" || die "could not move the existing ORE.app aside."
   fi
 
   if ! mv "$STAGED" "$dest"; then
     # Put back what was there. A failed install that leaves the Mac without
     # the app it started with is the one outcome worth this much code.
-    [ -n "$previous" ] && mv "$previous" "$dest" 2>/dev/null
+    # PREVIOUS is deliberately left set: if this restore is the one that
+    # failed, $dest is still empty and cleanup gets a second attempt at it.
+    # If it succeeded, cleanup's own `[ ! -e "$dest" ]` guard skips.
+    [ -n "$PREVIOUS" ] && mv "$PREVIOUS" "$dest" 2>/dev/null
     die "could not move the new ORE.app into place; the previous install was restored."
   fi
   STAGED=""
-  [ -n "$previous" ] && rm -rf "$previous"
+  # Cleared before the delete, not after: from here on $dest holds the *new*
+  # app, and a cleanup that put $PREVIOUS back would be a silent downgrade.
+  old="$PREVIOUS"
+  PREVIOUS=""
+  [ -n "$old" ] && rm -rf "$old"
 
   # Tells telemetry which channel the install came from, so we can see whether
   # curl, Homebrew or the DMG actually carries adoption.
@@ -273,11 +303,32 @@ finish() {
   say ""
   say "ORE $version installed to $dest"
 
+  # Homebrew installs to /Applications and this script prefers it but falls
+  # back to ~/Applications, so curl-then-brew (or the reverse) leaves two
+  # copies and no warning. Two ORE.apps means the Dock, Spotlight and the
+  # in-app updater can each be pointing at a different one. Checked in
+  # finish() rather than choose_destination() so it also covers an explicit
+  # ORE_INSTALL_DIR.
+  for other in "/Applications/ORE.app" "$HOME/Applications/ORE.app"; do
+    if [ -e "$other" ] && [ "$other" != "$dest" ]; then
+      say ""
+      say "Note: another copy of ORE is at $other."
+      say "      Two copies update independently. Remove that one with:"
+      say "        rm -rf '$other'"
+    fi
+  done
+
+  # Outside the ORE_INSTALL_DIR guard: telemetry is on by default and this is
+  # the disclosure. A test install is still an install, and the sentence costs
+  # one line.
+  say ""
+  say "What ORE measures, and how to turn it off:"
+  say "  https://github.com/$REPO/blob/master/PRIVACY.md"
+
   if [ -z "${ORE_INSTALL_DIR:-}" ]; then
     open "$dest" 2>/dev/null || say "Open it with: open '$dest'"
     say ""
     say "Docs and source: https://github.com/$REPO"
-    say "What ORE measures: https://github.com/$REPO/blob/master/PRIVACY.md"
   fi
 }
 

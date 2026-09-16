@@ -603,6 +603,26 @@ public actor InProcessCoreClient: CoreClient {
         let root = try await canonicalRepositoryURL(path)
         let git = try gitClient(for: root.path)
 
+        // Checked here, not left to the first workspace.
+        //
+        // `canonicalRepositoryURL` falls back to the path exactly as given
+        // when `rev-parse --show-toplevel` fails. That is correct for its own
+        // job — resolving symlinks — but it meant *any* folder could be
+        // registered as a project. The user picked a directory, got a sidebar
+        // entry that looked like every other one, and only discovered it was
+        // not a repository when their first workspace died on a raw git
+        // command line, by which point the mistake was several screens behind
+        // them.
+        guard (try? await git.topLevel()) != nil else {
+            throw GitError.notARepository(path: root.path)
+        }
+        // A repository with no commits has no HEAD, and `git worktree add`
+        // fails on it with "invalid reference: HEAD" — accurate, and useless
+        // to somebody who has just cloned an empty repo or run `git init`.
+        guard (try? await git.resolve("HEAD")) != nil else {
+            throw GitError.repositoryHasNoCommits(path: root.path)
+        }
+
         try await store.addRepository(RepositoryRecord(
             path: root.path,
             name: root.lastPathComponent,

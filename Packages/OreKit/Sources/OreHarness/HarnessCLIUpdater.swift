@@ -434,7 +434,7 @@ public enum HarnessCLIUpdater {
 
     /// Follows one level of symlink so `/usr/local/bin/codex` →
     /// `…/node_modules/@openai/codex/…` is classified correctly.
-    static func resolvingSymlinks(_ path: String) -> String {
+    public static func resolvingSymlinks(_ path: String) -> String {
         var current = path
         for _ in 0..<6 {
             guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: current)
@@ -457,7 +457,10 @@ public enum HarnessCLIUpdater {
     /// machine running the suite not happening to have a Homebrew-node install
     /// at that exact path. That is a test that passes on CI and fails on the
     /// laptop of the one contributor it describes.
-    typealias PathResolver = (String) -> String
+    /// Public, like `brewIsAvailable()`, for the same reason: it is a
+    /// parameter type and a default-argument value on `public` methods, and
+    /// Swift will not let either be internal there.
+    public typealias PathResolver = (String) -> String
 
     static func isHomebrewPath(
         _ path: String, resolve: PathResolver = Self.resolvingSymlinks

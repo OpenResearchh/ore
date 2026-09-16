@@ -1,25 +1,40 @@
 name: Release
 
-# The attested release path, for once GitHub Actions runs for this repository.
+# How a release happens: label a pull request `release:patch`, `release:minor`
+# or `release:major`, then merge it. This workflow does what
+# Apps/OreMac/Scripts/certify-release.sh does on a maintainer's Mac, plus build
+# attestations, which only a CI build can have:
 #
-# Until then, releases are cut with Apps/OreMac/Scripts/certify-release.sh from
-# a clean master checkout on a maintainer's Mac. It runs the same suites and
-# publishes the same four files. What it cannot do is attest them: build
-# provenance can only be produced where the artifact is built, so its releases
-# say "not attested" in their notes.
+#   tests → bump → build → attest → push the bump and the tag → draft release
+#   → check the drafted files → publish → check anonymous downloads and
+#   install.sh → update the Homebrew cask
+#
+# A merge without a release label stops after the first, cheap job. Only people
+# with triage access or above can add labels, so an outside contributor can't
+# cut a release. A maintainer can also run it by hand from the Actions tab,
+# which releases master's head.
+#
+# Repository secrets it needs:
+#   ORE_POSTHOG_KEY   the PostHog project key (phc_…), stamped into the app
+#   RELEASE_SSH_KEY   private half of this repository's "ORE release (CI)"
+#                     deploy key. master requires pull requests, and a ruleset
+#                     can't exempt GITHUB_TOKEN, so the version bump and the
+#                     tag are pushed with this key, which the ruleset does
+#                     exempt. A deploy key reaches this repository and nothing
+#                     else.
+#   TAP_SSH_KEY       the same, for OpenResearchh/homebrew-tap, to publish the
+#                     cask.
 #
 # Users verify a download with:
 #   gh attestation verify ORE-<version>.zip -R OpenResearchh/ore
 #
-# Order matters and is the point of the file. It used to bump the version and
-# push to master *first*, then build — so a compile error or a failing test
-# left master carrying a release commit for a version that was never
-# published, and the recovery was manual. Now nothing is pushed until the
-# tests pass and the artifacts exist.
-#
-# The version-bump commit is pushed with GITHUB_TOKEN, whose pushes do not
-# retrigger workflows; the `[skip ci]` marker is belt-and-braces.
+# Order matters. Nothing is pushed until the tests pass and the artifacts
+# exist, so a failed build never leaves master carrying a release commit for a
+# version that was never published. A deploy key's pushes do start workflows,
+# so `[skip ci]` on the bump is what keeps this from running again.
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       bump:
@@ -32,37 +47,98 @@ on:
         default: patch
 
 permissions:
-  contents: write
-  # Both are required by attest-build-provenance: id-token to prove to
-  # Sigstore which workflow is asking, attestations to record the result.
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
+  decide:
+    name: Is this a release?
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      part: ${{ steps.part.outputs.part }}
+    steps:
+      - id: part
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT: ${{ inputs.bump }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            part="$INPUT"
+          else
+            # The pull request this push merged, and its labels. If someone
+            # added more than one release label, the largest wins.
+            labels="$(gh api "repos/$REPO/commits/$SHA/pulls" \
+              --jq '[.[] | select(.merged_at != null) | .labels[].name] | join(" ")')"
+            part=""
+            for candidate in patch minor major; do
+              case " $labels " in *" release:$candidate "*) part="$candidate" ;; esac
+            done
+          fi
+          echo "part=$part" >> "$GITHUB_OUTPUT"
+          if [ -n "$part" ]; then
+            echo "Cutting a $part release."
+          else
+            echo "No release label on the merged pull request; nothing to release."
+          fi
+
   release:
-    name: Certify, build, attest, publish
+    name: Test, build, attest, publish
+    needs: decide
+    if: needs.decide.outputs.part != ''
     # Must match the OreMac CI job: the app needs the macOS 26 SDK for the
     # Liquid Glass symbols behind its availability checks.
     runs-on: macos-26
+    permissions:
+      contents: write
+      # Both are required by attest-build-provenance: id-token to prove to
+      # Sigstore which workflow is asking, attestations to record the result.
+      id-token: write
+      attestations: write
+    env:
+      PART: ${{ needs.decide.outputs.part }}
     steps:
-      # master is what ships. Dispatch can select any ref, and building one
-      # while pushing the bump to master would publish a version whose tag
-      # points at code that was never on master.
+      - name: Refuse a manual run from anywhere but master
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/master'
+        run: |
+          echo "::error::Dispatched from ${{ github.ref }}. Releases are cut from master."
+          exit 1
+
+      # First, so a missing one is a clear message rather than a failed
+      # checkout or a push rejected after the whole build. Without the PostHog
+      # key a release ships with analytics silently off.
+      - name: Check the secrets are set
+        env:
+          ORE_POSTHOG_KEY: ${{ secrets.ORE_POSTHOG_KEY }}
+          RELEASE_SSH_KEY: ${{ secrets.RELEASE_SSH_KEY }}
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$ORE_POSTHOG_KEY" ] || missing="$missing ORE_POSTHOG_KEY"
+          [ -n "$RELEASE_SSH_KEY" ] || missing="$missing RELEASE_SSH_KEY"
+          [ -n "$TAP_SSH_KEY" ] || missing="$missing TAP_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing. See the top of release.yml."
+            exit 1
+          fi
+
+      # The merge that asked for this release, not whatever master has moved
+      # on to by the time the job starts. The deploy key stays configured for
+      # the push below.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: master
-
-      - name: Refuse a dispatch from anywhere but master
-        run: |
-          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
-            echo "::error::Dispatched from ${{ github.ref }}. Releases are cut from master."
-            exit 1
-          fi
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'master' || github.sha }}
+          ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
 
       - name: Record the toolchain
         run: |
@@ -84,10 +160,9 @@ jobs:
       - name: Bump version
         id: bump
         working-directory: Apps/OreMac
-        run: echo "version=$(./Scripts/bump-version.sh ${{ inputs.bump }})" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(./Scripts/bump-version.sh "$PART")" >> "$GITHUB_OUTPUT"
 
-      # Build-time configuration. Absent, the app is simply silent — see
-      # TelemetryClient.make. Stamped into Info.plist by bundle.sh.
+      # Stamped into Info.plist by bundle.sh. See TelemetryFactory.
       - name: Build zip, dmg and checksums
         working-directory: Apps/OreMac
         env:
@@ -115,16 +190,6 @@ jobs:
           codesign --verify --deep --strict verify/ORE.app
           rm -rf verify
 
-      # Only now is anything published. The bump commit is pushed at the same
-      # point as the release, so master and the tag agree even if a later step
-      # fails.
-      - name: Commit the bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore(release): v${{ steps.bump.outputs.version }} [skip ci]"
-          git push origin HEAD:master
-
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -135,23 +200,63 @@ jobs:
             Apps/OreMac/.build/dist/ORE-${{ steps.bump.outputs.version }}.dmg
             Apps/OreMac/.build/dist/SHA256SUMS
 
-      # Published as a draft first, so a failed download check never leaves a
-      # half-usable release visible to users.
-      - name: Publish the release as a draft
+      # Only now does anything leave the runner. The tag names the exact commit
+      # that was built. If another merge landed on master in the meantime, the
+      # bump is rebased onto it and the tag still names what was built.
+      - name: Push the bump and the tag
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v$VERSION [skip ci]"
+          git tag "v$VERSION"
+          git push origin "refs/tags/v$VERSION"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:refs/heads/master; then
+              exit 0
+            fi
+            git fetch origin master
+            git rebase origin/master
+          done
+          echo "::error::Could not push the version bump to master."
+          exit 1
+
+      # A draft first, so a failed check never leaves a half-usable release
+      # visible to users.
+      - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
+          set -eu
+          previous="$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)"
+          dist=Apps/OreMac/.build/dist
           gh release create "v$VERSION" \
-            "Apps/OreMac/.build/dist/ORE-$VERSION.zip" \
-            "Apps/OreMac/.build/dist/ORE-$VERSION.dmg" \
-            "Apps/OreMac/.build/dist/SHA256SUMS" \
-            "Apps/OreMac/.build/dist/RELEASE" \
+            "$dist/ORE-$VERSION.zip" \
+            "$dist/ORE-$VERSION.dmg" \
+            "$dist/SHA256SUMS" \
+            "$dist/RELEASE" \
+            --verify-tag \
             --title "ORE v$VERSION" \
             --generate-notes \
-            --notes-start-tag "$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo '')" \
-            --draft \
-            --target "$(git rev-parse HEAD)"
+            ${previous:+--notes-start-tag "$previous"} \
+            --draft
+
+      # Only maintainers can see a draft, so this download is authenticated.
+      # It proves the uploaded files are the ones that were built, before
+      # anyone else can fetch them.
+      - name: Check the drafted files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          gh release download "v$VERSION" -D "$work"
+          (cd "$work" && shasum -a 256 -c SHA256SUMS)
+          grep -qx "version=$VERSION" "$work/RELEASE"
 
       - name: Publish
         env:
@@ -201,10 +306,42 @@ jobs:
       # against the release that was just published is the only check that
       # covers the manifest, the checksums and the asset names together.
       - name: Install from the published release
-        env:
-          VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -eu
           ORE_INSTALL_DIR="$(mktemp -d)/Applications" \
           ORE_HOME="$(mktemp -d)" \
             sh ./install.sh
+
+      # certify-release.sh's last step. Skipping it leaves Homebrew users a
+      # version behind, and `brew upgrade` then walks them backwards onto the
+      # older build.
+      - name: Update the Homebrew cask
+        env:
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -eu
+          sha="$(shasum -a 256 "Apps/OreMac/.build/dist/ORE-$VERSION.zip" | cut -d' ' -f1)"
+          key="$(mktemp)"
+          printf '%s\n' "$TAP_SSH_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          tap="$(mktemp -d)"
+          git clone -q git@github.com:OpenResearchh/homebrew-tap.git "$tap"
+          mkdir -p "$tap/Casks"
+          sed -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+              -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" \
+              packaging/homebrew/ore.rb > "$tap/Casks/ore.rb"
+          # The template ships placeholders on purpose; publishing an
+          # unstamped cask would hand `brew install` a checksum that can't match.
+          if grep -qE '^  (version "0\.0\.0"|sha256 "0{64}")' "$tap/Casks/ore.rb"; then
+            echo "::error::The cask wasn't stamped with v$VERSION and its checksum."
+            exit 1
+          fi
+          cd "$tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/ore.rb
+          git commit -qm "ore $VERSION"
+          git push -q origin HEAD
+          rm -f "$key"

@@ -25,13 +25,43 @@ are in priority order and are meant to be picked up as written.
 | 17 | Folder/volume usage strings in `Info.plist`; "Operation not permitted" git failures name macOS privacy; `worktree prune` before `worktree add` |
 | C2/C3 | Release notes lead with the Gatekeeper warning and the privacy link; the Homebrew cask discloses telemetry in `caveats` |
 
-## Known gap in how this was produced
+## How this was produced, and what that leaves open
 
-The Swift changes above were written without being compiled: the app is
-macOS-only and the environment they were authored in had no Swift toolchain.
-`install.sh`, `packaging/test-install.sh`, `Info.plist`, the cask and the
-release workflow were all exercised directly. The Swift is covered by new
-tests but CI is the first thing to actually build it.
+All of it was written without a Swift compiler: the app is macOS-only and the
+environment had no toolchain, so the shell, plist, cask and release-workflow
+changes were exercised directly and the Swift was checked by reading —
+signatures against call sites, new enum cases against every switch, and
+`Packages/` against the Linux build.
+
+CI has now built and tested the lot. Exactly one thing did not compile: a
+`public` method given an internal typealias and an internal default-argument
+value, added by hand after the review passes had finished and therefore seen
+by none of them. Nothing the agents wrote failed to build.
+
+What passing CI does **not** cover, and what is therefore still unverified:
+
+- **Every new piece of SwiftUI has compiled but nobody has looked at it.**
+  The sidebar narration notice, the HUD failure pill (a long denial message in
+  a fixed-height pill), the Settings login-item, notification and shadowed-copy
+  rows, the composer's voice error row, and the failed-update card. Layout,
+  truncation and overflow are unchecked.
+- **The disk-space floors are judgement calls.** 1 GB for a CLI update, 1.2 GB
+  for the neural voice, neither measured against a real install. Both refuse
+  work a tighter machine might have completed.
+- **`isUnknownSubcommand` is a heuristic.** Bounded to self-update plans for
+  harnesses whose `update` subcommand is unconfirmed — never Claude Code — so
+  a false positive costs one extra run of the vendor installer.
+- **`.unsupported` over-claims for corrupt weights.** A load that fails because
+  the model is damaged is reported as hardware that cannot run it, and the
+  retry is a no-op in that case. The two are indistinguishable from the error.
+- **Two new costs on the startup path are unprofiled**: the PATH walk for
+  shadowed copies now runs on every probe of every harness, and an activation
+  re-probe discards the login-shell PATH cache. The re-probe is bounded to
+  users with no ready agent, which is the case it exists for.
+- **The vendor cache check is one-directional by design.** A missing
+  `~/.cache/fluidaudio` proves nothing is cached; its presence proves only that
+  some backend downloaded something. Verified against FluidAudio at the
+  revision `Package.resolved` pins.
 
 ---
 

@@ -6,6 +6,7 @@ import OreCore
 import OreGit
 import OrePersistence
 import OreProtocol
+import OreSupport
 import OreTelemetry
 import UserNotifications
 
@@ -334,7 +335,18 @@ final class AppModel {
             }
         }
         Task {
-            try? await client.start()
+            do {
+                try await client.start()
+            } catch {
+                // Swallowed by `try?` before this. A core that never started
+                // spawns no harness probe, so the welcome screen sat on an
+                // `.unknown` ladder forever with nothing on it — the failure
+                // that caused it was the one thing not on screen.
+                banners.append(Banner(
+                    message: "ORE couldn't finish starting up: \(error.localizedDescription)",
+                    detail: nil
+                ))
+            }
             await refreshRepositories()
             isLoaded = true
             // A beat for the fleet snapshot to land, then say hello.
@@ -530,6 +542,14 @@ final class AppModel {
         guard launchBriefing == nil else { return }
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: Self.greetingEnabledKey) as? Bool ?? true else { return }
+        // Nothing to brief on, and a brand-new user is the worst audience for
+        // one: ORE spoke a greeting aloud and dimmed the next-step card behind
+        // the briefing overlay seconds into a first launch, on top of the
+        // notification permission dialog. Returning *before* the `lastSeenKey`
+        // write below is deliberate — stamping "seen" now would make the first
+        // real briefing measure its absence from a moment there was nothing to
+        // be absent from.
+        guard !sortedWorkspaces.isEmpty else { return }
 
         let lastSeen = defaults.double(forKey: Self.lastSeenKey)
         let lastSeenAt = lastSeen > 0 ? Date(timeIntervalSince1970: lastSeen) : nil
@@ -544,9 +564,7 @@ final class AppModel {
         // Speak only when there was a real absence: a voice greeting on every
         // quick relaunch is clingy, and the master narration switch always
         // wins. Milestone priority — it defers to anything urgent.
-        let awayLongEnough = lastSeenAt.map {
-            Date().timeIntervalSince($0) > LaunchBriefing.spokenAwayThreshold
-        } ?? true
+        let awayLongEnough = Self.isLongAbsence(lastSeenAt: lastSeenAt)
         let voiceWanted = defaults.object(forKey: Self.greetingVoiceKey) as? Bool ?? true
         if awayLongEnough, voiceWanted, narration.isMasterEnabled {
             narration.speakAssistant(
@@ -563,6 +581,19 @@ final class AppModel {
         // The delta is delivered; a relaunch five minutes from now should not
         // replay it.
         defaults.set(Date().timeIntervalSince1970, forKey: Self.lastSeenKey)
+    }
+
+    /// Whether the gap since the last launch is long enough to be worth
+    /// speaking aloud.
+    ///
+    /// A machine that has never recorded a `lastSeenAt` used to answer `true`
+    /// here, so "we have no idea" was treated as the longest absence there is —
+    /// the one case that always speaks. That is exactly backwards on the launch
+    /// where it matters: a restored `~/ore` gives a first run a non-empty fleet
+    /// and no timestamp, and ORE talks to somebody who has never used it.
+    nonisolated static func isLongAbsence(lastSeenAt: Date?, now: Date = Date()) -> Bool {
+        guard let lastSeenAt else { return false }
+        return now.timeIntervalSince(lastSeenAt) > LaunchBriefing.spokenAwayThreshold
     }
 
     func dismissLaunchBriefing() {
@@ -1246,6 +1277,27 @@ final class AppModel {
         // passed along — the user names these after what they are working on.
         telemetry.record(translator.workspaceCreated(harness: request.harness))
         Task { await client.send(.createWorkspace(request)) }
+    }
+
+    /// The same create, awaited.
+    ///
+    /// `createWorkspace` fires and forgets, which is right for ⌘N and for the
+    /// intents — nobody is watching a spinner there. The New Workspace sheet is
+    /// the opposite case: it dismissed the moment the command was *queued*, so
+    /// the click that makes somebody's first workspace closed the window onto
+    /// an empty sidebar and several seconds of nothing while the worktree was
+    /// cut. Awaiting the core keeps the sheet's existing `isCreating` spinner up
+    /// until there is a workspace to switch to. No new state and no placeholder
+    /// row: a placeholder has to be torn down on `.commandFailed` as well as on
+    /// `.workspaceAdded`, and one that outlives a failed create is worse than
+    /// the delay it was covering.
+    func createWorkspaceAndWait(_ request: CreateWorkspaceRequest) async {
+        var request = request
+        if request.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            request.name = suggestedResearchIdentity().name
+        }
+        telemetry.record(translator.workspaceCreated(harness: request.harness))
+        await client.send(.createWorkspace(request))
     }
 
     /// The ⌘N action: spin up a fresh worktree in the same repository as the
@@ -2493,8 +2545,13 @@ final class AppModel {
         Task { await client.send(.approveRepositoryScripts(approval)) }
     }
 
+    /// Declining is not purely local: the core may be holding this workspace's
+    /// first message for the setup script that is now never going to run, and
+    /// only the core can hand it back. Dismissing the dialog without telling it
+    /// dropped that text silently.
     func declineRepositoryScripts(_ approval: RepositoryScriptsApproval) {
         pendingScriptApprovals.removeAll { $0 == approval }
+        Task { await client.send(.declineRepositoryScripts(approval)) }
     }
 
     /// A workspace staged for the archive confirmation dialog. Confirming
@@ -3324,14 +3381,69 @@ final class AppModel {
         return (parts[0], parts[1])
     }
 
+    /// Whether a refresh is in flight.
+    ///
+    /// A probe spawns a login shell per harness and the update check goes to
+    /// the network, so the whole thing can take half a minute. There was no
+    /// sign of that anywhere: Refresh looked inert and people pressed it
+    /// repeatedly, queueing the work they were waiting on.
+    private(set) var isRefreshingHarnesses = false
+
     /// Re-detect the installed CLIs and re-ask their channels what's published.
     /// Both, because a user pressing Refresh is asking about right now — and
     /// the check runs second so it compares against the versions just probed.
     func refreshHarnesses() {
+        guard !isRefreshingHarnesses else { return }
+        isRefreshingHarnesses = true
         Task {
+            defer { isRefreshingHarnesses = false }
             await client.send(.probeHarnesses)
             await client.send(.checkHarnessUpdates(force: true))
         }
+    }
+
+    /// How long an activation re-probe stays suppressed after the last one.
+    nonisolated static let activationProbeInterval: TimeInterval = 20
+
+    /// Whether coming back to ORE should cost another probe.
+    ///
+    /// Activation fires on every window focus — click away to read the docs,
+    /// click back, and that is two more — while a probe is a login shell per
+    /// harness. `nil` means we have never probed on an activation, which is the
+    /// one case that must always go through: it is the first cmd-tab back from
+    /// the Terminal the user was told to install the CLI in.
+    nonisolated static func shouldReprobe(now: Date, last: Date?) -> Bool {
+        guard let last else { return true }
+        return now.timeIntervalSince(last) >= activationProbeInterval
+    }
+
+    /// Seeded at construction rather than left nil, because the first
+    /// activation of a process is the app launching — and `start()` is already
+    /// probing at that moment. Left nil, the launch itself tripped
+    /// `shouldReprobe`'s "never probed" branch and bought a second probe, plus
+    /// a PATH cache invalidation, while the first one was still in flight.
+    @ObservationIgnored
+    private var lastActivationProbe: Date? = Date()
+
+    /// The other half of "copy the install command, run it in Terminal, cmd-tab
+    /// back": until this, nothing on screen changed when they came back, because
+    /// the harness probe only ran at launch and on an explicit Refresh — and the
+    /// login-shell PATH behind it was snapshotted once per process.
+    func refreshHarnessesOnActivation(now: Date = Date()) {
+        // Nothing to find once an agent works. This exists to notice a CLI that
+        // was installed or signed into while ORE was in the background, and a
+        // user who already has a ready harness did not go and do that. It
+        // matters because the probe is not cheap: an explicit Refresh discards
+        // the login-shell PATH and re-probes every harness, so charging every
+        // window focus for it would tax the steady-state user — who is most
+        // users, nearly all the time — to serve the first ten minutes.
+        guard !harnesses.contains(where: \.isReady) else { return }
+        guard Self.shouldReprobe(now: now, last: lastActivationProbe) else { return }
+        lastActivationProbe = now
+        // Deliberately not `refreshHarnesses()`: that also forces a harness
+        // update check, which is a network request. Coming back to a window is
+        // not a reason to make one.
+        Task { await client.send(.probeHarnesses) }
     }
 
     struct HarnessCLIUpdate: Equatable {
@@ -3361,13 +3473,50 @@ final class AppModel {
         Task { _ = await runHarnessCLIUpdate(kind) }
     }
 
+    /// Why an upgrade that exited zero did not actually change anything.
+    ///
+    /// For a self-updating CLI, ORE asks one oracle what is published (npm, a
+    /// vendor endpoint) and a different one to install it (the CLI's own
+    /// `update` subcommand). When those two disagree — the registry has moved
+    /// and the CLI's updater has not caught up — the update reports success,
+    /// the version does not move, and the card came back on the next check
+    /// looking exactly as it did before. Pressing the button again was the only
+    /// thing to do, and it did the same nothing.
+    ///
+    /// Returns nil when the version genuinely moved, when the channel no longer
+    /// advertises a newer one, or when there was no version to compare.
+    nonisolated static func noOpUpdateExplanation(
+        kind: HarnessKind,
+        before: String?,
+        after: HarnessUpdateStatus?
+    ) -> String? {
+        guard let after, after.isUpdateAvailable else { return nil }
+        guard let before, after.installedVersion == before else { return nil }
+        return "\(kind.displayName) reported success but is still on \(before). "
+            + "Its self-updater may be lagging the published version."
+    }
+
     /// True when the upgrade landed. A failure is left on `harnessCLIUpdate`
     /// for whichever surface is showing it, rather than thrown away into a log.
     @discardableResult
     private func runHarnessCLIUpdate(_ kind: HarnessKind) async -> Bool {
+        // What the card was offering before the upgrade ran, so the version can
+        // be the oracle rather than the exit code. See `noOpUpdateExplanation`.
+        let before = harnessUpdate(for: kind)?.installedVersion
         harnessCLIUpdate = HarnessCLIUpdate(kind: kind, isRunning: true, error: nil)
         do {
             try await client.updateHarnessCLI(kind)
+            // The core's own post-update status, not `harnessUpdates`: the
+            // event carrying it is still in flight on the app's stream.
+            let after = await client.harnessUpdateStatus(kind)
+            if let explanation = Self.noOpUpdateExplanation(
+                kind: kind, before: before, after: after
+            ) {
+                harnessCLIUpdate = HarnessCLIUpdate(
+                    kind: kind, isRunning: false, error: explanation
+                )
+                return false
+            }
             harnessCLIUpdate = nil
             return true
         } catch {
@@ -3428,31 +3577,119 @@ final class AppModel {
         return dismissed
     }
 
+    /// How long a browser sign-in gets before ORE stops waiting on it.
+    nonisolated static let harnessSignInTimeout: Duration = .seconds(180)
+
+    /// The live sign-in child, so Cancel has something to kill. One at a time:
+    /// Settings disables the button for every harness while one is running.
+    @ObservationIgnored
+    private var harnessSignIn: Process?
+    @ObservationIgnored
+    private var harnessSignInWasCancelled = false
+
+    /// The verification URL the CLI printed, once it has printed one. Observed,
+    /// because it arrives seconds after the button was pressed.
+    private(set) var harnessAuthenticationURL: String?
+
     /// Starts the provider's own browser-based login. Credentials remain in
     /// the CLI's credential store; ORE only observes the process exit and then
     /// re-runs its readiness probe.
+    ///
+    /// Three things used to make this a trap. The child's output went to
+    /// `/dev/null`, so the verification URL every one of these CLIs prints —
+    /// the whole point, when the browser does not open by itself — was thrown
+    /// away. Nothing bounded the wait, so a login the user abandoned left
+    /// Settings on "Waiting for browser…" for the rest of the session. And
+    /// nothing held the process, so there was nothing to cancel.
     func authenticateHarness(_ kind: HarnessKind) async throws {
         guard kind != .claudeCode else { throw HarnessAuthenticationError.interactiveOnly }
         guard let executable = harnesses.first(where: { $0.kind == kind })?.executablePath
         else { throw HarnessAuthenticationError.notInstalled(kind.displayName) }
 
-        let exitCode: Int32 = try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = ["login"]
-            process.currentDirectoryURL = OreHome.directory
-            process.environment = ProcessInfo.processInfo.environment
-            process.standardInput = FileHandle.nullDevice
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { child in
-                continuation.resume(returning: child.terminationStatus)
-            }
-            do { try process.run() }
-            catch { continuation.resume(throwing: error) }
+        harnessAuthenticationURL = nil
+        harnessSignInWasCancelled = false
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["login"]
+        process.currentDirectoryURL = OreHome.directory
+        // The login-shell environment, not ORE's own: a CLI launched from the
+        // Dock inherits a PATH with none of nvm/mise/asdf on it, and several of
+        // these logins shell out to node. The probes have always used this.
+        process.environment = ShellEnvironment.childEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        // One pipe for both: this is read for a URL to show the user, not
+        // parsed, and which stream a CLI prints its login link on is its own
+        // business.
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty,
+                  let url = AppModel.firstURL(in: String(decoding: chunk, as: UTF8.self))
+            else { return }
+            Task { @MainActor in self?.harnessAuthenticationURL = url }
         }
+
+        do {
+            try process.run()
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            throw error
+        }
+        harnessSignIn = process
+
+        // Polled rather than a termination handler, because the deadline and
+        // Cancel both have to be able to end the wait, not just the child.
+        let deadline = ContinuousClock.now.advanced(by: Self.harnessSignInTimeout)
+        while process.isRunning, !Task.isCancelled, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        let abandoned = Task.isCancelled
+        let timedOut = process.isRunning && !abandoned
+        if process.isRunning { process.terminate() }
+
+        harnessSignIn = nil
+        output.fileHandleForReading.readabilityHandler = nil
+        let cancelled = harnessSignInWasCancelled
+        harnessSignInWasCancelled = false
+
+        if timedOut {
+            throw HarnessAuthenticationError.timedOut(HarnessSetup.signInCommand(for: kind))
+        }
+        if cancelled || abandoned { throw HarnessAuthenticationError.cancelled }
+        let exitCode = process.terminationStatus
         guard exitCode == 0 else { throw HarnessAuthenticationError.failed(exitCode) }
+        // Kept on a timeout — a link the user can still open is the best thing
+        // left to offer — but a finished login has no use for it.
+        harnessAuthenticationURL = nil
         await client.send(.probeHarnesses)
+    }
+
+    /// Stops a sign-in that is going nowhere.
+    func cancelHarnessAuthentication() {
+        guard let process = harnessSignIn else { return }
+        harnessSignInWasCancelled = true
+        harnessAuthenticationURL = nil
+        process.terminate()
+    }
+
+    /// The first `https://` link in a chunk of CLI output.
+    ///
+    /// Deliberately crude: these CLIs print one line with one link on it, and
+    /// anything cleverer would be guessing at three vendors' output formats.
+    /// The surrounding punctuation is trimmed because a link in prose is as
+    /// often as not wrapped in quotes or brackets.
+    nonisolated static func firstURL(in output: String) -> String? {
+        let punctuation = CharacterSet(charactersIn: "\"'<>()[]{},.;")
+        for token in output.split(whereSeparator: { $0.isWhitespace }) {
+            let trimmed = token.trimmingCharacters(in: punctuation)
+            guard trimmed.hasPrefix("https://"), trimmed.count > "https://".count
+            else { continue }
+            return trimmed
+        }
+        return nil
     }
 
     func suggestedResearchIdentity() -> ResearchIdentity {
@@ -3899,6 +4136,15 @@ final class AppModel {
 
         case .modelCatalogUpdated(let harness, let models):
             modelCatalog[harness] = models
+            // A retired model leaves its pin behind: the id keeps going to the
+            // CLI, which rejects it, while Settings shows "Agent default"
+            // because it cannot find the id to display. A freshly answered
+            // catalogue is the only place that verdict can be reached — see
+            // `StaleModelPin`, which is why this is not in `defaultModelID`.
+            let key = Self.defaultModelKey(for: harness)
+            if StaleModelPin.isStale(UserDefaults.standard.string(forKey: key), in: models) {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
 
         case .commandFailed(let failure):
             if let workspaceID = failure.workspaceID {
@@ -3960,6 +4206,33 @@ final class AppModel {
         )
     }
 
+    /// `ore.toml`'s `[agent] harness` for a repository, read once per path.
+    ///
+    /// `launchInputs` is evaluated from view bodies on every keystroke and
+    /// `OreConfiguration.load` is a file read, so the answer is cached. A
+    /// project's default agent is checked into the repository and moves about
+    /// as often as its build script does; Settings rewrites the file from this
+    /// same process and clears this when it does.
+    @ObservationIgnored
+    private var repositoryDefaultHarnesses: [String: HarnessKind?] = [:]
+
+    func repositoryDefaultHarness(_ path: String) -> HarnessKind? {
+        if let cached = repositoryDefaultHarnesses[path] { return cached }
+        let resolved = OreConfiguration
+            .load(repositoryPath: URL(fileURLWithPath: path))
+            .defaultHarness
+        // `updateValue`, not the subscript: the value type is itself optional,
+        // and `dict[key] = nil` removes the entry — so "this repo has no
+        // default" would be re-read from disk on every keystroke.
+        repositoryDefaultHarnesses.updateValue(resolved, forKey: path)
+        return resolved
+    }
+
+    /// Called after `ore.toml` is written from Settings.
+    func forgetRepositoryDefaults() {
+        repositoryDefaultHarnesses.removeAll()
+    }
+
     /// The machine's side of "start work on this sentence".
     ///
     /// Lives here so the composer, the Advanced sheet and Start itself all
@@ -3988,7 +4261,10 @@ final class AppModel {
             modelOverride: modelOverride,
             repositoryOverride: repositoryOverride,
             wantsNewProject: wantsNewProject,
-            explicitBranch: explicitBranch
+            explicitBranch: explicitBranch,
+            repositoryDefaultHarness: { [weak self] path in
+                self?.repositoryDefaultHarness(path) ?? nil
+            }
         )
     }
 
@@ -4850,10 +5126,17 @@ func workspaceSelectionAfterListChange(
     return active.first
 }
 
-private enum HarnessAuthenticationError: LocalizedError, Sendable {
+/// Internal rather than file-private so the copy a stuck sign-in shows can be
+/// asserted in a test: the timeout message is the only thing standing between
+/// the user and a hang, and it names a command that has to stay correct.
+enum HarnessAuthenticationError: LocalizedError, Sendable {
     case interactiveOnly
     case notInstalled(String)
     case failed(Int32)
+    /// Carries the command to run by hand instead, because that is the only
+    /// advice left once the browser handshake has plainly not happened.
+    case timedOut(String)
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -4863,6 +5146,10 @@ private enum HarnessAuthenticationError: LocalizedError, Sendable {
             "\(name) is not installed."
         case .failed(let status):
             "The provider login exited with status \(status)."
+        case .timedOut(let command):
+            "Sign-in timed out. Run `\(command)` in Terminal instead."
+        case .cancelled:
+            "Sign-in cancelled."
         }
     }
 }

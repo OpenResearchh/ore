@@ -1543,6 +1543,13 @@ extension InProcessCoreClient {
                 line += "not installed"
             } else if probe.isEnabled == false {
                 line += "installed but disabled"
+            } else if probe.isUnlaunchable == true {
+                // Ahead of the auth rung: an unlaunchable CLI reports itself
+                // signed out and now keeps its path, so this said "installed
+                // but not signed in" and the assistant went on to suggest it
+                // for work it cannot do. The path is the actionable part.
+                line += "installed at \(probe.executablePath ?? "an unknown path") "
+                    + "but cannot be launched — needs reinstalling"
             } else if probe.authState == .notAuthenticated {
                 line += "installed but not signed in"
             } else if harnessRateLimit(probe.kind)?.report.status == .exhausted {
@@ -1658,6 +1665,11 @@ extension InProcessCoreClient {
             lines.append("usable-now: \(usable ? "yes" : "no")")
             if let probe {
                 lines.append("installed: \(probe.isInstalled ? "yes" : "no")")
+                // Stated outright rather than left to be inferred from the
+                // diagnostic prose: `installed: yes` now covers a binary that
+                // is present and will not start, and the assistant reads these
+                // as facts, not sentences.
+                if probe.isUnlaunchable == true { lines.append("launchable: no") }
                 lines.append("enabled: \(probe.isEnabled == false ? "no" : "yes")")
                 lines.append("authentication: \(probe.authState.rawValue)")
                 if let path = probe.executablePath { lines.append("executable: \(path)") }

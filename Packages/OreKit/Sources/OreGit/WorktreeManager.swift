@@ -81,6 +81,19 @@ public actor WorktreeManager {
 
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        // Clears registrations whose directory is gone.
+        //
+        // git records every worktree under `.git/worktrees/<name>`, and
+        // deleting the directory in Finder — or losing it with an external
+        // drive, or a `rm -rf` in a terminal — leaves the record behind. The
+        // next `worktree add` at that slug then fails with "already exists",
+        // naming a path the user can see is not there. `uniquePath` cannot
+        // help: it checks the filesystem, which agrees the path is free.
+        //
+        // Best-effort on purpose: prune failing is not a reason to refuse to
+        // make a worktree, and the `add` below reports anything that matters.
+        try? await git.runSerialized(["worktree", "prune"])
+
         // `baseRevision` can come from a pull request's head branch or from the
         // assistant; ending option parsing keeps a name that starts with a
         // dash from being read as a flag.

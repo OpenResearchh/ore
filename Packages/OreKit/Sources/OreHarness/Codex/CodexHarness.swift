@@ -27,9 +27,14 @@ public struct CodexHarness: AgentHarness {
     }
 
     public var executablePathOverride: String?
+    /// See `ClaudeCodeHarness.allowAPIKeyFallback`: probes strip provider
+    /// credentials unless the user opted in, which is why an `OPENAI_API_KEY`
+    /// user was told to sign in to a CLI they are already authenticated to.
+    public var allowAPIKeyFallback: Bool
 
-    public init(executablePathOverride: String? = nil) {
+    public init(executablePathOverride: String? = nil, allowAPIKeyFallback: Bool = false) {
         self.executablePathOverride = executablePathOverride
+        self.allowAPIKeyFallback = allowAPIKeyFallback
     }
 
     public func probe() async -> HarnessProbeResult {
@@ -37,19 +42,36 @@ public struct CodexHarness: AgentHarness {
             return HarnessProbeResult(
                 kind: kind,
                 authState: .notAuthenticated,
-                diagnostic: "Not found on PATH (\(ShellEnvironment.searchPathDescription))"
+                diagnostic: await HarnessDiagnostic.notFound(
+                    executableName: kind.defaultExecutableName
+                )
             )
         }
 
-        let version = await CommandProbe.firstLine(
-            executablePath: path, arguments: ["--version"], timeout: .seconds(10)
+        // See `ClaudeCodeHarness.probe`: every other copy on PATH, because the
+        // one ORE updates and the one the shell runs need not be the same file.
+        let shadowed = HarnessPathScan.shadowed(
+            of: [kind.defaultExecutableName], winner: path
         )
+
+        let versionProbe = await CommandProbe.run(
+            executablePath: path,
+            arguments: ["--version"],
+            timeout: .seconds(10),
+            allowAPIKeyFallback: allowAPIKeyFallback
+        )
+        if case .couldNotLaunch(let reason) = versionProbe {
+            return HarnessDiagnostic.unlaunchable(
+                kind: kind, path: path, reason: reason, shadowedPaths: shadowed
+            )
+        }
 
         return HarnessProbeResult(
             kind: kind,
             executablePath: path,
-            version: version,
-            authState: await probeAuthState(executablePath: path)
+            version: versionProbe.firstLine,
+            authState: await probeAuthState(executablePath: path),
+            shadowedPaths: shadowed
         )
     }
 
@@ -60,7 +82,9 @@ public struct CodexHarness: AgentHarness {
                 executablePath: path,
                 arguments: ["app-server"],
                 workingDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
-                environment: ShellEnvironment.childEnvironment(),
+                environment: ShellEnvironment.childEnvironment(
+                    allowProviderCredentials: allowAPIKeyFallback
+                ),
                 discardStandardError: true
             )
             let connection = JSONRPCConnection(process: process)
@@ -138,20 +162,35 @@ public struct CodexHarness: AgentHarness {
     }
 
     private func probeAuthState(executablePath: String) async -> HarnessProbeResult.AuthState {
-        guard let output = await CommandProbe.output(
-            executablePath: executablePath, arguments: ["login", "status"], timeout: .seconds(15)
-        ) else {
-            // Fall back to the credentials file the CLI writes on login.
-            let authFile = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex/auth.json")
-            return FileManager.default.fileExists(atPath: authFile.path)
-                ? .authenticated
-                : .notAuthenticated
-        }
-
-        let text = output.lowercased()
+        let outcome = await CommandProbe.run(
+            executablePath: executablePath,
+            arguments: ["login", "status"],
+            timeout: .seconds(15),
+            allowAPIKeyFallback: allowAPIKeyFallback
+        )
+        // Stderr counts as an answer here: the CLI reports "Not logged in" on
+        // it and exits non-zero, which the stdout-only read threw away and
+        // then guessed at from the credentials file.
+        let text = (outcome.spokenText ?? "").lowercased()
         if text.contains("not logged in") || text.contains("logged out") { return .notAuthenticated }
         if text.contains("logged in") { return .authenticated }
-        return .unknown
+
+        // Fall back to the credentials file the CLI writes on login. Anything
+        // that isn't one of the two answers above lands here, including a
+        // non-zero exit with nothing to say: reading `spokenText` must not
+        // cost us this check, which is the only evidence left when the CLI
+        // declines to state its login state.
+        //
+        // Its *absence* is real evidence: the CLI has never logged in on
+        // this machine. Its presence is not — the file survives an expired
+        // or revoked token, and reading it as `.authenticated` told the
+        // user "CLI subscription connected" right up until their first
+        // turn failed on auth. `.unknown` is what we actually know, and
+        // the UI already has wording for it ("Managed by CLI").
+        let authFile = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/auth.json")
+        return FileManager.default.fileExists(atPath: authFile.path)
+            ? .unknown
+            : .notAuthenticated
     }
 }

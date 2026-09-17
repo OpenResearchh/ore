@@ -95,6 +95,7 @@ final class AssistantVoiceHUD {
         withObservationTracking {
             _ = model.tabNeedsYou
             _ = controller.phase
+            _ = controller.failure
             _ = model.narration.currentSpokenText
         } onChange: {
             Task { @MainActor in
@@ -125,7 +126,12 @@ final class AssistantVoiceHUD {
                 dismissedNeedsYouIDs, against: model.tabNeedsYou
             )
         }
-        let voiceActive = HUDVoiceSource.current(
+        // A failure has to outlive the phase that produced it: by the time
+        // there is anything to say the session is already back to `.idle`, and
+        // hiding on `.idle` is exactly what made a denied microphone a pill
+        // that blinked once. The controller clears it on its own timer.
+        let hasFailure = controller?.failure != nil
+        let voiceActive = hasFailure || HUDVoiceSource.current(
             isAssistantActive: (controller?.phase ?? .idle) != .idle,
             narrationText: model?.narration.currentSpokenText
         ) != .none
@@ -363,7 +369,7 @@ private struct AssistantHUDView: View {
         HStack(spacing: 12) {
             Image(systemName: voiceIcon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(showsFailure ? Color.orange : Color.accentColor)
 
             WaveformBars(mode: waveform, level: { controller.audioLevel })
                 .frame(width: 34, height: 20)
@@ -372,7 +378,9 @@ private struct AssistantHUDView: View {
             // arrive many times a second, and reading them here re-ran the
             // whole pill — and the action card under it — for each one.
             StreamingTranscript(text: { transcript }, placeholder: placeholder)
-                .foregroundStyle(micIsOpen ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .foregroundStyle(
+                    micIsOpen || showsFailure ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary)
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             // Narration from a tab doesn't always say where it came from —
@@ -410,6 +418,12 @@ private struct AssistantHUDView: View {
         controller.phase == .listening || controller.phase == .answering
     }
 
+    /// The pill is being kept alive only to explain why the last session went
+    /// nowhere — see `VoiceAssistantController.failure`.
+    private var showsFailure: Bool {
+        controller.phase == .idle && controller.failure != nil
+    }
+
     /// The tab whose narration is playing, by the name its tab shows.
     private var narratingPlace: String? {
         guard let model, let id = model.narration.speakingChatID else { return nil }
@@ -438,7 +452,10 @@ private struct AssistantHUDView: View {
         case .listening, .answering: "mic.fill"
         case .speaking: "speaker.wave.2.fill"
         case .thinking: "sparkles"
-        case .idle: isNarrating ? "speaker.wave.2.fill" : "sparkles"
+        case .idle:
+            if showsFailure { "exclamationmark.triangle.fill" }
+            else if isNarrating { "speaker.wave.2.fill" }
+            else { "sparkles" }
         }
     }
 
@@ -484,7 +501,12 @@ private struct AssistantHUDView: View {
         // a pre-roll cushion that grows on a loaded machine. Calling it
         // "Speaking…" made a working synthesiser look like a wedged one.
         case .speaking: "Preparing to speak…"
-        case .idle: isNarrating ? "Preparing to speak…" : ""
+        // The reason the last session went nowhere, in place of the words it
+        // never got: the pill is only still up because of it.
+        case .idle:
+            if showsFailure { controller.failure ?? "" }
+            else if isNarrating { "Preparing to speak…" }
+            else { "" }
         }
     }
 }

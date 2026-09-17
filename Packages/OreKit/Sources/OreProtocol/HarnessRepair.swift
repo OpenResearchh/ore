@@ -90,12 +90,17 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
     ///     rather than a whole prefix.
     ///   - npmPrefix: `npm config get prefix`, when npm is installed.
     ///   - brewPrefix: `brew --prefix`, when Homebrew is installed.
+    ///   - brewToken: the cask or formula token this install actually came
+    ///     from, where the caller could read it off the path. Defaults to the
+    ///     harness's stable token — which is a guess, and wrong for anyone on
+    ///     a `@latest` cask, so a caller that can do better should.
     public static func forPermissionFailure(
         kind: HarnessKind,
         method: HarnessInstallMethod,
         executablePath: String?,
         npmPrefix: String? = nil,
-        brewPrefix: String? = nil
+        brewPrefix: String? = nil,
+        brewToken: String? = nil
     ) -> HarnessRepair? {
         switch method {
         case .homebrew:
@@ -104,20 +109,22 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
             // and the bin directory holding its symlink, rather than the
             // `chown -R` on the whole prefix that Homebrew's own error text
             // suggests. A prefix can hold hundreds of unrelated packages.
-            guard let formula = kind.brewFormula else {
-                return fallback(kind: kind, npmPrefix: npmPrefix)
+            guard let formula = brewToken ?? kind.brewFormula else {
+                return fallback(kind: kind)
             }
             guard let brewPrefix else {
                 // The path says Homebrew but `brew` is not on PATH: a
                 // migrated machine, or an Intel prefix on an Apple Silicon
                 // Mac. Reinstalling through Homebrew cannot be the advice.
-                return fallback(kind: kind, npmPrefix: npmPrefix)
+                return fallback(kind: kind)
             }
             return HarnessRepair(
                 reason: "Homebrew's files for \(formula) are owned by another user.",
                 commands: [
                     "sudo chown -R \"$(whoami)\" "
-                        + quote("\(brewPrefix)/Cellar/\(formula)") + " "
+                        + quote(brewKegDirectory(
+                            prefix: brewPrefix, token: formula, executablePath: executablePath
+                        )) + " "
                         + quote("\(brewPrefix)/bin"),
                     "brew upgrade \(quote(formula))",
                 ] + verification(for: kind),
@@ -126,7 +133,7 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
 
         case .npm:
             guard let package = kind.npmPackage else {
-                return fallback(kind: kind, npmPrefix: npmPrefix)
+                return fallback(kind: kind)
             }
             // `$(npm config get prefix)` rather than a guess when npm has not
             // been asked: the answer differs per node manager, and a wrong
@@ -150,7 +157,7 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
 
         case .nativeUserBin, .selfUpdate:
             guard let executablePath else {
-                return fallback(kind: kind, npmPrefix: npmPrefix)
+                return fallback(kind: kind)
             }
             // A vendor installer run under `sudo` once leaves a root-owned
             // file in the user's own bin directory, and every self-update
@@ -167,36 +174,59 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
             )
 
         case .unknown:
-            return fallback(kind: kind, npmPrefix: npmPrefix)
+            return fallback(kind: kind)
         }
     }
 
-    /// When the install cannot be classified, reinstall through the channel
-    /// the vendor documents — and do it without root, so a failure here
-    /// cannot make the ownership situation any worse than it already is.
-    private static func fallback(kind: HarnessKind, npmPrefix: String?) -> HarnessRepair? {
-        if let package = kind.npmPackage {
-            return HarnessRepair(
-                reason: "ORE can't tell where \(kind.displayName) was installed from, "
-                    + "so this installs it under your own account instead.",
-                commands: [
-                    // A user-owned prefix sidesteps the permission problem
-                    // entirely rather than arguing with it as root.
-                    "npm config set prefix ~/.npm-global",
-                    "npm install -g \(quote(package))@latest",
-                    // And the new copy has to actually win: the old one is
-                    // still on PATH, usually earlier.
-                    "echo 'export PATH=\"$HOME/.npm-global/bin:$PATH\"' >> ~/.zshrc",
-                    "export PATH=\"$HOME/.npm-global/bin:$PATH\"",
-                ] + verification(for: kind),
-                needsRoot: false
-            )
-        }
-        guard kind == .cursorAgent else { return nil }
-        return HarnessRepair(
+    /// Where Homebrew keeps this install's files, read off the resolved path.
+    ///
+    /// `Cellar` for a formula, `Caskroom` for a cask, and the difference is
+    /// not cosmetic: the repair's first line `chown`s this directory, and a
+    /// cask's files have never been in `Cellar`. That line failed with "No
+    /// such file or directory" before the `brew upgrade` behind it could run —
+    /// harmless when pasted into a shell one line at a time, and alarming
+    /// either way. Latent until `brewToken` began resolving cask tokens like
+    /// `claude-code@latest` off the path.
+    ///
+    /// `Cellar` when the path does not say, which is what this always assumed.
+    static func brewKegDirectory(
+        prefix: String, token: String, executablePath: String?
+    ) -> String {
+        let container = executablePath.flatMap { path -> String? in
+            for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+                switch component.lowercased() {
+                case "cellar": return "Cellar"
+                case "caskroom": return "Caskroom"
+                default: continue
+                }
+            }
+            return nil
+        } ?? "Cellar"
+        return "\(prefix)/\(container)/\(token)"
+    }
+
+    /// When the channel this install came from cannot be used, reinstall
+    /// through the one the vendor documents — and do it without root, so a
+    /// failure here cannot make the ownership situation any worse than it
+    /// already is.
+    ///
+    /// The vendor's script, not npm. This used to run
+    /// `npm config set prefix ~/.npm-global && npm install -g` for any CLI
+    /// with an npm package, which is a repair that fails on its first line for
+    /// the user who installed the way ORE itself now recommends: the install
+    /// script leaves a working CLI in `~/.local/bin` on a machine with no node
+    /// at all. The script needs nothing but curl, and installs under the
+    /// user's own account — which is also what sidesteps the permission
+    /// problem instead of arguing with it as root.
+    ///
+    /// The privileged npm repair above is untouched: a root-owned
+    /// `lib/node_modules` is a real situation and chowning it back is the
+    /// right answer *there*, where we know that is what we are looking at.
+    private static func fallback(kind: HarnessKind) -> HarnessRepair? {
+        HarnessRepair(
             reason: "\(kind.displayName) installs through its own script, which "
-                + "replaces whatever is there now.",
-            commands: ["curl -fsSL https://cursor.com/install | bash"]
+                + "replaces whatever is there now and needs nothing else installed.",
+            commands: ["curl -fsSL \(kind.nativeInstallerURL) | bash"]
                 + verification(for: kind),
             needsRoot: false
         )

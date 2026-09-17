@@ -54,8 +54,9 @@ struct HarnessUpdateCheckerTests {
         // leads the cask, and offering a version `brew upgrade` cannot fetch
         // makes a card that never clears.
         #expect(
-            HarnessUpdateChecker.source(for: .codex, executablePath: "/opt/homebrew/bin/codex")
-                == .homebrew(token: "codex")
+            HarnessUpdateChecker.source(
+                for: .codex, executablePath: "/opt/homebrew/bin/codex", isBrewAvailable: true
+            ) == .homebrew(token: "codex")
         )
         #expect(
             HarnessUpdateChecker.source(
@@ -78,11 +79,89 @@ struct HarnessUpdateCheckerTests {
         )
     }
 
+    /// cursor-agent is the one harness with no Homebrew formula ORE knows, so
+    /// a brew-prefix install of it fell through to the vendor's install script
+    /// — a channel that would land a second copy in front of the brew one. No
+    /// channel is the honest answer, and it is what suppresses the card.
+    @Test func brewInstallWithNoFormulaIsNotOfferedTheVendorScript() {
+        #expect(HarnessKind.cursorAgent.brewFormula == nil)
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .cursorAgent, executablePath: "/opt/homebrew/bin/cursor-agent",
+                isBrewAvailable: true
+            ) == .unknown
+        )
+        // A vendor install is still upgradable through the vendor.
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .cursorAgent, executablePath: "/Users/me/.local/bin/cursor-agent"
+            ) == .cursorInstallScript
+        )
+    }
+
+    /// And the card it produces says so rather than advertising a version.
+    @Test func anUnknownChannelReportsThatItCannotTell() async {
+        let status = await HarnessUpdateChecker.check(
+            kind: .cursorAgent,
+            installedVersion: "2026.09.02-c22c1a3",
+            executablePath: "/opt/homebrew/bin/cursor-agent",
+            fetch: { _ in Issue.record("an unknown channel must not be fetched"); return nil },
+            isBrewAvailable: true
+        )
+        #expect(status.latestVersion == nil)
+        #expect(!status.isUpdateAvailable)
+        #expect(status.failure?.contains("can't tell") == true)
+    }
+
     @Test func homebrewFallsBackToTheFormulaNamespace() {
         let cask = HarnessUpdateChecker.Source.homebrew(token: "codex")
         #expect(cask.url?.absoluteString.contains("/api/cask/codex.json") == true)
         #expect(cask.fallbackURL?.absoluteString.contains("/api/formula/codex.json") == true)
         #expect(HarnessUpdateChecker.Source.npm(package: "@openai/codex").fallbackURL == nil)
+    }
+
+    /// Homebrew ships Claude Code as two casks. Reading the stable one for a
+    /// user on `claude-code@latest` reports a release about a week behind what
+    /// their own `brew upgrade` would fetch — so the oracle follows the cask
+    /// the install names, and the URL has to survive the `@`.
+    @Test func theCaskTheInstallNamesIsTheOneRead() {
+        let source = HarnessUpdateChecker.source(
+            for: .claudeCode,
+            executablePath: "/opt/homebrew/Caskroom/claude-code@latest/2.1.263/claude",
+            isBrewAvailable: true
+        )
+        #expect(source == .homebrew(token: "claude-code@latest"))
+        #expect(
+            source.url?.absoluteString
+                == "https://formulae.brew.sh/api/cask/claude-code@latest.json"
+        )
+    }
+
+    /// A migrated Mac keeps `/opt/homebrew/bin` and loses Homebrew. Suppressing
+    /// the card there strands the user on whatever version the migration left
+    /// behind — the vendor's script is not a rival to a maintained copy when
+    /// there is no Homebrew left to maintain it.
+    @Test func aHomebrewPathWithoutBrewStillHasAChannel() async {
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .claudeCode, executablePath: "/opt/homebrew/bin/claude",
+                isBrewAvailable: false
+            ) == .npm(package: "@anthropic-ai/claude-code")
+        )
+
+        let status = await HarnessUpdateChecker.check(
+            kind: .claudeCode,
+            installedVersion: "2.1.154",
+            executablePath: "/opt/homebrew/bin/claude",
+            fetch: Self.serving([
+                "/@anthropic-ai/claude-code/latest": #"{"version":"2.1.263"}"#,
+            ]),
+            isBrewAvailable: false
+        )
+        #expect(status.isUpdateAvailable)
+        // And the command it offers is one this machine can actually run.
+        #expect(status.updateCommand?.contains("brew") != true)
+        #expect(status.updateCommand?.contains("claude.ai/install.sh") == true)
     }
 
     // MARK: - Channel payloads
@@ -126,7 +205,8 @@ struct HarnessUpdateCheckerTests {
             executablePath: "/opt/homebrew/bin/codex",
             fetch: Self.serving([
                 "/api/cask/codex.json": #"{"token":"codex","version":"0.153.4"}"#,
-            ])
+            ]),
+            isBrewAvailable: true
         )
         #expect(status.installedVersion == "0.148.0")
         #expect(status.latestVersion == "0.153.4")
@@ -154,7 +234,8 @@ struct HarnessUpdateCheckerTests {
             kind: .codex,
             installedVersion: "0.148.0",
             executablePath: "/opt/homebrew/bin/codex",
-            fetch: { _ in nil }
+            fetch: { _ in nil },
+            isBrewAvailable: true
         )
         #expect(status.latestVersion == nil)
         #expect(!status.isUpdateAvailable)
@@ -171,7 +252,8 @@ struct HarnessUpdateCheckerTests {
             executablePath: "/opt/homebrew/bin/codex",
             fetch: Self.serving([
                 "/api/cask/codex.json": #"{"token":"codex","version":"0.153.4"}"#,
-            ])
+            ]),
+            isBrewAvailable: true
         )
         #expect(!status.isUpdateAvailable)
         #expect(status.failure != nil)
@@ -185,7 +267,8 @@ struct HarnessUpdateCheckerTests {
             executablePath: "/opt/homebrew/bin/codex",
             fetch: Self.serving([
                 "/api/formula/codex.json": #"{"versions":{"stable":"0.153.4"}}"#,
-            ])
+            ]),
+            isBrewAvailable: true
         )
         #expect(status.latestVersion == "0.153.4")
         #expect(status.isUpdateAvailable)

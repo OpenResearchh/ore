@@ -103,6 +103,44 @@ struct PersistenceTests {
         #expect(try await second.workspaces().count == 1)
     }
 
+    @Test func aStoreFromANewerOREIsRefusedRatherThanMigrated() async throws {
+        // install.sh takes an ORE_VERSION, so downgrading is one command away.
+        // An older build must not quietly migrate a database it does not
+        // understand — before Unit 3 this error would have dropped the user
+        // into an in-memory store and thrown the afternoon away.
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-\(UUID().uuidString)")
+            .appendingPathComponent("ore.sqlite")
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+
+        let current = try OreStore(path: path)
+        _ = try await seedWorkspace(current)
+
+        // The older build, standing in for one whose migrations stop earlier.
+        #expect(throws: OreStoreError.self) {
+            _ = try OreStore(path: path, expectedStoreVersion: OreSchema.userVersion - 1)
+        }
+
+        // Refused, not migrated: what the newer build wrote is still there.
+        let reopened = try OreStore(path: path)
+        #expect(try await reopened.workspaces().count == 1)
+    }
+
+    @Test func aStoreFromAnOlderOREIsStampedAndOpened() async throws {
+        // The other direction is an ordinary upgrade, including the very first
+        // open of a file written before the stamp existed (it reads as 0).
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-\(UUID().uuidString)")
+            .appendingPathComponent("ore.sqlite")
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+
+        let old = try OreStore(path: path, expectedStoreVersion: 0)
+        _ = try await seedWorkspace(old)
+
+        let upgraded = try OreStore(path: path)
+        #expect(try await upgraded.workspaces().count == 1)
+    }
+
     @Test func sidebarOrderPutsPinnedFirstThenMostRecentlyActive() async throws {
         let store = try makeStore()
         _ = try await seedWorkspace(store, id: "old", name: "old")

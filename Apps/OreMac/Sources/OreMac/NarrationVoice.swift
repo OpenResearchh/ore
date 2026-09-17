@@ -252,19 +252,97 @@ enum NeuralNarrationSynthesis {
 @MainActor
 @Observable
 final class NeuralNarrationVoice: NarrationVoice {
+    /// How far a fetch in flight has got.
+    ///
+    /// `.installing` used to carry nothing, so 940 MB arrived behind a
+    /// spinner that looked identical at second one and minute six. FluidAudio
+    /// does report byte-weighted progress — just not through
+    /// `PocketTtsManager.initialize()`, which drops the handler — so the
+    /// download phase can show a real percentage. The two phases either side
+    /// of it report nothing, and are labelled rather than given an invented
+    /// number.
+    enum InstallStage: Equatable, Sendable {
+        /// FluidAudio is listing the repository; no byte counts exist yet.
+        case preparing
+        /// Fetching weights. `fraction` is FluidAudio's own byte-weighted
+        /// figure, not a guess.
+        case downloading(fraction: Double)
+        /// The weights are on disk and CoreML is compiling and loading them.
+        /// Measured at 2-11s on an M1, and silent throughout.
+        case loading
+    }
+
     enum Readiness: Equatable {
         case notInstalled
-        case installing
+        case installing(InstallStage)
         case ready
         case failed(String)
+        /// The weights are on disk but this Mac cannot load them — no Metal
+        /// device on a VM or a headless session, or a CoreML runtime that
+        /// rejects the model. Distinct from `.failed` because the retry that
+        /// fixes a download cannot fix this: the same files would be loaded
+        /// on the same hardware, forever.
+        case unsupported(String)
+
+        /// The button that starts — or restarts — the fetch, and `nil` when
+        /// there is nothing to start.
+        ///
+        /// `.notInstalled` is reachable with the neural voice already chosen:
+        /// a download interrupted by a quit, or a relaunch where
+        /// `loadNeuralVoiceIfNeeded` rightly declines to spend 940 MB unasked.
+        /// That state had no affordance at all, so the only way back to the
+        /// download was to switch the picker away and back again.
+        ///
+        /// `.unsupported` deliberately offers none: a "Try again" that fails
+        /// identically every time is worse than saying plainly that this Mac
+        /// will be using the system voice.
+        var installActionTitle: String? {
+            switch self {
+            case .notInstalled: "Download"
+            case .failed: "Try again"
+            case .installing, .ready, .unsupported: nil
+            }
+        }
+
+        /// The button that stops a fetch in flight. There was none at all
+        /// before, which is what made the download feel like something
+        /// happening *to* the user rather than something they asked for.
+        var cancelActionTitle: String? {
+            switch self {
+            case .installing: "Cancel"
+            case .notInstalled, .ready, .failed, .unsupported: nil
+            }
+        }
     }
 
     /// Set once the model has been fetched, so later launches can load it
     /// without asking again or hitting the network.
     private static let installedKey = "ore.narration.neuralInstalled"
 
-    private(set) var readiness: Readiness
+    /// FluidAudio's on-disk root for TTS weights on macOS.
+    ///
+    /// Verified against FluidAudio at the revision `Package.resolved` pins
+    /// (0.15.5, 19600a4): `ModelHub.clearAllCaches` names this as the shared
+    /// TTS root for every backend on macOS, with the Application Support
+    /// variant on the `#else` iOS branch that this app never takes. Pocket
+    /// TTS puts its language packs somewhere beneath it.
+    ///
+    /// Still read in one direction only, because only one direction is sound.
+    /// A missing root proves nothing is cached and clears the install flag; a
+    /// present root proves only that *some* backend has downloaded something,
+    /// not that this language pack is complete, so it changes nothing. Being
+    /// wrong that way costs one press of a button that already exists. Being
+    /// wrong the other way costs 940 MB nobody asked for.
+    private static let vendorCacheRoot = ".cache/fluidaudio"
 
+    /// The exact language pack this voice fetches and loads.
+    ///
+    /// Held in one place because two calls now have to agree on it:
+    /// `install()` runs FluidAudio's downloader first, for the progress it
+    /// reports, and `PocketTtsManager` then loads out of the cache that
+    /// filled. Any drift between the two is a second 940 MB download.
+    nonisolated static let modelLanguage = PocketTtsLanguage.english
+    nonisolated static let modelPrecision = PocketTtsPrecision.fp16
     /// `.gpu` is FluidAudio's default and, measured on an M1, the right one:
     /// GPU ran 1.6-1.9x real time idle and 1.08x with all cores busy, while
     /// `.ane` managed only 1.3-1.4x and 0.83x — below real time, i.e. audible
@@ -272,9 +350,30 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// outright on this model version ("`functionName` must be nil unless the
     /// model type is ML Program"). The Neural Engine looks like the obvious
     /// home for this and isn't; don't switch without re-measuring.
+    nonisolated static let modelPlacement = PocketTtsModelPlacement.gpu
+
+    /// Free space `install()` insists on before it starts.
+    ///
+    /// There was no check at all, so a volume with no room announced itself
+    /// twenty minutes in as whatever the vendor's file writer happened to
+    /// throw. Deliberately larger than the 940 MB the pack settles at: each
+    /// file streams into a `.partial` beside its destination before being
+    /// moved into place, so the peak is everything downloaded so far plus the
+    /// largest model a second time.
+    nonisolated static let requiredFreeBytes: Int64 = 1_200_000_000
+
+    private(set) var readiness: Readiness
+
+    /// How long the current fetch has been running. The only thing that moves
+    /// while FluidAudio lists the repository or CoreML compiles, both of which
+    /// report nothing.
+    private(set) var installElapsed: TimeInterval = 0
+
     @ObservationIgnored private let manager = PocketTtsManager(
         defaultVoice: NeuralNarrationSynthesis.voice,
-        placement: .gpu
+        language: NeuralNarrationVoice.modelLanguage,
+        precision: NeuralNarrationVoice.modelPrecision,
+        placement: NeuralNarrationVoice.modelPlacement
     )
     /// Lines already spoken, so a repeat costs a buffer copy instead of a
     /// second pass through the model. See `NarrationPhraseCache`.
@@ -290,6 +389,14 @@ final class NeuralNarrationVoice: NarrationVoice {
 
     @ObservationIgnored private var speakTask: Task<Void, Never>?
     @ObservationIgnored private var installTask: Task<Void, Never>?
+    /// Ticks `installElapsed` while a fetch runs, and only then.
+    @ObservationIgnored private var installClockTask: Task<Void, Never>?
+    @ObservationIgnored private var installStartedAt: Date?
+    /// Bumped by every `install()` and every `cancelInstall()`, so a fetch
+    /// that is still unwinding cannot report its outcome over the state the
+    /// user has since moved to. Same device as `generation` does for
+    /// utterances, for the same reason: cancellation lands late.
+    @ObservationIgnored private var installGeneration = 0
     /// Fills the persistent phrase cache only while narration is otherwise
     /// idle. Foreground speech cancels this immediately; a later quiet period
     /// resumes at the first uncached phrase.
@@ -384,27 +491,288 @@ final class NeuralNarrationVoice: NarrationVoice {
 
     /// True when the weights are already on disk from a previous run, so the
     /// UI can load quietly instead of showing a download.
+    ///
+    /// The stored flag alone is not enough. It was written once on success
+    /// and never unwritten, so a Mac whose caches had been emptied — a
+    /// cleaner, Migration Assistant, someone reclaiming space — still claimed
+    /// the model was installed, and the next narration line silently re-spent
+    /// 940 MB with no consent, no progress and no way to stop it. Reading it
+    /// is therefore also where a stale flag gets cleared, which puts the
+    /// Download button back.
     var wasInstalledPreviously: Bool {
-        UserDefaults.standard.bool(forKey: Self.installedKey)
+        guard UserDefaults.standard.bool(forKey: Self.installedKey) else { return false }
+        guard Self.installFlagIsStale(vendorCacheRootExists: Self.hasVendorCacheRoot())
+        else { return true }
+        UserDefaults.standard.set(false, forKey: Self.installedKey)
+        return false
+    }
+
+    /// Whether a stored install flag has been outlived by its weights.
+    ///
+    /// One-directional on purpose — see `vendorCacheRoot`. Absence is proof;
+    /// presence is not evidence of anything.
+    nonisolated static func installFlagIsStale(vendorCacheRootExists: Bool) -> Bool {
+        !vendorCacheRootExists
+    }
+
+    private static func hasVendorCacheRoot() -> Bool {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(vendorCacheRoot)
+        return FileManager.default.fileExists(atPath: root.path)
+    }
+
+    /// How much of the volume the cache lives on is free, or nil when the
+    /// system declines to say. Unknowable is not the same as too small, so a
+    /// nil refuses nothing.
+    private static func freeBytesForDownload() -> Int64? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let values = try? home.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        )
+        return values?.volumeAvailableCapacityForImportantUsage
+    }
+
+    /// How much more room the fetch needs than the volume has, or nil when
+    /// there is enough — or when free space could not be read at all.
+    nonisolated static func diskShortfall(
+        freeBytes: Int64?,
+        required: Int64 = requiredFreeBytes
+    ) -> Int64? {
+        guard let freeBytes, freeBytes < required else { return nil }
+        return required - freeBytes
+    }
+
+    /// Names the shortfall rather than the failure. A download that dies at
+    /// 900 MB reports whatever the vendor's file writer threw, which tells the
+    /// user nothing about what to do next.
+    nonisolated static func notEnoughSpaceMessage(shortfall: Int64) -> String {
+        let needed = ByteCountFormatter.string(
+            fromByteCount: requiredFreeBytes, countStyle: .file
+        )
+        let missing = ByteCountFormatter.string(fromByteCount: shortfall, countStyle: .file)
+        return "Not enough disk space. Installing the neural voice needs about "
+            + "\(needed) free — \(missing) more than this Mac has right now."
     }
 
     /// Downloads the model if needed and loads it. Safe to call repeatedly;
     /// concurrent calls share the one in-flight attempt.
+    ///
+    /// Two phases, not one. `PocketTtsManager.initialize()` does both but
+    /// drops FluidAudio's progress handler on the floor, which is what left
+    /// 940 MB behind a spinner. Running the downloader first — with exactly
+    /// the pack the manager is built for — buys a real percentage and leaves
+    /// `initialize()` as a pure load off the cache that just filled. It also
+    /// separates the two failures: a fetch that broke is worth retrying, a
+    /// load that broke will break the same way on the same hardware forever.
     func install() {
         guard readiness != .ready, installTask == nil else { return }
-        readiness = .installing
+        if case .unsupported = readiness { return }
+        // Only a fetch needs the room. This is also the path a normal session
+        // takes to *load* an already-downloaded model, and refusing that on a
+        // nearly-full volume would silence the voice of someone who had
+        // already paid the 940 MB — with a message about disk space for a
+        // download that was never going to happen.
+        if !wasInstalledPreviously,
+           let shortfall = Self.diskShortfall(freeBytes: Self.freeBytesForDownload()) {
+            readiness = .failed(Self.notEnoughSpaceMessage(shortfall: shortfall))
+            return
+        }
+        installGeneration += 1
+        let generation = installGeneration
+        installStartedAt = Date()
+        installElapsed = 0
+        readiness = .installing(.preparing)
+        startInstallClock()
+        // FluidAudio documents this as called from an unspecified queue, so
+        // the hop is its contract, not belt and braces.
+        let onProgress: ProgressHandler = { [weak self] progress in
+            Task { @MainActor in
+                self?.noteInstallStage(
+                    Self.installStage(for: progress), generation: generation
+                )
+            }
+        }
         installTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.manager.initialize()
-                self.readiness = .ready
-                UserDefaults.standard.set(true, forKey: Self.installedKey)
-                self.scheduleCorpusWarmup()
+                try await Self.fetchWeights(progress: onProgress)
             } catch {
-                self.readiness = .failed(error.localizedDescription)
+                self.finishInstall(
+                    with: Self.fetchFailure(error), generation: generation
+                )
+                return
             }
-            self.installTask = nil
+            self.noteInstallStage(.loading, generation: generation)
+            do {
+                try await self.manager.initialize()
+            } catch {
+                self.finishInstall(with: Self.loadFailure(error), generation: generation)
+                return
+            }
+            self.finishInstall(with: .ready, generation: generation)
         }
+    }
+
+    /// Stops a fetch in flight.
+    ///
+    /// FluidAudio streams each file into a `.partial` beside its destination
+    /// and resumes from there with `Range`/`If-Range`, so this is a pause the
+    /// user can undo rather than 940 MB thrown away. The state flips here
+    /// instead of waiting for the task to unwind: cancellation only lands at
+    /// the next suspension point, and a spinner that keeps spinning after
+    /// Cancel is the same non-answer the button was added to remove.
+    func cancelInstall() {
+        guard installTask != nil else { return }
+        installGeneration += 1
+        installTask?.cancel()
+        installTask = nil
+        stopInstallClock()
+        readiness = .notInstalled
+    }
+
+    /// Fetches the language pack, reporting FluidAudio's byte-weighted
+    /// progress. Everything `PocketTtsManager` would download on its own,
+    /// with the handler it doesn't forward.
+    private static func fetchWeights(
+        progress: @escaping ProgressHandler
+    ) async throws {
+        _ = try await PocketTtsResourceDownloader.ensureModels(
+            language: modelLanguage,
+            precision: modelPrecision,
+            placement: modelPlacement,
+            progressHandler: progress
+        )
+    }
+
+    nonisolated static func installStage(for progress: DownloadProgress) -> InstallStage {
+        switch progress.phase {
+        case .listing:
+            .preparing
+        case .downloading:
+            .downloading(fraction: progress.fractionCompleted)
+        case .compiling:
+            .loading
+        }
+    }
+
+    /// A fetch that broke: the network, the mirror, or the disk. Worth
+    /// another press, so `.failed` — which is what carries "Try again".
+    nonisolated static func fetchFailure(_ error: Error) -> Readiness {
+        wasCancelled(error) ? .notInstalled : .failed(error.localizedDescription)
+    }
+
+    /// A load that broke with the weights already on disk. Retrying feeds the
+    /// same files to the same CoreML runtime on the same machine: a VM or a
+    /// headless session with no Metal device fails here every time. Saying so
+    /// once beats a "Try again" that can only ever fail.
+    nonisolated static func loadFailure(_ error: Error) -> Readiness {
+        wasCancelled(error) ? .notInstalled : .unsupported(error.localizedDescription)
+    }
+
+    /// Cancellation arrives as `CancellationError` from our own checks and as
+    /// `URLError.cancelled` from the download task URLSession tore down.
+    /// Neither is a failure to report.
+    nonisolated static func wasCancelled(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
+    private func noteInstallStage(_ stage: InstallStage, generation: Int) {
+        guard generation == installGeneration,
+              case .installing(let current) = readiness,
+              Self.stageAdvances(from: current, to: stage)
+        else { return }
+        readiness = .installing(stage)
+    }
+
+    /// Progress callbacks hop to the main actor, so one belonging to a phase
+    /// that has already ended can land after the next phase started. Letting
+    /// it through would put "Downloading 100%" back under a line that already
+    /// said "Loading the voice…", which reads as the fetch restarting. Stages
+    /// therefore only ever move forward.
+    nonisolated static func stageAdvances(
+        from current: InstallStage,
+        to next: InstallStage
+    ) -> Bool {
+        switch (current, next) {
+        case (.loading, .preparing), (.loading, .downloading), (.downloading, .preparing):
+            false
+        case (.downloading(let done), .downloading(let now)):
+            now >= done
+        default:
+            true
+        }
+    }
+
+    private func finishInstall(with outcome: Readiness, generation: Int) {
+        guard generation == installGeneration else { return }
+        installTask = nil
+        stopInstallClock()
+        readiness = outcome
+        guard outcome == .ready else { return }
+        UserDefaults.standard.set(true, forKey: Self.installedKey)
+        scheduleCorpusWarmup()
+    }
+
+    private func startInstallClock() {
+        installClockTask?.cancel()
+        installClockTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, let started = self.installStartedAt else { return }
+                self.installElapsed = Date().timeIntervalSince(started)
+            }
+        }
+    }
+
+    private func stopInstallClock() {
+        installClockTask?.cancel()
+        installClockTask = nil
+        installStartedAt = nil
+    }
+
+    /// The determinate fraction for the progress bar, or nil in the phases
+    /// FluidAudio reports nothing for. A bar parked at 0% through repository
+    /// listing and the CoreML load would read as stalled, which is the
+    /// impression this whole change exists to remove.
+    var installFraction: Double? {
+        guard case .installing(let stage) = readiness,
+              case .downloading(let fraction) = stage
+        else { return nil }
+        return min(max(fraction, 0), 1)
+    }
+
+    /// One line of honest status under the picker while a fetch runs.
+    var installStatusLine: String? {
+        guard case .installing(let stage) = readiness else { return nil }
+        return Self.installStatus(stage: stage, elapsed: installElapsed)
+    }
+
+    /// Elapsed time appears on every stage, not just the ones with a number:
+    /// it is the only thing that moves while FluidAudio lists the repository
+    /// or CoreML compiles, and "something is still happening" is exactly what
+    /// the bare spinner failed to say.
+    nonisolated static func installStatus(
+        stage: InstallStage,
+        elapsed: TimeInterval
+    ) -> String {
+        let clock = elapsedDescription(elapsed)
+        switch stage {
+        case .preparing:
+            return "Preparing the download… \(clock)"
+        case .downloading(let fraction):
+            let percent = Int((min(max(fraction, 0), 1) * 100).rounded())
+            return "Downloading \(percent)% of about 940 MB — \(clock)"
+        case .loading:
+            return "Loading the voice… \(clock)"
+        }
+    }
+
+    nonisolated static func elapsedDescription(_ seconds: TimeInterval) -> String {
+        let whole = max(0, Int(seconds.rounded()))
+        guard whole >= 60 else { return "\(whole)s" }
+        return "\(whole / 60):" + String(format: "%02d", whole % 60)
     }
 
     func speak(_ text: String, priority: NarrationPriority) {
@@ -846,19 +1214,38 @@ struct NarrationVoicePicker: View {
     private var status: some View {
         switch voice.readiness {
         case .notInstalled:
-            // Measured, not quoted: the English pack lands at 939 MB on disk
-            // because it ships both FlowLM variants and the MLState pipeline
-            // alongside the models actually loaded.
-            Text("A one-time download of about 940 MB. Runs entirely on this Mac once installed.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        case .installing:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Downloading voice…")
+            VStack(alignment: .leading, spacing: 4) {
+                // Measured, not quoted: the English pack lands at 939 MB on
+                // disk because it ships both FlowLM variants and the MLState
+                // pipeline alongside the models actually loaded.
+                Text("A one-time download of about 940 MB. Runs entirely on this Mac once installed.")
+                    .foregroundStyle(.secondary)
+                if let title = voice.readiness.installActionTitle {
+                    Button(title) { voice.install() }
+                        .buttonStyle(.link)
+                }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+        case .installing:
+            VStack(alignment: .leading, spacing: 4) {
+                // Determinate while FluidAudio is counting bytes, a spinner
+                // through the two phases that count nothing. A bar parked at
+                // 0% for the repository listing and the CoreML load reads as
+                // hung, which is the thing being fixed.
+                if let fraction = voice.installFraction {
+                    ProgressView(value: fraction)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                if let line = voice.installStatusLine {
+                    Text(line).foregroundStyle(.secondary)
+                }
+                if let title = voice.readiness.cancelActionTitle {
+                    Button(title) { voice.cancelInstall() }
+                        .buttonStyle(.link)
+                }
+            }
+            .font(.caption)
         case .ready:
             Label("Ready", systemImage: "checkmark.circle.fill")
                 .font(.caption)
@@ -868,8 +1255,24 @@ struct NarrationVoicePicker: View {
                 Label("Download failed — using the system voice", systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
                 Text(message).foregroundStyle(.secondary)
-                Button("Try again") { voice.install() }
-                    .buttonStyle(.link)
+                if let title = voice.readiness.installActionTitle {
+                    Button(title) { voice.install() }
+                        .buttonStyle(.link)
+                }
+            }
+            .font(.caption)
+        case .unsupported(let message):
+            // No "Try again": the weights are already on disk and the load
+            // failed on this machine's CoreML runtime, so the retry would run
+            // the identical thing to the identical end. Say what will happen
+            // instead of offering a button that can only disappoint.
+            VStack(alignment: .leading, spacing: 4) {
+                Label(
+                    "This Mac can't run the neural voice — narration will use the system voice",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .foregroundStyle(.orange)
+                Text(message).foregroundStyle(.secondary)
             }
             .font(.caption)
         }

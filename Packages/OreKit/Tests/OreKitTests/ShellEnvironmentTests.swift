@@ -93,6 +93,56 @@ struct ShellEnvironmentTests {
         #expect(cache.resolve { ["PROBE": "again"] } == ["PROBE": "fresh"])
     }
 
+    @Test func invalidateCacheForcesRecompute() {
+        // The whole point of Refresh: a CLI installed after launch lives in a
+        // directory that wasn't on the PATH the probe saw.
+        let cache = ShellEnvironment.Cache()
+        let computeCount = Lockbox(0)
+
+        _ = cache.resolve {
+            computeCount.withLock { $0 += 1 }
+            return ["PATH": "/before"]
+        }
+        // Still cached — nothing has changed yet.
+        #expect(cache.resolve { ["PATH": "/never"] } == ["PATH": "/before"])
+
+        cache.invalidate()
+        let after = cache.resolve {
+            computeCount.withLock { $0 += 1 }
+            return ["PATH": "/after"]
+        }
+
+        #expect(computeCount.get() == 2)
+        #expect(after == ["PATH": "/after"])
+
+        // And the public entry point reaches that same invalidation.
+        ShellEnvironment.invalidateCache()
+        #expect(ShellEnvironment.loginShellEnvironment()["PATH"]?.isEmpty == false)
+    }
+
+    @Test func exoticShellsGetAPlainDashC() {
+        // fish and nu reject `-ilc`, so bundling the flags meant no probe at
+        // all for the users most likely to have a customised PATH.
+        #expect(ShellEnvironment.probeFlagAttempts(for: "/bin/zsh") == ["-ilc", "-lc"])
+        #expect(ShellEnvironment.probeFlagAttempts(for: "/bin/bash") == ["-ilc", "-lc"])
+        #expect(ShellEnvironment.probeFlagAttempts(for: "/opt/homebrew/bin/fish") == ["-c"])
+        #expect(ShellEnvironment.probeFlagAttempts(for: "/usr/local/bin/nu") == ["-c"])
+        #expect(ShellEnvironment.probeFlagAttempts(for: "/bin/sh") == ["-c"])
+    }
+
+    @Test func aFailedProbeIsReportedInTheDiagnostic() {
+        // A reduced PATH presented as the user's own turns "ORE never got to
+        // look" into "you didn't install it".
+        let honest = ShellEnvironment.describeSearchPath("/usr/bin:/bin", probeFailed: true)
+        #expect(honest.hasPrefix("/usr/bin:/bin"))
+        #expect(honest.contains("login shell did not answer"))
+
+        #expect(
+            ShellEnvironment.describeSearchPath("/usr/bin:/bin", probeFailed: false)
+                == "/usr/bin:/bin"
+        )
+    }
+
     @Test func locateFindsAKnownSystemBinary() {
         #expect(ShellEnvironment.locate("git") != nil)
         #expect(ShellEnvironment.locate("definitely-not-a-real-binary-xyz") == nil)

@@ -22,6 +22,23 @@ public enum OreHome {
     }
 }
 
+/// A failure that belongs to the store itself, phrased for the person who has
+/// to act on it rather than for a log.
+public enum OreStoreError: LocalizedError, Sendable {
+    /// The file on disk was written by a build of ORE newer than this one.
+    case storeWrittenByANewerORE(found: Int, expected: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .storeWrittenByANewerORE(found, expected):
+            return "This database was written by a newer version of ORE "
+                + "(store format \(found); this build reads \(expected)). "
+                + "Update ORE to open it — an older build can only read it by "
+                + "discarding what the newer one wrote."
+        }
+    }
+}
+
 /// The database.
 ///
 /// Everything durable goes through here: workspaces, transcripts, review state,
@@ -41,7 +58,7 @@ public actor OreStore {
     /// assistant's MCP server) without re-deriving `OreHome` there.
     public nonisolated let url: URL?
 
-    public init(path: URL) throws {
+    public init(path: URL, expectedStoreVersion: Int = OreSchema.userVersion) throws {
         var configuration = Configuration()
         // WAL plus a busy timeout: the app reads on several tasks while the
         // engine writes, and without this a concurrent read fails outright
@@ -59,7 +76,27 @@ public actor OreStore {
             withIntermediateDirectories: true
         )
         let pool = try DatabasePool(path: path.path, configuration: configuration)
+
+        // Before the migrator, not after: refusing a database from a newer ORE
+        // is only worth anything while nothing has been written to it. A file
+        // from before this guard existed reads as 0 and is simply stamped on
+        // the way past.
+        let found = try pool.read { db in try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0 }
+        guard found <= expectedStoreVersion else {
+            throw OreStoreError.storeWrittenByANewerORE(
+                found: found,
+                expected: expectedStoreVersion
+            )
+        }
         try OreSchema.migrator.migrate(pool)
+        // Only when it moved: every launch would otherwise take a write
+        // transaction to rewrite the number it already holds.
+        if found != expectedStoreVersion {
+            try pool.write { db in
+                try db.execute(sql: "PRAGMA user_version = \(expectedStoreVersion)")
+            }
+        }
+
         self.writer = pool
         self.url = path
     }
@@ -73,6 +110,26 @@ public actor OreStore {
         let queue = try DatabaseQueue(configuration: configuration)
         try OreSchema.migrator.migrate(queue)
         self.writer = queue
+        self.url = nil
+    }
+
+    /// A store for an ORE that could not open its real one.
+    ///
+    /// The app's model is not optional, so a failed launch still has to hand
+    /// the core *something*. That something used to be the in-memory store
+    /// above, and it was the bug: the sidebar, ⌘N and the agents all
+    /// worked, the user did an afternoon's work, and quitting threw it away.
+    /// No migrator runs here — the migrator may well be what failed — so
+    /// this store has no tables at all, and a write that slips through fails
+    /// loudly instead of succeeding and then evaporating.
+    public static func unopened() -> OreStore {
+        // In-memory SQLite has no file it can fail to open; the migrator, the
+        // part that realistically throws, is deliberately not run.
+        OreStore(placeholder: try! DatabaseQueue())
+    }
+
+    private init(placeholder: DatabaseQueue) {
+        self.writer = placeholder
         self.url = nil
     }
 

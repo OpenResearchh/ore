@@ -64,6 +64,11 @@ struct WorkspaceLaunchPlan {
         var wantsNewProject: Bool = false
         /// Whether a branch typed into Advanced should be honoured as-is.
         var explicitBranch: String?
+        /// A repository's own `[agent] harness` from its `ore.toml`. A closure
+        /// rather than a value because which project is being started in is
+        /// only settled part-way through `resolve`. Defaults to "no opinion",
+        /// so a caller that has no config to offer resolves exactly as before.
+        var repositoryDefaultHarness: (String) -> HarnessKind? = { _ in nil }
     }
 
     static func resolve(_ inputs: Inputs) -> WorkspaceLaunchPlan {
@@ -79,10 +84,28 @@ struct WorkspaceLaunchPlan {
             models: [],
             repositoryNames: repositoryNames
         )
+        // Which project this sentence points at, read from the pass that has
+        // not needed a harness yet. Only used to find that repository's own
+        // default agent; the resolution that counts happens further down,
+        // against the final intent.
+        let repositoryDefault = resolveRepository(intent: firstReading, inputs: inputs)
+            .flatMap { $0.isSettled ? inputs.repositoryDefaultHarness($0.path) : nil }
+
         // An override is a click the user made after typing, so it wins over
         // what the sentence said — including over an alias read out of prose.
+        //
+        // `ore.toml`'s `[agent] harness` sits below both of those and above the
+        // generic "whatever is installed first". It is the repository's
+        // preference, not the user's instruction: a project that wants Codex
+        // says so for the people who have no opinion, and must never overrule
+        // somebody who just picked Claude Code in the sheet. Resolving it the
+        // other way round — config first — is the obvious one-liner and it is
+        // backwards, because `CreateWorkspaceRequest.harness` is non-optional
+        // and so an explicit pick is indistinguishable from a default by the
+        // time the request exists. Here it is still distinguishable.
         let harness = inputs.harnessOverride
             ?? firstReading.harness
+            ?? repositoryDefault
             ?? inputs.readyHarnesses.first
             ?? .claudeCode
 

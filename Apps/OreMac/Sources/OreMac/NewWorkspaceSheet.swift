@@ -19,6 +19,21 @@ struct NewWorkspaceSheet: View {
     @State private var stackOn: WorkspaceID?
     @State private var repositorySource = RepositorySource.local
     @State private var githubStatus: GitHubClient.Status?
+
+    /// What the line under "GitHub connected" says.
+    ///
+    /// `Status.diagnostic` now carries the `gh auth status` summary — which
+    /// host, which account — so that a user signed in to an enterprise host
+    /// that has never heard of their repository can be told so. That is worth
+    /// knowing, but not here: this line's job is to say what the user may pick,
+    /// and reading a connected user their own username back costs them the one
+    /// sentence that answers the question they actually have. The diagnostic
+    /// replaces it only when something is wrong and there is something to do.
+    private var githubCaption: String {
+        let guidance = "Choose any public, private, organization, or collaborator repository."
+        guard let githubStatus, !githubStatus.isAuthenticated else { return guidance }
+        return githubStatus.diagnostic ?? guidance
+    }
     @State private var githubRepositories: [GitHubClient.Repository] = []
     @State private var githubReference = ""
     @State private var isLoadingGitHub = false
@@ -341,7 +356,7 @@ struct NewWorkspaceSheet: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(githubStatus?.isAuthenticated == true ? "GitHub connected" : "Connect GitHub")
                         .fontWeight(.medium)
-                    Text(githubStatus?.diagnostic ?? "Choose any public, private, organization, or collaborator repository.")
+                    Text(githubCaption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -489,7 +504,10 @@ struct NewWorkspaceSheet: View {
             return
         }
 
-        model.createWorkspace(CreateWorkspaceRequest(
+        // Awaited, so the sheet's `isCreating` spinner stays up until the
+        // worktree exists. Fire-and-forget dismissed on the click and left the
+        // user looking at an empty sidebar for as long as the branch took.
+        await model.createWorkspaceAndWait(CreateWorkspaceRequest(
             repositoryPath: repository.path,
             name: model.suggestedResearchIdentity().name,
             seed: plan.baseBranch.map { .branch($0) } ?? .defaultBranch,
@@ -570,7 +588,7 @@ struct NewWorkspaceSheet: View {
             return
         }
 
-        model.createWorkspace(CreateWorkspaceRequest(
+        await model.createWorkspaceAndWait(CreateWorkspaceRequest(
             repositoryPath: selectedRepository,
             name: name.isEmpty ? model.suggestedResearchIdentity().name : name,
             seed: selectedSeed,

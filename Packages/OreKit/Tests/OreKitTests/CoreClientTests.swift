@@ -103,6 +103,72 @@ struct CoreClientTests {
         )
     }
 
+    /// A folder that is not a repository used to be accepted: the sidebar got
+    /// an entry that looked like every other project, and the mistake only
+    /// surfaced as a raw git command line when the first workspace was
+    /// attempted, several screens later.
+    @Test func addingAFolderThatIsNotARepositoryFailsImmediately() async throws {
+        let fixture = try await GitFixture.initialized()
+        let plain = fixture.root.appendingPathComponent("just-a-folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+
+        let store = try OreStore()
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: plain.path))
+
+        guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
+            if case .commandFailed = $0 { return true }
+            return false
+        }) else {
+            Issue.record("adding a non-repository must be reported")
+            return
+        }
+        #expect(failure.detail?.contains("not a git repository") == true)
+        #expect(try await store.repositories().isEmpty, "nothing may be registered")
+
+        await client.shutdown()
+    }
+
+    /// `git init` with no commit yet. It is a real repository, so the
+    /// not-a-repository check passes — but it has no HEAD, and `git worktree
+    /// add` fails on it with "invalid reference: HEAD", which tells the user
+    /// nothing about what to do.
+    @Test func addingARepositoryWithNoCommitsSaysSoInsteadOfFailingLater() async throws {
+        let fixture = try await GitFixture.initialized()
+        let empty = fixture.root.appendingPathComponent("unborn", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let git = try GitClient(repositoryURL: empty)
+        try await git.run(["init", "-q", "-b", "main"], in: empty)
+
+        let store = try OreStore()
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot
+        )
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: empty.path))
+
+        guard case .commandFailed(let failure)? = await recorder.waitFor(matching: {
+            if case .commandFailed = $0 { return true }
+            return false
+        }) else {
+            Issue.record("an unborn repository must be reported")
+            return
+        }
+        #expect(failure.detail?.contains("no commits yet") == true)
+        #expect(try await store.repositories().isEmpty)
+
+        await client.shutdown()
+    }
+
     @Test func addingARepositoryAndCreatingAWorkspaceEmitsASnapshot() async throws {
         let fixture = try await GitFixture.initialized()
         let client = try makeClient(fixture)
@@ -242,6 +308,105 @@ struct CoreClientTests {
             try? await Task.sleep(for: .milliseconds(100))
         }
         #expect(fixture.exists("setup-marker.txt", in: worktree))
+
+        await client.shutdown()
+    }
+
+    /// The approval dialog stays up for as long as the user takes to read it,
+    /// and the setup script behind it is what makes the worktree buildable. The
+    /// first turn used to be sent the moment the workspace existed, so the
+    /// agent's first build ran against a worktree with no dependencies
+    /// installed and reported that as the repository's own failure.
+    @Test func theFirstPromptWaitsForScriptApproval() async throws {
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo setup-ran > setup-marker.txt"
+        """)
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path,
+            name: "prepared",
+            initialPrompt: "run the test suite and fix what fails"
+        )))
+
+        guard case .workspaceAdded(let summary)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }), case .repositoryScriptsNeedApproval(let approval)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("expected the workspace and an approval request")
+            return
+        }
+        let worktree = URL(fileURLWithPath: summary.worktreePath)
+        #expect(!fixture.exists("setup-marker.txt", in: worktree))
+
+        await client.send(.approveRepositoryScripts(approval))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < deadline,
+              !fixture.exists("setup-marker.txt", in: worktree) {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(fixture.exists("setup-marker.txt", in: worktree))
+        // Released, not lost: the message only comes back as a failure when it
+        // is never going to be sent (see the decline case below).
+        let events = await recorder.all()
+        let handedBack = events.contains { event in
+            if case .commandFailed(let failure) = event {
+                return failure.detail?.contains("run the test suite") == true
+            }
+            return false
+        }
+        #expect(!handedBack)
+
+        await client.shutdown()
+    }
+
+    /// "Don't Run" left the held message in a dictionary for the life of the
+    /// process: no event, no banner, no transcript entry — user-authored text
+    /// silently gone. Handing it back is the least ORE can do.
+    @Test func decliningTheSetupScriptHandsTheFirstMessageBack() async throws {
+        let fixture = try await GitFixture.initialized()
+        try fixture.write("ore.toml", """
+        [scripts]
+        setup = "echo setup-ran > setup-marker.txt"
+        """)
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path,
+            name: "declined",
+            initialPrompt: "run the test suite and fix what fails"
+        )))
+
+        guard case .repositoryScriptsNeedApproval(let approval)? = await recorder.waitFor(matching: {
+            if case .repositoryScriptsNeedApproval = $0 { return true }
+            return false
+        }) else {
+            Issue.record("expected an approval request")
+            return
+        }
+
+        let checkpoint = await recorder.checkpoint()
+        await client.send(.declineRepositoryScripts(approval))
+
+        guard case .commandFailed(let failure)? = await recorder.waitFor(
+            after: checkpoint,
+            matching: {
+                if case .commandFailed = $0 { return true }
+                return false
+            }
+        ) else {
+            Issue.record("declining must say the first message was not sent")
+            return
+        }
+        #expect(failure.workspaceID == approval.workspaceID)
+        #expect(failure.detail?.contains("run the test suite and fix what fails") == true)
 
         await client.shutdown()
     }

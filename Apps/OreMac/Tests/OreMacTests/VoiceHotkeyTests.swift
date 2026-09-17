@@ -294,3 +294,52 @@ struct VoiceCancelKeyTests {
         }
     }
 }
+
+/// Coming back to ORE after being sent out of it.
+///
+/// Accessibility is granted in System Settings and a CLI is installed in
+/// Terminal, so both land while ORE is in the background. Activation is the
+/// only moment ORE gets to notice — and for the hotkey, noticing is not enough:
+/// a global monitor installed while the process was untrusted stays blind for
+/// the rest of the process's life, which is why the grant used to do nothing
+/// until the next relaunch.
+struct AccessibilityTrustRestartTests {
+    @Test func trustFlipRestartsTheGlobalMonitor() {
+        #expect(VoiceHotkeyMonitor.shouldRestartMonitors(was: false, now: true))
+    }
+
+    @Test func unchangedTrustLeavesTheMonitorsAlone() {
+        #expect(!VoiceHotkeyMonitor.shouldRestartMonitors(was: false, now: false))
+        #expect(!VoiceHotkeyMonitor.shouldRestartMonitors(was: true, now: true))
+    }
+
+    /// Losing trust needs no restart: the global monitors simply stop seeing
+    /// other apps, which is the correct behaviour. Tearing everything down
+    /// would also drop the local monitors, which need no permission at all.
+    @Test func losingTrustDoesNotRestart() {
+        #expect(!VoiceHotkeyMonitor.shouldRestartMonitors(was: true, now: false))
+    }
+}
+
+/// The harness half of the same activation. A probe spawns a login shell per
+/// harness, and activation fires on every window focus, so it is throttled —
+/// but never on the first one, which is the cmd-tab back from the Terminal the
+/// user was told to install the CLI in.
+struct ActivationProbeThrottleTests {
+    @Test func activationProbeIsThrottled() {
+        let now = Date()
+        #expect(AppModel.shouldReprobe(now: now, last: nil))
+        #expect(!AppModel.shouldReprobe(now: now, last: now.addingTimeInterval(-1)))
+        #expect(AppModel.shouldReprobe(
+            now: now,
+            last: now.addingTimeInterval(-AppModel.activationProbeInterval - 1)
+        ))
+    }
+
+    /// Long enough to absorb a burst of focus changes, short enough that going
+    /// to Terminal and back is not a wait.
+    @Test func theThrottleIsMeasuredInSeconds() {
+        #expect(AppModel.activationProbeInterval >= 5)
+        #expect(AppModel.activationProbeInterval <= 60)
+    }
+}

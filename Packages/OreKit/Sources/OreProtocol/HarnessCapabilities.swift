@@ -174,10 +174,37 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
     public var isEnabled: Bool?
     /// Set when the CLI is present but something is wrong we can explain.
     public var diagnostic: String?
+    /// The CLI was found on PATH but could not be executed — quarantined, not
+    /// marked executable, a broken symlink, an unmounted network volume.
+    ///
+    /// Distinct from "not installed", and the distinction is the whole point:
+    /// telling somebody to install a CLI that is sitting right there, at a path
+    /// ORE can name, sends them to do the one thing that will not help.
+    ///
+    /// Optional for the same reason as `isEnabled`: synthesized `Codable`
+    /// throws on a missing key for a non-optional, so an older serialized
+    /// probe snapshot would fail to decode. nil means "not assessed".
+    public var isUnlaunchable: Bool?
+    /// Other copies of this CLI found on PATH, in search order, excluding the
+    /// one at `executablePath` that actually wins.
+    ///
+    /// Two copies from two install channels is the usual shape of "I updated
+    /// it but ORE still reports the old version": the updater upgrades the one
+    /// it can see, and PATH keeps running the other.
+    public var shadowedPaths: [String]?
 
     public var isInstalled: Bool { executablePath != nil }
+    /// Present *and* able to start — what a caller asking "is it there?"
+    /// almost always means.
+    ///
+    /// `isInstalled` stopped carrying that meaning when an unlaunchable binary
+    /// began keeping its `executablePath`: a probe can now be installed, at a
+    /// path worth naming, and unable to run a single command. Anything that
+    /// treated `isInstalled` as "usable" wants this instead. `isReady` is this
+    /// plus signed in and not gated off.
+    public var isLaunchable: Bool { isInstalled && isUnlaunchable != true }
     public var isReady: Bool {
-        isEnabled != false && isInstalled && authState != .notAuthenticated
+        isEnabled != false && isLaunchable && authState != .notAuthenticated
     }
 
     public init(
@@ -186,7 +213,9 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         version: String? = nil,
         authState: AuthState = .unknown,
         isEnabled: Bool? = nil,
-        diagnostic: String? = nil
+        diagnostic: String? = nil,
+        isUnlaunchable: Bool? = nil,
+        shadowedPaths: [String]? = nil
     ) {
         self.kind = kind
         self.executablePath = executablePath
@@ -194,6 +223,8 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         self.authState = authState
         self.isEnabled = isEnabled
         self.diagnostic = diagnostic
+        self.isUnlaunchable = isUnlaunchable
+        self.shadowedPaths = shadowedPaths
     }
 }
 
@@ -212,6 +243,13 @@ extension HarnessKind {
         }
     }
 
+    /// The Homebrew token to assume when the install cannot name its own.
+    ///
+    /// An assumption, not a fact: Anthropic publishes two casks — `claude-code`
+    /// and `claude-code@latest` — and this is the stable one. Where there is a
+    /// path to read, `HarnessCLIUpdater.brewToken` asks the Caskroom which one
+    /// is actually installed; upgrading the wrong cask is a no-op the user
+    /// cannot tell apart from a broken update button.
     public var brewFormula: String? {
         switch self {
         case .claudeCode: return "claude-code"
@@ -220,4 +258,34 @@ extension HarnessKind {
         }
     }
 
+    /// Whether `token` is one of this CLI's Homebrew tokens.
+    ///
+    /// Taking the token out of a path is only safe if it is checked: an npm
+    /// install under a Homebrew-managed node lives at
+    /// `…/Cellar/node/24.1.0/lib/node_modules/@anthropic-ai/claude-code/…`,
+    /// and reading that path's token gives `node` — a real cask, and a
+    /// catastrophic thing to `brew upgrade` on the user's behalf.
+    public func ownsBrewToken(_ token: String) -> Bool {
+        guard let brewFormula else { return false }
+        // `@`-suffixed variants (`claude-code@latest`) are the same package on
+        // a different release channel, which is exactly the case this exists
+        // to keep.
+        return token == brewFormula || token.hasPrefix(brewFormula + "@")
+    }
+
+    /// The vendor's own install script — the one channel that needs nothing
+    /// installed first.
+    ///
+    /// Each CLI has its own. They used to share Cursor's, which was a
+    /// landmine rather than a bug: nothing reached the fallthrough, so a
+    /// Claude Code install one edit away from installing cursor-agent looked
+    /// fine. These are the URLs Anthropic, OpenAI and Cursor document, and
+    /// they match `HarnessSetup.installCommand` in the Mac app.
+    public var nativeInstallerURL: String {
+        switch self {
+        case .claudeCode: return "https://claude.ai/install.sh"
+        case .codex: return "https://chatgpt.com/codex/install.sh"
+        case .cursorAgent: return "https://cursor.com/install"
+        }
+    }
 }

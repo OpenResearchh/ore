@@ -148,6 +148,7 @@ struct OreMacApp: App {
         // The store and the core are created before the first window exists, so
         // a broken database surfaces as a message rather than a blank window.
         let created: AppModel
+        let failure: String?
         do {
             let store = try OreStore(path: OreStore.defaultURL)
             created = AppModel(
@@ -156,27 +157,44 @@ struct OreMacApp: App {
                     harnessRegistry: .standard(
                         cursorAllowUnprompted: UserDefaults.standard.bool(
                             forKey: "ore.cursorAllowUnprompted"
+                        ),
+                        // The registry needs this too, not just the sessions
+                        // below: probes strip provider credentials by default,
+                        // so without it an ANTHROPIC_API_KEY user is told to
+                        // sign in to a CLI that is already authenticated.
+                        allowAPIKeyFallback: UserDefaults.standard.bool(
+                            forKey: "ore.apiKeyFallback"
                         )
                     ),
                     allowAPIKeyFallback: UserDefaults.standard.bool(forKey: "ore.apiKeyFallback")
                 ),
                 telemetry: recorder
             )
+            failure = nil
         } catch {
+            // `OreStore.unopened()`, not the in-memory store this used to
+            // substitute: that one worked. The sidebar filled, ⌘N made
+            // worktrees, agents ran — and the whole day went away on quit,
+            // behind a raw error in one pane of an otherwise normal window.
             created = AppModel(
                 client: InProcessCoreClient(
-                    store: try! OreStore(), harnessRegistry: .standard()
+                    store: OreStore.unopened(), harnessRegistry: .standard()
                 ),
                 telemetry: recorder
             )
-            _launchFailure = State(initialValue: String(describing: error))
+            failure = LaunchFailure.message(for: error)
+            _launchFailure = State(initialValue: failure)
         }
         _model = State(initialValue: created)
         // Started here, not in the window's task: App Intents, notification
         // actions, and the menu bar all need a live core before — or without —
         // any window existing. `start()` is idempotent, so the window calling
         // it again is harmless.
-        created.start()
+        //
+        // Not started at all when the store failed: no engines, no harness
+        // probe, no `AppModel.shared` for an App Intent to find. The window is
+        // a failure screen and there is nothing behind it to drive.
+        if failure == nil { created.start() }
 
         // Created stopped; started with the rest of the deferred work.
         let updater = Updater()
@@ -236,7 +254,7 @@ struct OreMacApp: App {
                 // available" that says nothing about the attempt the user
                 // already sat through.
                 githubUpdater.reconcilePendingRestart()
-                model.start()
+                if launchFailure == nil { model.start() }
                 // Sparkle and telemetry setup, a beat after the window is up.
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(500))
@@ -258,14 +276,19 @@ struct OreMacApp: App {
                 // ⌘N spins up a fresh worktree in the current tab's project;
                 // when there's no active workspace to borrow a project from, it
                 // falls back to the picker so the shortcut is never a no-op.
+                //
+                // Both disabled when the store never opened: a workspace made
+                // now is a worktree on disk with no row to remember it.
                 Button("New Worktree") {
                     if !model.createWorktreeInCurrentProject() { isShowingNewWorkspace = true }
                 }
                 .keyboardShortcut("n", modifiers: .command)
+                .disabled(!LaunchFailure.commandsEnabled(launchFailure: launchFailure))
 
                 // ⇧⌘N opens the full picker to choose project, seed, and harness.
                 Button("New Workspace…") { isShowingNewWorkspace = true }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
+                    .disabled(!LaunchFailure.commandsEnabled(launchFailure: launchFailure))
 
                 Divider()
 
@@ -533,6 +556,60 @@ private struct OpenDreamsCommand: View {
     }
 }
 
+/// How a launch that could not open the database is presented.
+///
+/// Extracted from the views so the two decisions that matter — that the
+/// message names the file, and that the new-workspace commands go dead — can
+/// be tested without a window.
+enum LaunchFailure {
+    /// What the failure screen says.
+    ///
+    /// The path is the part the user can act on: "database is locked" is a
+    /// sentence about a file nobody has ever told them the location of, and
+    /// Reveal in Finder has to lead somewhere they recognise.
+    static func message(
+        for error: any Error,
+        storePath: String = OreStore.defaultURL.path
+    ) -> String {
+        // A typed store error is already a sentence; a GRDB error is not, and
+        // its raw description is the only place the SQLite message survives.
+        let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return "\(detail)\n\nORE's database lives at \(storePath)"
+    }
+
+    /// ⌘N and ⇧⌘N. A workspace created now is a worktree on disk with no row
+    /// anywhere to remember it by.
+    static func commandsEnabled(launchFailure: String?) -> Bool {
+        launchFailure == nil
+    }
+}
+
+/// The entire window when the store would not open.
+private struct LaunchFailureScreen: View {
+    let message: String
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("ORE couldn\u{2019}t open its database", systemImage: "exclamationmark.triangle")
+        } description: {
+            Text(message)
+        } actions: {
+            Button("Reveal in Finder") {
+                // Rooted at the enclosing folder so the window opens on `~/ore`
+                // with the file selected, rather than on a fresh Finder root.
+                _ = NSWorkspace.shared.selectFile(
+                    OreStore.defaultURL.path,
+                    inFileViewerRootedAtPath: OreStore.defaultURL
+                        .deletingLastPathComponent().path
+                )
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .textSelection(.enabled)
+    }
+}
+
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
@@ -557,6 +634,7 @@ struct RootView: View {
     // meaning "not checked", which `Readiness` treats as "say nothing yet"
     // rather than "missing".
     @State private var githubStatus: GitHubClient.Status?
+    @State private var gitAvailability: GitAvailability?
     @State private var hasGitIdentity: Bool?
 
     /// What the user still needs before ORE is useful to them. Recomputed
@@ -570,6 +648,7 @@ struct RootView: View {
             repositoryCount: model.repositories.count,
             workspaceCount: model.workspaces.count,
             github: githubStatus,
+            git: gitAvailability,
             hasGitIdentity: hasGitIdentity
         )
     }
@@ -585,6 +664,17 @@ struct RootView: View {
     }
 
     var body: some View {
+        if let launchFailure {
+            // The whole window, not a pane of it. A failure screen beside a
+            // working sidebar and a live ⌘N is an invitation to do work that
+            // cannot be saved.
+            LaunchFailureScreen(message: launchFailure)
+        } else {
+            workspaceWindow
+        }
+    }
+
+    private var workspaceWindow: some View {
         // NavigationSplitView gives the sidebar the real system chrome —
         // translucent material, automatic scroll-edge effects, and on macOS 26
         // the proper Liquid Glass treatment — none of which a hand-rolled
@@ -750,13 +840,7 @@ struct RootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let failure = launchFailure {
-            ContentUnavailableView(
-                "ORE couldn't open its database",
-                systemImage: "exclamationmark.triangle",
-                description: Text(failure)
-            )
-        } else if let workspace = model.selectedWorkspace {
+        if let workspace = model.selectedWorkspace {
             // One structural path whether or not the terminal is open: only the
             // bottom slot changes identity. The terminal branch used to wrap
             // `workspaceMain` in a GeometryReader the dock branch didn't have,
@@ -1038,9 +1122,11 @@ struct RootView: View {
         // workspaces never pays for them.
         .task {
             async let github = model.githubStatus()
-            async let git = Readiness.probeGitIdentity()
+            async let git = Readiness.probeGit()
             githubStatus = await github
-            hasGitIdentity = await git
+            let (availability, identity) = await git
+            gitAvailability = availability
+            hasGitIdentity = identity
         }
         // No fill: the welcome floats directly on the window's glass base.
     }

@@ -54,12 +54,20 @@ public actor GitHubClient {
             return cached
         }
         let version = try? await run(["--version"]).lines.first
-        let authenticated = (try? await run(["auth", "status"])) != nil
+        let authStatus = try? await run(["auth", "status"])
+        let authenticated = authStatus != nil
         let status = Status(
             isInstalled: true,
             isAuthenticated: authenticated,
             version: version,
-            diagnostic: authenticated ? nil : "Run `gh auth login` to connect GitHub."
+            // An exit code alone cannot tell "signed in to github.com as ada"
+            // from "signed in to an enterprise host that has never heard of
+            // this repository", and the second one looks identical right up
+            // until a push fails. `gh auth status` says which, so keep what it
+            // said instead of only whether it succeeded.
+            diagnostic: authenticated
+                ? Self.connectionSummary(authStatus)
+                : "Run `gh auth login` to connect GitHub."
         )
         GitHubStateCache.shared.store(status, for: executablePath)
         return status
@@ -629,6 +637,30 @@ public actor GitHubClient {
             }
             throw error
         }
+    }
+
+    /// The host-and-account lines out of `gh auth status`.
+    ///
+    /// Older `gh` writes the report to stderr and current ones to stdout, so
+    /// both are read. Everything but the "Logged in to …" lines is dropped:
+    /// token scopes and the protocol are noise on a card whose job is to name
+    /// the account, and the token line is a secret's prefix.
+    static func connectionSummary(_ output: GitOutput?) -> String? {
+        guard let output else { return nil }
+        let lines = (output.standardOutput + "\n" + output.standardError)
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .compactMap { line -> String? in
+                // The line arrives with a status glyph in front of it ("✓ "),
+                // which reads as noise once ORE has decided it is signed in.
+                guard let marker = line.range(of: "Logged in to", options: .caseInsensitive)
+                else { return nil }
+                return String(line[marker.lowerBound...])
+            }
+        guard !lines.isEmpty else { return nil }
+        // One line: the card gives this a single caption row, and a machine
+        // signed in to three hosts would push the rest of it off screen.
+        return lines.joined(separator: " · ")
     }
 
     /// A failure that means the remembered `status()` may be wrong: `gh` could

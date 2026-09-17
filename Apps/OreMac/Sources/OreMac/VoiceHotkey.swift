@@ -348,6 +348,33 @@ final class VoiceHotkeyMonitor {
         return isTrusted
     }
 
+    /// Whether a change in Accessibility trust means the monitors have to be
+    /// torn down and installed again.
+    ///
+    /// Only the grant direction. `NSEvent.addGlobalMonitorForEvents` hands back
+    /// a monitor object whether or not the process is trusted, and one added
+    /// while untrusted never fires — not when the grant arrives, not ever. So
+    /// ticking ORE in System Settings ▸ Accessibility changed nothing until the
+    /// app was relaunched: the row was on, the hotkey was dead, and nothing
+    /// connected the two. Losing trust needs no restart; the monitors simply go
+    /// quiet, which is what they should do.
+    nonisolated static func shouldRestartMonitors(was: Bool, now: Bool) -> Bool {
+        !was && now
+    }
+
+    /// Re-reads the trust and, if it has just been granted, reinstalls the
+    /// monitors under it. Called when ORE comes back to the front, because
+    /// System Settings is where the grant happens.
+    @discardableResult
+    func reinstallIfTrustChanged() -> Bool {
+        let was = isTrusted
+        let now = refreshTrust()
+        guard isRunning, Self.shouldRestartMonitors(was: was, now: now) else { return false }
+        stop()
+        start()
+        return true
+    }
+
     /// Opens the system prompt that adds ORE to Accessibility. Returns whether
     /// permission was already granted.
     @discardableResult

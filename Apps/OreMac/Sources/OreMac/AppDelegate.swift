@@ -35,9 +35,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Apps are installed and removed while ORE is in the background, so
     /// coming back is when to look again. The alternative — asking on every
     /// redraw — is what the caches exist to stop.
+    ///
+    /// The same is true of everything else ORE sends people out of the app to
+    /// do. A CLI is installed in Terminal and a permission is granted in System
+    /// Settings; both land while ORE is in the background, and until this the
+    /// user came back to a screen that still said what it said before they
+    /// followed ORE's own instructions.
     func applicationDidBecomeActive(_ notification: Notification) {
         ExternalTools.refreshDiscoveredApps()
-        MainActor.assumeIsolated { AppIcons.forget() }
+        MainActor.assumeIsolated {
+            AppIcons.forget()
+            VoiceHotkeyMonitor.shared.reinstallIfTrustChanged()
+            AppModel.running()?.refreshHarnessesOnActivation()
+        }
     }
 
     // MARK: - Notification actions

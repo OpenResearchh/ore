@@ -210,29 +210,34 @@ struct Sidebar: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            HStack(spacing: OreTheme.Space.sm) {
-                SidebarPresencePill(total: layout.ordered.count)
-                Spacer()
-                // The assistant's global mute sits with the app-wide controls,
-                // not in a tab: it silences every workspace at once.
-                SidebarMuteButton()
-                SettingsLink {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: OreTheme.Font.body))
-                        .frame(width: 28, height: OreTheme.RowHeight.bar)
-                        .contentShape(Rectangle())
+            VStack(spacing: 0) {
+                // Above the bar rather than inside it: the bar is one fixed
+                // row of controls, and this is prose that has to wrap.
+                SidebarNarrationNotice()
+                HStack(spacing: OreTheme.Space.sm) {
+                    SidebarPresencePill(total: layout.ordered.count)
+                    Spacer()
+                    // The assistant's global mute sits with the app-wide controls,
+                    // not in a tab: it silences every workspace at once.
+                    SidebarMuteButton()
+                    SettingsLink {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: OreTheme.Font.body))
+                            .frame(width: 28, height: OreTheme.RowHeight.bar)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Settings (⌘,)")
                 }
-                .buttonStyle(.plain)
-                .help("Settings (⌘,)")
+                .padding(.leading, OreTheme.Space.md)
+                .padding(.trailing, OreTheme.Space.xs)
+                .frame(height: OreTheme.RowHeight.bar)
+                // No bar, no hairline: the system sidebar is already Liquid
+                // Glass on macOS 26, and layering a second material over it is
+                // exactly the glass-on-glass stacking Apple warns against. The
+                // connected pill carries its own glass; rows scrolling under
+                // pick up the system's scroll-edge treatment.
             }
-            .padding(.leading, OreTheme.Space.md)
-            .padding(.trailing, OreTheme.Space.xs)
-            .frame(height: OreTheme.RowHeight.bar)
-            // No bar, no hairline: the system sidebar is already Liquid Glass
-            // on macOS 26, and layering a second material over it is exactly
-            // the glass-on-glass stacking Apple warns against. The connected
-            // pill carries its own glass; rows scrolling under pick up the
-            // system's scroll-edge treatment.
         }
         .onHover { pointerMoved(inside: $0) }
         // A hold normally ends when the pointer leaves. Tracking areas are
@@ -717,6 +722,69 @@ private struct SidebarPresencePill: View {
             tint: isLive ? OreTheme.Presence.active.opacity(0.12) : nil
         ))
         .animation(.easeOut(duration: 0.2), value: isLive)
+    }
+}
+
+/// Why narration isn't using the voice the user chose — and, where one could
+/// help, the button that fixes it.
+///
+/// The mismatch is heard, not seen. `NarrationEngine` attempts the neural load
+/// once per session and never retries, so somebody who picked the neural voice
+/// and then never reopened Settings heard the system voice indefinitely with
+/// nothing anywhere saying why. This sits above the sidebar's own speaker
+/// control, which is where a person who has noticed the wrong voice already
+/// goes looking.
+///
+/// Not in the assistant HUD, which would be the more obvious home: that panel
+/// sets `ignoresMouseEvents` whenever it is showing the voice pill alone, so
+/// a Download button drawn there could not be pressed.
+private struct SidebarNarrationNotice: View {
+    @Environment(AppModel.self) private var model
+    /// Dismissed for this session only, and only until the notice itself
+    /// changes. `.unsupported` carries no button to resolve it, so without
+    /// this it would sit in the sidebar forever repeating a fact the user has
+    /// read and cannot act on.
+    @State private var dismissed: NeuralVoiceNotice?
+
+    var body: some View {
+        let notice = model.narration.neuralVoiceNotice
+        if let notice, notice != dismissed {
+            HStack(alignment: .top, spacing: OreTheme.Space.sm) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.orange)
+                Text(notice.message)
+                    .font(.system(size: OreTheme.Font.caption))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .trailing, spacing: 2) {
+                    // No button when the notice carries no title: that is the
+                    // case where a retry loads the same files on the same
+                    // hardware to the same end.
+                    if let title = notice.retryTitle {
+                        Button(title) { model.narration.retryNeuralVoice() }
+                            .buttonStyle(.link)
+                            .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    }
+                    Button { dismissed = notice } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .semibold))
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Dismiss")
+                }
+            }
+            .padding(.horizontal, OreTheme.Space.md)
+            .padding(.vertical, OreTheme.Space.sm)
+            .background(OreTheme.subduedFill)
+            .overlay(alignment: .top) {
+                Rectangle().fill(OreTheme.hairline).frame(height: 1)
+            }
+        }
     }
 }
 

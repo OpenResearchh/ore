@@ -177,9 +177,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// bounded nothing and the quit hung exactly as before.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isTerminating else { return .terminateLater }
-        guard let model = MainActor.assumeIsolated({ AppModel.running() }) else {
-            return .terminateNow
+        let model = MainActor.assumeIsolated { AppModel.running() }
+        if QuitConfirmation.isCommandQ(NSApp.currentEvent),
+           !UserDefaults.standard.bool(forKey: QuitConfirmation.suppressedKey) {
+            let confirmed = MainActor.assumeIsolated {
+                let busy = model?.workspaces
+                    .filter { !$0.isArchived && $0.status.occupiesComposer }.count ?? 0
+                return QuitConfirmation.confirm(busyAgents: busy)
+            }
+            guard confirmed else { return .terminateCancel }
         }
+        guard let model else { return .terminateNow }
         isTerminating = true
         let gate = MainActor.assumeIsolated {
             TerminationGate { sender.reply(toApplicationShouldTerminate: true) }

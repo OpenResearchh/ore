@@ -67,6 +67,7 @@ private struct SettingsPanes: View {
     @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
+    @AppStorage(QuitConfirmation.suppressedKey) private var quitWithoutAsking = false
     @AppStorage(AppModel.automaticRoutinePermissionsKey)
     private var automaticRoutinePermissions = AppModel.automaticRoutinePermissionsDefault
     @AppStorage("ore.settingsSection") private var sectionRaw = "Agents"
@@ -350,6 +351,10 @@ private struct SettingsPanes: View {
                 Text("ORE lives in the menu bar: agents keep running and the assistant keeps answering ⇧⌥ with every window closed. Starting at login makes that permanent.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle(
+                    "Ask before quitting with \u{2318}Q",
+                    isOn: Binding(get: { !quitWithoutAsking }, set: { quitWithoutAsking = !$0 })
+                )
                 Divider()
                 Toggle("Proactive updates from the assistant", isOn: $assistantProactive)
                 Text("The assistant watches activity across your workspaces and speaks up only for what matters — failures, finished work you asked about, agents blocked on you. Tell it what to surface or mute (\u{201C}only update me about kailash\u{201D}) and it remembers.")

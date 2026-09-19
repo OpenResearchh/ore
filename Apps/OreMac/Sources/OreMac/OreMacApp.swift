@@ -251,7 +251,10 @@ struct OreMacApp: App {
             // Match the combined pane minimums while leaving enough room for a
             // real navigation sidebar; narrower windows collapse columns using
             // NavigationSplitView instead of crushing labels and controls.
-            .frame(minWidth: 1_080, minHeight: 650)
+            .frame(
+                minWidth: WindowMetrics.minimumContent.width,
+                minHeight: WindowMetrics.minimumContent.height
+            )
             .task {
                 // First, ahead of anything that can await on the user: this
                 // settles whatever the last launch staged, so an update that
@@ -276,7 +279,7 @@ struct OreMacApp: App {
                 if !updater.isConfigured { await githubUpdater.check() }
             }
         }
-        .defaultSize(width: 1_320, height: 820)
+        .defaultSize(WindowMetrics.defaultWindow)
         .commands {
             CommandGroup(replacing: .newItem) {
                 // ⌘N spins up a fresh worktree in the current tab's project;
@@ -857,6 +860,7 @@ struct RootView: View {
                 workspaceMain(workspace)
             } dock: {
                 bottomDock(workspace)
+                    .layoutProbe("status-bar")
             } terminal: {
                 TerminalPane(workspace: workspace) { bottomPane = .none }
             }

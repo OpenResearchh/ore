@@ -243,6 +243,7 @@ struct Sidebar: View {
                 .padding(.leading, OreTheme.Space.md)
                 .padding(.trailing, OreTheme.Space.xs)
                 .frame(height: OreTheme.RowHeight.bar)
+                .layoutProbe("sidebar-controls")
                 // No bar, no hairline: the system sidebar is already Liquid
                 // Glass on macOS 26, and layering a second material over it is
                 // exactly the glass-on-glass stacking Apple warns against. The

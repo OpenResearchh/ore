@@ -3932,7 +3932,7 @@ final class AppModel {
 
     // MARK: - Events
 
-    private func apply(_ event: CoreEvent) {
+    func apply(_ event: CoreEvent) {
         // One funnel for analytics: every core event passes through here exactly
         // once, so nothing has to be instrumented twice or kept in sync with
         // a second dispatch path. The translator decides what, if anything,

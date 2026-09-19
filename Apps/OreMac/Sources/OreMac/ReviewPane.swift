@@ -256,6 +256,7 @@ struct ReviewPane: View {
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: OreTheme.RowHeight.bar)
+        .layoutProbe("review-tabs")
         // Sits directly on the inspector's glass — a bar material here would
         // stack a second pane over it.
     }

@@ -333,7 +333,11 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// not that this language pack is complete, so it changes nothing. Being
     /// wrong that way costs one press of a button that already exists. Being
     /// wrong the other way costs 940 MB nobody asked for.
-    private static let vendorCacheRoot = ".cache/fluidaudio"
+    ///
+    /// `nonisolated` because the directory scan that reads it runs off the
+    /// main actor: an immutable `String` needs no isolation to be safe, and
+    /// the class being `@MainActor` would otherwise lend it some.
+    private nonisolated static let vendorCacheRoot = ".cache/fluidaudio"
 
     /// The one file every compiled CoreML model carries.
     ///
@@ -589,9 +593,7 @@ final class NeuralNarrationVoice: NarrationVoice {
     }
 
     private static func hasVendorCacheRoot() -> Bool {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(vendorCacheRoot)
-        return FileManager.default.fileExists(atPath: root.path)
+        FileManager.default.fileExists(atPath: vendorCacheDirectory().path)
     }
 
     /// How much of the volume the cache lives on is free, or nil when the

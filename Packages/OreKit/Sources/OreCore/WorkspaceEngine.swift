@@ -2583,6 +2583,7 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case pathOutsideWorkspace(String)
     case assistantWorkspaceProtected
     case questionNotPending(QuestionID, ChatID)
+    case projectFilesNotTrashed([String])
 
     public var description: String {
         switch self {
@@ -2605,6 +2606,9 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
             return "\(path) is outside this workspace."
         case .assistantWorkspaceProtected:
             return "The assistant workspace belongs to ORE and can't be archived or deleted."
+        case .projectFilesNotTrashed(let paths):
+            return "The project was removed from ORE, but these couldn't be moved to the Trash: "
+                + paths.joined(separator: ", ")
         case .questionNotPending(let id, let chatID):
             return "Question \(id.rawValue) is not pending on chat \(chatID.rawValue). Refresh app state and use the current IDs."
         }

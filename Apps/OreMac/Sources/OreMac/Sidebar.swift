@@ -137,6 +137,17 @@ struct Sidebar: View {
                                 binding.wrappedValue.toggle()
                             }
                         }
+                        .contextMenu {
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting(
+                                    [URL(fileURLWithPath: repository.path)]
+                                )
+                            }
+                            Divider()
+                            Button("Delete Project\u{2026}", role: .destructive) {
+                                model.requestProjectDelete(repository.path)
+                            }
+                        }
                 }
                 .listRowSeparator(.hidden)
             }

@@ -744,6 +744,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
         .modifier(ScriptApprovalDialog())
+        .modifier(ProjectDeleteDialog())
         .confirmationDialog(
             "Archive \u{201C}\(model.pendingArchive?.workspace.name ?? "workspace")\u{201D}?",
             isPresented: Binding(
@@ -1434,6 +1435,36 @@ private struct FilePalette: View {
     private func open(_ path: String) {
         model.openSourceFile(path, in: workspace.id)
         dismiss()
+    }
+}
+
+/// Deleting a whole project. Kept out of `RootView`'s modifier chain for the
+/// same reason as `ScriptApprovalDialog`.
+private struct ProjectDeleteDialog: ViewModifier {
+    @Environment(AppModel.self) private var model
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "Delete \u{201C}\(model.pendingProjectDelete?.name ?? "project")\u{201D}?",
+            isPresented: Binding(
+                get: { model.pendingProjectDelete != nil },
+                set: { if !$0 { model.pendingProjectDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: model.pendingProjectDelete
+        ) { pending in
+            Button("Move to Trash", role: .destructive) {
+                model.deleteProject(pending.repositoryPath, moveToTrash: true)
+                model.pendingProjectDelete = nil
+            }
+            Button("Remove from ORE, Keep Files") {
+                model.deleteProject(pending.repositoryPath, moveToTrash: false)
+                model.pendingProjectDelete = nil
+            }
+            Button("Cancel", role: .cancel) { model.pendingProjectDelete = nil }
+        } message: { pending in
+            Text(pending.confirmationMessage)
+        }
     }
 }
 

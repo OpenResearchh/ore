@@ -50,6 +50,18 @@ func runWorkspaceCommand(_ command: String, options: CommandLineOptions) async {
     case "new-project":
         await createProject(client, options: options)
 
+    case "delete-project":
+        // Worktrees and the repository folder go to the Trash; --keep-files
+        // only makes ORE forget the project.
+        guard let path = options.positional.first else {
+            usage("delete-project <repository-path> [--keep-files]")
+            break
+        }
+        await client.send(.deleteProject(
+            repositoryPath: path, moveToTrash: !options.flag("--keep-files")
+        ))
+        await settle()
+
     case "workspaces":
         await listWorkspaces(client, printer: printer)
 

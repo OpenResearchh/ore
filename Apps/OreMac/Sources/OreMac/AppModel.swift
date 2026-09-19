@@ -2584,6 +2584,48 @@ final class AppModel {
         pendingArchivedDelete = PendingArchivedDelete(workspace: workspace)
     }
 
+    /// A project staged for the delete confirmation dialog.
+    struct PendingProjectDelete: Identifiable, Equatable {
+        let repositoryPath: String
+        /// Every workspace in it, archived ones included — all of them go.
+        let workspaceCount: Int
+        var id: String { repositoryPath }
+        var name: String { URL(fileURLWithPath: repositoryPath).lastPathComponent }
+
+        var confirmationMessage: String {
+            let stopped = switch workspaceCount {
+            case 0: "This removes the project from ORE."
+            case 1: "This stops its workspace and removes it and its chats from ORE."
+            default: "This stops all \(workspaceCount) of its workspaces and removes "
+                + "them and their chats from ORE."
+            }
+            return stopped + " Move to Trash also sends the project folder and its "
+                + "worktrees to the Trash, which frees the name for a new project "
+                + "and keeps the files restorable."
+        }
+    }
+
+    var pendingProjectDelete: PendingProjectDelete?
+
+    func requestProjectDelete(_ repositoryPath: String) {
+        pendingProjectDelete = PendingProjectDelete(
+            repositoryPath: repositoryPath,
+            workspaceCount: workspaces.filter { $0.repositoryPath == repositoryPath }.count
+        )
+    }
+
+    /// Stops and removes every workspace in the project and forgets it. With
+    /// `moveToTrash` its worktrees and folder go to the Trash, which frees the
+    /// name for a new project and is still one drag away from undone.
+    func deleteProject(_ repositoryPath: String, moveToTrash: Bool) {
+        Task {
+            await client.send(.deleteProject(
+                repositoryPath: repositoryPath, moveToTrash: moveToTrash
+            ))
+            await refreshRepositories()
+        }
+    }
+
     func unarchive(_ id: WorkspaceID) {
         Task { await client.send(.unarchiveWorkspace(id)) }
     }

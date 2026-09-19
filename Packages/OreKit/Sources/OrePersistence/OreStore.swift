@@ -185,6 +185,24 @@ public actor OreStore {
         }
     }
 
+    /// Drops a repository and, by cascade, every workspace, chat and
+    /// transcript under it. The script approval goes too: it was granted to
+    /// the code that lived at this path, and a project created here later is
+    /// different code.
+    public func deleteRepository(path: String) throws {
+        _ = try writer.write { db in
+            try db.execute(
+                sql: "DELETE FROM repositoryScriptApproval WHERE repositoryPath = ?",
+                arguments: [path]
+            )
+            try RepositoryRecord.deleteOne(db, key: path)
+        }
+    }
+
+    public nonisolated func repository(path: String) async throws -> RepositoryRecord? {
+        try await writer.read { db in try RepositoryRecord.fetchOne(db, key: path) }
+    }
+
     // MARK: - Workspaces
 
     public func saveWorkspace(_ record: WorkspaceRecord) throws {

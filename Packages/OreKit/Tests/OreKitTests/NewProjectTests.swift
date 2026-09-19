@@ -205,6 +205,131 @@ struct NewProjectTests {
     }
 }
 
+/// Deleting a project has to leave the name free: before it existed, the only
+/// way out was finding and removing the folder by hand, and creating the same
+/// project again failed with "already a git repository".
+struct DeleteProjectTests {
+    /// Stands in for the Trash, so the tests don't fill the user's.
+    private func trash(in fixture: GitFixture) -> (URL, @Sendable (URL) throws -> Void) {
+        let trash = fixture.root.appendingPathComponent("Trash", isDirectory: true)
+        return (trash, { url in
+            try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+            try FileManager.default.moveItem(
+                at: url,
+                to: trash.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
+            )
+        })
+    }
+
+    private func workspaceAdded(_ recorder: CoreEventRecorder, after checkpoint: Int = 0) async
+        -> WorkspaceSummary?
+    {
+        let event = await recorder.waitFor(after: checkpoint, timeout: .seconds(20)) {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }
+        guard case .workspaceAdded(let summary)? = event else { return nil }
+        return summary
+    }
+
+    @Test func aDeletedProjectGoesToTheTrashAndItsNameCanBeUsedAgain() async throws {
+        let fixture = try await GitFixture.initialized()
+        let (trash, discard) = trash(in: fixture)
+        let store = try OreStore()
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot,
+            discardItem: discard
+        )
+        let recorder = CoreEventRecorder(client)
+        let projects = fixture.root.appendingPathComponent("projects", isDirectory: true)
+        let request = CreateProjectRequest(
+            name: "LACE", parentDirectory: projects.path, workspaceName: "Curie"
+        )
+
+        await client.send(.createProject(request))
+        let first = try #require(await workspaceAdded(recorder))
+        let repository = try #require(try await client.repositories().first).path
+
+        let checkpoint = await recorder.checkpoint()
+        await client.send(.deleteProject(repositoryPath: repository, moveToTrash: true))
+        let removed = await recorder.waitFor(after: checkpoint, timeout: .seconds(10)) {
+            if case .workspaceRemoved(first.id) = $0 { return true }
+            return false
+        }
+        #expect(removed != nil)
+        #expect(try await client.repositories().isEmpty)
+        #expect(try await store.workspaces(includeArchived: true).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: repository))
+        #expect(!FileManager.default.fileExists(atPath: first.worktreePath))
+        // The per-project worktree folder is not left behind empty.
+        let parent = URL(fileURLWithPath: first.worktreePath).deletingLastPathComponent()
+        #expect(!FileManager.default.fileExists(atPath: parent.path))
+        // Recoverable: both are in the Trash, not gone.
+        #expect(try FileManager.default.contentsOfDirectory(atPath: trash.path).count == 2)
+
+        let again = await recorder.checkpoint()
+        await client.send(.createProject(request))
+        let second = try #require(await workspaceAdded(recorder, after: again))
+        #expect(second.name == "Curie")
+        #expect(try await client.repositories().count == 1)
+
+        await client.shutdown()
+    }
+
+    @Test func keepingFilesOnlyForgetsTheProject() async throws {
+        let fixture = try await GitFixture.initialized()
+        let (trash, discard) = trash(in: fixture)
+        let client = InProcessCoreClient(
+            store: try OreStore(),
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot,
+            discardItem: discard
+        )
+        let recorder = CoreEventRecorder(client)
+        let projects = fixture.root.appendingPathComponent("projects", isDirectory: true)
+
+        await client.send(.createProject(CreateProjectRequest(
+            name: "LACE", parentDirectory: projects.path
+        )))
+        let workspace = try #require(await workspaceAdded(recorder))
+        let repository = try #require(try await client.repositories().first).path
+
+        await client.send(.deleteProject(repositoryPath: repository, moveToTrash: false))
+
+        #expect(try await client.repositories().isEmpty)
+        #expect(FileManager.default.fileExists(atPath: repository))
+        #expect(FileManager.default.fileExists(atPath: workspace.worktreePath))
+        #expect(!FileManager.default.fileExists(atPath: trash.path))
+
+        await client.shutdown()
+    }
+
+    @Test func anUnknownProjectIsAReadableFailure() async throws {
+        let fixture = try await GitFixture.initialized()
+        let client = InProcessCoreClient(
+            store: try OreStore(),
+            harnessRegistry: HarnessRegistry(harnesses: []),
+            worktreeRoot: fixture.worktreeRoot,
+            discardItem: { _ in Issue.record("nothing should be discarded") }
+        )
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.deleteProject(
+            repositoryPath: fixture.root.appendingPathComponent("nope").path,
+            moveToTrash: true
+        ))
+        let failure = await recorder.waitFor(timeout: .seconds(10)) {
+            if case .commandFailed = $0 { return true }
+            return false
+        }
+        #expect(failure != nil)
+
+        await client.shutdown()
+    }
+}
+
 /// A scratch directory that removes itself, for the cases that need a parent
 /// folder but no repository in it.
 final class TemporaryDirectory {

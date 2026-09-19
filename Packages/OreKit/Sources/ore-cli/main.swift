@@ -26,7 +26,7 @@ case "record":
     await runRecord(options: options)
 case "replay":
     runReplay(options: options)
-case "repos", "add-repo", "new-project", "workspaces", "new", "say", "diff", "git-action",
+case "repos", "add-repo", "new-project", "delete-project", "workspaces", "new", "say", "diff", "git-action",
      "archive", "delete", "search", "turns", "revert":
     await runWorkspaceCommand(command, options: options)
 default:
@@ -73,6 +73,9 @@ func printUsage() {
                   [--harness claude|codex] [--model <id>] [--prompt <text>]
           Create an empty local repository for a project that doesn't exist
           yet, register it, and open its first workspace.
+      ore-cli delete-project <repository-path> [--keep-files]
+          Stop and remove every workspace in a project and forget it. The
+          worktrees and repository folder go to the Trash unless --keep-files.
       ore-cli new --repo <path> --name <name> [--harness claude|codex]
                   [--branch <name> | --stack-on <workspace-id> | --issue <n>]
                   [--model <name>] [--prompt <text>]
@@ -472,7 +475,7 @@ struct CommandLineOptions {
             let argument = arguments[index]
             if argument.hasPrefix("--") {
                 // Flags take no value; everything else consumes the next word.
-                let isFlag = ["--raw", "--full", "--auto-allow", "--delete-branch", "--assistant", "--dream"]
+                let isFlag = ["--raw", "--full", "--auto-allow", "--delete-branch", "--assistant", "--dream", "--keep-files"]
                     .contains(argument)
                 index = arguments.index(index, offsetBy: isFlag ? 1 : 2)
             } else {

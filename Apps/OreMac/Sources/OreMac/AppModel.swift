@@ -636,6 +636,15 @@ final class AppModel {
         _ id: String,
         decision: AssistantConfirmationDecision
     ) {
+        var decision = decision
+        // A permanent delete takes no standing answer from any surface — a
+        // spoken "always yes" or a notification's "This task" included. The
+        // core enforces it too; doing it here skips a pointless Touch ID.
+        if case .allow = decision,
+           assistantConfirmations.first(where: { $0.id == id })?.actionClass
+               .allowsStandingGrant == false {
+            decision = .allow(.once)
+        }
         // "Always" is the one answer that outlives this moment — a standing
         // permission deserves the user's fingerprint, from every surface
         // (window, menu bar, voice). Failing or cancelling authentication

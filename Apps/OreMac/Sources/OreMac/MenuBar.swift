@@ -158,13 +158,15 @@ struct MenuBarDashboard: View {
                             )
                         }
                         .controlSize(.small)
-                        Button("This task") {
-                            model.resolveAssistantConfirmation(
-                                confirmation.id, decision: .allow(.task)
-                            )
+                        if confirmation.actionClass.allowsStandingGrant {
+                            Button("This task") {
+                                model.resolveAssistantConfirmation(
+                                    confirmation.id, decision: .allow(.task)
+                                )
+                            }
+                            .controlSize(.small)
+                            .buttonStyle(.borderedProminent)
                         }
-                        .controlSize(.small)
-                        .buttonStyle(.borderedProminent)
                     }
                 }
                 .padding(OreTheme.Space.sm)

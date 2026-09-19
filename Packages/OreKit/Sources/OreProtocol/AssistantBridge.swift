@@ -63,6 +63,16 @@ public enum AssistantActionClass: String, Sendable, Codable, CaseIterable, Hasha
     /// machine, with whatever the vendor is publishing right now.
     case updateHarnessCLI
 
+    /// Whether "for this task" or "always" may cover this class.
+    ///
+    /// Not for a permanent delete. One "Always" pressed on 2026-09-19 let the
+    /// assistant delete workspaces for the rest of the session without a word,
+    /// which is the one outcome a confirmation exists to prevent: nothing can
+    /// bring those back. Every delete asks, whatever was pressed before.
+    public var allowsStandingGrant: Bool {
+        self != .deleteWorkspace
+    }
+
     public var displayName: String {
         switch self {
         case .commit: "Commit"

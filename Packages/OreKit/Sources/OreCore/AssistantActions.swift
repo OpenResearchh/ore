@@ -289,6 +289,8 @@ extension InProcessCoreClient {
         workspaceID: WorkspaceID?,
         chatID: ChatID? = nil
     ) async -> String? {
+        // A grant stored before this rule existed must not keep working.
+        guard actionClass.allowsStandingGrant else { return nil }
         let key = AssistantTaskGrantKey(
             actionClass: actionClass, workspaceID: workspaceID, chatID: chatID
         )
@@ -317,6 +319,7 @@ extension InProcessCoreClient {
         workspaceID: WorkspaceID?,
         chatID: ChatID? = nil
     ) async {
+        guard actionClass.allowsStandingGrant else { return }
         switch scope {
         case .once:
             break

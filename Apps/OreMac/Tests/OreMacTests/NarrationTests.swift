@@ -1114,7 +1114,24 @@ struct NeuralVoiceNoticeTests {
         // Which voice is actually talking is the part the user can hear and
         // cannot otherwise account for.
         #expect(notice?.message.contains("system voice") == true)
-        #expect(notice?.message.contains("no network") == true)
+    }
+
+    /// These render in the sidebar, where the column is ~230 pt wide and the
+    /// height they take is what `safeAreaInset` reserves. Appending the raw
+    /// vendor error ran one of them to six wrapped lines and pushed the
+    /// control bar below it off the bottom of the window; the detail belongs
+    /// in Settings, which has the room. Length is the property that broke, so
+    /// length is what is checked.
+    @Test func everyNoticeStaysShortEnoughForTheSidebar() {
+        let every: [NeuralNarrationVoice.Readiness] = [
+            .notInstalled,
+            .failed(String(repeating: "vendor error detail ", count: 20)),
+            .unsupported(String(repeating: "no Metal device ", count: 20)),
+        ]
+        for readiness in every {
+            let notice = NarrationEngine.neuralVoiceNotice(for: .neural, readiness: readiness)
+            #expect(notice?.message.count ?? 0 <= 80, "too long for the sidebar: \(readiness)")
+        }
     }
 
     @Test func aMacThatCannotRunItIsToldSoWithoutAButton() {

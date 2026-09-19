@@ -559,6 +559,17 @@ struct AssistantActivityView: View {
                 .buttonStyle(OreSecondaryButtonStyle())
                 .keyboardShortcut(.cancelAction)
                 Spacer(minLength: OreTheme.Space.sm)
+                if !confirmation.actionClass.allowsStandingGrant {
+                    // Irreversible: one answer per action, so no task or
+                    // always to press by reflex.
+                    Button("Allow") {
+                        model.resolveAssistantConfirmation(
+                            confirmation.id, decision: .allow(.once)
+                        )
+                    }
+                    .buttonStyle(OrePrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+                } else {
                 Button("Once") {
                     model.resolveAssistantConfirmation(
                         confirmation.id, decision: .allow(.once)
@@ -579,6 +590,7 @@ struct AssistantActivityView: View {
                 }
                 .buttonStyle(OreSecondaryButtonStyle())
                 .help("Never ask about \(confirmation.actionClass.displayName.lowercased()) again")
+                }
             }
         }
         .cardLayout()

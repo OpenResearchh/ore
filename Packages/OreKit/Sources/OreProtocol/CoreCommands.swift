@@ -17,6 +17,11 @@ public enum CoreCommand: Sendable, Codable {
     case archiveWorkspace(WorkspaceID)
     case unarchiveWorkspace(WorkspaceID)
     case deleteWorkspace(WorkspaceID, deleteBranch: Bool)
+    /// Forget a project: stop and remove every workspace in it, archived ones
+    /// included, and drop the repository. With `moveToTrash` the worktrees and
+    /// the repository folder go to the Trash — recoverable, and the name is
+    /// free for a new project; without it nothing on disk is touched.
+    case deleteProject(repositoryPath: String, moveToTrash: Bool)
     /// `userInitiated` marks a name the user typed, so the engine won't later
     /// replace it with a prompt-derived or generated title. Automatic
     /// research-identity assignment passes `false`.

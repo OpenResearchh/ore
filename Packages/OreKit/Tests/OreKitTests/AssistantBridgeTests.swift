@@ -240,6 +240,49 @@ struct AssistantBridgeTests {
         }
     }
 
+    /// On 2026-09-19 one "Always" let the assistant permanently delete
+    /// workspaces for the rest of the session without a word. A delete must
+    /// ask every time — including under a grant stored before this rule.
+    @Test func aPermanentDeleteAsksEvenUnderAStoredAlways() async throws {
+        try await BridgeHarness.run { harness in
+            let workspaceID = try await harness.makeWorkspace(named: "delete-always")
+            await harness.client.send(.archiveWorkspace(workspaceID))
+            _ = await harness.recorder.waitFor(matching: {
+                if case .workspaceUpdated(let summary) = $0 { return summary.isArchived }
+                return false
+            })
+            try await harness.store.saveAssistantGrant(AssistantActionClass.deleteWorkspace.rawValue)
+
+            async let deleted = harness.callBridgeAsync(
+                tool: "DeleteWorkspace",
+                arguments: ["workspaceID": .string(workspaceID.rawValue)]
+            )
+            guard case .assistantConfirmationRequested(let confirmation)? =
+                await harness.recorder.waitFor(timeout: .seconds(10), matching: {
+                    if case .assistantConfirmationRequested = $0 { return true }
+                    return false
+                })
+            else {
+                Issue.record("the delete ran without asking")
+                return
+            }
+            #expect(confirmation.actionClass == .deleteWorkspace)
+            // Answering "always" again allows this one delete and no more.
+            await harness.client.send(
+                .resolveAssistantConfirmation(confirmation.id, .allow(.always))
+            )
+            #expect(try await deleted.ok)
+            let audit = try await harness.store.assistantActions()
+            #expect(!audit.contains { $0.decision == "granted:always" })
+        }
+    }
+
+    @Test func onlyPermanentDeletesRefuseStandingGrants() {
+        for actionClass in AssistantActionClass.allCases {
+            #expect(actionClass.allowsStandingGrant == (actionClass != .deleteWorkspace))
+        }
+    }
+
     @Test func longHomesDoNotBindABareSocketInTmp() {
         let deep = URL(
             fileURLWithPath: "/" + String(repeating: "deep/", count: 30) + "ore.sqlite"

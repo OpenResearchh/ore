@@ -106,6 +106,32 @@ struct TelemetryQueueTests {
         #expect(try store.count() == 0)
     }
 
+    /// The bug this guards: events were queued and never sent, because
+    /// nothing but the tests ever called `flush()`. The schedule has to send
+    /// the backlog on its own, and keep sending what arrives after.
+    @Test("Periodic delivery sends the backlog and what follows, unprompted")
+    func periodicDeliverySends() async throws {
+        let store = try TelemetryStore()
+        let client = TelemetryClient(
+            configuration: configuration(), store: store, context: context(),
+            transport: { _ in 200 }
+        )
+        await client.recordForTesting(repeatable())
+        let delivery = Task { await client.deliverPeriodically(every: .milliseconds(50)) }
+        defer { delivery.cancel() }
+
+        try await waitUntil { try store.count() == 0 }
+        await client.recordForTesting(repeatable())
+        try await waitUntil { try store.count() == 0 }
+        #expect(try store.count() == 0)
+    }
+
+    private func waitUntil(_ condition: () throws -> Bool) async throws {
+        for _ in 0..<100 where try !condition() {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
     /// A 400 means the payload will be rejected identically forever.
     /// Retrying it blocks every event queued behind it, so it must be
     /// dropped rather than retried.

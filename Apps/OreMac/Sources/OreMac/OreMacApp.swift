@@ -220,6 +220,12 @@ struct OreMacApp: App {
                     )
                 }
                 recorder.install(telemetry.recorder)
+                // Sends the backlog now and the queue every few minutes after;
+                // without it nothing recorded ever left the Mac. Loose on
+                // purpose, so it rides along with other wake-ups.
+                await recorder.deliverPeriodically(
+                    every: .seconds(300), tolerance: .seconds(60)
+                )
             }
         }
         // A launch can show no window at all (the menu bar keeps ORE alive),
@@ -246,16 +252,17 @@ struct OreMacApp: App {
             // real navigation sidebar; narrower windows collapse columns using
             // NavigationSplitView instead of crushing labels and controls.
             //
-            // The height floor is lower than it looks like it should be, and
-            // deliberately so: a minimum on the root of a `WindowGroup`
-            // constrains the *content view*, not the window. Where the window
-            // is shorter than the floor — a tiled half-screen, a display whose
-            // visible frame is smaller than the app assumed — SwiftUI still
-            // lays the root out at the floor and centres it, so the overflow
-            // is clipped off the top and the bottom at once. That takes the
-            // tab strips with it at one end and the sidebar's control bar at
-            // the other, which is a far worse failure than a cramped window.
-            .frame(minWidth: 1_080, minHeight: 560)
+            // A minimum on the root of a `WindowGroup` constrains the *content
+            // view*, not the window. Where the window is shorter than the
+            // floor — a tiled half-screen, a small display on Larger Text —
+            // SwiftUI still lays the root out at the floor and centres it, so
+            // the overflow is clipped off the top and the bottom at once. The
+            // floor is therefore held to the smallest screen a supported Mac
+            // offers; see `WindowMetrics` and `LayoutMatrixTests`.
+            .frame(
+                minWidth: WindowMetrics.minimumContent.width,
+                minHeight: WindowMetrics.minimumContent.height
+            )
             .task {
                 // First, ahead of anything that can await on the user: this
                 // settles whatever the last launch staged, so an update that
@@ -281,14 +288,11 @@ struct OreMacApp: App {
             }
         }
         // Sized to fit the smallest screen ORE is likely to open on rather
-        // than the largest it looks good on. A 13" MacBook Air runs 1280x800
-        // points by default, which leaves about 775 once the menu bar has its
-        // share — so the old 1320x820 was wider *and* taller than the space it
-        // was being asked to appear in, and the first launch on one of those
-        // put the composer and the sidebar's controls below the bottom of the
-        // screen. Anything larger is a window the user has resized, and that
-        // is remembered.
-        .defaultSize(width: 1_200, height: 740)
+        // than the largest it looks good on: 1320x820 was wider and taller
+        // than a 13" MacBook's visible frame, so a first launch there put the
+        // composer and the sidebar's controls below the screen. Anything
+        // larger is a window the user resized, and that is remembered.
+        .defaultSize(WindowMetrics.defaultWindow)
         .commands {
             CommandGroup(replacing: .newItem) {
                 // ⌘N spins up a fresh worktree in the current tab's project;
@@ -762,6 +766,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
         .modifier(ScriptApprovalDialog())
+        .modifier(ProjectDeleteDialog())
         .confirmationDialog(
             "Archive \u{201C}\(model.pendingArchive?.workspace.name ?? "workspace")\u{201D}?",
             isPresented: Binding(
@@ -868,6 +873,7 @@ struct RootView: View {
                 workspaceMain(workspace)
             } dock: {
                 bottomDock(workspace)
+                    .layoutProbe("status-bar")
             } terminal: {
                 TerminalPane(workspace: workspace) { bottomPane = .none }
             }
@@ -1468,6 +1474,36 @@ private struct FilePalette: View {
     private func open(_ path: String) {
         model.openSourceFile(path, in: workspace.id)
         dismiss()
+    }
+}
+
+/// Deleting a whole project. Kept out of `RootView`'s modifier chain for the
+/// same reason as `ScriptApprovalDialog`.
+private struct ProjectDeleteDialog: ViewModifier {
+    @Environment(AppModel.self) private var model
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            "Delete \u{201C}\(model.pendingProjectDelete?.name ?? "project")\u{201D}?",
+            isPresented: Binding(
+                get: { model.pendingProjectDelete != nil },
+                set: { if !$0 { model.pendingProjectDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: model.pendingProjectDelete
+        ) { pending in
+            Button("Move to Trash", role: .destructive) {
+                model.deleteProject(pending.repositoryPath, moveToTrash: true)
+                model.pendingProjectDelete = nil
+            }
+            Button("Remove from ORE, Keep Files") {
+                model.deleteProject(pending.repositoryPath, moveToTrash: false)
+                model.pendingProjectDelete = nil
+            }
+            Button("Cancel", role: .cancel) { model.pendingProjectDelete = nil }
+        } message: { pending in
+            Text(pending.confirmationMessage)
+        }
     }
 }
 

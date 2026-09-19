@@ -325,7 +325,7 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// (0.15.5, 19600a4): `ModelHub.clearAllCaches` names this as the shared
     /// TTS root for every backend on macOS, with the Application Support
     /// variant on the `#else` iOS branch that this app never takes. Pocket
-    /// TTS puts its language packs somewhere beneath it.
+    /// TTS keeps its packs beneath it — see `languagePackDirectory`.
     ///
     /// Still read in one direction only, because only one direction is sound.
     /// A missing root proves nothing is cached and clears the install flag; a
@@ -355,54 +355,106 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// reports it as "Unable to load model … Compile the model with Xcode",
     /// which reads like the app shipped the wrong file and sent the whole
     /// thing to `.unsupported` — "This Mac can't run the neural voice" on a
-    /// Mac that runs it fine. Meanwhile FluidAudio sees a directory already
-    /// in place and never refetches, so the state was permanent.
+    /// Mac that runs it fine.
     ///
-    /// This is the narrowest check that catches it: directory named
-    /// `.mlmodelc`, no manifest inside. Nothing else is inspected and nothing
-    /// else is ever removed.
+    /// Only this voice's own required models are looked at, by name, inside
+    /// its own language pack. The cache root is shared by every FluidAudio
+    /// backend, and a half-finished download belonging to one of those says
+    /// nothing about this voice — reading it here would clear a good install
+    /// flag, blame a download for a Mac that can't run the model, and hand a
+    /// stranger's files to `removeIncompleteModels`.
     nonisolated static func incompleteCompiledModels(
-        under root: URL,
+        in languagePack: URL,
+        required: Set<String> = requiredModelNames,
         fileManager: FileManager = .default
     ) -> [URL] {
-        guard let walk = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        var incomplete: [URL] = []
-        for case let url as URL in walk {
-            guard url.pathExtension == "mlmodelc" else { continue }
-            // Whatever is under a model directory, complete or not, is the
-            // model's own business — the manifest is the only thing read.
-            walk.skipDescendants()
-            let manifest = url.appendingPathComponent(compiledModelManifest)
-            if !fileManager.fileExists(atPath: manifest.path) { incomplete.append(url) }
+        required.sorted().compactMap { name in
+            guard name.hasSuffix(".mlmodelc") else { return nil }
+            let model = languagePack.appendingPathComponent(name, isDirectory: true)
+            guard fileManager.fileExists(atPath: model.path) else { return nil }
+            let manifest = model.appendingPathComponent(compiledModelManifest)
+            return fileManager.fileExists(atPath: manifest.path) ? nil : model
         }
-        return incomplete
     }
 
-    /// Clears half-written models so the next fetch replaces them, and says
-    /// whether anything had to go.
+    /// Whether FluidAudio will skip the fetch outright.
+    ///
+    /// Mirrors `PocketTtsResourceDownloader.ensureModels` at the pinned
+    /// revision: it checks only that every required entry *exists*, and when
+    /// they all do it downloads nothing. When any is missing it walks the
+    /// whole pack, skips each finished file, and resumes each `.partial` with
+    /// `Range`/`If-Range` — incomplete directories included.
+    nonisolated static func fetchWillBeSkipped(
+        languagePack: URL,
+        required: Set<String> = requiredModelNames,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        required.allSatisfy { name in
+            fileManager.fileExists(atPath: languagePack.appendingPathComponent(name).path)
+        }
+    }
+
+    /// The half-written models that have to go before a fetch, and no more.
+    ///
+    /// Only when FluidAudio would otherwise skip the fetch: then an
+    /// incomplete directory is permanent, and removing it is what puts it
+    /// back on the fetch list. In every other case the fetch is going to run
+    /// anyway and resumes whatever `.partial` files the directory holds, so
+    /// deleting it would throw away exactly the download Cancel promised to
+    /// keep.
+    nonisolated static func modelsToClearBeforeFetch(
+        in languagePack: URL,
+        required: Set<String> = requiredModelNames,
+        fileManager: FileManager = .default
+    ) -> [URL] {
+        guard fetchWillBeSkipped(
+            languagePack: languagePack, required: required, fileManager: fileManager
+        ) else { return [] }
+        return incompleteCompiledModels(
+            in: languagePack, required: required, fileManager: fileManager
+        )
+    }
+
+    /// Clears half-written models so the next fetch replaces them.
     ///
     /// Deleting inside a vendor cache is a bigger step than reading one, and
-    /// it is taken only for directories CoreML has already refused: an
-    /// unloadable `.mlmodelc` is worth exactly nothing to keep, and removing
-    /// it is what turns "stuck forever" back into "the download resumes".
+    /// it is taken only for this voice's own directories that CoreML would
+    /// refuse and FluidAudio would never refetch: an unloadable `.mlmodelc`
+    /// is worth exactly nothing to keep, and removing it is what turns "stuck
+    /// forever" back into "the download resumes".
     private nonisolated static func removeIncompleteModels() {
-        for model in incompleteCompiledModels(under: vendorCacheDirectory()) {
+        for model in modelsToClearBeforeFetch(in: languagePackDirectory()) {
             try? FileManager.default.removeItem(at: model)
         }
     }
 
     private nonisolated static func hasIncompleteModels() -> Bool {
-        !incompleteCompiledModels(under: vendorCacheDirectory()).isEmpty
+        !incompleteCompiledModels(in: languagePackDirectory()).isEmpty
     }
 
     private nonisolated static func vendorCacheDirectory() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(vendorCacheRoot)
     }
+
+    private nonisolated static func languagePackDirectory() -> URL {
+        languagePackDirectory(cacheRoot: vendorCacheDirectory())
+    }
+
+    /// Where `ensureModels` puts this voice's pack beneath the shared root,
+    /// built from the same public names it uses —
+    /// `Models/pocket-tts/v2.1/english` at the pinned revision.
+    nonisolated static func languagePackDirectory(cacheRoot: URL) -> URL {
+        cacheRoot
+            .appendingPathComponent(PocketTtsConstants.defaultModelsSubdirectory)
+            .appendingPathComponent(Repo.pocketTts.folderName)
+            .appendingPathComponent(modelLanguage.repoSubdirectory)
+    }
+
+    /// Everything `ensureModels` requires for this precision and placement.
+    nonisolated static let requiredModelNames = ModelNames.PocketTTS.requiredModels(
+        precision: modelPrecision, placement: modelPlacement
+    )
 
     /// The exact language pack this voice fetches and loads.
     ///
@@ -670,11 +722,11 @@ final class NeuralNarrationVoice: NarrationVoice {
         }
         installTask = Task { [weak self] in
             guard let self else { return }
-            // Before the fetch, not after it: FluidAudio decides what to
-            // download from what is already on disk, and a directory left
-            // behind by an interrupted download looks finished to it. Clearing
-            // the unloadable ones is what puts them back on the fetch list —
-            // and only those, so a complete pack costs one directory scan.
+            // Before the fetch, not after it: FluidAudio skips the fetch when
+            // every required directory exists, finished or not. Clearing the
+            // unloadable ones — only then, and only this voice's — is what
+            // puts them back on the fetch list without discarding a resumable
+            // download.
             await Task.detached(priority: .utility) {
                 NeuralNarrationVoice.removeIncompleteModels()
             }.value

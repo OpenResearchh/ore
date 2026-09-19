@@ -256,6 +256,7 @@ struct ReviewPane: View {
         }
         .padding(.horizontal, OreTheme.Space.sm)
         .frame(height: OreTheme.RowHeight.bar)
+        .layoutProbe("review-tabs")
         // Sits directly on the inspector's glass — a bar material here would
         // stack a second pane over it.
     }
@@ -2755,7 +2756,14 @@ private struct ShipStatusPanel: View {
         commits = await loadedCommits
         workingTree = await loadedTree
         let pr = await loadedPR
+        let changed = pr != pullRequest
         pullRequest = pr
+        // The toolbar's "Checks running" reads its own copy of the PR, which
+        // nothing else refreshes when CI finishes. This read is live and has
+        // just refilled the shared cache, so the recompute costs no fetch.
+        if changed {
+            await model.refreshGitAction(for: workspace.id)
+        }
 
         // Auto-switch to Checks when runs appear or progress; return to
         // Commits when a PR (and its checks) go away entirely.
@@ -2788,6 +2796,7 @@ private struct ShipStatusPanel: View {
 /// with no commits ahead of base must not offer "Create pull request".
 struct GitActionToolbar: View {
     @Environment(AppModel.self) private var model
+    static let checksPollInterval = 10
     let workspace: WorkspaceSummary
 
     @State private var chosenBase: String?
@@ -2896,6 +2905,17 @@ struct GitActionToolbar: View {
                 branches = await model.remoteBranches(for: workspace.id)
             }
             prURL = actionImpliesPR ? await model.pullRequestURL(for: workspace.id) : nil
+        }
+        // "Checks running" is a claim about GitHub that no local event will
+        // ever correct, so while it is showing it polls for itself — with the
+        // review pane closed too. Ends the moment the title changes.
+        .task(id: "\(workspace.id.rawValue)-checks-\(action.title)") {
+            guard case .waitForChecks = action else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.checksPollInterval))
+                if Task.isCancelled { return }
+                await model.refreshChecks(for: workspace.id)
+            }
         }
     }
 

@@ -2,6 +2,9 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(os)
+import os
+#endif
 
 /// What the app talks to. Everything is fire-and-forget: telemetry must never
 /// be able to slow down, block, or fail a user action.
@@ -17,6 +20,32 @@ public protocol TelemetryRecorder: Sendable {
     /// Settings. Being able to read your own queue is worth more to a
     /// developer audience than any promise in a privacy policy.
     func pendingDescriptions() async -> [String]
+}
+
+extension TelemetryRecorder {
+    /// Sends what is queued now, then again every `interval` until the task
+    /// is cancelled.
+    ///
+    /// Recording only ever wrote to the local queue; nothing in the app called
+    /// `flush()`, so no event but the opt-out marker ever reached PostHog. The
+    /// schedule lives here, next to the queue, so a host starts it with one
+    /// call instead of having to remember to.
+    ///
+    /// `tolerance` lets the system coalesce the wake-up with others: an idle
+    /// ORE should not be woken just to find an empty queue.
+    public func deliverPeriodically(
+        every interval: Duration,
+        tolerance: Duration? = nil
+    ) async {
+        while !Task.isCancelled {
+            await flush()
+            do {
+                try await Task.sleep(for: interval, tolerance: tolerance)
+            } catch {
+                return
+            }
+        }
+    }
 }
 
 /// The no-op. Returned by `TelemetryClient.make` whenever telemetry is off for
@@ -198,6 +227,9 @@ public actor TelemetryClient: TelemetryRecorder {
 
             let status = await transport(request)
             let ids = batch.compactMap(\.id)
+            if status.map({ !(200...299).contains($0) }) ?? true {
+                Self.log("delivery of \(ids.count) events got \(status.map(String.init) ?? "no response")")
+            }
 
             switch status {
             case .some(200...299):
@@ -221,6 +253,14 @@ public actor TelemetryClient: TelemetryRecorder {
 
             if batch.count < configuration.batchSize { return }
         }
+    }
+
+    /// Failures used to vanish: a 401 from the wrong key or region deleted
+    /// the batch without a trace. Status codes only — never payloads.
+    private static func log(_ message: String) {
+        #if canImport(os)
+        Logger(subsystem: "dev.ore.telemetry", category: "delivery").notice("\(message, privacy: .public)")
+        #endif
     }
 
     private func makeRequest(for batch: [QueuedEvent]) -> URLRequest? {

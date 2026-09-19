@@ -836,14 +836,16 @@ struct NeuralVoiceInstallFlagTests {
 /// and never refetched — so the state never cleared.
 @MainActor
 struct NeuralVoiceIncompleteDownloadTests {
-    /// Builds a cache tree and returns its root; each model is a directory of
-    /// the named files.
-    private func makeCache(_ models: [String: [String]]) throws -> URL {
+    private let required: Set<String> = [
+        "cond_prefill.mlmodelc", "mimi_decoder.mlmodelc", "constants_bin",
+    ]
+
+    /// Builds a cache tree and returns its language pack; each entry is a
+    /// directory of the named files, relative to the cache root.
+    private func makeCache(_ entries: [String: [String]]) throws -> (root: URL, pack: URL) {
         let root = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        for (model, files) in models {
-            let directory = root
-                .appendingPathComponent("Models/pocket-tts/v2.1/english", isDirectory: true)
-                .appendingPathComponent(model, isDirectory: true)
+        for (entry, files) in entries {
+            let directory = root.appendingPathComponent(entry, isDirectory: true)
             try FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true
             )
@@ -854,21 +856,38 @@ struct NeuralVoiceIncompleteDownloadTests {
                         at: url, withIntermediateDirectories: true
                     )
                 } else {
+                    try FileManager.default.createDirectory(
+                        at: url.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
                     try Data().write(to: url)
                 }
             }
         }
-        return root
+        return (root, NeuralNarrationVoice.languagePackDirectory(cacheRoot: root))
+    }
+
+    private let pack = "Models/pocket-tts/v2.1/english/"
+
+    /// The layout observed on disk, built from FluidAudio's own names.
+    @Test func thePackLivesWhereFluidAudioPutsIt() {
+        let root = URL(fileURLWithPath: "/cache")
+        #expect(
+            NeuralNarrationVoice.languagePackDirectory(cacheRoot: root).path
+                == "/cache/Models/pocket-tts/v2.1/english"
+        )
     }
 
     @Test func aModelMissingItsManifestIsReportedIncomplete() throws {
-        let root = try makeCache([
-            "flowlm_step.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
-            "mimi_decoder.mlmodelc": ["analytics/", "weights/"],
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
+            pack + "mimi_decoder.mlmodelc": ["analytics/", "weights/"],
         ])
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? FileManager.default.removeItem(at: cache.root) }
 
-        let incomplete = NeuralNarrationVoice.incompleteCompiledModels(under: root)
+        let incomplete = NeuralNarrationVoice.incompleteCompiledModels(
+            in: cache.pack, required: required
+        )
         #expect(incomplete.map(\.lastPathComponent) == ["mimi_decoder.mlmodelc"])
     }
 
@@ -876,33 +895,97 @@ struct NeuralVoiceIncompleteDownloadTests {
     /// `model.mil`, a neural network has `model.espresso.net` — so only the
     /// manifest may be required.
     @Test func aCompletePackReportsNothing() throws {
-        let root = try makeCache([
-            "program.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
-            "espresso.mlmodelc": ["coremldata.bin", "model.espresso.net"],
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
+            pack + "mimi_decoder.mlmodelc": ["coremldata.bin", "model.espresso.net"],
         ])
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? FileManager.default.removeItem(at: cache.root) }
 
-        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: root).isEmpty)
+        #expect(
+            NeuralNarrationVoice.incompleteCompiledModels(
+                in: cache.pack, required: required
+            ).isEmpty
+        )
     }
 
-    /// A model's own contents are its business. Walking into them would be
-    /// both slow and a second, weaker guess about a vendor's layout.
-    @Test func whatIsInsideACompleteModelIsNotInspected() throws {
-        let root = try makeCache([
-            "outer.mlmodelc": ["coremldata.bin"],
+    /// The cache root is shared by every FluidAudio backend. Another one's
+    /// download in progress must neither retire this voice's install flag nor
+    /// be deleted by this voice's Download button.
+    @Test func anotherBackendsHalfDownloadIsNotThisVoicesBusiness() throws {
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin"],
+            pack + "mimi_decoder.mlmodelc": ["coremldata.bin"],
+            pack + "constants_bin": ["tokenizer.model"],
+            "Models/kokoro/some_model.mlmodelc": ["weights/weight.bin.partial"],
+            pack + "flowlm_step_ane.mlmodelc": ["weights/"],
         ])
-        defer { try? FileManager.default.removeItem(at: root) }
-        let nested = root
-            .appendingPathComponent("Models/pocket-tts/v2.1/english/outer.mlmodelc")
-            .appendingPathComponent("weights/nested.mlmodelc", isDirectory: true)
-        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cache.root) }
 
-        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: root).isEmpty)
+        #expect(
+            NeuralNarrationVoice.incompleteCompiledModels(
+                in: cache.pack, required: required
+            ).isEmpty
+        )
+        #expect(
+            NeuralNarrationVoice.modelsToClearBeforeFetch(
+                in: cache.pack, required: required
+            ).isEmpty
+        )
+    }
+
+    /// A cancelled download with other required models still to come: the
+    /// fetch will run and resume the `.partial`, so nothing may be removed.
+    @Test func aResumableDownloadIsLeftForTheFetchToResume() throws {
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin"],
+            pack + "mimi_decoder.mlmodelc": ["weights/weight.bin.partial"],
+        ])
+        defer { try? FileManager.default.removeItem(at: cache.root) }
+
+        #expect(
+            !NeuralNarrationVoice.fetchWillBeSkipped(
+                languagePack: cache.pack, required: required
+            )
+        )
+        #expect(
+            NeuralNarrationVoice.modelsToClearBeforeFetch(
+                in: cache.pack, required: required
+            ).isEmpty
+        )
+    }
+
+    /// Every required entry present, one of them unloadable: FluidAudio would
+    /// skip the fetch, so that one directory — and only it — has to go.
+    @Test func aStuckModelIsClearedWhenTheFetchWouldSkipIt() throws {
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin"],
+            pack + "mimi_decoder.mlmodelc": ["analytics/", "weights/"],
+            pack + "constants_bin": ["tokenizer.model"],
+        ])
+        defer { try? FileManager.default.removeItem(at: cache.root) }
+
+        #expect(
+            NeuralNarrationVoice.fetchWillBeSkipped(
+                languagePack: cache.pack, required: required
+            )
+        )
+        #expect(
+            NeuralNarrationVoice.modelsToClearBeforeFetch(
+                in: cache.pack, required: required
+            ).map(\.lastPathComponent) == ["mimi_decoder.mlmodelc"]
+        )
     }
 
     @Test func aCacheThatWasNeverCreatedIsNotAFailure() {
         let missing = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: missing).isEmpty)
+        #expect(NeuralNarrationVoice.incompleteCompiledModels(in: missing).isEmpty)
+        #expect(NeuralNarrationVoice.modelsToClearBeforeFetch(in: missing).isEmpty)
+    }
+
+    /// The real required set is what `ensureModels` checks for this voice.
+    @Test func theRequiredSetMatchesTheShippedPack() {
+        #expect(NeuralNarrationVoice.requiredModelNames.contains("mimi_decoder.mlmodelc"))
+        #expect(NeuralNarrationVoice.requiredModelNames.contains("constants_bin"))
     }
 }
 

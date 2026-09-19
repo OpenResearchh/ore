@@ -454,6 +454,7 @@ final class AppModel {
         // Last chance to get an unsent draft to disk, and it has to complete
         // before the core below us shuts down.
         await flushPendingDraftsAwaitingWrites()
+        await flushTelemetryBriefly()
         eventTask?.cancel()
         flushTask?.cancel()
         fleetTickTask?.cancel()
@@ -462,6 +463,28 @@ final class AppModel {
         for task in continuationTasks.values { task.cancel() }
         continuationTasks.removeAll()
         await client.shutdown()
+    }
+
+    /// One attempt to send this session's events on the way out, capped so
+    /// a slow network never holds up the quit. Whatever misses it stays
+    /// queued on disk and goes with the next launch's first delivery.
+    ///
+    /// Raced rather than grouped: a task group waits for every child, and a
+    /// URL request does not stop for cancellation, so a group would wait out
+    /// the full request timeout anyway.
+    private func flushTelemetryBriefly() async {
+        let telemetry = telemetry
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            let gate = TerminationGate { done.resume() }
+            Task { @MainActor in
+                await telemetry.flush()
+                gate.reply()
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                gate.reply()
+            }
+        }
     }
 
     // MARK: - Harness usage
@@ -613,6 +636,15 @@ final class AppModel {
         _ id: String,
         decision: AssistantConfirmationDecision
     ) {
+        var decision = decision
+        // A permanent delete takes no standing answer from any surface — a
+        // spoken "always yes" or a notification's "This task" included. The
+        // core enforces it too; doing it here skips a pointless Touch ID.
+        if case .allow = decision,
+           assistantConfirmations.first(where: { $0.id == id })?.actionClass
+               .allowsStandingGrant == false {
+            decision = .allow(.once)
+        }
         // "Always" is the one answer that outlives this moment — a standing
         // permission deserves the user's fingerprint, from every surface
         // (window, menu bar, voice). Failing or cancelling authentication
@@ -2584,6 +2616,48 @@ final class AppModel {
         pendingArchivedDelete = PendingArchivedDelete(workspace: workspace)
     }
 
+    /// A project staged for the delete confirmation dialog.
+    struct PendingProjectDelete: Identifiable, Equatable {
+        let repositoryPath: String
+        /// Every workspace in it, archived ones included — all of them go.
+        let workspaceCount: Int
+        var id: String { repositoryPath }
+        var name: String { URL(fileURLWithPath: repositoryPath).lastPathComponent }
+
+        var confirmationMessage: String {
+            let stopped = switch workspaceCount {
+            case 0: "This removes the project from ORE."
+            case 1: "This stops its workspace and removes it and its chats from ORE."
+            default: "This stops all \(workspaceCount) of its workspaces and removes "
+                + "them and their chats from ORE."
+            }
+            return stopped + " Move to Trash also sends the project folder and its "
+                + "worktrees to the Trash, which frees the name for a new project "
+                + "and keeps the files restorable."
+        }
+    }
+
+    var pendingProjectDelete: PendingProjectDelete?
+
+    func requestProjectDelete(_ repositoryPath: String) {
+        pendingProjectDelete = PendingProjectDelete(
+            repositoryPath: repositoryPath,
+            workspaceCount: workspaces.filter { $0.repositoryPath == repositoryPath }.count
+        )
+    }
+
+    /// Stops and removes every workspace in the project and forgets it. With
+    /// `moveToTrash` its worktrees and folder go to the Trash, which frees the
+    /// name for a new project and is still one drag away from undone.
+    func deleteProject(_ repositoryPath: String, moveToTrash: Bool) {
+        Task {
+            await client.send(.deleteProject(
+                repositoryPath: repositoryPath, moveToTrash: moveToTrash
+            ))
+            await refreshRepositories()
+        }
+    }
+
     func unarchive(_ id: WorkspaceID) {
         Task { await client.send(.unarchiveWorkspace(id)) }
     }
@@ -2767,7 +2841,13 @@ final class AppModel {
     }
 
     func rerunFailedChecks(_ id: WorkspaceID) {
-        Task { await client.send(.rerunFailedChecks(id)) }
+        Task {
+            await client.send(.rerunFailedChecks(id))
+            // GitHub takes a moment to queue the new runs; asking at once
+            // would read the old failure straight back.
+            try? await Task.sleep(for: .seconds(3))
+            await refreshChecks(for: id)
+        }
     }
 
     func retryLastTurn(in workspaceID: WorkspaceID, chatID: ChatID? = nil) {
@@ -3158,6 +3238,18 @@ final class AppModel {
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
         diffCache.state(for: workspaceID).store(snapshot)
+    }
+
+    /// Re-reads the pull request live, then recomputes the toolbar from it.
+    ///
+    /// `refreshGitAction` reads through a 60s PR cache, which is right for
+    /// turn boundaries but not for CI: "Checks running" would sit up to a
+    /// minute past the run it describes. The live read refills that cache,
+    /// so the recompute after it sees what GitHub says now.
+    func refreshChecks(for workspaceID: WorkspaceID) async {
+        guard isBackgroundPollingEnabled else { return }
+        _ = await loadPullRequestStatus(for: workspaceID)
+        await refreshGitAction(for: workspaceID)
     }
 
     /// Best-effort background warm-up of a workspace's diff so a later switch is
@@ -3840,7 +3932,7 @@ final class AppModel {
 
     // MARK: - Events
 
-    private func apply(_ event: CoreEvent) {
+    func apply(_ event: CoreEvent) {
         // One funnel for analytics: every core event passes through here exactly
         // once, so nothing has to be instrumented twice or kept in sync with
         // a second dispatch path. The translator decides what, if anything,

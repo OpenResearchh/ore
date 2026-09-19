@@ -639,6 +639,7 @@ struct ChatPane: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if !reviewingPlan {
                 composer(paneHeight: paneHeight, chat: chat, chatSummary: chatSummary)
+                    .layoutProbe("composer")
             }
             }
             .background(

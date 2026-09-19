@@ -32,6 +32,9 @@ public actor InProcessCoreClient: CoreClient {
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
     private var engineTasks: [WorkspaceID: [Task<Void, Never>]] = [:]
     private var gitClients: [String: GitClient] = [:]
+    /// Where `deleteProject` sends files: the Trash, so a mistaken delete is
+    /// a drag back out of it. Injectable so tests don't fill the user's.
+    private let discardItem: @Sendable (URL) throws -> Void
     private var backgroundPollingEnabled = true
     var harnessProbes: [HarnessProbeResult] = []
     var harnessUpdates: [HarnessUpdateStatus] = []
@@ -85,12 +88,22 @@ public actor InProcessCoreClient: CoreClient {
         store: OreStore,
         harnessRegistry: HarnessRegistry = .standard(),
         worktreeRoot: URL? = nil,
-        allowAPIKeyFallback: Bool = false
+        allowAPIKeyFallback: Bool = false,
+        discardItem: (@Sendable (URL) throws -> Void)? = nil
     ) {
         self.store = store
         self.harnessRegistry = harnessRegistry
         self.worktreeRoot = worktreeRoot
         self.allowAPIKeyFallback = allowAPIKeyFallback
+        self.discardItem = discardItem ?? { url in
+            #if os(macOS)
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            #else
+            // No Trash to recover from, so nothing is deleted outright: the
+            // project leaves ORE and the error names what stayed on disk.
+            throw CocoaError(.featureUnsupported)
+            #endif
+        }
 
         let (stream, continuation) = AsyncStream<CoreEvent>.makeStream(
             bufferingPolicy: .unbounded
@@ -135,6 +148,9 @@ public actor InProcessCoreClient: CoreClient {
 
         case .deleteWorkspace(let id, let deleteBranch):
             try await deleteWorkspace(id, deleteBranch: deleteBranch)
+
+        case .deleteProject(let path, let moveToTrash):
+            try await deleteProject(repositoryPath: path, moveToTrash: moveToTrash)
 
         case .approveRepositoryScripts(let approval):
             try await approveRepositoryScripts(approval)
@@ -1131,6 +1147,80 @@ public actor InProcessCoreClient: CoreClient {
         continuation.yield(.workspaceRemoved(id))
     }
 
+    func deleteProject(repositoryPath requested: String, moveToTrash: Bool) async throws {
+        // Registered paths are canonical; a typed one (the CLI) may not be.
+        var path = requested
+        if try await store.repository(path: path) == nil {
+            path = try await canonicalRepositoryURL(requested).path
+        }
+        guard try await store.repository(path: path) != nil else {
+            throw OreCoreError.repositoryNotFound(requested)
+        }
+        let members = try await store.workspaces(includeArchived: true, includeAssistant: true)
+            .filter { $0.repositoryPath == path }
+        // The assistant's home is registered as a repository; it is ORE's.
+        guard !members.contains(where: { $0.workspaceKind == .assistant }) else {
+            throw OreCoreError.assistantWorkspaceProtected
+        }
+
+        for member in members {
+            await stopEngine(member.workspaceID)
+            promptsHeldForScriptApproval.removeValue(forKey: member.workspaceID)
+        }
+        if !moveToTrash, let git = try? gitClient(for: path) {
+            // The files stay, so ORE's own refs must not: they would pin every
+            // checkpoint and archived tree in a repository ORE no longer knows.
+            for member in members {
+                try? await CheckpointStore(git: git).removeAll(workspaceID: member.workspaceID)
+                try? await git.runSerialized(
+                    ["update-ref", "-d", "refs/ore/archive/\(member.id)"]
+                )
+            }
+        }
+        gitClients.removeValue(forKey: path)
+
+        try await store.deleteRepository(path: path)
+        markListMutation()
+        for member in members {
+            continuation.yield(.workspaceRemoved(member.workspaceID))
+        }
+
+        guard moveToTrash else { return }
+        // After the rows, not before: the project is gone from ORE either way,
+        // and a folder the Trash refused is reported rather than leaving a
+        // project half-deleted in the sidebar.
+        let fileManager = FileManager.default
+        let root = (worktreeRoot ?? WorktreeManager.defaultRoot).standardizedFileURL
+        var failures: [String] = []
+        var parents = Set<URL>()
+        for member in members where !member.isArchived {
+            let worktree = URL(fileURLWithPath: member.worktreePath)
+            guard fileManager.fileExists(atPath: worktree.path) else { continue }
+            do {
+                try discardItem(worktree)
+                parents.insert(worktree.deletingLastPathComponent().standardizedFileURL)
+            } catch {
+                failures.append(worktree.path)
+            }
+        }
+        // `~/ore/workspaces/<project>/`, emptied: remove it so a project of
+        // the same name starts clean. Only ever inside the worktree root.
+        for parent in parents where parent.path.hasPrefix(root.path + "/") {
+            let contents = (try? fileManager.contentsOfDirectory(atPath: parent.path)) ?? []
+            if contents.allSatisfy({ $0 == ".DS_Store" }) {
+                try? fileManager.removeItem(at: parent)
+            }
+        }
+        do {
+            try discardItem(URL(fileURLWithPath: path))
+        } catch {
+            failures.append(path)
+        }
+        guard failures.isEmpty else {
+            throw OreCoreError.projectFilesNotTrashed(failures)
+        }
+    }
+
     private func workspaceAndGit(_ id: WorkspaceID) async throws -> (WorkspaceRecord, GitClient, URL) {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
@@ -2067,7 +2157,7 @@ private extension CoreCommand {
         case .approveRepositoryScripts(let approval),
              .declineRepositoryScripts(let approval):
             return approval.workspaceID
-        case .addRepository, .createProject, .createWorkspace, .probeHarnesses,
+        case .addRepository, .createProject, .deleteProject, .createWorkspace, .probeHarnesses,
              .checkHarnessUpdates,
              .resolveAssistantConfirmation, .updateDreamSettings,
              .updateDreamEnvironment, .startDreamRun, .abortDreamRun,

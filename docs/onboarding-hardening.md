@@ -71,6 +71,21 @@ What passing CI does **not** cover, and what is therefore still unverified:
   makes it a broken download (`.failed`, retryable) rather than a broken Mac,
   and `install()` removes those directories before fetching so the download
   has something to replace.
+
+  Both halves are scoped to this voice: only its required models, by name,
+  inside `Models/pocket-tts/v2.1/english`. The first version scanned the whole
+  shared `~/.cache/fluidaudio` root, so another backend's download in progress
+  could clear the install flag, turn a genuine `.unsupported` into a retry
+  that never works, and be deleted by this voice's Download button. It also
+  cleared before every fetch, which threw away the `.partial` a cancelled
+  download resumes from. Read against FluidAudio at the pinned revision,
+  `ensureModels` skips the fetch only when every required entry exists, and
+  otherwise resumes each `.partial` — so clearing now happens only in the
+  skip case, the one where it is needed. `NeuralVoiceCacheIntegrationTests`
+  holds both claims against the real downloader on a clone of the installed
+  pack (opt-in: `ORE_FLUIDAUDIO_INTEGRATION=1`); the resume case logs
+  "Resuming … from byte N". A cancel landing in the last missing model is
+  still the skip case, and that one model's partial is lost.
 - **Two new costs on the startup path are unprofiled**: the PATH walk for
   shadowed copies now runs on every probe of every harness, and an activation
   re-probe discards the login-shell PATH cache. The re-probe is bounded to

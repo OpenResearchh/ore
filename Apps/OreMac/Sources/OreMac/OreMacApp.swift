@@ -245,7 +245,17 @@ struct OreMacApp: App {
             // Match the combined pane minimums while leaving enough room for a
             // real navigation sidebar; narrower windows collapse columns using
             // NavigationSplitView instead of crushing labels and controls.
-            .frame(minWidth: 1_080, minHeight: 650)
+            //
+            // The height floor is lower than it looks like it should be, and
+            // deliberately so: a minimum on the root of a `WindowGroup`
+            // constrains the *content view*, not the window. Where the window
+            // is shorter than the floor — a tiled half-screen, a display whose
+            // visible frame is smaller than the app assumed — SwiftUI still
+            // lays the root out at the floor and centres it, so the overflow
+            // is clipped off the top and the bottom at once. That takes the
+            // tab strips with it at one end and the sidebar's control bar at
+            // the other, which is a far worse failure than a cramped window.
+            .frame(minWidth: 1_080, minHeight: 560)
             .task {
                 // First, ahead of anything that can await on the user: this
                 // settles whatever the last launch staged, so an update that
@@ -270,7 +280,15 @@ struct OreMacApp: App {
                 if !updater.isConfigured { await githubUpdater.check() }
             }
         }
-        .defaultSize(width: 1_320, height: 820)
+        // Sized to fit the smallest screen ORE is likely to open on rather
+        // than the largest it looks good on. A 13" MacBook Air runs 1280x800
+        // points by default, which leaves about 775 once the menu bar has its
+        // share — so the old 1320x820 was wider *and* taller than the space it
+        // was being asked to appear in, and the first launch on one of those
+        // put the composer and the sidebar's controls below the bottom of the
+        // screen. Anything larger is a window the user has resized, and that
+        // is remembered.
+        .defaultSize(width: 1_200, height: 740)
         .commands {
             CommandGroup(replacing: .newItem) {
                 // ⌘N spins up a fresh worktree in the current tab's project;
@@ -877,7 +895,8 @@ struct RootView: View {
                         ChatPane(workspace: workspace)
                             .frame(
                                 width: max(0, geometry.size.width - resolvedReviewWidth - 5),
-                                height: geometry.size.height
+                                height: geometry.size.height,
+                                alignment: .top
                             )
                             .clipped()
                         reviewResizeHandle
@@ -896,7 +915,22 @@ struct RootView: View {
                             )
                             .padding(.vertical, OreTheme.Space.sm)
                             .padding(.trailing, OreTheme.Space.sm)
-                            .frame(width: resolvedReviewWidth, height: geometry.size.height)
+                            // Top, not the default centre — the same lesson
+                            // `ChatPane` already learned about its own stack.
+                            // The inspector's fixed chrome (tab row, stack
+                            // strip, ship status) can add up to more than a
+                            // short pane has, and a centred overflow spills
+                            // at *both* ends: the tab row loses its top to
+                            // the pane's edge, and on a shorter window the
+                            // whole row is carried outside the card. Anchored
+                            // here, the overflow goes one way, and it is the
+                            // status strip at the bottom that gives, not the
+                            // navigation at the top.
+                            .frame(
+                                width: resolvedReviewWidth,
+                                height: geometry.size.height,
+                                alignment: .top
+                            )
                             .clipped()
                     }
                 } else {
@@ -907,7 +941,7 @@ struct RootView: View {
             // to a lone detail child. Pinning the workspace to the actual
             // viewport prevents an infinitely-flexible empty state from
             // centring a much taller view and pushing tabs/composer offscreen.
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             .clipped()
         }
     }

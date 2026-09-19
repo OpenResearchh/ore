@@ -749,16 +749,27 @@ private struct SidebarNarrationNotice: View {
     var body: some View {
         let notice = model.narration.neuralVoiceNotice
         if let notice, notice != dismissed {
-            HStack(alignment: .top, spacing: OreTheme.Space.sm) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: OreTheme.Font.caption))
-                    .foregroundStyle(.orange)
-                Text(notice.message)
-                    .font(.system(size: OreTheme.Font.caption))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                VStack(alignment: .trailing, spacing: 2) {
+            // Prose on its own row, controls under it. Sharing a row with the
+            // buttons left the sentence about a third of an already narrow
+            // column to wrap in, and the height `safeAreaInset` reserves for
+            // this is measured from that wrap: it reserved one line and the
+            // notice needed six, so everything below — including the control
+            // bar with the settings gear — was laid out off the bottom of the
+            // window. Full width plus a line cap keeps the reservation honest
+            // however long a future message gets.
+            VStack(alignment: .leading, spacing: OreTheme.Space.xs) {
+                HStack(alignment: .top, spacing: OreTheme.Space.xs) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(.orange)
+                    Text(notice.message)
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                HStack(spacing: OreTheme.Space.sm) {
                     // No button when the notice carries no title: that is the
                     // case where a retry loads the same files on the same
                     // hardware to the same end.
@@ -767,6 +778,7 @@ private struct SidebarNarrationNotice: View {
                             .buttonStyle(.link)
                             .font(.system(size: OreTheme.Font.caption, weight: .medium))
                     }
+                    Spacer(minLength: 0)
                     Button { dismissed = notice } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .semibold))

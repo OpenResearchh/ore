@@ -96,7 +96,13 @@ public actor InProcessCoreClient: CoreClient {
         self.worktreeRoot = worktreeRoot
         self.allowAPIKeyFallback = allowAPIKeyFallback
         self.discardItem = discardItem ?? { url in
+            #if os(macOS)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            #else
+            // No Trash to recover from, so nothing is deleted outright: the
+            // project leaves ORE and the error names what stayed on disk.
+            throw CocoaError(.featureUnsupported)
+            #endif
         }
 
         let (stream, continuation) = AsyncStream<CoreEvent>.makeStream(

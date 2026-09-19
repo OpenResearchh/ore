@@ -220,6 +220,12 @@ struct OreMacApp: App {
                     )
                 }
                 recorder.install(telemetry.recorder)
+                // Sends the backlog now and the queue every few minutes after;
+                // without it nothing recorded ever left the Mac. Loose on
+                // purpose, so it rides along with other wake-ups.
+                await recorder.deliverPeriodically(
+                    every: .seconds(300), tolerance: .seconds(60)
+                )
             }
         }
         // A launch can show no window at all (the menu bar keeps ORE alive),

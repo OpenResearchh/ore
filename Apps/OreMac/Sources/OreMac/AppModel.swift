@@ -454,6 +454,7 @@ final class AppModel {
         // Last chance to get an unsent draft to disk, and it has to complete
         // before the core below us shuts down.
         await flushPendingDraftsAwaitingWrites()
+        await flushTelemetryBriefly()
         eventTask?.cancel()
         flushTask?.cancel()
         fleetTickTask?.cancel()
@@ -462,6 +463,28 @@ final class AppModel {
         for task in continuationTasks.values { task.cancel() }
         continuationTasks.removeAll()
         await client.shutdown()
+    }
+
+    /// One attempt to send this session's events on the way out, capped so
+    /// a slow network never holds up the quit. Whatever misses it stays
+    /// queued on disk and goes with the next launch's first delivery.
+    ///
+    /// Raced rather than grouped: a task group waits for every child, and a
+    /// URL request does not stop for cancellation, so a group would wait out
+    /// the full request timeout anyway.
+    private func flushTelemetryBriefly() async {
+        let telemetry = telemetry
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            let gate = TerminationGate { done.resume() }
+            Task { @MainActor in
+                await telemetry.flush()
+                gate.reply()
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                gate.reply()
+            }
+        }
     }
 
     // MARK: - Harness usage

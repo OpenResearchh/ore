@@ -251,6 +251,14 @@ struct OreMacApp: App {
             // Match the combined pane minimums while leaving enough room for a
             // real navigation sidebar; narrower windows collapse columns using
             // NavigationSplitView instead of crushing labels and controls.
+            //
+            // A minimum on the root of a `WindowGroup` constrains the *content
+            // view*, not the window. Where the window is shorter than the
+            // floor — a tiled half-screen, a small display on Larger Text —
+            // SwiftUI still lays the root out at the floor and centres it, so
+            // the overflow is clipped off the top and the bottom at once. The
+            // floor is therefore held to the smallest screen a supported Mac
+            // offers; see `WindowMetrics` and `LayoutMatrixTests`.
             .frame(
                 minWidth: WindowMetrics.minimumContent.width,
                 minHeight: WindowMetrics.minimumContent.height
@@ -279,6 +287,11 @@ struct OreMacApp: App {
                 if !updater.isConfigured { await githubUpdater.check() }
             }
         }
+        // Sized to fit the smallest screen ORE is likely to open on rather
+        // than the largest it looks good on: 1320x820 was wider and taller
+        // than a 13" MacBook's visible frame, so a first launch there put the
+        // composer and the sidebar's controls below the screen. Anything
+        // larger is a window the user resized, and that is remembered.
         .defaultSize(WindowMetrics.defaultWindow)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -888,7 +901,8 @@ struct RootView: View {
                         ChatPane(workspace: workspace)
                             .frame(
                                 width: max(0, geometry.size.width - resolvedReviewWidth - 5),
-                                height: geometry.size.height
+                                height: geometry.size.height,
+                                alignment: .top
                             )
                             .clipped()
                         reviewResizeHandle
@@ -907,7 +921,22 @@ struct RootView: View {
                             )
                             .padding(.vertical, OreTheme.Space.sm)
                             .padding(.trailing, OreTheme.Space.sm)
-                            .frame(width: resolvedReviewWidth, height: geometry.size.height)
+                            // Top, not the default centre — the same lesson
+                            // `ChatPane` already learned about its own stack.
+                            // The inspector's fixed chrome (tab row, stack
+                            // strip, ship status) can add up to more than a
+                            // short pane has, and a centred overflow spills
+                            // at *both* ends: the tab row loses its top to
+                            // the pane's edge, and on a shorter window the
+                            // whole row is carried outside the card. Anchored
+                            // here, the overflow goes one way, and it is the
+                            // status strip at the bottom that gives, not the
+                            // navigation at the top.
+                            .frame(
+                                width: resolvedReviewWidth,
+                                height: geometry.size.height,
+                                alignment: .top
+                            )
                             .clipped()
                     }
                 } else {
@@ -918,7 +947,7 @@ struct RootView: View {
             // to a lone detail child. Pinning the workspace to the actual
             // viewport prevents an infinitely-flexible empty state from
             // centring a much taller view and pushing tabs/composer offscreen.
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             .clipped()
         }
     }

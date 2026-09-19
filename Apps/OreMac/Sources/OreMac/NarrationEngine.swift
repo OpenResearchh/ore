@@ -221,19 +221,25 @@ final class NarrationEngine {
             // fetch reports itself in Settings, which is where it was asked
             // for.
             return nil
+        // Short enough to wrap inside a sidebar. These used to carry the raw
+        // vendor error too, which in a 230 pt column ran to six lines of
+        // caption text — and `safeAreaInset` reserved one line's height for
+        // it, so the notice and the control bar under it were laid out past
+        // the bottom of the window. The detail is still shown in Settings,
+        // which is the pane with room for it.
         case .notInstalled:
             return NeuralVoiceNotice(
-                message: "The neural voice isn't downloaded, so narration is using the system voice.",
+                message: "Neural voice not downloaded — using the system voice.",
                 retryTitle: "Download"
             )
-        case .failed(let detail):
+        case .failed:
             return NeuralVoiceNotice(
-                message: "The neural voice couldn't be installed, so narration is using the system voice. \(detail)",
+                message: "Neural voice couldn't be installed — using the system voice.",
                 retryTitle: "Try again"
             )
-        case .unsupported(let detail):
+        case .unsupported:
             return NeuralVoiceNotice(
-                message: "This Mac can't run the neural voice, so narration will use the system voice. \(detail)",
+                message: "This Mac can't run the neural voice — using the system voice.",
                 retryTitle: nil
             )
         }

@@ -799,7 +799,11 @@ struct NeuralVoiceInstallFlagTests {
     @Test func aMissingVendorCacheRootRetiresTheInstalledFlag() {
         // Nothing can be cached under a root that isn't there, so this is the
         // one direction the inference is sound in.
-        #expect(NeuralNarrationVoice.installFlagIsStale(vendorCacheRootExists: false))
+        #expect(
+            NeuralNarrationVoice.installFlagIsStale(
+                vendorCacheRootExists: false, hasIncompleteModels: false
+            )
+        )
     }
 
     @Test func aPresentVendorCacheRootIsNotTakenAsProofOfAnything() {
@@ -807,7 +811,98 @@ struct NeuralVoiceInstallFlagTests {
         // exists says nothing about these weights. Believing the flag costs at
         // worst one press of the Download button; disbelieving it wrongly
         // would cost 940 MB unasked, which is the bug.
-        #expect(!NeuralNarrationVoice.installFlagIsStale(vendorCacheRootExists: true))
+        #expect(
+            !NeuralNarrationVoice.installFlagIsStale(
+                vendorCacheRootExists: true, hasIncompleteModels: false
+            )
+        )
+    }
+
+    /// The second kind of proof: not "the layout might be incomplete" but "a
+    /// model directory has no manifest", which CoreML refuses outright.
+    @Test func anUnloadableModelRetiresTheInstalledFlagToo() {
+        #expect(
+            NeuralNarrationVoice.installFlagIsStale(
+                vendorCacheRootExists: true, hasIncompleteModels: true
+            )
+        )
+    }
+}
+
+/// Unit 20: a download that stopped partway left `mimi_decoder.mlmodelc`
+/// holding only `analytics/` and `weights/`. CoreML refused it with "Compile
+/// the model with Xcode", the app read that as hardware and said "This Mac
+/// can't run the neural voice", and FluidAudio saw a directory already there
+/// and never refetched — so the state never cleared.
+@MainActor
+struct NeuralVoiceIncompleteDownloadTests {
+    /// Builds a cache tree and returns its root; each model is a directory of
+    /// the named files.
+    private func makeCache(_ models: [String: [String]]) throws -> URL {
+        let root = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        for (model, files) in models {
+            let directory = root
+                .appendingPathComponent("Models/pocket-tts/v2.1/english", isDirectory: true)
+                .appendingPathComponent(model, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+            for file in files {
+                let url = directory.appendingPathComponent(file)
+                if file.hasSuffix("/") {
+                    try FileManager.default.createDirectory(
+                        at: url, withIntermediateDirectories: true
+                    )
+                } else {
+                    try Data().write(to: url)
+                }
+            }
+        }
+        return root
+    }
+
+    @Test func aModelMissingItsManifestIsReportedIncomplete() throws {
+        let root = try makeCache([
+            "flowlm_step.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
+            "mimi_decoder.mlmodelc": ["analytics/", "weights/"],
+        ])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let incomplete = NeuralNarrationVoice.incompleteCompiledModels(under: root)
+        #expect(incomplete.map(\.lastPathComponent) == ["mimi_decoder.mlmodelc"])
+    }
+
+    /// Model types differ in what sits beside the manifest — an ML Program has
+    /// `model.mil`, a neural network has `model.espresso.net` — so only the
+    /// manifest may be required.
+    @Test func aCompletePackReportsNothing() throws {
+        let root = try makeCache([
+            "program.mlmodelc": ["coremldata.bin", "model.mil", "weights/"],
+            "espresso.mlmodelc": ["coremldata.bin", "model.espresso.net"],
+        ])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: root).isEmpty)
+    }
+
+    /// A model's own contents are its business. Walking into them would be
+    /// both slow and a second, weaker guess about a vendor's layout.
+    @Test func whatIsInsideACompleteModelIsNotInspected() throws {
+        let root = try makeCache([
+            "outer.mlmodelc": ["coremldata.bin"],
+        ])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nested = root
+            .appendingPathComponent("Models/pocket-tts/v2.1/english/outer.mlmodelc")
+            .appendingPathComponent("weights/nested.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: root).isEmpty)
+    }
+
+    @Test func aCacheThatWasNeverCreatedIsNotAFailure() {
+        let missing = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        #expect(NeuralNarrationVoice.incompleteCompiledModels(under: missing).isEmpty)
     }
 }
 
@@ -941,18 +1036,41 @@ struct NeuralVoiceFailureClassificationTests {
         #expect(readiness.installActionTitle == "Try again")
     }
 
-    /// A load breaks with the weights already on disk, so the retry would feed
+    /// A load breaks with *complete* weights on disk, so the retry would feed
     /// the same files to the same runtime on the same machine.
-    @Test func aBrokenLoadIsThisMacSayingNo() {
-        let readiness = NeuralNarrationVoice.loadFailure(coreMLFailure)
+    @Test func aBrokenLoadOnCompleteWeightsIsThisMacSayingNo() {
+        let readiness = NeuralNarrationVoice.loadFailure(
+            coreMLFailure, modelsAreComplete: true
+        )
         #expect(readiness == .unsupported("Error in declaring network."))
         #expect(readiness.installActionTitle == nil)
+    }
+
+    /// The same throw with a half-written model on disk is a broken download,
+    /// and blaming the Mac for it is both wrong and a dead end — this is the
+    /// state that left a working Mac permanently on the system voice.
+    @Test func aBrokenLoadOnAHalfWrittenModelStaysRetryable() {
+        let readiness = NeuralNarrationVoice.loadFailure(
+            coreMLFailure, modelsAreComplete: false
+        )
+        #expect(readiness.installActionTitle == "Try again")
+        // CoreML's "Compile the model with Xcode" describes a build-time
+        // mistake the user can do nothing about, so it is not what they read.
+        guard case .failed(let message) = readiness else {
+            Issue.record("expected a retryable failure, got \(readiness)")
+            return
+        }
+        #expect(!message.contains("Xcode"))
     }
 
     /// Pressing Cancel is not a failure to report back at the user.
     @Test func cancellationIsNotAFailure() {
         #expect(NeuralNarrationVoice.fetchFailure(CancellationError()) == .notInstalled)
-        #expect(NeuralNarrationVoice.loadFailure(CancellationError()) == .notInstalled)
+        #expect(
+            NeuralNarrationVoice.loadFailure(
+                CancellationError(), modelsAreComplete: true
+            ) == .notInstalled
+        )
         // URLSession reports the torn-down task its own way.
         #expect(NeuralNarrationVoice.fetchFailure(URLError(.cancelled)) == .notInstalled)
     }
@@ -996,7 +1114,24 @@ struct NeuralVoiceNoticeTests {
         // Which voice is actually talking is the part the user can hear and
         // cannot otherwise account for.
         #expect(notice?.message.contains("system voice") == true)
-        #expect(notice?.message.contains("no network") == true)
+    }
+
+    /// These render in the sidebar, where the column is ~230 pt wide and the
+    /// height they take is what `safeAreaInset` reserves. Appending the raw
+    /// vendor error ran one of them to six wrapped lines and pushed the
+    /// control bar below it off the bottom of the window; the detail belongs
+    /// in Settings, which has the room. Length is the property that broke, so
+    /// length is what is checked.
+    @Test func everyNoticeStaysShortEnoughForTheSidebar() {
+        let every: [NeuralNarrationVoice.Readiness] = [
+            .notInstalled,
+            .failed(String(repeating: "vendor error detail ", count: 20)),
+            .unsupported(String(repeating: "no Metal device ", count: 20)),
+        ]
+        for readiness in every {
+            let notice = NarrationEngine.neuralVoiceNotice(for: .neural, readiness: readiness)
+            #expect(notice?.message.count ?? 0 <= 80, "too long for the sidebar: \(readiness)")
+        }
     }
 
     @Test func aMacThatCannotRunItIsToldSoWithoutAButton() {

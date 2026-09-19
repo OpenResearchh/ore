@@ -335,6 +335,71 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// wrong the other way costs 940 MB nobody asked for.
     private static let vendorCacheRoot = ".cache/fluidaudio"
 
+    /// The one file every compiled CoreML model carries.
+    ///
+    /// A `.mlmodelc` is a directory, and its contents vary by model type — an
+    /// ML Program has `model.mil`, a neural network has `model.espresso.net`
+    /// — but all of them have this manifest, and CoreML will not open a
+    /// directory without it. So its absence is not a guess about a model
+    /// being broken: it is the exact condition the loader refuses on.
+    nonisolated static let compiledModelManifest = "coremldata.bin"
+
+    /// A download that stopped partway leaves the directory behind.
+    ///
+    /// Seen in the wild as `mimi_decoder.mlmodelc` holding only `analytics/`
+    /// and `weights/`: the fetch died before the manifest landed. CoreML then
+    /// reports it as "Unable to load model … Compile the model with Xcode",
+    /// which reads like the app shipped the wrong file and sent the whole
+    /// thing to `.unsupported` — "This Mac can't run the neural voice" on a
+    /// Mac that runs it fine. Meanwhile FluidAudio sees a directory already
+    /// in place and never refetches, so the state was permanent.
+    ///
+    /// This is the narrowest check that catches it: directory named
+    /// `.mlmodelc`, no manifest inside. Nothing else is inspected and nothing
+    /// else is ever removed.
+    nonisolated static func incompleteCompiledModels(
+        under root: URL,
+        fileManager: FileManager = .default
+    ) -> [URL] {
+        guard let walk = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        var incomplete: [URL] = []
+        for case let url as URL in walk {
+            guard url.pathExtension == "mlmodelc" else { continue }
+            // Whatever is under a model directory, complete or not, is the
+            // model's own business — the manifest is the only thing read.
+            walk.skipDescendants()
+            let manifest = url.appendingPathComponent(compiledModelManifest)
+            if !fileManager.fileExists(atPath: manifest.path) { incomplete.append(url) }
+        }
+        return incomplete
+    }
+
+    /// Clears half-written models so the next fetch replaces them, and says
+    /// whether anything had to go.
+    ///
+    /// Deleting inside a vendor cache is a bigger step than reading one, and
+    /// it is taken only for directories CoreML has already refused: an
+    /// unloadable `.mlmodelc` is worth exactly nothing to keep, and removing
+    /// it is what turns "stuck forever" back into "the download resumes".
+    private nonisolated static func removeIncompleteModels() {
+        for model in incompleteCompiledModels(under: vendorCacheDirectory()) {
+            try? FileManager.default.removeItem(at: model)
+        }
+    }
+
+    private nonisolated static func hasIncompleteModels() -> Bool {
+        !incompleteCompiledModels(under: vendorCacheDirectory()).isEmpty
+    }
+
+    private nonisolated static func vendorCacheDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(vendorCacheRoot)
+    }
+
     /// The exact language pack this voice fetches and loads.
     ///
     /// Held in one place because two calls now have to agree on it:
@@ -501,18 +566,26 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// Download button back.
     var wasInstalledPreviously: Bool {
         guard UserDefaults.standard.bool(forKey: Self.installedKey) else { return false }
-        guard Self.installFlagIsStale(vendorCacheRootExists: Self.hasVendorCacheRoot())
-        else { return true }
+        guard Self.installFlagIsStale(
+            vendorCacheRootExists: Self.hasVendorCacheRoot(),
+            hasIncompleteModels: Self.hasIncompleteModels()
+        ) else { return true }
         UserDefaults.standard.set(false, forKey: Self.installedKey)
         return false
     }
 
     /// Whether a stored install flag has been outlived by its weights.
     ///
-    /// One-directional on purpose — see `vendorCacheRoot`. Absence is proof;
-    /// presence is not evidence of anything.
-    nonisolated static func installFlagIsStale(vendorCacheRootExists: Bool) -> Bool {
-        !vendorCacheRootExists
+    /// Still one-directional on the root — see `vendorCacheRoot`. Absence is
+    /// proof; presence is not evidence of anything. A model directory with no
+    /// manifest is the second kind of proof: not "something may be missing"
+    /// but "CoreML will refuse this", which makes the flag a lie however it
+    /// got written.
+    nonisolated static func installFlagIsStale(
+        vendorCacheRootExists: Bool,
+        hasIncompleteModels: Bool
+    ) -> Bool {
+        !vendorCacheRootExists || hasIncompleteModels
     }
 
     private static func hasVendorCacheRoot() -> Bool {
@@ -562,8 +635,9 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// 940 MB behind a spinner. Running the downloader first — with exactly
     /// the pack the manager is built for — buys a real percentage and leaves
     /// `initialize()` as a pure load off the cache that just filled. It also
-    /// separates the two failures: a fetch that broke is worth retrying, a
-    /// load that broke will break the same way on the same hardware forever.
+    /// separates the two failures: a fetch that broke is worth retrying, and a
+    /// load that broke is read against the weights on disk — see
+    /// `loadFailure(_:modelsAreComplete:)`.
     func install() {
         guard readiness != .ready, installTask == nil else { return }
         if case .unsupported = readiness { return }
@@ -594,6 +668,14 @@ final class NeuralNarrationVoice: NarrationVoice {
         }
         installTask = Task { [weak self] in
             guard let self else { return }
+            // Before the fetch, not after it: FluidAudio decides what to
+            // download from what is already on disk, and a directory left
+            // behind by an interrupted download looks finished to it. Clearing
+            // the unloadable ones is what puts them back on the fetch list —
+            // and only those, so a complete pack costs one directory scan.
+            await Task.detached(priority: .utility) {
+                NeuralNarrationVoice.removeIncompleteModels()
+            }.value
             do {
                 try await Self.fetchWeights(progress: onProgress)
             } catch {
@@ -606,7 +688,10 @@ final class NeuralNarrationVoice: NarrationVoice {
             do {
                 try await self.manager.initialize()
             } catch {
-                self.finishInstall(with: Self.loadFailure(error), generation: generation)
+                self.finishInstall(
+                    with: Self.loadFailure(error, modelsAreComplete: !Self.hasIncompleteModels()),
+                    generation: generation
+                )
                 return
             }
             self.finishInstall(with: .ready, generation: generation)
@@ -661,13 +746,32 @@ final class NeuralNarrationVoice: NarrationVoice {
         wasCancelled(error) ? .notInstalled : .failed(error.localizedDescription)
     }
 
-    /// A load that broke with the weights already on disk. Retrying feeds the
-    /// same files to the same CoreML runtime on the same machine: a VM or a
-    /// headless session with no Metal device fails here every time. Saying so
-    /// once beats a "Try again" that can only ever fail.
-    nonisolated static func loadFailure(_ error: Error) -> Readiness {
-        wasCancelled(error) ? .notInstalled : .unsupported(error.localizedDescription)
+    /// A load that broke with the weights already on disk.
+    ///
+    /// Which of the two failures it is turns entirely on whether those
+    /// weights are whole. Complete weights that will not load are the machine
+    /// saying no — a VM or a headless session with no Metal device fails here
+    /// every time — and retrying feeds the same files to the same runtime to
+    /// the same end, so `.unsupported` says it once instead of offering a
+    /// button that can only disappoint. Weights with a model directory
+    /// missing its manifest are the opposite: nothing is wrong with the Mac,
+    /// a download stopped partway, and another press is precisely the fix.
+    nonisolated static func loadFailure(
+        _ error: Error,
+        modelsAreComplete: Bool
+    ) -> Readiness {
+        if wasCancelled(error) { return .notInstalled }
+        guard modelsAreComplete else { return .failed(incompleteDownloadMessage) }
+        return .unsupported(error.localizedDescription)
     }
+
+    /// CoreML's own wording for this — "Compile the model with Xcode or
+    /// `MLModel.compileModel(at:)`" — describes a mistake the app would have
+    /// had to make at build time, and there is nothing a user can do with it.
+    /// Name the thing that actually happened instead.
+    nonisolated static let incompleteDownloadMessage =
+        "Part of the voice download is missing or damaged. Trying again "
+        + "re-fetches only what is incomplete."
 
     /// Cancellation arrives as `CancellationError` from our own checks and as
     /// `URLError.cancelled` from the download task URLSession tore down.

@@ -41,19 +41,36 @@ by none of them. Nothing the agents wrote failed to build.
 What passing CI does **not** cover, and what is therefore still unverified:
 
 - **Every new piece of SwiftUI has compiled but nobody has looked at it.**
-  The sidebar narration notice, the HUD failure pill (a long denial message in
-  a fixed-height pill), the Settings login-item, notification and shadowed-copy
-  rows, the composer's voice error row, and the failed-update card. Layout,
-  truncation and overflow are unchecked.
+  The HUD failure pill (a long denial message in a fixed-height pill), the
+  Settings login-item, notification and shadowed-copy rows, the composer's
+  voice error row, and the failed-update card. Layout, truncation and overflow
+  are unchecked.
+
+  The sidebar narration notice came off this list the way the list predicted
+  it would. Its message shared a row with the Download and dismiss buttons, so
+  in a 230 pt column the sentence had about a third of the width to wrap in
+  and ran to six lines — and the height `safeAreaInset` reserved for it was
+  one. The notice and the control bar below it were laid out past the bottom
+  of the window, taking the settings gear with them. Now: prose on its own
+  full-width row, controls under it, `lineLimit(3)`, and the vendor detail
+  left to Settings. Still nobody has looked at it.
 - **The disk-space floors are judgement calls.** 1 GB for a CLI update, 1.2 GB
   for the neural voice, neither measured against a real install. Both refuse
   work a tighter machine might have completed.
 - **`isUnknownSubcommand` is a heuristic.** Bounded to self-update plans for
   harnesses whose `update` subcommand is unconfirmed — never Claude Code — so
   a false positive costs one extra run of the vendor installer.
-- **`.unsupported` over-claims for corrupt weights.** A load that fails because
-  the model is damaged is reported as hardware that cannot run it, and the
-  retry is a no-op in that case. The two are indistinguishable from the error.
+- ~~**`.unsupported` over-claims for corrupt weights.**~~ Fixed, and it was
+  not hypothetical: a fetch died leaving `mimi_decoder.mlmodelc` holding only
+  `analytics/` and `weights/`, CoreML refused it with "Compile the model with
+  Xcode", and an M-series Mac on macOS 26 was told it could not run the neural
+  voice — permanently, since `.unsupported` carries no retry and FluidAudio
+  saw a directory already in place. The two are indeed indistinguishable from
+  the error, so the error is no longer what decides: the weights on disk are.
+  A `.mlmodelc` with no `coremldata.bin` is one CoreML will refuse, which
+  makes it a broken download (`.failed`, retryable) rather than a broken Mac,
+  and `install()` removes those directories before fetching so the download
+  has something to replace.
 - **Two new costs on the startup path are unprofiled**: the PATH walk for
   shadowed copies now runs on every probe of every harness, and an activation
   re-probe discards the login-shell PATH cache. The re-probe is bounded to
@@ -61,7 +78,18 @@ What passing CI does **not** cover, and what is therefore still unverified:
 - **The vendor cache check is one-directional by design.** A missing
   `~/.cache/fluidaudio` proves nothing is cached; its presence proves only that
   some backend downloaded something. Verified against FluidAudio at the
-  revision `Package.resolved` pins.
+  revision `Package.resolved` pins. There is now a second check alongside it
+  that runs the other way and is equally sound: a `.mlmodelc` without its
+  manifest is not "possibly incomplete" but "will be refused", so it retires
+  the install flag too.
+
+- **Window sizing was tuned on a large display.** The default 1320x820 was
+  wider and taller than a 13" MacBook Air's 1280x800, so a first launch there
+  put the composer and the sidebar's controls below the bottom of the screen;
+  it is now 1200x740. The root's `minHeight` came down from 650 to 560 for a
+  related reason: a minimum on the root of a `WindowGroup` constrains the
+  content view rather than the window, and a window shorter than the floor
+  gets the overflow clipped off both ends at once. Unmeasured on a real 13".
 
 ---
 

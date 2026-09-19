@@ -1738,6 +1738,8 @@ public actor WorkspaceEngine {
 
     public func rerunFailedChecks() async throws {
         try await gitHub.rerunFailedChecks(forBranch: record.branch)
+        // The remembered rollup still says "failed"; the next read must ask.
+        await gitHub.forgetCachedPullRequests()
     }
 
     public func checkLog(named name: String) async -> String? {

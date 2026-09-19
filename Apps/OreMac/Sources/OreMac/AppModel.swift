@@ -2832,7 +2832,13 @@ final class AppModel {
     }
 
     func rerunFailedChecks(_ id: WorkspaceID) {
-        Task { await client.send(.rerunFailedChecks(id)) }
+        Task {
+            await client.send(.rerunFailedChecks(id))
+            // GitHub takes a moment to queue the new runs; asking at once
+            // would read the old failure straight back.
+            try? await Task.sleep(for: .seconds(3))
+            await refreshChecks(for: id)
+        }
     }
 
     func retryLastTurn(in workspaceID: WorkspaceID, chatID: ChatID? = nil) {
@@ -3223,6 +3229,18 @@ final class AppModel {
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
         diffCache.state(for: workspaceID).store(snapshot)
+    }
+
+    /// Re-reads the pull request live, then recomputes the toolbar from it.
+    ///
+    /// `refreshGitAction` reads through a 60s PR cache, which is right for
+    /// turn boundaries but not for CI: "Checks running" would sit up to a
+    /// minute past the run it describes. The live read refills that cache,
+    /// so the recompute after it sees what GitHub says now.
+    func refreshChecks(for workspaceID: WorkspaceID) async {
+        guard isBackgroundPollingEnabled else { return }
+        _ = await loadPullRequestStatus(for: workspaceID)
+        await refreshGitAction(for: workspaceID)
     }
 
     /// Best-effort background warm-up of a workspace's diff so a later switch is

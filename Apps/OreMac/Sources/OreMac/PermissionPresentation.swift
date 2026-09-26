@@ -130,12 +130,17 @@ struct PermissionPresentation: Equatable {
         case "NotebookEdit": return "Edit a notebook"
         case "Glob": return "Find files"
         case "Grep": return "Search file contents"
+        case "Skill": return "Use a skill"
         case "WebFetch": return "Fetch a web page"
         case "WebSearch": return "Search the web"
         case "Task", "Agent": return "Run a subagent"
         case "ExitPlanMode": return "Start on the plan"
         case "CreatePlan": return "Save the plan"
-        default: return nil
+        default:
+            if let web = ToolWebActivity.classify(tool: tool, input: nil) {
+                return web.kind == .fetch ? "Fetch a web page" : "Search the web"
+            }
+            return ToolMCPActivity.actionName(for: tool)
         }
     }
 
@@ -149,18 +154,23 @@ struct PermissionPresentation: Equatable {
         func field(_ key: String) -> String? { input[key]?.stringValue.flatMap(nonEmpty) }
         switch tool {
         case "Bash": return field("command")
-        case "BashOutput", "KillShell", "KillBash": return field("shell_id") ?? field("bash_id")
+        case "BashOutput", "KillShell", "KillBash":
+            return field("command") ?? field("shell_id") ?? field("bash_id")
         case "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "LS", "Delete", "ReadLints":
             return field("file_path") ?? field("path") ?? field("notebook_path")
         case "Glob", "Grep":
             guard let pattern = field("pattern") else { return field("path") }
             guard let path = field("path") else { return pattern }
             return "\(pattern) in \(path)"
-        case "WebFetch": return field("url")
-        case "WebSearch": return field("query")
+        case "WebFetch": return ToolWebActivity.url(from: input) ?? field("url")
+        case "WebSearch": return ToolWebActivity.query(from: input) ?? field("query")
+        case "Skill":
+            return field("skill") ?? field("command") ?? field("name")
         case "Task", "Agent": return field("description")
         case "ExitPlanMode", "CreatePlan": return field("name") ?? field("title")
-        default: return nil
+        default:
+            return ToolWebActivity.classify(tool: tool, input: input)?.subject
+                ?? ToolMCPActivity.classify(tool: tool, input: input)?.subject
         }
     }
 

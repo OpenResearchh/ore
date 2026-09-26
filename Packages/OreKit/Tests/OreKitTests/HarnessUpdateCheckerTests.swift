@@ -68,6 +68,11 @@ struct HarnessUpdateCheckerTests {
             HarnessUpdateChecker.source(for: .cursorAgent, executablePath: nil)
                 == .cursorInstallScript
         )
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .cursorAgent, executablePath: "/Users/me/.local/bin/agent"
+            ) == .cursorInstallScript
+        )
     }
 
     @Test func selfUpdatingCLIsStillReadTheirRegistryForTheVersion() {
@@ -79,17 +84,23 @@ struct HarnessUpdateCheckerTests {
         )
     }
 
-    /// cursor-agent is the one harness with no Homebrew formula ORE knows, so
-    /// a brew-prefix install of it fell through to the vendor's install script
-    /// — a channel that would land a second copy in front of the brew one. No
-    /// channel is the honest answer, and it is what suppresses the card.
-    @Test func brewInstallWithNoFormulaIsNotOfferedTheVendorScript() {
+    /// cursor-agent is the one harness with no Homebrew formula ORE knows.
+    /// The vendor's `curl | bash` would land a second copy in front of the
+    /// brew one, so the *fallback* is suppressed — but the binary's own
+    /// `update` subcommand is safe to try, and is what the card now offers.
+    @Test func brewInstallWithNoFormulaUsesTheBinarysOwnUpdater() {
         #expect(HarnessKind.cursorAgent.brewFormula == nil)
+        let path = "/opt/homebrew/bin/cursor-agent"
+        let plan = HarnessCLIUpdater.plan(
+            for: .cursorAgent, executablePath: path,
+            isBrewAvailable: true, resolve: { $0 }
+        )
+        #expect(plan == .selfUpdate(executablePath: path))
+        #expect(!HarnessCLIUpdater.script(for: plan).contains("cursor.com"))
         #expect(
             HarnessUpdateChecker.source(
-                for: .cursorAgent, executablePath: "/opt/homebrew/bin/cursor-agent",
-                isBrewAvailable: true
-            ) == .unknown
+                for: .cursorAgent, executablePath: path, isBrewAvailable: true
+            ) == .cursorInstallScript
         )
         // A vendor install is still upgradable through the vendor.
         #expect(
@@ -99,18 +110,23 @@ struct HarnessUpdateCheckerTests {
         )
     }
 
-    /// And the card it produces says so rather than advertising a version.
-    @Test func anUnknownChannelReportsThatItCannotTell() async {
+    /// And the card it produces offers the binary's updater, not a second copy.
+    @Test func aHomebrewCursorAgentIsCheckableWithoutTheVendorScript() async {
         let status = await HarnessUpdateChecker.check(
             kind: .cursorAgent,
             installedVersion: "2026.09.02-c22c1a3",
             executablePath: "/opt/homebrew/bin/cursor-agent",
-            fetch: { _ in Issue.record("an unknown channel must not be fetched"); return nil },
+            fetch: Self.serving([
+                "/install": """
+                FINAL_DIR="$HOME/.local/share/cursor-agent/versions/2026.09.03-abc1234"
+                """,
+            ]),
             isBrewAvailable: true
         )
-        #expect(status.latestVersion == nil)
-        #expect(!status.isUpdateAvailable)
-        #expect(status.failure?.contains("can't tell") == true)
+        #expect(status.isUpdateAvailable)
+        #expect(status.updateCommand?.contains("update") == true)
+        #expect(status.updateCommand?.contains("cursor.com") != true)
+        #expect(status.failure == nil)
     }
 
     @Test func homebrewFallsBackToTheFormulaNamespace() {
@@ -213,7 +229,7 @@ struct HarnessUpdateCheckerTests {
         #expect(status.isUpdateAvailable)
         #expect(status.failure == nil)
         // The card tells the user how the upgrade will happen, in their terms.
-        #expect(status.updateCommand == "brew upgrade 'codex'")
+        #expect(status.updateCommand == "brew upgrade --greedy 'codex'")
     }
 
     @Test func matchingVersionsAreNotAnUpdate() async {

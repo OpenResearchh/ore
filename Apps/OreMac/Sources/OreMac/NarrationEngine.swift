@@ -175,11 +175,15 @@ final class NarrationEngine {
         neuralVoice.onEnd = { [weak self] in self?.utteranceEnded() }
         systemVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
         neuralVoice.onProgress = { [weak self] in self?.noteSpokenProgress($1, of: $0) }
-        // No voice load and no ticker here. Both used to start at launch and
-        // ran for the whole session even with narration off: the neural
-        // weights now load on the first line there is to say
-        // (`loadNeuralVoiceIfNeeded`), and the ticker runs only while there is
-        // something for it to do (`ensureTicker`).
+        // No ticker here — it runs only while there is something for it to
+        // do (`ensureTicker`). The neural weights still load lazily when the
+        // user has not chosen them. When they have, and the pack is already
+        // on disk, load now: leaving readiness at `.notInstalled` until the
+        // first spoken line is what put "Neural voice not downloaded" on
+        // every launch of a machine that had already paid the 940 MB.
+        if voiceKind == .neural {
+            loadNeuralVoiceIfNeeded()
+        }
     }
 
     /// Weights already fetched on a previous run load the first time a line is
@@ -207,12 +211,17 @@ final class NarrationEngine {
     /// is heard in the HUD and the sidebar, so the explanation belongs there
     /// too.
     var neuralVoiceNotice: NeuralVoiceNotice? {
-        Self.neuralVoiceNotice(for: voiceKind, readiness: neuralVoice.readiness)
+        Self.neuralVoiceNotice(
+            for: voiceKind,
+            readiness: neuralVoice.readiness,
+            weightsOnDisk: NeuralNarrationVoice.weightsAreComplete()
+        )
     }
 
     static func neuralVoiceNotice(
         for voiceKind: NarrationVoiceKind,
-        readiness: NeuralNarrationVoice.Readiness
+        readiness: NeuralNarrationVoice.Readiness,
+        weightsOnDisk: Bool = false
     ) -> NeuralVoiceNotice? {
         guard voiceKind == .neural else { return nil }
         switch readiness {
@@ -220,6 +229,11 @@ final class NarrationEngine {
             // Nothing is wrong: it is either speaking or on its way. The
             // fetch reports itself in Settings, which is where it was asked
             // for.
+            return nil
+        case .notInstalled where weightsOnDisk:
+            // Weights are present; CoreML just has not loaded them yet.
+            // Calling that "not downloaded" is the prompt that came back
+            // every launch.
             return nil
         // Short enough to wrap inside a sidebar. These used to carry the raw
         // vendor error too, which in a 230 pt column ran to six lines of

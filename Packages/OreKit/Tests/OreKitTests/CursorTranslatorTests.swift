@@ -93,6 +93,20 @@ struct CursorTranslatorTests {
         #expect(byID["sem"]?.input["pattern"]?.stringValue == "hover preview")
     }
 
+    @Test func webFetchCarriesTheUrlEvenWhenCursorSpellsItTargetUrl() {
+        let all = events([
+            #"{"type":"tool_call","subtype":"started","call_id":"wf","tool_call":{"webFetchToolCall":{"args":{"targetUrl":"https://cursor.com/docs"}}}}"#,
+            #"{"type":"tool_call","subtype":"started","call_id":"ws","tool_call":{"webSearchToolCall":{"args":{"search_query":"thinking chips"}}}}"#,
+        ])
+        let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
+        let byID = Dictionary(uniqueKeysWithValues: calls.map { ($0.id.rawValue, $0) })
+        #expect(byID["wf"]?.name == "WebFetch")
+        #expect(byID["wf"]?.input["url"]?.stringValue == "https://cursor.com/docs")
+        #expect(byID["wf"]?.displayName == "https://cursor.com/docs")
+        #expect(byID["ws"]?.name == "WebSearch")
+        #expect(byID["ws"]?.displayName == "thinking chips")
+    }
+
     @Test func createPlanBecomesAPlanProposal() {
         // Cursor writes a plan with CreatePlan and then exits the turn. If that
         // stays a generic tool chip, the user never sees a plan to approve and

@@ -370,6 +370,40 @@ struct MarkdownRenderer {
         return string.attributedSubstring(from: NSRange(location: 0, length: length))
     }
 
+    /// A click on a transcript chip: workspace files stay in ORE, web and
+    /// mail links go to the system. `NSTextView`'s own follow-link path does
+    /// not run for a non-editable view once `clickedOnLink` is implemented, so
+    /// the click handler has to classify the destination itself.
+    enum TranscriptLink: Equatable {
+        case openFile(String)
+        case openURL(URL)
+
+        static func parse(_ link: Any) -> TranscriptLink? {
+            if let url = link as? URL { return parse(url) }
+            if let url = link as? NSURL { return parse(url as URL) }
+            if let string = link as? String, let url = URL(string: string) {
+                return parse(url)
+            }
+            return nil
+        }
+
+        static func parse(_ url: URL) -> TranscriptLink? {
+            switch url.scheme?.lowercased() {
+            case "ore-file":
+                let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "path" })?.value
+                guard let path, !path.isEmpty else { return nil }
+                return .openFile(path)
+            case "http", "https", "mailto":
+                return .openURL(url)
+            case "file":
+                return .openFile(url.path)
+            default:
+                return nil
+            }
+        }
+    }
+
     /// A deterministic local URL keeps workspace references inside ORE. A
     /// regular relative URL is otherwise handed to NSWorkspace, which treats
     /// `server/index.ts` as a Finder target and produces an opaque -50 error.
@@ -382,7 +416,8 @@ struct MarkdownRenderer {
     }
 
     /// Compiled once: every render of every row used to rebuild this pattern
-    /// and its long extension alternation.
+    /// and its long extension alternation. Dotenv files (`.env`, `.env.b2b`)
+    /// are a dedicated alternative so a second label isn't an unknown extension.
     private static let fileReferenceExpression: NSRegularExpression? = {
         let extensions = [
             "swift", "m", "mm", "h", "c", "cc", "cpp", "cs", "go", "rs", "java", "kt",
@@ -394,10 +429,30 @@ struct MarkdownRenderer {
         // click can jump straight to it. The trailing `(?![A-Za-z0-9])` boundary
         // stops a one-letter extension from matching the head of a longer run —
         // e.g. the `.c` in `github.com` — which used to fracture URLs.
-        let pattern = #"(?<![A-Za-z0-9_])(?:/?(?:[A-Za-z0-9_.@+\-]+/)+)?[A-Za-z0-9_.@+\-]+\.(?:"#
-            + extensions + #")(?::\d+(?:[:,]\d+)?)?(?![A-Za-z0-9])"#
+        let path = #"(?:/?(?:[A-Za-z0-9_.@+\-]+/)+)?"#
+        let locator = #"(?::\d+(?:[:,]\d+)?)?"#
+        let pattern = #"(?<![A-Za-z0-9_])"# + path
+            + #"(?:\.env(?:\.[A-Za-z0-9_+-]+)?|[A-Za-z0-9_.@+\-]+\.(?:"# + extensions + #"))"#
+            + locator + #"(?![A-Za-z0-9])"#
         return try? NSRegularExpression(pattern: pattern)
     }()
+
+    /// Two-letter suffixes that are both source extensions and ccTLDs. A name
+    /// with three or more labels and one of these tails (`api.openjev.sh`) is
+    /// a host, not a file. `install.sh` and `lib.rs` stay files.
+    private static let collidingCcTLDExtensions: Set<String> = [
+        "sh", "md", "cc", "mm", "rs", "py", "cs",
+    ]
+
+    /// True when a file-reference match is really a hostname. Paths with a
+    /// slash, a `:line` locator, or fewer than three labels stay files.
+    static func isLikelyHostname(_ token: String) -> Bool {
+        if token.contains("/") || token.contains(":") { return false }
+        if token.hasPrefix(".") { return false }
+        let labels = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 3, labels.allSatisfy({ !$0.isEmpty }) else { return false }
+        return collidingCcTLDExtensions.contains(labels[labels.count - 1].lowercased())
+    }
 
     private static let bareURLExpression = try? NSRegularExpression(
         pattern: #"(?:https?://|mailto:)[^\s<>]+"#
@@ -409,6 +464,16 @@ struct MarkdownRenderer {
         for match in expression.matches(in: result.string, range: whole).reversed() {
             guard result.attribute(.link, at: match.range.location, effectiveRange: nil) == nil else { continue }
             let reference = (result.string as NSString).substring(with: match.range)
+            // `api.openjev.sh` matches the `.sh` file pattern. Chip it as a
+            // site, not a workspace file — there is no `api.openjev.sh` to open.
+            if Self.isLikelyHostname(reference),
+               let url = URL(string: "https://\(reference)") {
+                result.replaceCharacters(
+                    in: match.range,
+                    with: Self.urlChip(url: url, label: Self.linkLabel(for: url), baseFont: baseFont)
+                )
+                continue
+            }
             guard let url = Self.fileReferenceURL(reference) else { continue }
             // Render as a quiet inline "chip": monospaced, accent-tinted, with a
             // subtle fill — reads as a file token rather than a raw blue link.

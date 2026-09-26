@@ -199,6 +199,10 @@ enum SpokenToolClass {
         // "ReadLints" contains "read" and would otherwise speak as a file read.
         if tool.contains("lint") { return nil }
         if tool == "ls" || tool == "list" || tool == "glob" { return nil }
+        if tool == "bashoutput" || tool.hasSuffix("bashoutput")
+            || tool == "killshell" || tool == "killbash" {
+            return nil
+        }
         if tool == "delete" || tool == "remove" {
             return ToolActivity(kind: .delete, subject: spokenFileName(from: input))
         }
@@ -226,8 +230,15 @@ enum SpokenToolClass {
         if key.contains("read") || key.contains("file") {
             return ToolActivity(kind: .read, subject: spokenFileName(from: input))
         }
-        if key.contains("web") || key.contains("fetch") || input?["url"]?.stringValue != nil {
-            return ToolActivity(kind: .fetch, subject: nil)
+        if let web = ToolWebActivity.classify(tool: name, input: input, fallback: displayName) {
+            // Web search and fetch both speak as looking something up online —
+            // the codebase-search frames would be a lie for a URL. Frames do
+            // not interpolate the subject, so the host is recorded for
+            // coalescing distinct lookups without changing the spoken line.
+            return ToolActivity(
+                kind: .fetch,
+                subject: web.subject.flatMap(ToolWebActivity.spokenHost) ?? web.chipLabel
+            )
         }
         if key.contains("search") || key.contains("grep") {
             return ToolActivity(kind: .search, subject: nil)

@@ -142,6 +142,16 @@ public enum HarnessCLIUpdater {
             return .nativeInstaller(url: kind.nativeInstallerURL)
 
         case .cursorAgent:
+            // Same as Codex: talk to the binary that is actually on PATH.
+            // The vendor's `curl | bash` installer is the fallback, not the
+            // first try — it is what used to run for every Cursor update, and
+            // from a GUI app with stdin closed it either hung on a prompt or
+            // laid down a second copy in `~/.local/bin` in front of the one
+            // the user already had, so the button reported success and the
+            // version did not move.
+            if let original {
+                return .selfUpdate(executablePath: original)
+            }
             return .nativeInstaller(url: kind.nativeInstallerURL)
         }
     }
@@ -157,6 +167,35 @@ public enum HarnessCLIUpdater {
             return .npm(package: package)
         }
         return .nativeInstaller(url: kind.nativeInstallerURL)
+    }
+
+    /// Whether running `plan` would install a *second* copy of a CLI that
+    /// Homebrew still owns.
+    ///
+    /// The vendor script drops a binary in `~/.local/bin` and puts that
+    /// directory first on PATH. Harmless when Homebrew is gone; a second
+    /// install in front of a Cellar one is the bug `source(for:)` already
+    /// suppresses the card to avoid, and the update button has to keep the
+    /// same promise.
+    static func canSafelyRun(
+        _ plan: Plan,
+        executablePath: String?,
+        isBrewAvailable: Bool = brewIsAvailable()
+    ) -> Bool {
+        guard case .nativeInstaller = plan else { return true }
+        guard let executablePath, isHomebrewPath(executablePath), isBrewAvailable else {
+            return true
+        }
+        return false
+    }
+
+    /// A successful self-update that left the version unchanged should try
+    /// the install's own channel once, not report success and come back
+    /// looking like the button is broken.
+    static func shouldFollowNoOp(primary: Plan, fallback: Plan) -> Bool {
+        guard primary != fallback else { return false }
+        guard case .selfUpdate = primary else { return false }
+        return true
     }
 
     /// Whether Homebrew itself is installed, as opposed to having once been.
@@ -297,22 +336,76 @@ public enum HarnessCLIUpdater {
         }
 
         let plan = plan(for: kind, executablePath: executablePath)
+        let fallback = fallbackPlan(for: kind, executablePath: executablePath)
+        let before: String?
+        if let executablePath {
+            before = await readInstalledVersion(at: executablePath)
+        } else {
+            before = nil
+        }
+
+        let ran = try await run(plan, kind: kind, fallback: fallback, executablePath: executablePath)
+        guard shouldFollowNoOp(primary: plan, fallback: fallback),
+              ran == plan,
+              canSafelyRun(fallback, executablePath: executablePath),
+              let executablePath, let before
+        else { return }
+        let after = await readInstalledVersion(at: executablePath)
+        guard after == before else { return }
+        // The CLI's own updater exited zero and changed nothing. Finish the
+        // job through the channel the install itself implies, rather than
+        // returning success that the next check will contradict.
+        try await runLoginShell(runnableScript(for: fallback), kind: kind)
+    }
+
+    /// Runs `plan`, and on an unknown-subcommand failure of an unconfirmed
+    /// self-updater, `fallback` — but never a fallback that would plant a
+    /// second copy in front of a Homebrew install.
+    private static func run(
+        _ plan: Plan,
+        kind: HarnessKind,
+        fallback: Plan,
+        executablePath: String?
+    ) async throws -> Plan {
         do {
-            try await runLoginShell(script(for: plan), kind: kind)
+            try await runLoginShell(runnableScript(for: plan), kind: kind)
+            return plan
         } catch let error as UpdateError {
             guard case .selfUpdate = plan,
                   !selfUpdateIsConfirmed(for: kind),
                   case .commandFailed(_, _, let exitCode, let output) = error,
                   isUnknownSubcommand(output: output, exitCode: exitCode)
             else { throw error }
-            // The CLI has no `update` subcommand. Nobody has confirmed that it
-            // does, and a guess that is wrong takes every update in ORE down
-            // with it — so treat it as a fact learned at runtime and finish
-            // the job through the channel the install itself implies.
-            try await runLoginShell(
-                script(for: fallbackPlan(for: kind, executablePath: executablePath)), kind: kind
-            )
+            guard canSafelyRun(fallback, executablePath: executablePath),
+                  fallback != plan
+            else { throw error }
+            try await runLoginShell(runnableScript(for: fallback), kind: kind)
+            return fallback
         }
+    }
+
+    /// `cli --version`, normalized. Used to notice a self-update that
+    /// reported success without moving the binary.
+    static func readInstalledVersion(at path: String) async -> String? {
+        guard let process = try? ChildProcess(
+            executablePath: path,
+            arguments: ["--version"],
+            workingDirectory: FileManager.default.homeDirectoryForCurrentUser,
+            environment: ShellEnvironment.childEnvironment()
+        ) else { return nil }
+        process.closeStandardInput()
+        let timer = Task {
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled else { return }
+            await process.terminate(gracePeriod: .milliseconds(200))
+        }
+        async let standardOutput = process.stdoutChunks.collectText()
+        async let standardError = process.stderrChunks.collectText()
+        _ = await process.waitForExit()
+        timer.cancel()
+        let output = await standardOutput
+        let errorOutput = await standardError
+        return HarnessVersion.normalize(output + errorOutput)
     }
 
     /// Whether this CLI's `update` subcommand is known to exist.
@@ -386,13 +479,30 @@ public enum HarnessCLIUpdater {
     static func script(for plan: Plan) -> String {
         switch plan {
         case .brew(let formula):
-            return "brew upgrade \(shellEscape(formula))"
+            // Homebrew skips casks with `auto_updates true` unless `--greedy`
+            // is passed. Claude Code and Codex both ship that way, so a plain
+            // `brew upgrade` exited zero, changed nothing, and made the
+            // Update button look like a no-op.
+            return "brew upgrade --greedy \(shellEscape(formula))"
         case .npm(let package):
             return "npm install -g \(shellEscape(package))@latest"
         case .selfUpdate(let path):
             return "\(shellEscape(path)) update"
         case .nativeInstaller(let url):
             return "curl -fsSL \(shellEscape(url)) | bash"
+        }
+    }
+
+    /// What actually runs. `script(for:)` is the honest line on the card;
+    /// this wraps it so a GUI app with a closed stdin still gets a
+    /// non-interactive, confirmed upgrade.
+    static func runnableScript(for plan: Plan) -> String {
+        let displayed = script(for: plan)
+        switch plan {
+        case .selfUpdate:
+            return "set -o pipefail; CI=1 NONINTERACTIVE=1 yes | \(displayed)"
+        case .brew, .npm, .nativeInstaller:
+            return "CI=1 NONINTERACTIVE=1 \(displayed)"
         }
     }
 

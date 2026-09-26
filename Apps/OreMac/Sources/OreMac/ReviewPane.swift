@@ -2862,12 +2862,42 @@ struct GitActionToolbar: View {
                     if case .commit = action {
                         Button("Write Commit Message Manually…") { editor = .commit }
                     }
+                    if model.committedPullRequest(for: workspace.id) != nil {
+                        Button("Open Pull Request for Commits…") {
+                            model.openCommittedPullRequest(in: workspace.id)
+                        }
+                    }
                     if case .createPullRequest = action {
                         Button("Write PR Title and Body Manually…") { editor = .pullRequest }
                     }
                 }
                 .popover(item: $editor) { kind in
                     gitEditor(kind)
+                }
+            }
+
+            if let committed = model.committedPullRequest(for: workspace.id),
+               case .createPullRequest = committed {
+                Button {
+                    model.openCommittedPullRequest(
+                        in: workspace.id,
+                        base: chosenBase ?? defaultPRBase
+                    )
+                } label: {
+                    Text("Open PR")
+                        .font(.system(size: OreTheme.Font.body, weight: .medium))
+                        .padding(.horizontal, 9)
+                        .frame(height: 26)
+                        .background(OreTheme.subduedFill, in: Capsule())
+                        .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
+                }
+                .buttonStyle(OrePressableButtonStyle())
+                .disabled(model.isGitOpInFlight(workspace.id))
+                .help("Open a pull request for the commits already on this branch. Leaves uncommitted files unstaged.")
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityLabel("Open pull request for commits")
+                .contextMenu {
+                    Button("Write PR Title and Body Manually…") { editor = .pullRequest }
                 }
             }
 
@@ -3075,11 +3105,17 @@ struct GitActionToolbar: View {
 
     private var defaultPRBase: String {
         if case .createPullRequest(let base, _) = action { return base }
+        if case .createPullRequest(let base, _) = model.committedPullRequest(for: workspace.id) {
+            return base
+        }
         return workspace.baseBranch
     }
 
     private var isStackedPR: Bool {
         if case .createPullRequest(_, let stacked) = action { return stacked }
+        if case .createPullRequest(_, let stacked) = model.committedPullRequest(for: workspace.id) {
+            return stacked
+        }
         return workspace.stackedOn != nil
     }
 

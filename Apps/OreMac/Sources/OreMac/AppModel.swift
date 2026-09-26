@@ -195,6 +195,9 @@ final class AppModel {
         var diffs: [FileDiff]
         var gitAction: SuggestedGitAction
         var pullRequest: GitHubClient.PullRequest?
+        /// Open a PR from commits already on the branch while Commit remains
+        /// the primary action — leftover WIP stays unstaged.
+        var committedPullRequest: SuggestedGitAction? = nil
     }
     /// One observable per workspace, like `workspaceLive`: a refresh in one
     /// worktree used to rewrite a shared dictionary and invalidate every
@@ -2746,6 +2749,27 @@ final class AppModel {
         cachedDiff(for: id)?.pullRequest
     }
 
+    /// A PR opened from commits already on the branch, offered while Commit
+    /// is still the primary action because the tree is dirty.
+    func committedPullRequest(for id: WorkspaceID) -> SuggestedGitAction? {
+        cachedDiff(for: id)?.committedPullRequest
+    }
+
+    /// Ask this tab to open a PR for commits already on the branch, leaving
+    /// unstaged and uncommitted files where they are.
+    func openCommittedPullRequest(in workspaceID: WorkspaceID, base: String? = nil) {
+        guard case .createPullRequest(let defaultBase, let isStacked) =
+            committedPullRequest(for: workspaceID) else { return }
+        sendToCurrentTab(
+            GitShipPrompt.pullRequest(
+                base: base ?? defaultBase,
+                isStacked: isStacked,
+                leavingUncommitted: true
+            ),
+            in: workspaceID
+        )
+    }
+
     var selectedGitAction: SuggestedGitAction {
         guard let id = selectedWorkspaceID else { return .none }
         return gitAction(for: id)
@@ -3187,7 +3211,8 @@ final class AppModel {
             generation: generation,
             diffs: try await diffs,
             gitAction: status.action,
-            pullRequest: status.pullRequest
+            pullRequest: status.pullRequest,
+            committedPullRequest: status.committedPullRequest
         )
         // Reads race: the review pane refreshes on both workspace switch and
         // every git-status bump, and `prefetchDiff` runs more in the
@@ -3220,7 +3245,8 @@ final class AppModel {
         guard let status = try? await loadGitStatus(for: workspaceID) else { return }
         guard var snapshot = cachedDiff(for: workspaceID) else { return }
         guard snapshot.gitAction != status.action
-            || snapshot.pullRequest != status.pullRequest else { return }
+            || snapshot.pullRequest != status.pullRequest
+            || snapshot.committedPullRequest != status.committedPullRequest else { return }
 
         // A pull request appearing where there wasn't one is the value moment
         // ORE exists to produce, so it is worth counting accurately.
@@ -3237,6 +3263,7 @@ final class AppModel {
 
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
+        snapshot.committedPullRequest = status.committedPullRequest
         diffCache.state(for: workspaceID).store(snapshot)
     }
 
@@ -3834,7 +3861,7 @@ final class AppModel {
     func workspaceFiles(for workspace: WorkspaceSummary) async -> [WorkspaceFileNode] {
         let root = workspace.worktreePath
         return await Task.detached(priority: .userInitiated) {
-            Self.scanWorkspace(at: root)
+            WorkspaceFileScanner.default.scan(at: root)
         }.value
     }
 
@@ -3882,45 +3909,6 @@ final class AppModel {
             throw CocoaError(.fileReadNoPermission)
         }
         return url
-    }
-
-    private nonisolated static func scanWorkspace(at root: String) -> [WorkspaceFileNode] {
-        let manager = FileManager.default
-        let rootURL = URL(fileURLWithPath: root)
-        let skipped = Set(["node_modules", ".build", "DerivedData", "Pods", ".swiftpm"])
-        var visited = 0
-
-        func children(of directory: URL, relativeBase: String) -> [WorkspaceFileNode] {
-            guard visited < 6_000,
-                  let urls = try? manager.contentsOfDirectory(
-                    at: directory,
-                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                    options: []
-                  ) else { return [] }
-            return urls.sorted { first, second in
-                let firstDirectory = (try? first.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                let secondDirectory = (try? second.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                if firstDirectory != secondDirectory { return firstDirectory }
-                return first.lastPathComponent.localizedStandardCompare(second.lastPathComponent) == .orderedAscending
-            }.compactMap { url in
-                guard visited < 6_000 else { return nil }
-                visited += 1
-                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                let isDirectory = values?.isDirectory == true
-                let relative = relativeBase.isEmpty ? url.lastPathComponent : relativeBase + "/" + url.lastPathComponent
-                if url.lastPathComponent == ".git", isDirectory { return nil }
-                let nested = isDirectory && values?.isSymbolicLink != true && !skipped.contains(url.lastPathComponent)
-                    ? children(of: url, relativeBase: relative)
-                    : nil
-                return WorkspaceFileNode(
-                    path: relative,
-                    name: url.lastPathComponent,
-                    isDirectory: isDirectory,
-                    children: nested
-                )
-            }
-        }
-        return children(of: rootURL, relativeBase: "")
     }
 
     struct SearchResult: Identifiable, Sendable {

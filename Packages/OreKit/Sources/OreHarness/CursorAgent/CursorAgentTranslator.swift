@@ -482,6 +482,12 @@ struct CursorAgentTranslator {
         if dict["pattern"] == nil, let query = dict["query"]?.stringValue {
             dict["pattern"] = .string(query)
         }
+        if dict["url"] == nil, let url = ToolWebActivity.url(from: .object(dict)) {
+            dict["url"] = .string(url)
+        }
+        if dict["query"] == nil, let query = ToolWebActivity.query(from: .object(dict)) {
+            dict["query"] = .string(query)
+        }
         applyEditContent(to: &dict)
         let input = JSONValue.object(dict)
         // Cursor's agent tool names the child's brief its own way. Only

@@ -126,7 +126,7 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
                             prefix: brewPrefix, token: formula, executablePath: executablePath
                         )) + " "
                         + quote("\(brewPrefix)/bin"),
-                    "brew upgrade \(quote(formula))",
+                    "brew upgrade --greedy \(quote(formula))",
                 ] + verification(for: kind),
                 needsRoot: true
             )

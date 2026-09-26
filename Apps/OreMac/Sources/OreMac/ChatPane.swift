@@ -825,7 +825,7 @@ struct ChatPane: View {
             UserDefaults.standard.set(enabled, forKey: key)
         }
         .task(id: workspace.id) {
-            workspaceFileIndex = Self.flattenFiles(await model.workspaceFiles(for: workspace))
+            workspaceFileIndex = AgentFileReferenceResolver.flatten(await model.workspaceFiles(for: workspace))
             mentionIndex = MentionSuggestionIndex(files: workspaceFileIndex)
             voiceFileMatcher = makeVoiceFileMatcher()
         }
@@ -2845,41 +2845,17 @@ struct ChatPane: View {
         return true
     }
 
-    private static func flattenFiles(_ nodes: [WorkspaceFileNode]) -> [WorkspaceFileNode] {
-        nodes.flatMap { node in
-            node.isDirectory ? flattenFiles(node.children ?? []) : [node]
-        }
-    }
-
     /// Agent output may use a repository-relative path, an absolute worktree
     /// path, or a short basename. Resolve all three into the workspace index so
     /// clicking a reference opens ORE's source tab rather than asking Finder to
     /// interpret a relative URL.
     private func openAgentFile(_ reference: String) {
-        var candidate = reference.removingPercentEncoding ?? reference
-        if candidate.hasPrefix("file://"), let url = URL(string: candidate) {
-            candidate = url.path
-        }
-        // Capture a trailing `:line`, `:line:col`, or `:line,col` locator, then
-        // strip it so the path resolves against the file index.
-        var focusLine: Int?
-        if let match = candidate.range(of: #":\d+(?:[:,]\d+)?$"#, options: .regularExpression) {
-            let locator = candidate[match].dropFirst()  // drop the leading ':'
-            focusLine = Int(locator.prefix { $0.isNumber })
-            candidate.removeSubrange(match)
-        }
-        let root = workspace.worktreePath.hasSuffix("/")
-            ? workspace.worktreePath
-            : workspace.worktreePath + "/"
-        if candidate.hasPrefix(root) { candidate.removeFirst(root.count) }
-        while candidate.hasPrefix("./") { candidate.removeFirst(2) }
-        candidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "`'\"()[]{}<>.,"))
-
-        let resolved = workspaceFileIndex.first(where: { $0.path == candidate })?.path
-            ?? workspaceFileIndex.first(where: { $0.path.hasSuffix("/" + candidate) })?.path
-            ?? workspaceFileIndex.first(where: { $0.name == candidate })?.path
-        guard let path = resolved, !path.split(separator: "/").contains("..") else { return }
-        model.openSourceFile(path, in: workspace.id, line: focusLine)
+        guard let resolved = AgentFileReferenceResolver.resolve(
+            reference,
+            worktreePath: workspace.worktreePath,
+            files: workspaceFileIndex
+        ) else { return }
+        model.openSourceFile(resolved.path, in: workspace.id, line: resolved.line)
     }
 
     private func composerErrorBanner(

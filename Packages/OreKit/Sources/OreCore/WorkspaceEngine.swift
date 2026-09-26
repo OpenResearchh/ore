@@ -1822,7 +1822,8 @@ public actor WorkspaceEngine {
         let context = await gitActionContext()
         return SuggestedGitStatus(
             action: SuggestedGitActionResolver.resolve(context),
-            pullRequest: context.pullRequest
+            pullRequest: context.pullRequest,
+            committedPullRequest: SuggestedGitActionResolver.committedPullRequest(from: context)
         )
     }
 

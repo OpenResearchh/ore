@@ -122,10 +122,20 @@ public enum SuggestedGitAction: Sendable, Hashable, Codable {
 public struct SuggestedGitStatus: Sendable, Hashable {
     public var action: SuggestedGitAction
     public var pullRequest: GitHubClient.PullRequest?
+    /// When the working tree is dirty, `action` is Commit. This is the quieter
+    /// sibling: open a PR from commits already on the branch, leaving WIP
+    /// unstaged. Nil when that would duplicate `action` or there is nothing
+    /// to open a PR from.
+    public var committedPullRequest: SuggestedGitAction?
 
-    public init(action: SuggestedGitAction, pullRequest: GitHubClient.PullRequest?) {
+    public init(
+        action: SuggestedGitAction,
+        pullRequest: GitHubClient.PullRequest?,
+        committedPullRequest: SuggestedGitAction? = nil
+    ) {
         self.action = action
         self.pullRequest = pullRequest
+        self.committedPullRequest = committedPullRequest
     }
 }
 
@@ -148,14 +158,31 @@ public enum GitShipPrompt: Sendable {
         return lines.joined(separator: "\n\n")
     }
 
-    public static func pullRequest(base: String, isStacked: Bool) -> String {
-        var lines = [
-            "Inspect the commits and the full diff against `\(base)`. Write a pull-request title and body in this repo's style: a short title, a summary of what changed and why, and a test plan.",
-            "Then create the PR onto `\(base)` with `gh pr create`. Do not merge it.",
-        ]
+    public static func pullRequest(
+        base: String,
+        isStacked: Bool,
+        leavingUncommitted: Bool = false
+    ) -> String {
+        var lines: [String] = []
+        if leavingUncommitted {
+            lines.append(
+                "Open a pull request from the commits already on this branch onto `\(base)`. Leave unstaged and uncommitted files where they are — they are not part of this PR."
+            )
+        }
+        lines.append(
+            "Inspect the commits and the full diff against `\(base)`. Write a pull-request title and body in this repo's style: a short title, a summary of what changed and why, and a test plan."
+        )
+        lines.append(
+            "Then create the PR onto `\(base)` with `gh pr create`. Do not merge it."
+        )
         if isStacked {
             lines.append(
                 "This branch is stacked; open the PR onto `\(base)` (the parent), not the repository's default branch."
+            )
+        }
+        if leavingUncommitted {
+            lines.append(
+                "Never force-push. Proceed without asking for confirmation, and finish by reporting the pull request URL."
             )
         }
         return lines.joined(separator: "\n\n")
@@ -345,6 +372,25 @@ public enum SuggestedGitActionResolver {
 
         return .merge(
             prNumber: pullRequest.number,
+            isStacked: context.parentBranch != nil
+        )
+    }
+
+    /// Open a PR from commits that already exist, even when the tree is dirty.
+    ///
+    /// The primary action stays Commit so leftover WIP is not forgotten. This
+    /// is the quieter path: git push / `gh pr create` only send commits, so
+    /// unstaged files stay behind.
+    public static func committedPullRequest(from context: GitActionContext) -> SuggestedGitAction? {
+        guard context.hasUncommittedChanges else { return nil }
+        guard context.commitsAheadOfBase > 0 else { return nil }
+        guard context.hasRemote else { return nil }
+        guard context.gitHubStatus.isInstalled, context.gitHubStatus.isAuthenticated else {
+            return nil
+        }
+        if let pullRequest = context.pullRequest, pullRequest.isOpen { return nil }
+        return .createPullRequest(
+            base: context.parentBranch ?? context.baseBranch,
             isStacked: context.parentBranch != nil
         )
     }

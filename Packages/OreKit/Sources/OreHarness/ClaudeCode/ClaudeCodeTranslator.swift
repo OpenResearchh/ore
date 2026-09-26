@@ -686,16 +686,26 @@ enum ClaudeToolSemantics {
             }
         case "Glob", "Grep":
             return input["pattern"]?.stringValue
+        case "Skill":
+            return ToolMCPActivity.classify(tool: tool, input: input)?.subject
+                ?? input["skill"]?.stringValue ?? input["command"]?.stringValue
+        case "BashOutput", "KillShell", "KillBash":
+            return input["command"]?.stringValue
+                ?? input["shell_id"]?.stringValue
+                ?? input["bash_id"]?.stringValue
         case "Task":
             return input["description"]?.stringValue
         case "CreatePlan", "ExitPlanMode":
             return input["name"]?.stringValue ?? input["title"]?.stringValue
         case "WebFetch":
-            return input["url"]?.stringValue
+            return ToolWebActivity.classify(tool: tool, input: input)?.subject
+                ?? input["url"]?.stringValue
         case "WebSearch":
-            return input["query"]?.stringValue
+            return ToolWebActivity.classify(tool: tool, input: input)?.subject
+                ?? input["query"]?.stringValue
         default:
-            return nil
+            return ToolMCPActivity.classify(tool: tool, input: input)?.subject
+                ?? ToolWebActivity.classify(tool: tool, input: input)?.subject
         }
     }
 }

@@ -459,8 +459,9 @@ struct CodexTranslatorTests {
             return nil
         }.first
         #expect(call?.name == "search_docs")
-        #expect(call?.displayName == "docs")
+        #expect(call?.displayName == "Indexes")
         #expect(call?.input["description"] == nil)
+        #expect(call?.displayName != "docs")
     }
 
     @Test func aStructuredMCPErrorIsNotHiddenByANullResult() {
@@ -536,5 +537,110 @@ struct CodexTranslatorTests {
         #expect(error.kind == .protocolMismatch)
         #expect(error.message.contains("upgrade to the latest"))
         #expect(!error.message.contains("\"status\""))
+    }
+
+    @Test func aWebSearchQueryBecomesWebSearchWithTheQuery() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("ws1"),
+                "type": .string("webSearch"),
+                "query": .string("ore thinking chips"),
+            ])])
+        ).events
+        let call = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "WebSearch")
+        #expect(call?.displayName == "ore thinking chips")
+        #expect(call?.input["query"]?.stringValue == "ore thinking chips")
+    }
+
+    @Test func openingAPageOnAWebSearchItemBecomesWebFetch() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("ws2"),
+                "type": .string("webSearch"),
+                "action": .object([
+                    "type": .string("open_page"),
+                    "url": .string("https://docs.python.org/3/library/os.html"),
+                ]),
+            ])])
+        ).events
+        let call = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "WebFetch")
+        #expect(call?.displayName == "https://docs.python.org/3/library/os.html")
+        #expect(call?.input["url"]?.stringValue == "https://docs.python.org/3/library/os.html")
+    }
+
+    @Test func aCompletedWebSearchFillsInTheUrlOmittedAtStart() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let started = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("ws3"),
+                "type": .string("webSearch"),
+            ])])
+        ).events
+        #expect(started.contains { if case .toolCall = $0 { return true }; return false })
+
+        let completed = translator.translate(
+            method: "item/completed",
+            params: .object(["item": .object([
+                "id": .string("ws3"),
+                "type": .string("webSearch"),
+                "action": .object([
+                    "type": .string("open_page"),
+                    "url": .string("https://swift.org/blog/swift-6/"),
+                ]),
+            ])])
+        ).events
+        let call = completed.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "WebFetch")
+        #expect(call?.input["url"]?.stringValue == "https://swift.org/blog/swift-6/")
+    }
+
+    @Test func anMCPFetchToolExposesTheUrlNotTheServer() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started", params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let events = translator.translate(
+            method: "item/started",
+            params: .object(["item": .object([
+                "id": .string("mcp-fetch"),
+                "type": .string("mcpToolCall"),
+                "tool": .string("web_fetch"),
+                "server": .string("codex"),
+                "arguments": .object(["url": .string("https://example.com/spec")]),
+            ])])
+        ).events
+        let call = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }.first
+        #expect(call?.name == "WebFetch")
+        #expect(call?.displayName == "https://example.com/spec")
+        #expect(call?.displayName != "codex")
+        #expect(call?.input["url"]?.stringValue == "https://example.com/spec")
     }
 }

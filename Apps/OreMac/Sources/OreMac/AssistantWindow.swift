@@ -315,7 +315,7 @@ struct AssistantActivityView: View {
                             expandedActivityGroups.remove(group)
                         }
                     },
-                    onOpenFile: { _ in },
+                    onOpenFile: { openTranscriptFile($0, in: assistant) },
                     onTurnAction: { _, _ in },
                     scrollAnchor: scrollAnchor,
                     bottomInset: bottomInset ?? Self.restingBottomInset
@@ -332,6 +332,18 @@ struct AssistantActivityView: View {
                 )
                 .frame(maxHeight: .infinity)
             }
+        }
+    }
+
+    private func openTranscriptFile(_ reference: String, in workspace: WorkspaceSummary) {
+        Task {
+            let files = await model.workspaceFiles(for: workspace)
+            guard let resolved = AgentFileReferenceResolver.resolve(
+                reference,
+                worktreePath: workspace.worktreePath,
+                files: files
+            ) else { return }
+            model.openSourceFile(resolved.path, in: workspace.id, line: resolved.line)
         }
     }
 

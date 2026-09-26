@@ -420,7 +420,7 @@ private struct DreamTranscriptSheet: View {
                         expandedActivityGroups.remove(group)
                     }
                 },
-                onOpenFile: { _ in },
+                onOpenFile: { openTranscriptFile($0) },
                 onTurnAction: { _, _ in },
                 scrollAnchor: scrollAnchor
             )
@@ -433,6 +433,21 @@ private struct DreamTranscriptSheet: View {
             Text("Loading transcript…")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func openTranscriptFile(_ reference: String) {
+        guard let workspaceID = finding.workspaceID,
+              let workspace = model.workspaces.first(where: { $0.id == workspaceID })
+        else { return }
+        Task {
+            let files = await model.workspaceFiles(for: workspace)
+            guard let resolved = AgentFileReferenceResolver.resolve(
+                reference,
+                worktreePath: workspace.worktreePath,
+                files: files
+            ) else { return }
+            model.openSourceFile(resolved.path, in: workspaceID, line: resolved.line)
         }
     }
 }

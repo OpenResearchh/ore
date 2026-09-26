@@ -96,6 +96,23 @@ struct SpokenToolClassTests {
         #expect(SpokenToolClass.classify(name: "ls", displayName: nil, input: nil) == nil)
         #expect(SpokenToolClass.classify(name: "Glob", displayName: nil, input: nil) == nil)
     }
+
+    @Test func bashOutputIsNotSpokenAsANewCommand() {
+        #expect(
+            SpokenToolClass.classify(
+                name: "BashOutput",
+                displayName: nil,
+                input: .object(["command": .string("swift test")])
+            ) == nil
+        )
+        #expect(
+            SpokenToolClass.classify(
+                name: "KillShell",
+                displayName: nil,
+                input: .object(["shell_id": .string("s-1")])
+            ) == nil
+        )
+    }
 }
 
 struct ToolActivityCoalescerTests {
@@ -906,6 +923,27 @@ struct NeuralVoiceIncompleteDownloadTests {
                 in: cache.pack, required: required
             ).isEmpty
         )
+        #expect(
+            NeuralNarrationVoice.weightsAreComplete(
+                languagePack: cache.pack, required: required
+            ) == false,
+            "constants_bin is in required and was not created"
+        )
+    }
+
+    @Test func aCompleteRequiredPackIsWhatDownloadWouldHaveFound() throws {
+        let cache = try makeCache([
+            pack + "cond_prefill.mlmodelc": ["coremldata.bin"],
+            pack + "mimi_decoder.mlmodelc": ["coremldata.bin"],
+            pack + "constants_bin": ["tokenizer.model"],
+        ])
+        defer { try? FileManager.default.removeItem(at: cache.root) }
+
+        #expect(
+            NeuralNarrationVoice.weightsAreComplete(
+                languagePack: cache.pack, required: required
+            )
+        )
     }
 
     /// The cache root is shared by every FluidAudio backend. Another one's
@@ -1228,5 +1266,13 @@ struct NeuralVoiceNoticeTests {
     @Test func anUndownloadedVoiceOffersTheDownload() {
         let notice = NarrationEngine.neuralVoiceNotice(for: .neural, readiness: .notInstalled)
         #expect(notice?.retryTitle == "Download")
+    }
+
+    @Test func aDownloadedVoiceDoesNotAskToDownloadAgain() {
+        #expect(
+            NarrationEngine.neuralVoiceNotice(
+                for: .neural, readiness: .notInstalled, weightsOnDisk: true
+            ) == nil
+        )
     }
 }

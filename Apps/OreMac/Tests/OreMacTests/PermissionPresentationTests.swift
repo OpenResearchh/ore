@@ -64,6 +64,14 @@ struct PermissionPresentationTests {
             ("WebSearch", .object(["query": .string("perco sd")]), "Search the web", "perco sd"),
             ("Grep", .object(["pattern": .string("TODO")]), "Search file contents", "TODO"),
             ("Task", .object(["description": .string("audit deps")]), "Run a subagent", "audit deps"),
+            ("Skill", .object(["skill": .string("pdf")]), "Use a skill", "pdf"),
+            ("Glob", .object(["pattern": .string("**/*.swift")]), "Find files", "**/*.swift"),
+            (
+                "mcp__ore__PostDiffComment",
+                .object(["filePath": .string("a.swift")]),
+                "Post a comment",
+                "a.swift"
+            ),
         ]
         for (tool, input, action, target) in cases {
             let content = PermissionPresentation(request: request(tool: tool, input: input))
@@ -107,8 +115,37 @@ struct PermissionPresentationTests {
     }
 
     @Test func anMCPToolNamesItsServer() {
+        let content = PermissionPresentation(request: request(tool: "mcp__ore__Frobnicate"))
+        #expect(content.action == "Frobnicate · ore")
+    }
+
+    @Test func aKnownMCPToolReadsAsAVerb() {
         let content = PermissionPresentation(request: request(tool: "mcp__ore__PostDiffComment"))
-        #expect(content.action == "PostDiffComment · ore")
+        #expect(content.action == "Post a comment")
+        #expect(content.toolLabel == "PostDiffComment · ore")
+    }
+
+    @Test func aCodexOpenPagePermissionNamesTheUrl() {
+        let content = PermissionPresentation(request: request(
+            tool: "WebFetch",
+            input: .object([
+                "action": .object([
+                    "type": .string("open_page"),
+                    "url": .string("https://docs.python.org/3/library/os.html"),
+                ]),
+            ])
+        ))
+        #expect(content.action == "Fetch a web page")
+        #expect(content.target == "https://docs.python.org/3/library/os.html")
+    }
+
+    @Test func anMCPFetchPermissionNamesTheUrl() {
+        let content = PermissionPresentation(request: request(
+            tool: "mcp__exa__web_fetch",
+            input: .object(["url": .string("https://exa.ai/blog")])
+        ))
+        #expect(content.action == "Fetch a web page")
+        #expect(content.target == "https://exa.ai/blog")
     }
 
     // MARK: - Standing grants

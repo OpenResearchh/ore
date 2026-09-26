@@ -24,6 +24,11 @@ struct CodexTranslator {
     private var status: AgentStatus = .idle
     private var reportedItemIDs: Set<String> = []
     private var toolNames: [ToolCallID: String] = [:]
+    /// Last name / label / input we announced for an item, so a completed
+    /// payload that only repeats the started one does not emit a second
+    /// `toolCall`. Web search is the case that *does* change: the URL lands
+    /// on `item/completed`.
+    private var lastToolPayloads: [String: (name: String, displayName: String?, input: JSONValue)] = [:]
     private var model: String?
     private var cliVersion: String?
     private var workingDirectory: String = ""
@@ -93,7 +98,7 @@ struct CodexTranslator {
                 turnID: ensureTurn(&output), blockID: BlockID(rawValue: itemID), text: delta
             )))
 
-        case "item/started":
+        case "item/started", "item/updated":
             applyItem(params["item"], completed: false, to: &output)
 
         case "item/completed":
@@ -252,34 +257,77 @@ struct CodexTranslator {
             // there are no child rows to nest under it.
             let rawName = item["tool"]?.stringValue ?? type
             let isSubagent = SubagentBrief.isSubagentTool(rawName)
-            let arguments = item["arguments"] ?? .object([:])
-            let input = isSubagent ? SubagentBrief.normalized(arguments) : arguments
+            let arguments = ToolWebActivity.unwrapped(item["arguments"])
+                ?? item["arguments"]
+                ?? .object([:])
+            if isSubagent {
+                let input = SubagentBrief.normalized(arguments)
+                applyToolItem(
+                    item,
+                    itemID: itemID,
+                    turnID: turnID,
+                    completed: completed,
+                    name: "Task",
+                    displayName: SubagentBrief.label(from: input),
+                    input: input,
+                    resultText: toolResultText(item),
+                    isError: item["error"] != nil && item["error"]?.isNull == false,
+                    to: &output
+                )
+            } else if let web = ToolWebActivity.classify(tool: rawName, input: arguments) {
+                // MCP fetch/search tools used to keep the server as displayName
+                // (`codex`, `exa`) while the URL sat in arguments under a key
+                // the transcript never read — a globe chip that said "Fetch"
+                // and nothing else.
+                applyToolItem(
+                    item,
+                    itemID: itemID,
+                    turnID: turnID,
+                    completed: completed,
+                    name: web.kind == .fetch ? "WebFetch" : "WebSearch",
+                    displayName: web.subject,
+                    input: ToolWebActivity.normalized(arguments),
+                    resultText: toolResultText(item),
+                    isError: item["error"] != nil && item["error"]?.isNull == false,
+                    to: &output
+                )
+            } else {
+                let mcp = ToolMCPActivity.classify(tool: rawName, input: arguments)
+                applyToolItem(
+                    item,
+                    itemID: itemID,
+                    turnID: turnID,
+                    completed: completed,
+                    name: rawName,
+                    displayName: mcp?.subject,
+                    input: arguments,
+                    resultText: toolResultText(item),
+                    isError: item["error"] != nil && item["error"]?.isNull == false,
+                    to: &output
+                )
+            }
+
+        case "webSearch", "webFetch":
+            // One item type covers both a web search and opening a page.
+            // `query` is only set for the search action; `open_page` /
+            // `find_in_page` put the URL on `action.url`. Mapping those to
+            // WebFetch with a canonical `url` is what lets the thinking chip
+            // name the page instead of a bare "Fetch".
+            let web = ToolWebActivity.classify(tool: type, input: item)
+                ?? ToolWebActivity(
+                    kind: type == "webFetch" ? .fetch : .search,
+                    subject: nil
+                )
             applyToolItem(
                 item,
                 itemID: itemID,
                 turnID: turnID,
                 completed: completed,
-                name: isSubagent ? "Task" : rawName,
-                displayName: isSubagent
-                    ? SubagentBrief.label(from: input)
-                    : (item["server"]?.stringValue ?? item["namespace"]?.stringValue),
-                input: input,
+                name: web.kind == .fetch ? "WebFetch" : "WebSearch",
+                displayName: web.subject,
+                input: Self.webToolInput(from: item),
                 resultText: toolResultText(item),
                 isError: item["error"] != nil && item["error"]?.isNull == false,
-                to: &output
-            )
-
-        case "webSearch":
-            applyToolItem(
-                item,
-                itemID: itemID,
-                turnID: turnID,
-                completed: completed,
-                name: "WebSearch",
-                displayName: item["query"]?.stringValue,
-                input: .object(["query": item["query"] ?? .null]),
-                resultText: "",
-                isError: false,
                 to: &output
             )
 
@@ -302,10 +350,16 @@ struct CodexTranslator {
     ) {
         let toolCallID = ToolCallID(rawValue: itemID)
 
-        // `item/started` and `item/completed` both carry the whole item, so the
-        // call is announced once and only its result is added on completion.
-        if !reportedItemIDs.contains(itemID) {
-            reportedItemIDs.insert(itemID)
+        // `item/started` often omits the query or URL that `item/completed`
+        // (and sometimes `item/updated`) then fills in. Announce the call once,
+        // then refresh the same id so the thinking chip can pick up the
+        // subject without duplicating the row.
+        let isNew = reportedItemIDs.insert(itemID).inserted
+        let changed = lastToolPayloads[itemID].map {
+            $0.name != name || $0.displayName != displayName || $0.input != input
+        } ?? true
+        if isNew || changed {
+            lastToolPayloads[itemID] = (name, displayName, input)
             toolNames[toolCallID] = name
             output.events.append(.toolCall(ToolCall(
                 turnID: turnID,
@@ -314,7 +368,9 @@ struct CodexTranslator {
                 displayName: displayName,
                 input: input
             )))
-            append(status: .runningTool, to: &output)
+            if isNew {
+                append(status: .runningTool, to: &output)
+            }
         }
 
         guard completed else { return }
@@ -325,6 +381,25 @@ struct CodexTranslator {
             text: resultText
         )))
         append(status: .requesting, to: &output)
+    }
+
+    /// Canonical `{url, query}` plus the nested `action` Codex uses for
+    /// `open_page`, so a later permission round-trip still has the original.
+    private static func webToolInput(from item: JSONValue) -> JSONValue {
+        var dictionary: [String: JSONValue] = [:]
+        if let url = ToolWebActivity.url(from: item) {
+            dictionary["url"] = .string(url)
+        }
+        if let query = ToolWebActivity.query(from: item) {
+            dictionary["query"] = .string(query)
+        }
+        if let prompt = item["prompt"], prompt.isNull == false {
+            dictionary["prompt"] = prompt
+        }
+        if let action = item["action"], action.isNull == false {
+            dictionary["action"] = action
+        }
+        return .object(dictionary)
     }
 
     // MARK: - Background terminals

@@ -570,6 +570,23 @@ struct TranscriptDisplayTests {
         #expect(ChatState.runningToolPhrase(name: "Edit", displayName: "a.swift") == "Editing a.swift")
         #expect(ChatState.runningToolPhrase(name: "Bash", displayName: "git status") == "Running git status")
         #expect(ChatState.runningToolPhrase(name: "Task", displayName: "Explore") == "Running subagent · Explore")
+        #expect(
+            ChatState.runningToolPhrase(
+                name: "WebFetch",
+                displayName: "https://docs.python.org/3/library/os.html"
+            ) == "Fetching docs.python.org/3/library/os.html"
+        )
+        #expect(
+            ChatState.runningToolPhrase(name: "WebSearch", displayName: "perco sd")
+                == "Searching the web for perco sd"
+        )
+        #expect(ChatState.runningToolPhrase(name: "Glob", displayName: "**/*.swift") == "Finding **/*.swift")
+        #expect(ChatState.runningToolPhrase(name: "Skill", displayName: "pdf") == "Using pdf")
+        #expect(
+            ChatState.runningToolPhrase(
+                name: "mcp__ore__PostDiffComment", displayName: "App.swift"
+            ) == "Comment · App.swift"
+        )
     }
 
     @Test func aCodexCLIUpgradeErrorOffersAnUpdateNotAUsageLimit() {

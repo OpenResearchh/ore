@@ -4106,6 +4106,104 @@ final class TranscriptCell: NSTableCellView {
             )
         }
 
+        // Follow-ups on a live shell. "BashOutput" contains "bash" and would
+        // otherwise look like a new command; KillShell contains "shell".
+        if tool == "bashoutput" || tool.hasSuffix("bashoutput") {
+            let command = input?["command"]?.stringValue ?? input?["cmd"]?.stringValue
+            let output = row.resultText ?? ""
+            return ProcessPresentation(
+                icon: "text.alignleft",
+                title: "Output",
+                detail: output.isEmpty ? (command ?? row.text) : output,
+                tint: .systemTeal,
+                subject: command.map { compact($0.split(separator: "\n").first.map(String.init) ?? $0) }
+            )
+        }
+        if tool == "killshell" || tool == "killbash"
+            || tool.hasSuffix("killshell") || tool.hasSuffix("killbash") {
+            let command = input?["command"]?.stringValue ?? input?["cmd"]?.stringValue
+            return ProcessPresentation(
+                icon: "stop.circle",
+                title: "Stop",
+                detail: command ?? row.text,
+                tint: row.isError ? .systemRed : .systemOrange,
+                subject: command.map { compact($0.split(separator: "\n").first.map(String.init) ?? $0) }
+            )
+        }
+
+        if tool == "glob" || tool.hasSuffix("glob") {
+            let pattern = input?["pattern"]?.stringValue
+                ?? input?["glob_pattern"]?.stringValue
+                ?? input?["globPattern"]?.stringValue
+            let globPath = input?["path"]?.stringValue
+                ?? input?["target_directory"]?.stringValue
+                ?? input?["targetDirectory"]?.stringValue
+            let label: String?
+            if let pattern, let globPath {
+                label = "\(pattern) in \((globPath as NSString).lastPathComponent)"
+            } else {
+                label = pattern ?? globPath.map { ($0 as NSString).lastPathComponent }
+            }
+            let output = row.resultText ?? ""
+            return ProcessPresentation(
+                icon: "folder",
+                title: "Find",
+                detail: output.isEmpty ? (label ?? row.text) : output,
+                tint: .systemIndigo,
+                subject: label.map { compact($0, limit: 64) }
+            )
+        }
+
+        if let web = ToolWebActivity.classify(
+            tool: row.toolName ?? "",
+            input: input,
+            fallback: row.text
+        ) {
+            let output = row.resultText ?? ""
+            let subject = web.chipLabel.flatMap { label in
+                label.caseInsensitiveCompare(web.kind == .fetch ? "Fetch" : "Search") == .orderedSame
+                    ? nil : compact(label, limit: 64)
+            }
+            switch web.kind {
+            case .fetch:
+                let url = web.subject ?? ""
+                return ProcessPresentation(
+                    icon: "globe",
+                    title: "Fetch",
+                    detail: output.isEmpty ? url : output,
+                    tint: .systemCyan,
+                    subject: subject
+                )
+            case .search:
+                let query = web.subject ?? ""
+                return ProcessPresentation(
+                    icon: "magnifyingglass",
+                    title: "Search",
+                    detail: output.isEmpty ? query : output,
+                    tint: .systemPurple,
+                    subject: subject
+                )
+            }
+        }
+
+        if let mcp = ToolMCPActivity.classify(
+            tool: row.toolName ?? "",
+            input: input,
+            fallback: row.text
+        ) {
+            let path = mcp.filePath
+            let output = row.resultText ?? ""
+            return ProcessPresentation(
+                icon: mcp.icon,
+                title: mcp.title,
+                detail: output.isEmpty ? (mcp.subject ?? row.text) : output,
+                tint: row.isError ? .systemRed : mcpTint(mcp.tintName),
+                fileIdentity: path.map { FileVisualIdentity(path: $0) },
+                subject: mcp.chipLabel,
+                filePath: path
+            )
+        }
+
         let directPath = input?["file_path"]?.stringValue
             ?? input?["path"]?.stringValue
             ?? input?[0]?["path"]?.stringValue
@@ -4225,15 +4323,19 @@ final class TranscriptCell: NSTableCellView {
                 filePath: path
             )
         }
-        if key.contains("web") || key.contains("fetch") || input?["url"]?.stringValue != nil {
-            let url = input?["url"]?.stringValue ?? input?["query"]?.stringValue ?? row.text
-            return ProcessPresentation(icon: "globe", title: "Fetch", detail: resultText, tint: .systemCyan, subject: compact(url))
-        }
-        if key.contains("search") || key.contains("grep") || key.contains("glob") {
+        if key.contains("search") || key.contains("grep") {
             let query = input?["query"]?.stringValue ?? input?["q"]?.stringValue ?? input?["pattern"]?.stringValue ?? row.text
             return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .systemPurple, subject: compact(query))
         }
         return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
+    }
+
+    /// Visible to tests so a Fetch chip can assert the URL it named, not just
+    /// the verb — the URL is drawn as a pill image, so it never appears in
+    /// `attributedText.string`.
+    static func processChip(for row: TranscriptRow) -> (title: String, subject: String?) {
+        let item = processPresentation(for: row)
+        return (item.title, item.subject)
     }
 
     /// Hover preview for image chips and pasted-text dumps in tool rows.
@@ -4311,6 +4413,16 @@ final class TranscriptCell: NSTableCellView {
     private static func compact(_ text: String, limit: Int = 110) -> String {
         guard text.count > limit else { return text }
         return String(text.prefix(limit - 1)) + "…"
+    }
+
+    private static func mcpTint(_ name: String) -> NSColor {
+        switch name {
+        case "orange": return .systemOrange
+        case "green": return .systemGreen
+        case "blue": return .systemBlue
+        case "purple": return .systemPurple
+        default: return .secondaryLabelColor
+        }
     }
 
     private static func prefixedLines(_ text: String, prefix: String) -> String {
@@ -4478,12 +4590,10 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
-        // Let NSTextView dispatch links before the row's expand/collapse click.
-        // This makes file chips inside process rows actionable as well.
-        if link(at: event) != nil {
-            super.mouseDown(with: event)
-            return
-        }
+        // Follow the link here. URL chips put a globe attachment in front of
+        // the label; NSTextView treats that as an attachment click and never
+        // calls `clickedOnLink`. Process-row expand still loses if we miss.
+        if let link = link(at: event), open(link) { return }
         if let onSingleClick {
             onSingleClick()
             return
@@ -4496,12 +4606,20 @@ private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
     }
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-        guard let url = link as? URL, url.scheme == "ore-file",
-              let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "path" })?.value
-        else { return false }
-        onOpenFile?(path)
-        return true
+        open(link)
+    }
+
+    @discardableResult
+    private func open(_ link: Any) -> Bool {
+        switch MarkdownRenderer.TranscriptLink.parse(link) {
+        case .openFile(let path):
+            onOpenFile?(path)
+            return true
+        case .openURL(let url):
+            return NSWorkspace.shared.open(url)
+        case nil:
+            return false
+        }
     }
 
     private func updateAttachmentPreview(at point: NSPoint) {

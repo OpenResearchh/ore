@@ -208,6 +208,130 @@ struct MarkdownRendererTests {
         }
         #expect(url?.scheme == "ore-file")
         #expect(path == "server/index.ts:42")
+        if let url {
+            #expect(MarkdownRenderer.TranscriptLink.parse(url) == .openFile("server/index.ts:42"))
+        }
+    }
+
+    @Test func dottedHostnamesAreNotWorkspaceFiles() {
+        #expect(MarkdownRenderer.isLikelyHostname("api.openjev.sh"))
+        #expect(MarkdownRenderer.isLikelyHostname("docs.example.md"))
+        #expect(!MarkdownRenderer.isLikelyHostname("install.sh"))
+        #expect(!MarkdownRenderer.isLikelyHostname("scripts/deploy.sh"))
+        #expect(!MarkdownRenderer.isLikelyHostname("lib.rs"))
+        #expect(!MarkdownRenderer.isLikelyHostname("app.test.ts"))
+        #expect(!MarkdownRenderer.isLikelyHostname("server/index.ts:42"))
+        #expect(!MarkdownRenderer.isLikelyHostname(".env.b2b"))
+    }
+
+    @Test func hostnamesWithFileLikeTailsBecomeWebChips() {
+        let result = render("TypeSafe, so api.openjev.sh is a proxy.")
+        #expect(firstWebLink(in: result)?.host == "api.openjev.sh")
+        var sawFileLink = false
+        result.enumerateAttribute(
+            .link, in: NSRange(location: 0, length: result.length)
+        ) { value, _, _ in
+            if (value as? URL)?.scheme == "ore-file" { sawFileLink = true }
+        }
+        #expect(!sawFileLink)
+    }
+
+    @Test func shellScriptsStillBecomeFileChips() {
+        let result = render("Run scripts/deploy.sh after the build.")
+        guard let range = result.string.range(of: "scripts/deploy.sh") else {
+            Issue.record("shell script path was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        #expect(url?.scheme == "ore-file")
+    }
+
+    @Test func dotenvFilesBecomeInternalLinks() {
+        let result = render("Put secrets in .env.b2b at the root.")
+        guard let range = result.string.range(of: ".env.b2b") else {
+            Issue.record("dotenv path was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        let path = url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "path" })?.value
+        }
+        #expect(url?.scheme == "ore-file")
+        #expect(path == ".env.b2b")
+    }
+
+    @Test func transcriptLinkClassifiesWebAndFileDestinations() {
+        let web = URL(string: "https://github.com/OpenResearchh/ore/pull/1")!
+        #expect(MarkdownRenderer.TranscriptLink.parse(web) == .openURL(web))
+        #expect(
+            MarkdownRenderer.TranscriptLink.parse("https://example.com/docs")
+                == .openURL(URL(string: "https://example.com/docs")!)
+        )
+        let mail = URL(string: "mailto:ore@example.com")!
+        #expect(MarkdownRenderer.TranscriptLink.parse(mail) == .openURL(mail))
+        guard let file = MarkdownRenderer.fileReferenceURL(
+            "Apps/OreMac/Sources/OreMac/ChatPane.swift"
+        ) else {
+            Issue.record("file reference URL was nil")
+            return
+        }
+        #expect(
+            MarkdownRenderer.TranscriptLink.parse(file)
+                == .openFile("Apps/OreMac/Sources/OreMac/ChatPane.swift")
+        )
+        #expect(MarkdownRenderer.TranscriptLink.parse("not-a-link") == nil)
+    }
+
+    @Test func urlChipIconCarriesTheSameDestinationAsTheLabel() {
+        // Clicks on the globe attachment used to do nothing because NSTextView
+        // treats attachments as cells, not as links. The chip must stamp `.link`
+        // on that first character so mouseDown can follow it.
+        let url = URL(string: "https://example.com/docs")!
+        let chip = MarkdownRenderer.urlChip(
+            url: url, label: "the docs", baseFont: .systemFont(ofSize: 13)
+        )
+        #expect(chip.length > 0)
+        guard let destination = chip.attribute(.link, at: 0, effectiveRange: nil) else {
+            Issue.record("chip has no link on the icon")
+            return
+        }
+        #expect(MarkdownRenderer.TranscriptLink.parse(destination) == .openURL(url))
+    }
+
+    @Test func agentFileReferencesResolveThroughWorkspaceIndex() {
+        let files = [
+            WorkspaceFileNode(
+                path: "Sources/App.swift",
+                name: "App.swift",
+                isDirectory: false,
+                children: nil
+            ),
+        ]
+        let root = "/tmp/ore-worktree"
+
+        let absolute = AgentFileReferenceResolver.resolve(
+            "/tmp/ore-worktree/Sources/App.swift:42",
+            worktreePath: root,
+            files: files
+        )
+        #expect(absolute == .init(path: "Sources/App.swift", line: 42))
+
+        let fileURL = AgentFileReferenceResolver.resolve(
+            "file:///tmp/ore-worktree/Sources/App.swift:42",
+            worktreePath: root,
+            files: files
+        )
+        #expect(fileURL == .init(path: "Sources/App.swift", line: 42))
+
+        let escaped = AgentFileReferenceResolver.resolve(
+            "../Sources/App.swift",
+            worktreePath: root,
+            files: files
+        )
+        #expect(escaped == nil)
     }
 
     @Test func emphasisAndStrongChangeTheFontRatherThanTheText() {
@@ -607,6 +731,176 @@ struct UserMessageAttachmentTests {
         )
         #expect(TranscriptCell.attributedText(for: lints).string.contains("Lints"))
         #expect(TranscriptCell.attributedText(for: list).string.contains("List"))
+    }
+
+    @Test func fetchChipsNameTheUrlAndSearchChipsNameTheQuery() {
+        let fetch = TranscriptRow(
+            id: "tool-fetch",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "WebFetch",
+            toolName: "WebFetch",
+            toolCallID: ToolCallID(rawValue: "c-fetch"),
+            toolInput: .object(["url": .string("https://docs.python.org/3/library/os.html")])
+        )
+        let search = TranscriptRow(
+            id: "tool-search",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "WebSearch",
+            toolName: "WebSearch",
+            toolCallID: ToolCallID(rawValue: "c-search"),
+            toolInput: .object(["query": .string("perco sd paper")])
+        )
+        let openPage = TranscriptRow(
+            id: "tool-open",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "WebSearch",
+            toolName: "WebSearch",
+            toolCallID: ToolCallID(rawValue: "c-open"),
+            toolInput: .object([
+                "action": .object([
+                    "type": .string("open_page"),
+                    "url": .string("https://www.github.com/openai/codex"),
+                ]),
+            ])
+        )
+        let empty = TranscriptRow(
+            id: "tool-empty",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "WebFetch",
+            toolName: "WebFetch",
+            toolCallID: ToolCallID(rawValue: "c-empty"),
+            toolInput: .object([:])
+        )
+
+        let fetchChip = TranscriptCell.processChip(for: fetch)
+        #expect(fetchChip.title == "Fetch")
+        #expect(fetchChip.subject == "docs.python.org/3/library/os.html")
+
+        let searchChip = TranscriptCell.processChip(for: search)
+        #expect(searchChip.title == "Search")
+        #expect(searchChip.subject == "perco sd paper")
+
+        let openChip = TranscriptCell.processChip(for: openPage)
+        #expect(openChip.title == "Fetch")
+        #expect(openChip.subject == "github.com/openai/codex")
+
+        let emptyChip = TranscriptCell.processChip(for: empty)
+        #expect(emptyChip.title == "Fetch")
+        #expect(emptyChip.subject == nil)
+    }
+
+    @Test func rawMCPWebToolsUseWebChips() {
+        let row = TranscriptRow(
+            id: "tool-mcp-web",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "exa",
+            toolName: "mcp__exa__web_fetch",
+            toolCallID: ToolCallID(rawValue: "c-mcp-web"),
+            toolInput: .object(["url": .string("https://exa.ai/blog")])
+        )
+
+        let chip = TranscriptCell.processChip(for: row)
+        #expect(chip.title == "Fetch")
+        #expect(chip.subject == "exa.ai/blog")
+    }
+
+    @Test func globIsFindNotSearchAndNamesThePattern() {
+        let glob = TranscriptRow(
+            id: "tool-glob",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Glob",
+            toolName: "Glob",
+            toolCallID: ToolCallID(rawValue: "c-glob"),
+            toolInput: .object([
+                "pattern": .string("**/*.swift"),
+                "path": .string("Apps/OreMac"),
+            ])
+        )
+        let chip = TranscriptCell.processChip(for: glob)
+        #expect(chip.title == "Find")
+        #expect(chip.subject == "**/*.swift in OreMac")
+    }
+
+    @Test func skillChipsNameTheSkill() {
+        let row = TranscriptRow(
+            id: "tool-skill",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Skill",
+            toolName: "Skill",
+            toolCallID: ToolCallID(rawValue: "c-skill"),
+            toolInput: .object(["skill": .string("pdf")])
+        )
+        let chip = TranscriptCell.processChip(for: row)
+        #expect(chip.title == "Skill")
+        #expect(chip.subject == "pdf")
+    }
+
+    @Test func bashOutputIsNotANewCommand() {
+        let output = TranscriptRow(
+            id: "tool-out",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "BashOutput",
+            toolName: "BashOutput",
+            toolCallID: ToolCallID(rawValue: "c-out"),
+            toolInput: .object([
+                "bash_id": .string("b-1"),
+                "command": .string("swift test"),
+            ])
+        )
+        let stop = TranscriptRow(
+            id: "tool-kill",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "KillShell",
+            toolName: "KillShell",
+            toolCallID: ToolCallID(rawValue: "c-kill"),
+            toolInput: .object(["shell_id": .string("s-1"), "command": .string("swift test")])
+        )
+        let outputChip = TranscriptCell.processChip(for: output)
+        #expect(outputChip.title == "Output")
+        #expect(outputChip.subject == "swift test")
+        let stopChip = TranscriptCell.processChip(for: stop)
+        #expect(stopChip.title == "Stop")
+        #expect(stopChip.subject == "swift test")
+    }
+
+    @Test func mcpChipsNameTheActNotTheServer() {
+        let comment = TranscriptRow(
+            id: "tool-comment",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "ore",
+            toolName: "mcp__ore__PostDiffComment",
+            toolCallID: ToolCallID(rawValue: "c-comment"),
+            toolInput: .object(["filePath": .string("Sources/App.swift")])
+        )
+        let issue = TranscriptRow(
+            id: "tool-issue",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "github",
+            toolName: "mcp__github__get_issue",
+            toolCallID: ToolCallID(rawValue: "c-issue"),
+            toolInput: .object([
+                "owner": .string("openai"),
+                "repo": .string("codex"),
+                "issue_number": .integer(412),
+            ])
+        )
+        let commentChip = TranscriptCell.processChip(for: comment)
+        #expect(commentChip.title == "Comment")
+        #expect(commentChip.subject == "App.swift")
+        let issueChip = TranscriptCell.processChip(for: issue)
+        #expect(issueChip.title == "Issue")
+        #expect(issueChip.subject == "openai/codex#412")
     }
 
     @Test func readImageToolChipsOfferAHoverPreview() {

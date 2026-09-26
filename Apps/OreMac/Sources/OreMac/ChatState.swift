@@ -1043,11 +1043,32 @@ final class ChatState {
         case "Write", "Edit", "NotebookEdit":
             return subject.map { "Editing \($0)" } ?? "Editing a file"
         case "Bash": return displayName.map { "Running \($0)" } ?? "Running a command"
-        case "Grep", "Glob", "LS": return displayName.map { "Searching \($0)" } ?? "Searching"
+        case "Grep": return displayName.map { "Searching \($0)" } ?? "Searching"
+        case "Glob", "LS": return displayName.map { "Finding \($0)" } ?? "Finding files"
+        case "Skill": return displayName.map { "Using \($0)" } ?? "Using a skill"
+        case "BashOutput": return "Reading command output"
+        case "KillShell", "KillBash": return "Stopping a command"
         case "Task": return displayName.map { "Running subagent · \($0)" } ?? "Running a subagent"
-        case "WebFetch": return displayName.map { "Fetching \($0)" } ?? "Fetching a page"
-        case "WebSearch": return displayName.map { "Searching the web for \($0)" } ?? "Searching the web"
+        case "WebFetch":
+            if let displayName,
+               let label = ToolWebActivity.compactURL(displayName) ?? ToolWebActivity.compactQuery(displayName) {
+                return "Fetching \(label)"
+            }
+            return "Fetching a page"
+        case "WebSearch":
+            if let displayName {
+                let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return "Searching the web for \(trimmed)"
+                }
+            }
+            return "Searching the web"
         default:
+            if let mcp = ToolMCPActivity.classify(tool: name, input: nil),
+               let displayName, !displayName.isEmpty {
+                let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                return "\(mcp.title) · \(trimmed)"
+            }
             if let displayName, !displayName.isEmpty { return "\(name) · \(displayName)" }
             return name
         }

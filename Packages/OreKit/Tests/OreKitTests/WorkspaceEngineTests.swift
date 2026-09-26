@@ -27,8 +27,14 @@ func waitUntil(
 
 actor StreamCounter {
     private var count = 0
+    private var lastChat: ChatSummary?
     func increment() { count += 1 }
+    func observe(_ summary: ChatSummary) {
+        count += 1
+        lastChat = summary
+    }
     func value() -> Int { count }
+    func lastContextUsage() -> UsageReport? { lastChat?.contextUsage }
 }
 
 /// The engine's job is wiring: checkpoints around turns, the message queue,
@@ -858,8 +864,8 @@ struct WorkspaceEngineTests {
         let engine = harness.engine
         let collector = StreamCounter()
         let collect = Task {
-            for await _ in await engine.chatUpdates() {
-                await collector.increment()
+            for await summary in await engine.chatUpdates() {
+                await collector.observe(summary)
             }
         }
 
@@ -874,7 +880,9 @@ struct WorkspaceEngineTests {
         session.emit(.usage(UsageReport(
             turnID: turnID, inputTokens: 1, outputTokens: 10, contextWindow: 200_000
         )))
-        try await Task.sleep(for: .milliseconds(250))
+        // Do not sleep-and-hope: on a loaded release runner the usage hop
+        // landed after the sample, so the meter looked like a delta publish.
+        #expect(await waitUntil { await collector.lastContextUsage() != nil })
         let before = await collector.value()
         #expect(before >= 1)
         let block = BlockID(rawValue: "b1")
@@ -887,14 +895,18 @@ struct WorkspaceEngineTests {
                 turnID: turnID, inputTokens: 1, outputTokens: tokens, contextWindow: 200_000
             )))
         }
-        try await Task.sleep(for: .milliseconds(300))
-        let afterDeltas = await collector.value()
-        #expect(afterDeltas == before)
+        // Crossing a visible percent after the firehose proves those events
+        // were processed: that one publish is expected, a second is not.
+        session.emit(.usage(UsageReport(
+            turnID: turnID, inputTokens: 1, outputTokens: 2_500, contextWindow: 200_000
+        )))
+        #expect(await waitUntil { await collector.value() > before })
+        #expect(await collector.value() == before + 1)
 
         session.emit(.turnCompleted(TurnResult(
             turnID: turnID, outcome: .completed, summary: "done"
         )))
-        #expect(await waitUntil { await collector.value() > before })
+        #expect(await waitUntil { await collector.value() > before + 1 })
         collect.cancel()
     }
 

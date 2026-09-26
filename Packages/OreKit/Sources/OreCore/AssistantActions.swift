@@ -2084,7 +2084,7 @@ extension InProcessCoreClient {
         case "AnswerChatQuestion": return "Answer a question\(place)"
         case "Commit": return "Commit changes\(place)"
         case "Push": return "Push the branch\(place)"
-        case "CreatePullRequest": return "Open a pull request\(place)"
+        case "CreatePullRequest": return "Open a pull request from commits\(place)"
         case "ArchiveWorkspace": return "Archive the workspace\(place)"
         default: return request.tool
         }

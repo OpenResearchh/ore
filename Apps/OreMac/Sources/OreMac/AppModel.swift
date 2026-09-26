@@ -195,6 +195,9 @@ final class AppModel {
         var diffs: [FileDiff]
         var gitAction: SuggestedGitAction
         var pullRequest: GitHubClient.PullRequest?
+        /// Open a PR from commits already on the branch while Commit remains
+        /// the primary action — leftover WIP stays unstaged.
+        var committedPullRequest: SuggestedGitAction? = nil
     }
     /// One observable per workspace, like `workspaceLive`: a refresh in one
     /// worktree used to rewrite a shared dictionary and invalidate every
@@ -2746,6 +2749,27 @@ final class AppModel {
         cachedDiff(for: id)?.pullRequest
     }
 
+    /// A PR opened from commits already on the branch, offered while Commit
+    /// is still the primary action because the tree is dirty.
+    func committedPullRequest(for id: WorkspaceID) -> SuggestedGitAction? {
+        cachedDiff(for: id)?.committedPullRequest
+    }
+
+    /// Ask this tab to open a PR for commits already on the branch, leaving
+    /// unstaged and uncommitted files where they are.
+    func openCommittedPullRequest(in workspaceID: WorkspaceID, base: String? = nil) {
+        guard case .createPullRequest(let defaultBase, let isStacked) =
+            committedPullRequest(for: workspaceID) else { return }
+        sendToCurrentTab(
+            GitShipPrompt.pullRequest(
+                base: base ?? defaultBase,
+                isStacked: isStacked,
+                leavingUncommitted: true
+            ),
+            in: workspaceID
+        )
+    }
+
     var selectedGitAction: SuggestedGitAction {
         guard let id = selectedWorkspaceID else { return .none }
         return gitAction(for: id)
@@ -3187,7 +3211,8 @@ final class AppModel {
             generation: generation,
             diffs: try await diffs,
             gitAction: status.action,
-            pullRequest: status.pullRequest
+            pullRequest: status.pullRequest,
+            committedPullRequest: status.committedPullRequest
         )
         // Reads race: the review pane refreshes on both workspace switch and
         // every git-status bump, and `prefetchDiff` runs more in the
@@ -3220,7 +3245,8 @@ final class AppModel {
         guard let status = try? await loadGitStatus(for: workspaceID) else { return }
         guard var snapshot = cachedDiff(for: workspaceID) else { return }
         guard snapshot.gitAction != status.action
-            || snapshot.pullRequest != status.pullRequest else { return }
+            || snapshot.pullRequest != status.pullRequest
+            || snapshot.committedPullRequest != status.committedPullRequest else { return }
 
         // A pull request appearing where there wasn't one is the value moment
         // ORE exists to produce, so it is worth counting accurately.
@@ -3237,6 +3263,7 @@ final class AppModel {
 
         snapshot.gitAction = status.action
         snapshot.pullRequest = status.pullRequest
+        snapshot.committedPullRequest = status.committedPullRequest
         diffCache.state(for: workspaceID).store(snapshot)
     }
 

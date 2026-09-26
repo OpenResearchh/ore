@@ -341,6 +341,69 @@ struct SuggestedGitActionTests {
         #expect(prompt.contains("stacked"))
     }
 
+    @Test func dirtyTreeWithCommitsStillOffersAQuietPullRequest() {
+        // Commit stays primary so leftover WIP is not forgotten. The quieter
+        // action opens a PR from commits already on the branch.
+        let context = GitActionContext(
+            hasUncommittedChanges: true,
+            changedFileCount: 1,
+            commitsAheadOfBase: 4,
+            hasUpstream: false,
+            baseBranch: "main"
+        )
+        #expect(SuggestedGitActionResolver.resolve(context)
+            == .commit(fileCount: 1, insertions: 0, deletions: 0))
+        #expect(
+            SuggestedGitActionResolver.committedPullRequest(from: context)
+                == .createPullRequest(base: "main", isStacked: false)
+        )
+    }
+
+    @Test func aQuietPullRequestOnAStackTargetsTheParent() {
+        let context = GitActionContext(
+            hasUncommittedChanges: true,
+            changedFileCount: 1,
+            commitsAheadOfBase: 2,
+            hasUpstream: true,
+            baseBranch: "main",
+            parentBranch: "ore/lower"
+        )
+        #expect(
+            SuggestedGitActionResolver.committedPullRequest(from: context)
+                == .createPullRequest(base: "ore/lower", isStacked: true)
+        )
+    }
+
+    @Test func aQuietPullRequestIsNotOfferedWithoutCommitsAhead() {
+        let context = GitActionContext(
+            hasUncommittedChanges: true,
+            changedFileCount: 2,
+            commitsAheadOfBase: 0,
+            hasUpstream: true
+        )
+        #expect(SuggestedGitActionResolver.committedPullRequest(from: context) == nil)
+    }
+
+    @Test func aQuietPullRequestIsNotOfferedWhenOneIsAlreadyOpen() {
+        let context = GitActionContext(
+            hasUncommittedChanges: true,
+            changedFileCount: 1,
+            commitsAheadOfBase: 3,
+            hasUpstream: true,
+            pullRequest: openPR()
+        )
+        #expect(SuggestedGitActionResolver.committedPullRequest(from: context) == nil)
+    }
+
+    @Test func openingAPullRequestFromCommitsLeavesWIPBehind() {
+        let prompt = GitShipPrompt.pullRequest(
+            base: "main", isStacked: false, leavingUncommitted: true
+        )
+        #expect(prompt.contains("Leave unstaged and uncommitted files"))
+        #expect(prompt.contains("`main`"))
+        #expect(!prompt.contains("Stage what belongs"))
+    }
+
     @Test func pushStillRunsDirectlyRatherThanThroughTheAgent() {
         let action = SuggestedGitAction.push(commitCount: 1, isFirstPush: false)
         #expect(!action.delegatesToAgent)

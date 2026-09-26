@@ -1014,7 +1014,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "CreatePullRequest",
-                "description": "Push and open a pull request for a workspace's branch. The user confirms this the first time in a task.",
+                "description": "Push this branch's commits and open a pull request. Uncommitted and unstaged files stay in the worktree and are not part of the PR. The user confirms this the first time in a task.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [

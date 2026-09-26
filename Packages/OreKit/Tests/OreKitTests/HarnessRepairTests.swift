@@ -26,7 +26,7 @@ struct HarnessRepairTests {
 
         #expect(repair.needsRoot)
         #expect(repair.script.contains("/opt/homebrew/Cellar/codex"))
-        #expect(repair.script.contains("brew upgrade 'codex'"))
+        #expect(repair.script.contains("brew upgrade --greedy 'codex'"))
         // Not the whole prefix: it holds every other package the user has.
         #expect(!repair.script.contains("chown -R \"$(whoami)\" '/opt/homebrew'"))
         #expect(!repair.script.contains("npm"))
@@ -49,7 +49,7 @@ struct HarnessRepairTests {
         #expect(!repair.script.contains("/opt/homebrew/Cellar"))
         // And the token the install actually names, not the stable cask the
         // user does not have.
-        #expect(repair.script.contains("brew upgrade 'claude-code@latest'"))
+        #expect(repair.script.contains("brew upgrade --greedy 'claude-code@latest'"))
     }
 
     /// A bare `bin` symlink names neither, and `Cellar` is what this always

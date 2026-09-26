@@ -73,6 +73,9 @@ public enum HarnessUpdateChecker {
         case .npm(let package):
             return .npm(package: package)
         case .selfUpdate:
+            // Cursor publishes no npm package; its install script is the
+            // oracle for both the native installer and `agent update`.
+            if kind == .cursorAgent { return .cursorInstallScript }
             // `codex update` and `claude update` both pull from the same release
             // stream the npm package publishes, so npm is the version oracle
             // even when the upgrade itself goes through the CLI.

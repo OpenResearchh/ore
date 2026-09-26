@@ -18,7 +18,7 @@ struct HarnessCLIUpdaterTests {
             resolve: { $0 }
         )
         #expect(plan == .brew(formula: "codex"))
-        #expect(HarnessCLIUpdater.script(for: plan) == "brew upgrade 'codex'")
+        #expect(HarnessCLIUpdater.script(for: plan) == "brew upgrade --greedy 'codex'")
     }
 
     @Test func nvmClaudeUsesNpm() {
@@ -159,7 +159,7 @@ struct HarnessCLIUpdaterTests {
             for: .claudeCode, executablePath: latest, isBrewAvailable: true
         )
         #expect(plan == .brew(formula: "claude-code@latest"))
-        #expect(HarnessCLIUpdater.script(for: plan) == "brew upgrade 'claude-code@latest'")
+        #expect(HarnessCLIUpdater.script(for: plan) == "brew upgrade --greedy 'claude-code@latest'")
 
         // And the version oracle has to follow the same cask, or the card
         // offers an upgrade that cannot land.
@@ -347,5 +347,67 @@ struct HarnessCLIUpdaterTests {
         #expect(HarnessCLIUpdater.UpdateError.describeBytes(2_500_000_000) == "2.5 GB")
         #expect(HarnessCLIUpdater.UpdateError.describeBytes(512_000_000) == "512 MB")
         #expect(HarnessCLIUpdater.UpdateError.describeBytes(0) == "0 MB")
+    }
+
+    // MARK: - A button that actually upgrades
+
+    @Test func cursorWithABinaryUsesSelfUpdateNotTheInstaller() {
+        let path = "/Users/me/.local/bin/agent"
+        let plan = HarnessCLIUpdater.plan(
+            for: .cursorAgent, executablePath: path, resolve: { $0 }
+        )
+        #expect(plan == .selfUpdate(executablePath: path))
+        #expect(HarnessCLIUpdater.script(for: plan) == "'/Users/me/.local/bin/agent' update")
+    }
+
+    @Test func aSelfUpdateThatChangesNothingIsFollowedByTheInstallChannel() {
+        let selfUpdate = HarnessCLIUpdater.Plan.selfUpdate(executablePath: "/usr/local/bin/codex")
+        let npm = HarnessCLIUpdater.Plan.npm(package: "@openai/codex")
+        #expect(HarnessCLIUpdater.shouldFollowNoOp(primary: selfUpdate, fallback: npm))
+        #expect(!HarnessCLIUpdater.shouldFollowNoOp(primary: npm, fallback: npm))
+        #expect(!HarnessCLIUpdater.shouldFollowNoOp(
+            primary: .brew(formula: "codex"),
+            fallback: .nativeInstaller(url: HarnessKind.codex.nativeInstallerURL)
+        ))
+    }
+
+    @Test func theVendorScriptIsNotASafeFallbackForAHomebrewInstall() {
+        let installer = HarnessCLIUpdater.Plan.nativeInstaller(
+            url: HarnessKind.cursorAgent.nativeInstallerURL
+        )
+        #expect(
+            !HarnessCLIUpdater.canSafelyRun(
+                installer, executablePath: "/opt/homebrew/bin/cursor-agent",
+                isBrewAvailable: true
+            )
+        )
+        #expect(
+            HarnessCLIUpdater.canSafelyRun(
+                installer, executablePath: "/opt/homebrew/bin/cursor-agent",
+                isBrewAvailable: false
+            )
+        )
+        #expect(
+            HarnessCLIUpdater.canSafelyRun(
+                installer, executablePath: "/Users/me/.local/bin/agent",
+                isBrewAvailable: true
+            )
+        )
+        #expect(
+            HarnessCLIUpdater.canSafelyRun(
+                .selfUpdate(executablePath: "/opt/homebrew/bin/cursor-agent"),
+                executablePath: "/opt/homebrew/bin/cursor-agent"
+            )
+        )
+    }
+
+    @Test func aClosedStdinStillConfirmsASelfUpdate() {
+        let plan = HarnessCLIUpdater.Plan.selfUpdate(executablePath: "/usr/local/bin/claude")
+        let runnable = HarnessCLIUpdater.runnableScript(for: plan)
+        #expect(runnable.contains("yes |"))
+        #expect(runnable.contains("pipefail"))
+        #expect(runnable.contains("NONINTERACTIVE=1"))
+        // The card still shows the command the user would type.
+        #expect(HarnessCLIUpdater.script(for: plan) == "'/usr/local/bin/claude' update")
     }
 }

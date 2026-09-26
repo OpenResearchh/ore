@@ -394,6 +394,29 @@ final class NeuralNarrationVoice: NarrationVoice {
         }
     }
 
+    /// Whether this voice's pack is on disk and loadable — the check the
+    /// Download button was using FluidAudio itself as, once pressed.
+    ///
+    /// The stored install flag is a cache of this, not the source of truth.
+    /// Launch used to trust the flag plus "some Fluidaudio cache exists", so a
+    /// completed pack with a lost flag (or a first launch of a debug build
+    /// that does not share UserDefaults with the installed app) showed
+    /// Download every time; pressing it then skipped the fetch and loaded in
+    /// a second. Asking the pack the downloader would ask is the same check,
+    /// without the press.
+    nonisolated static func weightsAreComplete(
+        languagePack: URL? = nil,
+        required: Set<String> = requiredModelNames,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        let pack = languagePack ?? languagePackDirectory()
+        return fetchWillBeSkipped(
+            languagePack: pack, required: required, fileManager: fileManager
+        ) && incompleteCompiledModels(
+            in: pack, required: required, fileManager: fileManager
+        ).isEmpty
+    }
+
     /// The half-written models that have to go before a fetch, and no more.
     ///
     /// Only when FluidAudio would otherwise skip the fetch: then an
@@ -613,21 +636,20 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// True when the weights are already on disk from a previous run, so the
     /// UI can load quietly instead of showing a download.
     ///
-    /// The stored flag alone is not enough. It was written once on success
-    /// and never unwritten, so a Mac whose caches had been emptied — a
-    /// cleaner, Migration Assistant, someone reclaiming space — still claimed
-    /// the model was installed, and the next narration line silently re-spent
-    /// 940 MB with no consent, no progress and no way to stop it. Reading it
-    /// is therefore also where a stale flag gets cleared, which puts the
-    /// Download button back.
+    /// The pack on disk is the answer, not the stored flag. The flag is
+    /// written on success and never otherwise, so a completed download whose
+    /// defaults did not survive — a debug build, a moved bundle, a cleared
+    /// suite — still looked like a first install. The downloader itself then
+    /// found every file and loaded immediately, which is how "Download" every
+    /// launch became a one-click no-op. Aligning the two checks (and healing
+    /// the flag either way) is what stops the prompt.
     var wasInstalledPreviously: Bool {
-        guard UserDefaults.standard.bool(forKey: Self.installedKey) else { return false }
-        guard Self.installFlagIsStale(
-            vendorCacheRootExists: Self.hasVendorCacheRoot(),
-            hasIncompleteModels: Self.hasIncompleteModels()
-        ) else { return true }
-        UserDefaults.standard.set(false, forKey: Self.installedKey)
-        return false
+        let complete = Self.weightsAreComplete()
+        let stored = UserDefaults.standard.bool(forKey: Self.installedKey)
+        if complete != stored {
+            UserDefaults.standard.set(complete, forKey: Self.installedKey)
+        }
+        return complete
     }
 
     /// Whether a stored install flag has been outlived by its weights.
@@ -642,10 +664,6 @@ final class NeuralNarrationVoice: NarrationVoice {
         hasIncompleteModels: Bool
     ) -> Bool {
         !vendorCacheRootExists || hasIncompleteModels
-    }
-
-    private static func hasVendorCacheRoot() -> Bool {
-        FileManager.default.fileExists(atPath: vendorCacheDirectory().path)
     }
 
     /// How much of the volume the cache lives on is free, or nil when the
@@ -1371,6 +1389,15 @@ struct NarrationVoicePicker: View {
     @ViewBuilder
     private var status: some View {
         switch voice.readiness {
+        case .notInstalled where NeuralNarrationVoice.weightsAreComplete():
+            // Pack is on disk; the engine loads it at launch when this voice
+            // is selected. Showing the 940 MB prompt here is the Settings
+            // half of the same false "not downloaded" on every start.
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView().controlSize(.small)
+                Text("Loading the voice…").foregroundStyle(.secondary)
+            }
+            .font(.caption)
         case .notInstalled:
             VStack(alignment: .leading, spacing: 4) {
                 // Measured, not quoted: the English pack lands at 939 MB on

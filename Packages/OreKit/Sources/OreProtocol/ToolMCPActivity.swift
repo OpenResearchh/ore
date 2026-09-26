@@ -198,16 +198,17 @@ public struct ToolMCPActivity: Equatable, Sendable {
             return field(input, "name") ?? field(input, "title")
         }
 
-        return github
-            ?? field(input, "title")
-            ?? firstLine(field(input, "message"))
-            ?? field(input, "question")
-            ?? field(input, "query")
-            ?? field(input, "q")
-            ?? field(input, "skill")
-            ?? field(input, "name")
-            ?? fileName(from: input)
-            ?? field(input, "pattern")
+        // Sequential, not a `??` chain: Swift 6.1 on CI timed out type-checking
+        // ten optional-coalesces of `field` in one expression.
+        if let github { return github }
+        if let title = field(input, "title") { return title }
+        if let message = firstLine(field(input, "message")) { return message }
+        if let question = field(input, "question") { return question }
+        if let query = field(input, "query") ?? field(input, "q") { return query }
+        if let skill = field(input, "skill") { return skill }
+        if let name = field(input, "name") { return name }
+        if let file = fileName(from: input) { return file }
+        return field(input, "pattern")
     }
 
     private static func githubRef(from input: JSONValue?) -> String? {
@@ -221,11 +222,12 @@ public struct ToolMCPActivity: Equatable, Sendable {
         }
         let number = field(input, "issue_number")
             ?? field(input, "issueNumber")
-            ?? field(input, "pull_number")
+        let pull = field(input, "pull_number")
             ?? field(input, "pullNumber")
             ?? field(input, "number")
-        if let combined, let number { return "\(combined)#\(number)" }
-        if let number { return "#\(number)" }
+        let issue = number ?? pull
+        if let combined, let issue { return "\(combined)#\(issue)" }
+        if let issue { return "#\(issue)" }
         return combined
     }
 

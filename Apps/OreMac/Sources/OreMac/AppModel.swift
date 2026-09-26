@@ -3834,7 +3834,7 @@ final class AppModel {
     func workspaceFiles(for workspace: WorkspaceSummary) async -> [WorkspaceFileNode] {
         let root = workspace.worktreePath
         return await Task.detached(priority: .userInitiated) {
-            Self.scanWorkspace(at: root)
+            WorkspaceFileScanner.default.scan(at: root)
         }.value
     }
 
@@ -3882,45 +3882,6 @@ final class AppModel {
             throw CocoaError(.fileReadNoPermission)
         }
         return url
-    }
-
-    private nonisolated static func scanWorkspace(at root: String) -> [WorkspaceFileNode] {
-        let manager = FileManager.default
-        let rootURL = URL(fileURLWithPath: root)
-        let skipped = Set(["node_modules", ".build", "DerivedData", "Pods", ".swiftpm"])
-        var visited = 0
-
-        func children(of directory: URL, relativeBase: String) -> [WorkspaceFileNode] {
-            guard visited < 6_000,
-                  let urls = try? manager.contentsOfDirectory(
-                    at: directory,
-                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                    options: []
-                  ) else { return [] }
-            return urls.sorted { first, second in
-                let firstDirectory = (try? first.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                let secondDirectory = (try? second.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                if firstDirectory != secondDirectory { return firstDirectory }
-                return first.lastPathComponent.localizedStandardCompare(second.lastPathComponent) == .orderedAscending
-            }.compactMap { url in
-                guard visited < 6_000 else { return nil }
-                visited += 1
-                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                let isDirectory = values?.isDirectory == true
-                let relative = relativeBase.isEmpty ? url.lastPathComponent : relativeBase + "/" + url.lastPathComponent
-                if url.lastPathComponent == ".git", isDirectory { return nil }
-                let nested = isDirectory && values?.isSymbolicLink != true && !skipped.contains(url.lastPathComponent)
-                    ? children(of: url, relativeBase: relative)
-                    : nil
-                return WorkspaceFileNode(
-                    path: relative,
-                    name: url.lastPathComponent,
-                    isDirectory: isDirectory,
-                    children: nested
-                )
-            }
-        }
-        return children(of: rootURL, relativeBase: "")
     }
 
     struct SearchResult: Identifiable, Sendable {

@@ -2810,6 +2810,8 @@ final class AppModel {
                 forwardFailingChecks(workspace.id)
             case .resolveConflicts(_, let base):
                 send("Rebase onto `\(base)`, resolve all conflicts, and explain the resolution.", to: workspace.id)
+            case .setUpGitHub:
+                await setupGitHub()
             default:
                 break
             }
@@ -3447,12 +3449,85 @@ final class AppModel {
         await GitHubClient(repositoryURL: OreHome.directory).status()
     }
 
+    /// Re-walks PATH first: the welcome card's GitHub rung is the other half of
+    /// "install gh in Terminal, cmd-tab back", and a cached login-shell PATH
+    /// would still say it is missing.
+    func refreshGitHubStatus() async -> GitHubClient.Status {
+        ShellEnvironment.invalidateCache()
+        return await githubStatus()
+    }
+
     func githubRepositories() async throws -> [GitHubClient.Repository] {
         try await GitHubClient(repositoryURL: OreHome.directory).repositories()
     }
 
     func authenticateGitHub() async throws {
+        isAuthenticatingGitHub = true
+        defer { isAuthenticatingGitHub = false }
         try await GitHubClient(repositoryURL: OreHome.directory).authenticate()
+    }
+
+    /// Opens Terminal with the vendor installer. ORE does not pipe `curl | bash`
+    /// itself — that is the user's decision, in a shell they can read first.
+    func installHarness(_ kind: HarnessKind) {
+        ExternalTools.copyAndRunInTerminal(HarnessSetup.installCommand(for: kind))
+    }
+
+    /// Install `gh` when Homebrew is on PATH; otherwise open the download page
+    /// and still copy the brew command for later.
+    func installGitHubCLI() {
+        if ShellEnvironment.locate("brew") != nil {
+            ExternalTools.copyAndRunInTerminal(GitHubCLISetup.installCommand)
+            return
+        }
+        ExternalTools.copyPath(GitHubCLISetup.installCommand)
+        if let url = URL(string: GitHubCLISetup.downloadURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Sign in, or install `gh` first when it is missing. Used by the review
+    /// pane's "Set up GitHub" button, which used to be a no-op.
+    func setupGitHub() async {
+        let status = await githubStatus()
+        if !status.isInstalled {
+            installGitHubCLI()
+            banners.append(Banner(
+                message: "Install the GitHub CLI in the Terminal window that just opened, then come back to ORE.",
+                detail: GitHubCLISetup.installCommand
+            ))
+            return
+        }
+        do {
+            try await authenticateGitHub()
+        } catch {
+            banners.append(Banner(
+                message: error.localizedDescription,
+                detail: GitHubCLISetup.signInCommand
+            ))
+        }
+    }
+
+    /// Provider login from every surface that used to only copy a command.
+    ///
+    /// Claude Code cannot be driven headlessly (`claude auth login` is a TTY
+    /// flow), so that path opens Terminal instead of throwing at the button.
+    func startHarnessSignIn(_ kind: HarnessKind) async throws {
+        if kind == .claudeCode {
+            openClaudeSignInInTerminal()
+            return
+        }
+        try await authenticateHarness(kind)
+    }
+
+    private func openClaudeSignInInTerminal() {
+        let command: String
+        if let path = harnesses.first(where: { $0.kind == .claudeCode })?.executablePath {
+            command = "\(ExternalTools.posixQuoted(path)) auth login"
+        } else {
+            command = HarnessSetup.signInCommand(for: .claudeCode)
+        }
+        ExternalTools.copyAndRunInTerminal(command)
     }
 
     /// Clones into ORE's repository library using owner/name folders, which
@@ -3557,6 +3632,11 @@ final class AppModel {
         // window focus for it would tax the steady-state user — who is most
         // users, nearly all the time — to serve the first ten minutes.
         guard !harnesses.contains(where: \.isReady) else { return }
+        // A real turn is stronger evidence than `auth status`. In particular,
+        // Claude can report a valid login while the organization refuses its
+        // subscription. Leave that verdict in place until the user explicitly
+        // presses Refresh after changing the account configuration.
+        guard !harnesses.contains(where: { $0.runtimeFailure != nil }) else { return }
         guard Self.shouldReprobe(now: now, last: lastActivationProbe) else { return }
         lastActivationProbe = now
         // Deliberately not `refreshHarnesses()`: that also forces a harness
@@ -3706,6 +3786,13 @@ final class AppModel {
     @ObservationIgnored
     private var harnessSignInWasCancelled = false
 
+    /// Which CLI is currently in a browser handshake. Shared by Settings and
+    /// the welcome card so the two cannot start two logins at once.
+    private(set) var authenticatingHarness: HarnessKind?
+
+    /// `gh auth login` in flight — same sharing reason as `authenticatingHarness`.
+    private(set) var isAuthenticatingGitHub = false
+
     /// The verification URL the CLI printed, once it has printed one. Observed,
     /// because it arrives seconds after the button was pressed.
     private(set) var harnessAuthenticationURL: String?
@@ -3725,8 +3812,10 @@ final class AppModel {
         guard let executable = harnesses.first(where: { $0.kind == kind })?.executablePath
         else { throw HarnessAuthenticationError.notInstalled(kind.displayName) }
 
+        authenticatingHarness = kind
         harnessAuthenticationURL = nil
         harnessSignInWasCancelled = false
+        defer { authenticatingHarness = nil }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)

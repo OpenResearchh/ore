@@ -42,6 +42,14 @@ struct ReadinessStep: Identifiable, Equatable {
         case addProject
         case newWorkspace
         case openURL(String)
+        /// An installed CLI that still needs its provider login. Codex and
+        /// Cursor can be driven from ORE; Claude Code opens Terminal.
+        case signIn(HarnessKind)
+        /// No usable agent yet. Offer every supported CLI rather than
+        /// handing Claude Code's installer to a Codex-only subscriber.
+        case installAgents
+        case githubSignIn
+        case githubInstall
     }
 
     let id: String
@@ -160,8 +168,8 @@ extension Readiness {
                 title: "Sign in to \(installed.kind.displayName)",
                 detail: "It's installed but not signed in. ORE uses your own subscription — it never handles API keys.",
                 status: .unmet,
-                action: .copyCommand(HarnessSetup.signInCommand(for: installed.kind)),
-                actionTitle: "Copy sign-in command",
+                action: .signIn(installed.kind),
+                actionTitle: "Sign in…",
                 isBlocking: true
             )
         }
@@ -211,15 +219,31 @@ extension Readiness {
             )
         }
 
+        let offered = HarnessSetup.offeredKinds(from: harnesses)
+        let names = offered.map(\.displayName)
+        let list = Self.joinedNames(names)
         return ReadinessStep(
             id: "agent",
             title: "Install a coding agent",
-            detail: "ORE drives Claude Code, Codex or cursor-agent. Install one and sign in with the plan you already pay for.",
+            detail: "ORE drives \(list) — whichever you already pay for. You only need one.",
             status: .unmet,
-            action: .copyCommand(HarnessSetup.installCommand(for: .claudeCode)),
-            actionTitle: "Copy install command",
+            action: .installAgents,
+            actionTitle: "Install",
             isBlocking: true
         )
+    }
+
+    /// "A, B or C" for the install card, so a Codex-only subscriber is not
+    /// told the product is Claude Code.
+    private static func joinedNames(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return "a coding agent"
+        case 1: return names[0]
+        case 2: return "\(names[0]) or \(names[1])"
+        default:
+            let head = names.dropLast().joined(separator: ", ")
+            return "\(head) or \(names[names.count - 1])"
+        }
     }
 
     /// Rung 2, and blocking for the same reason as rung 1: ORE drives git
@@ -357,15 +381,15 @@ extension Readiness {
             return ReadinessStep(
                 id: "github", title: "Connect GitHub",
                 detail: "Needed to open pull requests from ORE. Everything else works without it.",
-                status: .unmet, action: .copyCommand("gh auth login"),
-                actionTitle: "Copy command", isBlocking: false
+                status: .unmet, action: .githubSignIn,
+                actionTitle: "Sign in…", isBlocking: false
             )
         }
         return ReadinessStep(
             id: "github", title: "Install the GitHub CLI",
             detail: "Needed to open pull requests from ORE. Everything else works without it.",
-            status: .unmet, action: .copyCommand("brew install gh"),
-            actionTitle: "Copy command", isBlocking: false
+            status: .unmet, action: .githubInstall,
+            actionTitle: "Install GitHub CLI", isBlocking: false
         )
     }
 
@@ -487,4 +511,26 @@ enum HarnessSetup {
     static func installCommand(for kind: HarnessKind) -> String {
         "curl -fsSL \(kind.nativeInstallerURL) | bash"
     }
+
+    /// Agents the onboarding card should offer to install.
+    ///
+    /// Cursor Agent is omitted unless this build has enabled it: offering to
+    /// install a CLI ORE will not run is the same dead end as handing every
+    /// user Claude Code's installer.
+    static func offeredKinds(from harnesses: [HarnessProbeResult]) -> [HarnessKind] {
+        let disabled = Set(harnesses.filter { $0.isEnabled == false }.map(\.kind))
+        var kinds = HarnessKind.allCases.filter { !disabled.contains($0) }
+        if !harnesses.contains(where: { $0.kind == .cursorAgent && $0.isEnabled != false }) {
+            kinds.removeAll { $0 == .cursorAgent }
+        }
+        return kinds.isEmpty ? [.claudeCode, .codex] : kinds
+    }
+}
+
+/// `gh` is optional until the user wants to open a pull request, but it
+/// still needs a command and a download page that every surface can share.
+enum GitHubCLISetup {
+    static let installCommand = "brew install gh"
+    static let signInCommand = "gh auth login --hostname github.com --git-protocol https --web"
+    static let downloadURL = "https://cli.github.com"
 }

@@ -2864,6 +2864,7 @@ struct ChatPane: View {
         let harness = chatSummary?.harness ?? workspace.harness
         let update = model.harnessCLIUpdate
         let matchingUpdate: AppModel.HarnessCLIUpdate? = update?.kind == harness ? update : nil
+        let alternate = model.readyHarnesses.first { $0 != harness }
         return ProminentErrorBanner(
             error: error,
             harnessName: harness.displayName,
@@ -2874,9 +2875,19 @@ struct ChatPane: View {
             onContinueWhenAvailable: scheduleContinuation,
             onCancelSchedule: cancelScheduledContinuation,
             onRetry: { model.retryLastTurn(in: workspace.id) },
+            onRefreshHarnesses: { model.refreshHarnesses() },
+            alternateHarness: error.subscriptionBlocked ? alternate : nil,
+            onSwitchHarness: {
+                guard let chatSummary, let alternate else { return }
+                model.switchHarness(alternate, model: model.defaultModelID(for: alternate), for: chatSummary)
+            },
             onUpdateCLI: {
                 guard let chatSummary else { return }
                 model.updateHarnessCLI(for: chatSummary)
+            },
+            onInstall: { model.installHarness(harness) },
+            onSignIn: {
+                Task { try? await model.startHarnessSignIn(harness) }
             },
             onCopySignIn: {
                 model.refreshHarnesses()
@@ -4316,7 +4327,12 @@ private struct ProminentErrorBanner: View {
     var onContinueWhenAvailable: () -> Void
     var onCancelSchedule: () -> Void
     var onRetry: () -> Void
+    var onRefreshHarnesses: () -> Void
+    var alternateHarness: HarnessKind?
+    var onSwitchHarness: () -> Void
     var onUpdateCLI: () -> Void
+    var onInstall: (() -> Void)?
+    var onSignIn: (() -> Void)?
     var onCopySignIn: (() -> Void)?
     var onCopyInstall: (() -> Void)?
     let onDismiss: () -> Void
@@ -4332,6 +4348,7 @@ private struct ProminentErrorBanner: View {
         return error.isUsageLimit ? "hourglass.circle.fill" : "exclamationmark.triangle.fill"
     }
     private var title: String {
+        if error.subscriptionBlocked { return "Claude Code access is blocked" }
         if error.needsInstall { return "\(harnessName) isn't installed" }
         if error.needsSignIn { return "\(harnessName) needs you to sign in" }
         if error.needsCLIUpgrade { return "\(harnessName) needs an update" }
@@ -4377,35 +4394,60 @@ private struct ProminentErrorBanner: View {
                     // banner offered nothing but the button that cannot.
                     HStack(spacing: OreTheme.Space.xs) {
                         Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(installCommand, forType: .string)
-                            onCopyInstall?()
+                            onInstall?()
                         } label: {
-                            Label("Copy install command", systemImage: "doc.on.doc")
+                            Label("Install in Terminal", systemImage: "terminal")
                                 .font(.system(size: OreTheme.Font.caption, weight: .semibold))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(tint.opacity(0.18), in: Capsule())
                         }
                         .buttonStyle(.plain)
-                        .help("Copies `\(installCommand)` — run it in Terminal, then retry")
+                        .help("Runs `\(installCommand)` in Terminal")
+
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(installCommand, forType: .string)
+                            onCopyInstall?()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(tint.opacity(0.18), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copies `\(installCommand)`")
 
                         retryButton
                     }
                 } else if error.needsSignIn {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(signInCommand, forType: .string)
-                        onCopySignIn?()
-                    } label: {
-                        Label("Copy sign-in command", systemImage: "doc.on.doc")
-                            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(tint.opacity(0.18), in: Capsule())
+                    HStack(spacing: OreTheme.Space.xs) {
+                        Button {
+                            onSignIn?()
+                        } label: {
+                            Label("Sign in…", systemImage: "person.crop.circle.badge.checkmark")
+                                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(tint.opacity(0.18), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Signs in with `\(signInCommand)`")
+
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(signInCommand, forType: .string)
+                            onCopySignIn?()
+                        } label: {
+                            Label("Copy command", systemImage: "doc.on.doc")
+                                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(tint.opacity(0.18), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                    .help("Copies `\(signInCommand)` — run it in Terminal, then retry")
                 } else if error.needsCLIUpgrade {
                     updateCLIButton
                 } else if error.isUsageLimit {
@@ -4414,6 +4456,16 @@ private struct ProminentErrorBanner: View {
                     } else {
                         continueButton
                     }
+                } else if let alternateHarness {
+                    HStack(spacing: OreTheme.Space.xs) {
+                        Button("Switch to \(alternateHarness.displayName)", action: onSwitchHarness)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                    }
+                } else if error.subscriptionBlocked {
+                    Button("Refresh agents", action: onRefreshHarnesses)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                 } else {
                     retryButton
                 }

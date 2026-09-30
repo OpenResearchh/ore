@@ -325,6 +325,17 @@ finish() {
   say "What ORE measures, and how to turn it off:"
   say "  https://github.com/$REPO/blob/master/PRIVACY.md"
 
+  # Optional: ORE opens PRs through `gh`. Do not fail the install if it is
+  # missing — coding agents work without it — but name the command so a first
+  # launch does not have to discover it from a greyed-out Sign in button.
+  if ! command -v gh >/dev/null 2>&1 \
+      && [ ! -x /opt/homebrew/bin/gh ] \
+      && [ ! -x /usr/local/bin/gh ]; then
+    say ""
+    say "Optional: install the GitHub CLI to open pull requests from ORE:"
+    say "  brew install gh && gh auth login"
+  fi
+
   if [ -z "${ORE_INSTALL_DIR:-}" ]; then
     open "$dest" 2>/dev/null || say "Open it with: open '$dest'"
     say ""

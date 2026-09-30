@@ -37,6 +37,43 @@ enum ExternalTools {
         )
     }
 
+    /// Copies `command` and opens a Terminal window that runs it.
+    ///
+    /// Setup still ends in a real shell — vendor installers pipe a script,
+    /// and Claude Code's login is interactive — but the user should not have
+    /// to paste. Clipboard is a fallback if AppleScript is refused.
+    static func copyAndRunInTerminal(_ command: String) {
+        copyPath(command)
+        runCommandInTerminal(command)
+    }
+
+    /// Opens Terminal.app and runs `command` in a new window.
+    static func runCommandInTerminal(_ command: String) {
+        let source = """
+            tell application "Terminal"
+                activate
+                do script \(appleScriptStringLiteral(command))
+            end tell
+            """
+        if let script = NSAppleScript(source: source) {
+            var error: NSDictionary?
+            script.executeAndReturnError(&error)
+        }
+    }
+
+    /// Quote a value for an AppleScript string literal.
+    nonisolated static func appleScriptStringLiteral(_ value: String) -> String {
+        "\"" + value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            + "\""
+    }
+
+    /// POSIX single-quoted so a path with spaces survives `do script`.
+    nonisolated static func posixQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     // MARK: - The path itself
 
     /// Copies a path to the clipboard.

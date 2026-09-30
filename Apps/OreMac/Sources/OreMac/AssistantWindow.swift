@@ -697,6 +697,36 @@ private struct AssistantComposer: View {
     var body: some View {
         let isEmpty = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return VStack(alignment: .leading, spacing: 6) {
+            if let error = state.prominentError {
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(error.subscriptionBlocked ? "Claude Code access is blocked" : "The agent hit an error")
+                            .fontWeight(.semibold)
+                        Text(error.message)
+                            .textSelection(.enabled)
+                        if error.subscriptionBlocked {
+                            Button("Refresh agents") { model.refreshHarnesses() }
+                                .buttonStyle(.borderless)
+                        } else if error.needsSignIn {
+                            Button("Sign in…") {
+                                let kind = model.assistantWorkspace?.harness ?? .claudeCode
+                                Task { try? await model.startHarnessSignIn(kind) }
+                            }
+                            .buttonStyle(.borderless)
+                        } else if error.needsInstall {
+                            Button("Install in Terminal") {
+                                model.installHarness(model.assistantWorkspace?.harness ?? .claudeCode)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if state.isBusy {
                 Button {
                     model.interruptAssistant(chatID: chatID)

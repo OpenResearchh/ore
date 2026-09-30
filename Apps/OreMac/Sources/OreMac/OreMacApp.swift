@@ -1150,8 +1150,10 @@ struct RootView: View {
 
             NextStepCard(
                 readiness: readiness,
+                harnesses: model.harnesses,
                 onAddProject: { isShowingNewWorkspace = true },
-                onNewWorkspace: { isShowingNewWorkspace = true }
+                onNewWorkspace: { isShowingNewWorkspace = true },
+                onGitHubStatusChanged: { Task { githubStatus = await model.refreshGitHubStatus() } }
             )
             .padding(.top, OreTheme.Space.md)
         }
@@ -1167,6 +1169,9 @@ struct RootView: View {
             let (availability, identity) = await git
             gitAvailability = availability
             hasGitIdentity = identity
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { githubStatus = await model.refreshGitHubStatus() }
         }
         // No fill: the welcome floats directly on the window's glass base.
     }

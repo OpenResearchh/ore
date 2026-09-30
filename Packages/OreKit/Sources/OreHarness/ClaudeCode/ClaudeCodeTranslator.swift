@@ -486,9 +486,13 @@ struct ClaudeCodeTranslator {
             output.events.append(.usage(report))
         }
 
+        let (summaryBody, taggedNarration) = NarrationTag.extract(from: payload.result ?? "")
+        let accessBlocked = ProviderErrorCopy.isClaudeSubscriptionBlocked(summaryBody)
         let outcome: TurnResult.Outcome
         if sawInterruptMarker || Self.interruptedTerminalReasons.contains(payload.terminalReason ?? "") {
             outcome = .interrupted
+        } else if accessBlocked {
+            outcome = .failed
         } else if payload.subtype == "success" {
             outcome = .completed
         } else {
@@ -497,7 +501,6 @@ struct ClaudeCodeTranslator {
 
         // The result echoes the final assistant text, tag included — strip it
         // here too so titles, notifications and search never see the marker.
-        let (summaryBody, taggedNarration) = NarrationTag.extract(from: payload.result ?? "")
         output.events.append(.turnCompleted(TurnResult(
             turnID: turnID,
             outcome: outcome,

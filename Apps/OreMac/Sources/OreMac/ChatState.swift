@@ -101,6 +101,9 @@ final class ChatState {
         /// The CLI is not on the machine at all. Retry is the one thing that
         /// cannot help here, and it was all the banner used to offer.
         var needsInstall: Bool
+        /// Claude account policy refuses subscription use even when its CLI
+        /// reports a completed text response.
+        var subscriptionBlocked: Bool
         var resetsAt: Date?
 
         init(
@@ -112,6 +115,7 @@ final class ChatState {
         ) {
             let unwrapped = ProviderErrorCopy.unwrap(message)
             self.message = unwrapped
+            self.subscriptionBlocked = ProviderErrorCopy.isClaudeSubscriptionBlocked(unwrapped)
             // Missing beats every other reading of the same text: a CLI that
             // is not installed cannot be out of date, signed out or rate
             // limited, and each of those banners sends the user somewhere

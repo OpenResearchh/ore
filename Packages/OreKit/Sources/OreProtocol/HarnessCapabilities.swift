@@ -192,6 +192,9 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
     /// it but ORE still reports the old version": the updater upgrades the one
     /// it can see, and PATH keeps running the other.
     public var shadowedPaths: [String]?
+    /// A refusal observed during a real turn. Metadata probes can report a
+    /// valid login even when the account cannot use this CLI.
+    public var runtimeFailure: String?
 
     public var isInstalled: Bool { executablePath != nil }
     /// Present *and* able to start — what a caller asking "is it there?"
@@ -205,6 +208,7 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
     public var isLaunchable: Bool { isInstalled && isUnlaunchable != true }
     public var isReady: Bool {
         isEnabled != false && isLaunchable && authState != .notAuthenticated
+            && runtimeFailure == nil
     }
 
     public init(
@@ -215,7 +219,8 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         isEnabled: Bool? = nil,
         diagnostic: String? = nil,
         isUnlaunchable: Bool? = nil,
-        shadowedPaths: [String]? = nil
+        shadowedPaths: [String]? = nil,
+        runtimeFailure: String? = nil
     ) {
         self.kind = kind
         self.executablePath = executablePath
@@ -225,6 +230,7 @@ public struct HarnessProbeResult: Sendable, Codable, Hashable {
         self.diagnostic = diagnostic
         self.isUnlaunchable = isUnlaunchable
         self.shadowedPaths = shadowedPaths
+        self.runtimeFailure = runtimeFailure
     }
 }
 

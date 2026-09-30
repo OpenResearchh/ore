@@ -6,6 +6,17 @@ import Testing
 
 @MainActor
 struct ChatStateTests {
+    @Test func subscriptionDenialProducesSpecificComposerWarning() {
+        let state = ChatState()
+        let refusal = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"
+        state.apply(.turnCompleted(TurnResult(
+            turnID: TurnID(rawValue: "blocked"), outcome: .failed,
+            errorMessage: refusal
+        )))
+        #expect(state.prominentError?.subscriptionBlocked == true)
+        #expect(state.prominentError?.message == refusal)
+    }
+
     @Test func aRepeatedToolCallUpdatesInputInsteadOfAppending() {
         let state = ChatState()
         let turnID = TurnID(rawValue: "t1")

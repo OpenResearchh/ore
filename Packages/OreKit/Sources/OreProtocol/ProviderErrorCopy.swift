@@ -43,6 +43,16 @@ public enum ProviderErrorCopy {
             || value.contains("quota")
     }
 
+    /// Claude can return this account policy denial as ordinary assistant text
+    /// in a successful result. It is a provider refusal, not an answer to the
+    /// user's prompt. Keep the match narrow so quoted documentation is not
+    /// mistaken for a failed turn.
+    public static func isClaudeSubscriptionBlocked(_ text: String) -> Bool {
+        let value = unwrap(text).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value.hasPrefix("your organization has disabled claude subscription access for claude code")
+            && (value.contains("anthropic api key") || value.contains("ask your admin"))
+    }
+
     /// SessionError kind that matches the unwrapped copy, so the UI can offer
     /// Upgrade CLI / wait-for-reset rather than a generic Retry.
     public static func sessionKind(for text: String) -> SessionError.Kind {

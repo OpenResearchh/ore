@@ -1791,10 +1791,11 @@ extension InProcessCoreClient {
         var warnedProfiles: Set<String> = []
         for chat in chats where !chat.isClosed {
             let current = HarnessKind(rawValue: chat.harness)
+            let failed = assistantFailedHarnesses[chat.chatID] ?? []
             var seen: Set<HarnessKind> = []
             let candidates = ([current].compactMap { $0 }
                 + harnessProbes.filter(\.isReady).map(\.kind))
-                .filter { seen.insert($0).inserted }
+                .filter { !failed.contains($0) && seen.insert($0).inserted }
             let target = candidates.compactMap({ harness -> (
                 harness: HarnessKind, profile: AssistantManager.ModelProfile
             )? in
@@ -1877,6 +1878,7 @@ extension InProcessCoreClient {
         let current = HarnessKind(rawValue: chat.harness)
         var excluding = assistantFailedHarnesses[chatID] ?? []
         if let current { excluding.insert(current) }
+        assistantFailedHarnesses[chatID] = excluding
         guard let alternate = AssistantFailoverPolicy.nextHarness(
             current: current,
             excluding: excluding,

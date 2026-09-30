@@ -10,6 +10,23 @@ import OreProtocol
 /// model it cannot run, a worktree cut from a branch nobody named, work begun
 /// in a project the user explicitly said was not the one.
 struct WorkspaceLaunchPlanTests {
+    @Test func unavailableAgentBlocksStartingAndReadyAgentIsUsedInsteadOfRepositoryDefault() {
+        let noAgents = WorkspaceLaunchPlan.resolve(inputs("Fix the parser", ready: []))
+        #expect(noAgents.blocker == .noHarness)
+
+        let requested = WorkspaceLaunchPlan.resolve(inputs(
+            "Use Claude Code to fix the parser", ready: [.codex]
+        ))
+        #expect(requested.blocker == .harnessUnavailable(.claudeCode))
+
+        let defaulted = WorkspaceLaunchPlan.resolve(inputs(
+            "Fix the parser", ready: [.codex], repositories: [ore],
+            repositoryDefaultHarness: { _ in .claudeCode }
+        ))
+        #expect(defaulted.harness == .codex)
+        #expect(defaulted.canStart)
+    }
+
     private let ore = "/Users/x/code/ore"
     private let website = "/Users/x/code/website"
 

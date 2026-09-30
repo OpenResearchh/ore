@@ -46,6 +46,14 @@ struct AssistantFailoverPolicyTests {
         ))) == .providerFailed)
     }
 
+    @Test func organizationPolicyDenialTriggersFailover() {
+        #expect(AssistantFailoverPolicy.reason(for: .turnCompleted(TurnResult(
+            turnID: TurnID(rawValue: "t"),
+            outcome: .failed,
+            errorMessage: "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"
+        ))) == .providerFailed)
+    }
+
     @Test func unknownCopyOnlyFailsOverWhenItLooksLikeAQuota() {
         #expect(AssistantFailoverPolicy.reason(for: .sessionError(SessionError(
             kind: .unknown, message: "something odd"
@@ -108,6 +116,48 @@ struct AssistantFailoverPolicyTests {
 /// The Assistant's own agent, not a project tab, moves when its CLI dries up.
 @Suite(.serialized)
 struct AssistantFailoverIntegrationTests {
+    @Test func organizationDenialMarksClaudeUnavailableAndRetriesOnCodex() async throws {
+        let fixture = try await makeFixture()
+        let claude = FakeHarness(
+            kind: .claudeCode,
+            models: [AgentModel(id: "claude-haiku-4-5-20251001", displayName: "Haiku")]
+        )
+        let codex = FakeHarness(
+            kind: .codex,
+            models: [AgentModel(id: "gpt-5.6-luna", displayName: "Luna")]
+        )
+        let (client, store, recorder) = try makeClient(fixture: fixture, harnesses: [claude, codex])
+        try await client.start()
+        defer { Task { await client.shutdown() } }
+        try await waitForProbes(recorder, count: 2)
+
+        let assistant = try #require(try await store.assistantWorkspace())
+        let chat = try #require(try await store.chats(workspaceID: assistant.workspaceID).first)
+        await client.send(.sendMessage(SendMessageRequest(
+            workspaceID: assistant.workspaceID, chatID: chat.chatID, text: "What changed?"
+        )))
+        #expect(await waitUntil { claude.latestSession != nil })
+        claude.latestSession?.emit(.turnCompleted(TurnResult(
+            turnID: TurnID.generate(), outcome: .failed,
+            errorMessage: "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"
+        )))
+
+        #expect(await waitUntil {
+            (try? await store.chat(chat.chatID))?.harness == HarnessKind.codex.rawValue
+        })
+        let blockedProbe = await recorder.waitFor {
+            if case .harnessProbeCompleted(let probes) = $0 {
+                return probes.first(where: { $0.kind == .claudeCode })?.runtimeFailure != nil
+            }
+            return false
+        }
+        #expect(blockedProbe != nil)
+        #expect(await waitUntil {
+            let texts = await (codex.latestSession?.messageTexts() ?? [])
+            return texts.contains { $0.contains("What changed?") }
+        })
+    }
+
     @Test func anExhaustedAssistantMovesToAnotherReadyHarnessAndRetries() async throws {
         let fixture = try await makeFixture()
         let claude = FakeHarness(

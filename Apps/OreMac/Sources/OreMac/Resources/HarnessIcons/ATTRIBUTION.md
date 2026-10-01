@@ -7,7 +7,7 @@ not imply endorsement.
 - `claude.svg`: Claude rounded icon from Anthropic's official media press kit, downloaded from `https://www.anthropic.com/press-kit` on 2026-08-13. Claude is a trademark of Anthropic, PBC.
 - `codex.svg`: OpenAI Blossom provider mark from the CodexBar icon set (`steipete/CodexBar`), downloaded from `https://github.com/steipete/CodexBar/blob/main/Sources/CodexBar/Resources/ProviderIcon-codex.svg` on 2026-08-13. The file is distributed under CodexBar's MIT license, reproduced below. The OpenAI mark remains a trademark of OpenAI and is used in accordance with the OpenAI design guidelines.
 - `cursor.svg`: a simplified geometric rendering of the Cursor mark, drawn for this project. Cursor is a trademark of Anysphere, Inc.
-- `antigravity.svg`: a simplified geometric rendering of an upward mark, drawn for this project. Antigravity is a trademark of Google LLC.
+- `antigravity.svg`: Google Antigravity provider mark from the CodexBar icon set (`steipete/CodexBar`), copied from `https://github.com/steipete/CodexBar/blob/main/Sources/CodexBar/Resources/ProviderIcon-antigravity.svg` on 2026-10-01. The file is distributed under CodexBar's MIT license, reproduced below. Antigravity is a trademark of Google LLC.
 
 ## CodexBar license
 

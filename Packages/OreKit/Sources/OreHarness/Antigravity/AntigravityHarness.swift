@@ -8,9 +8,9 @@ import OreSupport
 /// **Experimental.** The CLI has a documented bidirectional stream-json
 /// protocol — closer to Claude Code than to cursor-agent — but no live
 /// permission callback. `control_request` on stdin aborts the session. Tool
-/// policy is therefore static: workspace reads/writes are auto-allowed,
-/// shell is Ask and soft-denied unless the user opts into Bypass
-/// (`--dangerously-skip-permissions`).
+/// policy is therefore static: `--mode accept-edits` so workspace writes
+/// aren't silently rejected, and shell stays on Antigravity's Ask policy
+/// unless the user opts into Bypass (`--dangerously-skip-permissions`).
 ///
 /// `permissionModel` is `.staticPolicy` so the UI can explain the allow-list
 /// rather than offering an Approve button there is no channel to answer on.
@@ -81,20 +81,24 @@ public struct AntigravityHarness: AgentHarness {
             version: versionProbe.firstLine,
             authState: await probeAuthState(executablePath: path),
             diagnostic: "Experimental: this CLI has no live approval channel. "
-                + "File edits inside the workspace are auto-allowed; shell "
-                + "commands follow Antigravity's Ask policy"
+                + "File edits use --mode accept-edits; shell commands follow "
+                + "Antigravity's Ask policy"
                 + (allowUnprompted ? ", or run unprompted in Bypass mode." : "."),
             shadowedPaths: shadowed
         )
     }
 
-    /// `agy models` is metadata-only and does not spend a turn. JSON when the
-    /// CLI offers it; the documented two-column text listing otherwise.
+    /// `agy models` is metadata-only and does not spend a turn.
+    ///
+    /// `--output-format` is a *global* flag (`agy --output-format json models`).
+    /// Passing it after `models` is a CLI error, which is why the picker used
+    /// to show only the four-item fallback. JSON when it works; the
+    /// tab-separated text listing otherwise.
     public func discoverModels() async -> [AgentModel] {
         guard let path = resolveExecutablePath() else { return [] }
         let json = await CommandProbe.output(
             executablePath: path,
-            arguments: ["models", "--output-format", "json"],
+            arguments: ["--output-format", "json", "models"],
             timeout: .seconds(15),
             allowAPIKeyFallback: allowAPIKeyFallback
         )
@@ -125,13 +129,30 @@ public struct AntigravityHarness: AgentHarness {
         )
     }
 
-    /// Maps ORE's effort ladder onto the three values `agy --effort` accepts.
+    /// Maps ORE's effort ladder onto the values `agy --effort` accepts.
     static func cliEffort(_ effort: ReasoningEffort) -> String {
         switch effort {
         case .none, .low: return "low"
         case .medium: return "medium"
         case .high, .xhigh, .max, .adaptive: return "high"
         }
+    }
+
+    /// Headless `agy` has no TTY and no permission callback. Without a mode
+    /// flag every write and shell call is rejected, which reads as a broken
+    /// agent rather than an unanswered prompt. `--mode accept-edits` is the
+    /// default; Bypass still requires the explicit opt-in.
+    static func permissionArguments(
+        mode: PermissionMode,
+        allowUnprompted: Bool
+    ) -> [String] {
+        if allowUnprompted, mode == .bypassPermissions {
+            return ["--dangerously-skip-permissions"]
+        }
+        if mode == .plan {
+            return ["--mode", "plan"]
+        }
+        return ["--mode", "accept-edits"]
     }
 
     private func resolveExecutablePath() -> String? {
@@ -161,14 +182,35 @@ public struct AntigravityHarness: AgentHarness {
         guard let data = output.data(using: .utf8),
               let value = try? JSONDecoder().decode(JSONValue.self, from: data)
         else { return nil }
-        let rows: [JSONValue]
-        if let array = value.arrayValue {
-            rows = array
-        } else if let array = value["models"]?.arrayValue ?? value["items"]?.arrayValue {
-            rows = array
-        } else {
-            return nil
+        if let rows = modelRows(in: value) {
+            let models = decodeModelRows(rows)
+            if !models.isEmpty { return models }
         }
+        // `agy --output-format json models` also repeats the listing as a
+        // tab-separated `response` string. Use it when `command.data` is absent.
+        if let response = value["response"]?.stringValue {
+            let models = parseTextModels(response)
+            if !models.isEmpty { return models }
+        }
+        return nil
+    }
+
+    /// Live `agy --output-format json models` wraps the catalogue as
+    /// `command.data.models`. Bare arrays and `{models:[…]}` stay accepted.
+    private static func modelRows(in value: JSONValue) -> [JSONValue]? {
+        if let array = value.arrayValue { return array }
+        if let array = value["models"]?.arrayValue ?? value["items"]?.arrayValue {
+            return array
+        }
+        if let array = value["command"]?["data"]?["models"]?.arrayValue
+            ?? value["command"]?["models"]?.arrayValue
+            ?? value["data"]?["models"]?.arrayValue {
+            return array
+        }
+        return nil
+    }
+
+    private static func decodeModelRows(_ rows: [JSONValue]) -> [AgentModel] {
         var models: [AgentModel] = []
         var seen: Set<String> = []
         for row in rows {
@@ -182,7 +224,8 @@ public struct AntigravityHarness: AgentHarness {
                 ?? row["model"]?.stringValue,
                   seen.insert(id).inserted
             else { continue }
-            let name = row["display_name"]?.stringValue
+            let name = row["label"]?.stringValue
+                ?? row["display_name"]?.stringValue
                 ?? row["displayName"]?.stringValue
                 ?? row["name"]?.stringValue
                 ?? row["title"]?.stringValue
@@ -199,21 +242,20 @@ public struct AntigravityHarness: AgentHarness {
                 supportedReasoningEfforts: ["low", "medium", "high"]
             ))
         }
-        return models.isEmpty ? nil : models
+        return models
     }
 
     private static func parseTextModels(_ output: String) -> [AgentModel] {
         var models: [AgentModel] = []
         var seen: Set<String> = []
-        for rawLine in output.split(separator: "\n") {
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, !line.hasPrefix("Available") else { continue }
-            guard let range = line.range(of: #"\s{2,}"#, options: .regularExpression) else {
-                continue
-            }
-            let id = String(line[..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
-            let name = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            guard !id.isEmpty, !id.contains(" "), seen.insert(id).inserted else { continue }
+            guard !line.isEmpty else { continue }
+            let lowered = line.lowercased()
+            if lowered.hasPrefix("available") || lowered.hasPrefix("fetching") { continue }
+            guard let (id, name) = splitListingLine(line),
+                  !id.isEmpty, !id.contains(" "), seen.insert(id).inserted
+            else { continue }
             models.append(AgentModel(
                 id: id,
                 displayName: name.isEmpty ? id : name,
@@ -221,6 +263,22 @@ public struct AntigravityHarness: AgentHarness {
             ))
         }
         return models
+    }
+
+    /// Live `agy models` is `id<TAB>label`. Older docs used two-or-more spaces.
+    private static func splitListingLine(_ line: String) -> (String, String)? {
+        if let tab = line.firstIndex(of: "\t") {
+            let id = String(line[..<tab]).trimmingCharacters(in: .whitespaces)
+            let name = String(line[line.index(after: tab)...])
+                .trimmingCharacters(in: .whitespaces)
+            return (id, name)
+        }
+        guard let range = line.range(of: #"\s{2,}"#, options: .regularExpression) else {
+            return nil
+        }
+        let id = String(line[..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+        let name = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+        return (id, name)
     }
 }
 

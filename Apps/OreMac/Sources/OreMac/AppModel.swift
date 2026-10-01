@@ -3510,22 +3510,25 @@ final class AppModel {
 
     /// Provider login from every surface that used to only copy a command.
     ///
-    /// Claude Code cannot be driven headlessly (`claude auth login` is a TTY
-    /// flow), so that path opens Terminal instead of throwing at the button.
+    /// Claude Code and Antigravity cannot be driven headlessly (TTY / browser
+    /// Google Sign-In), so those paths open Terminal instead of throwing at
+    /// the button.
     func startHarnessSignIn(_ kind: HarnessKind) async throws {
-        if kind == .claudeCode {
-            openClaudeSignInInTerminal()
+        if kind.requiresInteractiveSignIn {
+            openInteractiveSignInInTerminal(kind)
             return
         }
         try await authenticateHarness(kind)
     }
 
-    private func openClaudeSignInInTerminal() {
+    private func openInteractiveSignInInTerminal(_ kind: HarnessKind) {
         let command: String
-        if let path = harnesses.first(where: { $0.kind == .claudeCode })?.executablePath {
-            command = "\(ExternalTools.posixQuoted(path)) auth login"
+        if let path = harnesses.first(where: { $0.kind == kind })?.executablePath {
+            command = kind == .claudeCode
+                ? "\(ExternalTools.posixQuoted(path)) auth login"
+                : ExternalTools.posixQuoted(path)
         } else {
-            command = HarnessSetup.signInCommand(for: .claudeCode)
+            command = HarnessSetup.signInCommand(for: kind)
         }
         ExternalTools.copyAndRunInTerminal(command)
     }
@@ -3808,7 +3811,7 @@ final class AppModel {
     /// Settings on "Waiting for browser…" for the rest of the session. And
     /// nothing held the process, so there was nothing to cancel.
     func authenticateHarness(_ kind: HarnessKind) async throws {
-        guard kind != .claudeCode else { throw HarnessAuthenticationError.interactiveOnly }
+        guard !kind.requiresInteractiveSignIn else { throw HarnessAuthenticationError.interactiveOnly }
         guard let executable = harnesses.first(where: { $0.kind == kind })?.executablePath
         else { throw HarnessAuthenticationError.notInstalled(kind.displayName) }
 
@@ -4332,6 +4335,7 @@ final class AppModel {
         // Hoisted out of the `.codex` branch below: this is a switch
         // *expression*, and a branch of one may only be an expression.
         let codexEfforts = ["none", "low", "medium", "high", "xhigh"]
+        let antigravityEfforts = ["low", "medium", "high"]
         let curated: [AgentModel] = switch harness {
         case .claudeCode:
             [
@@ -4367,6 +4371,15 @@ final class AppModel {
                 AgentModel(id: "composer-2.5", displayName: "Composer 2.5"),
                 AgentModel(id: "cursor-grok-4.6-high", displayName: "Cursor Grok 4.6"),
                 AgentModel(id: "cursor-grok-4.5-high", displayName: "Cursor Grok 4.5"),
+            ]
+        case .antigravity:
+            // Fallback only — `agy models` is the account's real catalogue.
+            // These documented slugs keep the picker useful before discovery.
+            [
+                AgentModel(id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)", description: "Daily-driver Gemini in Antigravity", isDefault: true, supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.8-flash-medium", displayName: "Gemini 3.8 Flash (Medium)", description: "Faster Flash with less reasoning", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.1-pro-high", displayName: "Gemini 3.1 Pro (High)", description: "Long-horizon Gemini reasoning", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", description: "Claude via Antigravity", supportedReasoningEfforts: antigravityEfforts),
             ]
         }
         return AgentModelCatalog.merge(

@@ -249,6 +249,7 @@ struct HarnessCLIUpdaterTests {
         #expect(HarnessKind.claudeCode.nativeInstallerURL == "https://claude.ai/install.sh")
         #expect(HarnessKind.codex.nativeInstallerURL == "https://chatgpt.com/codex/install.sh")
         #expect(HarnessKind.cursorAgent.nativeInstallerURL == "https://cursor.com/install")
+        #expect(HarnessKind.antigravity.nativeInstallerURL == "https://antigravity.google/cli/install.sh")
 
         let paths: [String?] = [nil, "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
         for path in paths {

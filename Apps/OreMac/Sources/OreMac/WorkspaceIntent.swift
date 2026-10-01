@@ -117,6 +117,7 @@ extension WorkspaceIntent {
         case .claudeCode: return ["claude code", "claude-code"]
         case .codex: return []
         case .cursorAgent: return ["cursor agent", "cursor-agent"]
+        case .antigravity: return ["google antigravity", "antigravity"]
         }
     }
 
@@ -126,6 +127,7 @@ extension WorkspaceIntent {
         case .claudeCode: return ["claude"]
         case .codex: return ["codex"]
         case .cursorAgent: return ["cursor"]
+        case .antigravity: return ["agy", "gemini"]
         }
     }
 

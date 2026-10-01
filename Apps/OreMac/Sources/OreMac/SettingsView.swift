@@ -53,6 +53,7 @@ private struct SettingsPanes: View {
     @AppStorage(AppModel.DefaultKey.reviewModel) private var reviewModel = ""
     @AppStorage("ore.branchPrefix") private var branchPrefix = "ore"
     @AppStorage("ore.cursorAllowUnprompted") private var cursorAllowUnprompted = false
+    @AppStorage("ore.antigravityAllowUnprompted") private var antigravityAllowUnprompted = false
     @AppStorage("ore.apiKeyFallback") private var apiKeyFallback = false
     @AppStorage("ore.notifications.enabled") private var notifications = true
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
@@ -701,8 +702,10 @@ private struct SettingsPanes: View {
                                 beginHarnessAuthentication()
                             } label: {
                                 Label(
-                                    selectedHarness == .claudeCode ? "Open Terminal to sign in" : "Sign in…",
-                                    systemImage: selectedHarness == .claudeCode ? "terminal" : "person.crop.circle.badge.checkmark"
+                                    selectedHarness.requiresInteractiveSignIn
+                                        ? "Open Terminal to sign in" : "Sign in…",
+                                    systemImage: selectedHarness.requiresInteractiveSignIn
+                                        ? "terminal" : "person.crop.circle.badge.checkmark"
                                 )
                             }
                             .buttonStyle(.borderedProminent)
@@ -776,6 +779,14 @@ private struct SettingsPanes: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("Cursor's CLI has no approval channel. ORE normally lets Cursor's auto-review classifier decide each tool call; this runs every command instead, with no prompt, whenever the chat is in Bypass Permissions.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if selectedHarness == .antigravity {
+                    Toggle("Run tools unprompted in Bypass mode (restart required)", isOn: $antigravityAllowUnprompted)
+                    Label("Antigravity support is experimental", systemImage: "flask")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Antigravity's CLI has no live approval channel. File edits inside the workspace are auto-allowed; shell commands follow Ask unless this is on and the chat is in Bypass Permissions.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -1188,7 +1199,7 @@ private struct SettingsPanes: View {
         Task {
             do {
                 try await appModel.startHarnessSignIn(kind)
-                authenticationNotice = kind == .claudeCode
+                authenticationNotice = kind.requiresInteractiveSignIn
                     ? "Terminal opened with `\(HarnessSetup.signInCommand(for: kind))`. Finish the browser login, then press Refresh."
                     : "Sign-in completed. Refreshing \(kind.displayName)…"
             } catch {

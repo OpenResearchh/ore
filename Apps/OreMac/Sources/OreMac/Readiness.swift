@@ -498,6 +498,7 @@ enum HarnessSetup {
         case .claudeCode: "claude auth login"
         case .codex: "codex login"
         case .cursorAgent: "cursor-agent login"
+        case .antigravity: "agy"
         }
     }
 
@@ -530,14 +531,16 @@ enum HarnessSetup {
 
     /// Agents the onboarding card should offer to install.
     ///
-    /// Cursor Agent is omitted unless this build has enabled it: offering to
-    /// install a CLI ORE will not run is the same dead end as handing every
-    /// user Claude Code's installer.
+    /// Experimental CLIs are omitted unless this build has enabled them:
+    /// offering to install a CLI ORE will not run is the same dead end as
+    /// handing every user Claude Code's installer.
     static func offeredKinds(from harnesses: [HarnessProbeResult]) -> [HarnessKind] {
         let disabled = Set(harnesses.filter { $0.isEnabled == false }.map(\.kind))
         var kinds = HarnessKind.allCases.filter { !disabled.contains($0) }
-        if !harnesses.contains(where: { $0.kind == .cursorAgent && $0.isEnabled != false }) {
-            kinds.removeAll { $0 == .cursorAgent }
+        for kind in HarnessKind.allCases where kind.isExperimental {
+            if !harnesses.contains(where: { $0.kind == kind && $0.isEnabled != false }) {
+                kinds.removeAll { $0 == kind }
+            }
         }
         return kinds.isEmpty ? [.claudeCode, .codex] : kinds
     }

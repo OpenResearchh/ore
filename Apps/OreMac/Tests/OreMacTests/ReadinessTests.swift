@@ -64,7 +64,7 @@ struct ReadinessTests {
     /// harness, because the ladder is not the only caller.
     @Test("No install command depends on a toolchain the user may not have")
     func installCommandsBootstrapThemselves() {
-        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+        for kind in HarnessKind.allCases {
             let command = HarnessSetup.installCommand(for: kind)
             #expect(!command.contains("npm"), "\(kind) install command requires npm: \(command)")
             #expect(!command.contains("brew"), "\(kind) install command requires Homebrew: \(command)")
@@ -78,7 +78,7 @@ struct ReadinessTests {
     /// user in three cosmetically different forms depending on the screen.
     @Test("Install commands are built from the one list of installer URLs")
     func installCommandsUseTheSharedInstallerURLs() {
-        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+        for kind in HarnessKind.allCases {
             #expect(
                 HarnessSetup.installCommand(for: kind).contains(kind.nativeInstallerURL),
                 "\(kind) install command does not use its installer URL"
@@ -103,6 +103,7 @@ struct ReadinessTests {
         #expect(HarnessSetup.signInCommand(for: .claudeCode) == "claude auth login")
         #expect(HarnessSetup.signInCommand(for: .codex) == "codex login")
         #expect(HarnessSetup.signInCommand(for: .cursorAgent) == "cursor-agent login")
+        #expect(HarnessSetup.signInCommand(for: .antigravity) == "agy")
 
         let readiness = evaluate(harnesses: [probe(.cursorAgent, auth: .notAuthenticated)])
         #expect(readiness.nextStep?.action == .signIn(.cursorAgent))

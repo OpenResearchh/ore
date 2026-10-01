@@ -4,7 +4,7 @@ import OreSupport
 
 /// A driver for one agent CLI.
 ///
-/// The shape is identical for all three harnesses: spawn the user's installed
+/// The shape is identical for every harness: spawn the user's installed
 /// CLI as a child process rooted in the worktree, speak its machine protocol
 /// over stdio, and never touch an API key — the CLI carries the user's
 /// subscription credentials itself.

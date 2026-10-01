@@ -514,6 +514,7 @@ struct CommandLineOptions {
         case "claude", "claudecode", "claude-code": return .claudeCode
         case "codex": return .codex
         case "cursor", "cursor-agent", "grok": return .cursorAgent
+        case "antigravity", "agy", "gemini": return .antigravity
         default: return HarnessKind(rawValue: raw) ?? .claudeCode
         }
     }

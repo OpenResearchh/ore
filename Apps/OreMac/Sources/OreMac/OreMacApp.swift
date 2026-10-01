@@ -158,6 +158,9 @@ struct OreMacApp: App {
                         cursorAllowUnprompted: UserDefaults.standard.bool(
                             forKey: "ore.cursorAllowUnprompted"
                         ),
+                        antigravityAllowUnprompted: UserDefaults.standard.bool(
+                            forKey: "ore.antigravityAllowUnprompted"
+                        ),
                         // The registry needs this too, not just the sessions
                         // below: probes strip provider credentials by default,
                         // so without it an ANTHROPIC_API_KEY user is told to

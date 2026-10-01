@@ -2069,7 +2069,7 @@ struct HarnessDiscoveryCache: Codable, Sendable, Equatable {
     /// Only catalogs that cost a process: Codex starts an app-server and Cursor
     /// runs `--list-models`. Claude's list ships in this build, so caching it
     /// could only hide a newer one.
-    static let cachedCatalogKinds: Set<HarnessKind> = [.codex, .cursorAgent]
+    static let cachedCatalogKinds: Set<HarnessKind> = [.codex, .cursorAgent, .antigravity]
 
     func catalog(for kind: HarnessKind, harnessVersion: String?, now: Date) -> [AgentModel]? {
         guard Self.cachedCatalogKinds.contains(kind),

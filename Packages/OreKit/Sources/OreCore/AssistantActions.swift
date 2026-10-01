@@ -1464,6 +1464,7 @@ extension InProcessCoreClient {
         case "claude", "claudecode", "claude-code": .claudeCode
         case "codex": .codex
         case "cursor", "cursor-agent", "agent": .cursorAgent
+        case "antigravity", "agy", "gemini": .antigravity
         default: HarnessKind(rawValue: reference)
         }
         guard let kind else {
@@ -1498,7 +1499,7 @@ extension InProcessCoreClient {
     /// turning a discovery gap into a hard outage for a caller that never asked
     /// for a specific harness.
     private func fallbackHarness() throws -> HarnessKind {
-        let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent]
+        let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent, .antigravity]
         if let usable = preferred.first(where: isHarnessUsable) { return usable }
         guard !harnessProbes.isEmpty else { return .claudeCode }
         throw AssistantActionError.badRequest(

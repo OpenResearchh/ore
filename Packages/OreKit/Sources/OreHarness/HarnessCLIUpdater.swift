@@ -153,6 +153,15 @@ public enum HarnessCLIUpdater {
                 return .selfUpdate(executablePath: original)
             }
             return .nativeInstaller(url: kind.nativeInstallerURL)
+
+        case .antigravity:
+            // Native binary that self-updates in the background. Prefer asking
+            // it first; the vendor install script is the fallback if `agy
+            // update` is not a real subcommand on this build.
+            if let original {
+                return .selfUpdate(executablePath: original)
+            }
+            return .nativeInstaller(url: kind.nativeInstallerURL)
         }
     }
 
@@ -417,7 +426,7 @@ public enum HarnessCLIUpdater {
     static func selfUpdateIsConfirmed(for kind: HarnessKind) -> Bool {
         switch kind {
         case .claudeCode: return true
-        case .codex, .cursorAgent: return false
+        case .codex, .cursorAgent, .antigravity: return false
         }
     }
 

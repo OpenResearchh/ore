@@ -31,6 +31,8 @@ public enum AssistantManager {
             ModelProfile(model: "gpt-5.6-luna", reasoningEffort: .low)
         case .cursorAgent:
             ModelProfile(model: "composer-2.5", reasoningEffort: nil)
+        case .antigravity:
+            ModelProfile(model: "gemini-3.8-flash-medium", reasoningEffort: .low)
         }
     }
 

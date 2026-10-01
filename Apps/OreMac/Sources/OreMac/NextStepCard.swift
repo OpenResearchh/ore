@@ -184,7 +184,7 @@ struct NextStepCard: View {
                 Button("Cancel") { model.cancelHarnessAuthentication() }
             }
         } else {
-            Button(kind == .claudeCode ? "Open Terminal to sign in" : "Sign in…") {
+            Button(kind.requiresInteractiveSignIn ? "Open Terminal to sign in" : "Sign in…") {
                 Task { await signIn(kind) }
             }
             .buttonStyle(OrePrimaryButtonStyle())

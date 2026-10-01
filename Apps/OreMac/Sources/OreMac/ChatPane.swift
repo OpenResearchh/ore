@@ -4213,6 +4213,7 @@ private struct ModelChooser: View {
         if name.contains("haiku") { return "Fastest Claude model" }
         if name.contains("codex") { return "Optimized for agentic coding" }
         if harness == .cursorAgent { return "Available through Cursor" }
+        if harness == .antigravity { return "Available through Google Antigravity" }
         return "General-purpose model"
     }
 }

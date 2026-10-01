@@ -32,6 +32,14 @@ struct HarnessMark: View {
                     brandImage(HarnessBrandAssets.cursor)
                         .padding(size * 0.2)
                 }
+
+            case .antigravity:
+                ZStack {
+                    RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
+                        .fill(Color(red: 0.10, green: 0.18, blue: 0.42).opacity(isMuted ? 0.65 : 1))
+                    brandImage(HarnessBrandAssets.antigravity)
+                        .padding(size * 0.18)
+                }
             }
         }
         .frame(width: size, height: size)
@@ -60,6 +68,7 @@ enum HarnessBrandAssets {
     static let claude = load("claude")
     static let codex = load("codex")
     static let cursor = load("cursor")
+    static let antigravity = load("antigravity")
 
     private static let inlineMarks: [HarnessKind: NSImage] = {
         var marks: [HarnessKind: NSImage] = [:]
@@ -69,6 +78,7 @@ enum HarnessBrandAssets {
             case .claudeCode: source = claude
             case .codex: source = codex
             case .cursorAgent: source = cursor
+            case .antigravity: source = antigravity
             }
             guard let source else { continue }
             let size: CGFloat = 14
@@ -78,10 +88,18 @@ enum HarnessBrandAssets {
             let shape = NSBezierPath(roundedRect: rect, xRadius: 3.3, yRadius: 3.3)
             shape.addClip()
             if harness != .claudeCode {
-                NSColor.black.setFill()
+                if harness == .antigravity {
+                    NSColor(red: 0.10, green: 0.18, blue: 0.42, alpha: 1).setFill()
+                } else {
+                    NSColor.black.setFill()
+                }
                 shape.fill()
             }
-            let inset: CGFloat = harness == .claudeCode ? 0 : harness == .codex ? size * 0.13 : size * 0.2
+            let inset: CGFloat = switch harness {
+            case .claudeCode: 0
+            case .codex: size * 0.13
+            case .cursorAgent, .antigravity: size * 0.2
+            }
             source.draw(in: rect.insetBy(dx: inset, dy: inset))
             mark.unlockFocus()
             mark.accessibilityDescription = harness.displayName

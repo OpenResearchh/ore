@@ -6,12 +6,14 @@ public enum HarnessKind: String, Sendable, Codable, CaseIterable {
     case claudeCode
     case codex
     case cursorAgent
+    case antigravity
 
     public var displayName: String {
         switch self {
         case .claudeCode: return "Claude Code"
         case .codex: return "Codex"
         case .cursorAgent: return "Cursor Agent"
+        case .antigravity: return "Antigravity"
         }
     }
 
@@ -21,17 +23,33 @@ public enum HarnessKind: String, Sendable, Codable, CaseIterable {
         case .claudeCode: return "claude"
         case .codex: return "codex"
         case .cursorAgent: return "agent"
+        case .antigravity: return "agy"
         }
     }
 
     /// Harnesses that ship behind an experimental flag declare reduced
     /// capabilities rather than pretending to be at parity.
-    public var isExperimental: Bool { self == .cursorAgent }
+    public var isExperimental: Bool {
+        switch self {
+        case .cursorAgent, .antigravity: return true
+        case .claudeCode, .codex: return false
+        }
+    }
 
     /// Cursor bakes thinking level into the model id (`cursor-grok-4.6-high`)
     /// and `cursor-agent` has no `--effort` flag. Offering a chip would look
     /// like a setting and then silently do nothing.
     public var supportsReasoningEffort: Bool { self != .cursorAgent }
+
+    /// Provider login that cannot be driven with stdin closed. Claude's
+    /// `auth login` and Antigravity's Google Sign-In both need a TTY (and a
+    /// browser); spawning them from Settings hangs a spinner forever.
+    public var requiresInteractiveSignIn: Bool {
+        switch self {
+        case .claudeCode, .antigravity: return true
+        case .codex, .cursorAgent: return false
+        }
+    }
 }
 
 /// How a harness asks for permission before running a tool.
@@ -245,7 +263,7 @@ extension HarnessKind {
         switch self {
         case .claudeCode: return "@anthropic-ai/claude-code"
         case .codex: return "@openai/codex"
-        case .cursorAgent: return nil
+        case .cursorAgent, .antigravity: return nil
         }
     }
 
@@ -260,7 +278,7 @@ extension HarnessKind {
         switch self {
         case .claudeCode: return "claude-code"
         case .codex: return "codex"
-        case .cursorAgent: return nil
+        case .cursorAgent, .antigravity: return nil
         }
     }
 
@@ -292,6 +310,7 @@ extension HarnessKind {
         case .claudeCode: return "https://claude.ai/install.sh"
         case .codex: return "https://chatgpt.com/codex/install.sh"
         case .cursorAgent: return "https://cursor.com/install"
+        case .antigravity: return "https://antigravity.google/cli/install.sh"
         }
     }
 }

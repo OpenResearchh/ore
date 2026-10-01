@@ -29,6 +29,9 @@ struct HarnessSignInTests {
         let message = HarnessAuthenticationError.interactiveOnly.errorDescription ?? ""
         #expect(message.contains("interactive"))
         #expect(message.contains("Terminal") || message.contains("copied"))
+        #expect(HarnessKind.claudeCode.requiresInteractiveSignIn)
+        #expect(HarnessKind.antigravity.requiresInteractiveSignIn)
+        #expect(!HarnessKind.codex.requiresInteractiveSignIn)
     }
 
     @Test func appleScriptQuotingSurvivesQuotesAndBackslashes() {

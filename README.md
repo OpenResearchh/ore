@@ -18,10 +18,10 @@
 
 ---
 
-ORE gives every task its own git worktree and its own agent. Claude Code, Codex
-or cursor-agent works in each one. You follow the transcripts, comment directly
-on diff lines, and take each change through commit, PR and merge without
-leaving the app.
+ORE gives every task its own git worktree and its own agent. Claude Code, Codex,
+cursor-agent, or Antigravity works in each one. You follow the transcripts,
+comment directly on diff lines, and take each change through commit, PR and
+merge without leaving the app.
 
 It runs the agent CLIs you already have, on **your existing subscriptions**.
 ORE never handles API keys.
@@ -52,8 +52,9 @@ the DMG from [Releases](https://github.com/OpenResearchh/ore/releases/latest).
 **Requirements:** macOS 14 or later on Apple Silicon, `git`, and at least one
 signed-in agent CLI:
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
-[Codex](https://github.com/openai/codex) or
-[cursor-agent](https://cursor.com/install). For pull requests you also need
+[Codex](https://github.com/openai/codex),
+[cursor-agent](https://cursor.com/install), or
+[Antigravity](https://antigravity.google/cli). For pull requests you also need
 the [GitHub CLI](https://cli.github.com).
 
 > ORE isn't notarized yet. The two commands above install it without any

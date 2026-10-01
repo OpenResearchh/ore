@@ -78,14 +78,40 @@ final class Updater {
 /// The Check for Updates menu item.
 struct CheckForUpdatesCommand: View {
     @Environment(Updater.self) private var updater
+    @Environment(GitHubUpdater.self) private var githubUpdater
 
     var body: some View {
         Button("Check for Updates…") {
-            updater.checkForUpdates()
+            check()
         }
-        .disabled(!updater.canCheckForUpdates || !updater.isConfigured)
-        .help(updater.isConfigured
-            ? "Check whether a newer version of ORE is available"
-            : "This build isn't configured for updates")
+        .disabled(isDisabled)
+        .help(helpText)
+    }
+
+    private var isDisabled: Bool {
+        if updater.isConfigured { return !updater.canCheckForUpdates }
+        return githubUpdater.isChecking || githubUpdater.isInstalling
+    }
+
+    private var helpText: String {
+        if updater.isConfigured {
+            return "Check whether a newer version of ORE is available"
+        }
+        return "Check GitHub for a newer version of ORE"
+    }
+
+    private func check() {
+        if updater.isConfigured {
+            updater.checkForUpdates()
+            return
+        }
+        if githubUpdater.available != nil {
+            githubUpdater.presentAvailableRelease()
+            return
+        }
+        Task {
+            await githubUpdater.check()
+            githubUpdater.presentAvailableRelease()
+        }
     }
 }

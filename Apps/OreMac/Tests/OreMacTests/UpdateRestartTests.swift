@@ -489,6 +489,20 @@ struct UpdateRestartTests {
         #expect(newer.showsPrompt)
     }
 
+    @Test func checkForUpdatesReopensADismissedPrompt() {
+        let defaults = makeDefaults()
+        let updater = makeUpdater(probe: HookProbe(), defaults: defaults, version: "0.7.0")
+        updater.applyCheckResult(release("v0.8.0"))
+        updater.dismiss()
+        #expect(updater.showsPrompt == false)
+
+        updater.presentAvailableRelease()
+
+        #expect(updater.dismissed == false)
+        #expect(updater.showsPrompt)
+        #expect(defaults.string(forKey: GitHubUpdater.dismissedVersionKey) == nil)
+    }
+
     // MARK: - Rollback when the new app won't open
 
     @Test func relaunchScriptRestoresThePreviousBundleWhenOpenFails() throws {

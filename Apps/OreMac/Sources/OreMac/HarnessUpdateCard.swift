@@ -123,6 +123,7 @@ private struct HarnessUpdateRow: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(Color.accentColor.opacity(0.18), in: Capsule())
+                .contentShape(Capsule())
             }
             .buttonStyle(.plain)
             .disabled(isUpdating)

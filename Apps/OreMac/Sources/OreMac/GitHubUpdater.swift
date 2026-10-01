@@ -249,6 +249,14 @@ final class GitHubUpdater {
         if case .failed = phase { phase = .idle }
     }
 
+    /// Re-shows a release the user already waved off. Check for Updates is
+    /// the explicit ask; "Later" should not make that menu item a no-op.
+    func presentAvailableRelease() {
+        guard available != nil else { return }
+        dismissed = false
+        defaults.removeObject(forKey: Self.dismissedVersionKey)
+    }
+
     /// Clears the "you're now on vX" confirmation shown after a restart.
     func acknowledgeCompletion() {
         completedVersion = nil
@@ -976,8 +984,10 @@ struct GitHubUpdatePrompt: View {
 
                 if let completed = updater.completedVersion {
                     completionCard(completed)
+                        .zIndex(1)
                 } else if let available = updater.available {
                     card(for: available)
+                        .zIndex(1)
                 }
             }
             .transition(.opacity)
@@ -1018,6 +1028,7 @@ struct GitHubUpdatePrompt: View {
         }
         .frame(width: 420, alignment: .leading)
         .oreCard(padding: OreTheme.Space.lg, radius: 16)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private func card(for available: GitHubUpdater.Available) -> some View {
@@ -1077,6 +1088,7 @@ struct GitHubUpdatePrompt: View {
         }
         .frame(width: 420, alignment: .leading)
         .oreCard(padding: OreTheme.Space.lg, radius: 16)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private var title: String {

@@ -466,11 +466,21 @@ struct OreGlassSurface: ViewModifier {
                         .allowsHitTesting(false)
                 }
         } else if #available(macOS 26.0, *) {
-            // The system's glass carries its own edge lighting, optical
-            // response, *and depth*; hands off entirely. A manual `.shadow`
-            // here silhouetted the view's rectangular frame — not the glass
-            // shape — and printed square halos at the foot of every pane.
-            content.glassEffect(glass, in: shape)
+            // Behind the content, not wrapping it. `glassEffect` on a
+            // container that *holds* buttons intercepts those clicks on
+            // macOS 26 — the Update / Later prompt, harness cards, Settings
+            // tiles, and the welcome next-step actions all went dead. The
+            // material still fills the shape; controls sit on top and receive
+            // pointer events. Hands off the optics themselves: a manual
+            // `.shadow` here silhouetted the view's rectangular frame — not
+            // the glass shape — and printed square halos at the foot of
+            // every pane.
+            content
+                .background {
+                    shape.fill(.clear)
+                        .glassEffect(glass, in: shape)
+                        .allowsHitTesting(false)
+                }
         } else if OreGlassDebug.groupsGlass {
             // The same stand-in, with the shadow cast by the material's shape
             // rather than by the whole composited view: SwiftUI no longer has
@@ -821,6 +831,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
                 .padding(.horizontal, OreTheme.Space.md)
                 .frame(minHeight: OreTheme.RowHeight.button)
                 .opacity(isEnabled ? 1 : 0.55)
+                .contentShape(Capsule())
                 .glassEffect(
                     .regular.tint(OreTheme.brand).interactive(),
                     in: .capsule
@@ -850,6 +861,7 @@ struct OreSecondaryButtonStyle: ButtonStyle {
                 .font(.system(size: OreTheme.Font.body, weight: .medium))
                 .padding(.horizontal, 12)
                 .frame(minHeight: OreTheme.RowHeight.button)
+                .contentShape(Capsule())
                 .glassEffect(.regular.interactive(), in: .capsule)
         } else {
             configuration.label
@@ -896,6 +908,7 @@ struct OreGitActionButtonStyle: ButtonStyle {
                 .padding(.horizontal, 12)
                 .frame(minHeight: OreTheme.RowHeight.button)
                 .opacity(isEnabled ? 1 : 0.55)
+                .contentShape(Capsule())
                 .glassEffect(.regular.tint(tone.color).interactive(), in: .capsule)
         } else {
             configuration.label

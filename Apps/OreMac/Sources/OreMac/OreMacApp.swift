@@ -328,7 +328,9 @@ struct OreMacApp: App {
                 NextGitStepCommand().environment(model)
             }
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesCommand().environment(updater)
+                CheckForUpdatesCommand()
+                    .environment(updater)
+                    .environment(githubUpdater)
                 GitHubUpdateCommand().environment(githubUpdater)
             }
             CommandGroup(after: .toolbar) {

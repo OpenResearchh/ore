@@ -2813,15 +2813,30 @@ struct GitActionToolbar: View {
         model.gitAction(for: workspace.id)
     }
 
-    private var actionImpliesPR: Bool {
-        switch action {
-        case .waitForChecks, .fixFailingChecks, .waitForReview, .merge,
-             .resolveConflicts, .retargetAfterParentMerged, .merged,
-             .waitForParentToMerge:
-            return true
-        default:
-            return false
+    private var gitStatus: SuggestedGitStatus {
+        SuggestedGitStatus(
+            action: action,
+            pullRequest: model.pullRequest(for: workspace.id),
+            committedPullRequest: model.committedPullRequest(for: workspace.id)
+        )
+    }
+
+    private var pullRequestLink: URL? {
+        if let raw = gitStatus.toolbarPullRequestURL ?? prURL, let url = URL(string: raw) {
+            return url
         }
+        return nil
+    }
+
+    private var secondaryMergeHelp: String {
+        "Merge the open pull request on GitHub. Local uncommitted or unpushed work stays on this branch."
+    }
+
+    private var viewPullRequestHelp: String {
+        if let number = model.pullRequest(for: workspace.id)?.number {
+            return "Open pull request #\(number) on GitHub"
+        }
+        return "Open this pull request on GitHub"
     }
 
     var body: some View {
@@ -2913,6 +2928,16 @@ struct GitActionToolbar: View {
                     .help("Merge this pull request despite the failing checks")
                     .accessibilityLabel("Merge anyway")
                     .accessibilityHint("Merge this pull request despite the failing checks")
+            } else if gitStatus.secondaryMergeNumber != nil {
+                // Open PR used to vanish the Merge control because leftover
+                // WIP or an unpushed commit became the only toolbar action.
+                Button("Merge") { editor = .merge }
+                    .buttonStyle(OreGitActionButtonStyle(tone: .merge))
+                    .disabled(model.isGitOpInFlight(workspace.id))
+                    .help(secondaryMergeHelp)
+                    .fixedSize()
+                    .accessibilityLabel("Merge pull request")
+                    .accessibilityHint(secondaryMergeHelp)
             }
 
             if case .merged = action {
@@ -2921,20 +2946,37 @@ struct GitActionToolbar: View {
                     .help("Archive this workspace — frees the worktree's disk space")
             }
 
-            if let prURL, let url = URL(string: prURL) {
+            if let url = pullRequestLink {
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {
-                    Image(systemName: "arrow.up.right.square")
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.right.square")
+                        if let number = model.pullRequest(for: workspace.id)?.number {
+                            Text("#\(number)")
+                        }
+                    }
+                    .font(.system(size: OreTheme.Font.body, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(OreTheme.subduedFill, in: Capsule())
+                    .overlay(Capsule().stroke(OreTheme.hairline, lineWidth: 1))
                 }
-                .help("Open this pull request on GitHub")
+                .buttonStyle(OrePressableButtonStyle())
+                .help(viewPullRequestHelp)
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityLabel(viewPullRequestHelp)
             }
         }
-        .task(id: "\(workspace.id.rawValue)-\(action.title)-\(model.gitGeneration(for: workspace.id))") {
+        .task(id: "\(workspace.id.rawValue)-\(action.title)-\(model.gitGeneration(for: workspace.id))-\(model.pullRequest(for: workspace.id)?.number ?? 0)") {
             if case .createPullRequest = action {
                 branches = await model.remoteBranches(for: workspace.id)
             }
-            prURL = actionImpliesPR ? await model.pullRequestURL(for: workspace.id) : nil
+            if gitStatus.toolbarPullRequestURL == nil {
+                prURL = await model.pullRequestURL(for: workspace.id)
+            } else {
+                prURL = nil
+            }
         }
         // "Checks running" is a claim about GitHub that no local event will
         // ever correct, so while it is showing it polls for itself — with the

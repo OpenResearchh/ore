@@ -54,7 +54,7 @@ struct ReadinessTests {
     func freshMachine() {
         let readiness = evaluate(harnesses: [probe(.claudeCode, installed: false, auth: .unknown)])
         #expect(readiness.nextStep?.id == "agent")
-        #expect(readiness.nextStep?.action == .copyCommand("curl -fsSL https://claude.ai/install.sh | bash"))
+        #expect(readiness.nextStep?.action == .installAgents)
         #expect(!readiness.isReady)
     }
 
@@ -64,7 +64,7 @@ struct ReadinessTests {
     /// harness, because the ladder is not the only caller.
     @Test("No install command depends on a toolchain the user may not have")
     func installCommandsBootstrapThemselves() {
-        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+        for kind in HarnessKind.allCases {
             let command = HarnessSetup.installCommand(for: kind)
             #expect(!command.contains("npm"), "\(kind) install command requires npm: \(command)")
             #expect(!command.contains("brew"), "\(kind) install command requires Homebrew: \(command)")
@@ -78,7 +78,7 @@ struct ReadinessTests {
     /// user in three cosmetically different forms depending on the screen.
     @Test("Install commands are built from the one list of installer URLs")
     func installCommandsUseTheSharedInstallerURLs() {
-        for kind in [HarnessKind.claudeCode, .codex, .cursorAgent] {
+        for kind in HarnessKind.allCases {
             #expect(
                 HarnessSetup.installCommand(for: kind).contains(kind.nativeInstallerURL),
                 "\(kind) install command does not use its installer URL"
@@ -93,7 +93,7 @@ struct ReadinessTests {
         let readiness = evaluate(harnesses: [probe(.codex, auth: .notAuthenticated)])
         #expect(readiness.nextStep?.id == "agent")
         #expect(readiness.nextStep?.title == "Sign in to Codex")
-        #expect(readiness.nextStep?.action == .copyCommand("codex login"))
+        #expect(readiness.nextStep?.action == .signIn(.codex))
     }
 
     /// The bug this replaced: the old inline expression told every
@@ -103,9 +103,10 @@ struct ReadinessTests {
         #expect(HarnessSetup.signInCommand(for: .claudeCode) == "claude auth login")
         #expect(HarnessSetup.signInCommand(for: .codex) == "codex login")
         #expect(HarnessSetup.signInCommand(for: .cursorAgent) == "cursor-agent login")
+        #expect(HarnessSetup.signInCommand(for: .antigravity) == "agy")
 
         let readiness = evaluate(harnesses: [probe(.cursorAgent, auth: .notAuthenticated)])
-        #expect(readiness.nextStep?.action == .copyCommand("cursor-agent login"))
+        #expect(readiness.nextStep?.action == .signIn(.cursorAgent))
     }
 
     @Test("With an agent ready, the next step is adding a project")
@@ -236,7 +237,7 @@ struct ReadinessTests {
         #expect(first.isBlocking)
         #expect(!first.title.isEmpty)
 
-        #expect(NextStepCard.fallbackStep(for: readiness) == first)
+        #expect(readiness.fallbackStep == first)
     }
 
     /// The bug: a quarantined or non-executable CLI probes as "no usable
@@ -351,9 +352,7 @@ struct ReadinessTests {
             probe(.cursorAgent, auth: .notAuthenticated, unlaunchable: true, enabled: false)
         ])
         #expect(readiness.nextStep?.title == "Install a coding agent")
-        #expect(
-            readiness.nextStep?.action == .copyCommand(HarnessSetup.installCommand(for: .claudeCode))
-        )
+        #expect(readiness.nextStep?.action == .installAgents)
     }
 
     /// The last agent-rung predicate that disagreed with `isReady`. Signing
@@ -365,7 +364,8 @@ struct ReadinessTests {
             probe(.cursorAgent, auth: .notAuthenticated, enabled: false)
         ])
         #expect(readiness.nextStep?.title == "Install a coding agent")
-        #expect(readiness.nextStep?.action != .copyCommand("cursor-agent login"))
+        #expect(readiness.nextStep?.action != .signIn(.cursorAgent))
+        #expect(readiness.nextStep?.action == .installAgents)
     }
 
     /// Same rule for the duplicate-install warning: ORE runs neither copy of a
@@ -414,5 +414,68 @@ struct ReadinessTests {
         #expect(readiness.isReady)
         #expect(readiness.nextStep == nil)
         #expect(readiness.satisfiedCount == 6)
+    }
+
+    /// The product is any ready CLI, not Claude Code. A Codex-only subscriber
+    /// used to be parked on Claude's installer until they installed a tool
+    /// they do not pay for.
+    @Test("A ready Codex is enough — Claude is not required")
+    func anyReadyHarnessUnblocksOnboarding() {
+        let readiness = evaluate(harnesses: [
+            probe(.claudeCode, installed: false, auth: .unknown),
+            probe(.codex),
+        ])
+        #expect(readiness.nextStep?.id == "project")
+        let agent = readiness.steps.first { $0.id == "agent" }
+        #expect(agent?.title == "Codex is ready")
+        #expect(agent?.status == .satisfied)
+    }
+
+    /// The install rung used to copy Claude Code's curl | bash and nothing
+    /// else, which is how a Codex-only user concluded they had to install
+    /// Claude.
+    @Test("The install step offers every supported agent, not only Claude")
+    func installStepDoesNotForceClaude() {
+        let readiness = evaluate(harnesses: [
+            probe(.claudeCode, installed: false, auth: .unknown),
+            probe(.codex, installed: false, auth: .unknown),
+        ])
+        #expect(readiness.nextStep?.action == .installAgents)
+        #expect(readiness.nextStep?.detail.contains("Codex") == true)
+        #expect(
+            HarnessSetup.offeredKinds(from: [
+                probe(.claudeCode, installed: false, auth: .unknown),
+                probe(.codex, installed: false, auth: .unknown),
+                probe(.cursorAgent, installed: false, auth: .unknown, enabled: false),
+            ]) == [.claudeCode, .codex]
+        )
+    }
+
+    @Test("GitHub install and sign-in are real actions, never required to start")
+    func githubSetupIsOptionalAndActionable() {
+        let missing = evaluate(
+            harnesses: [probe(.codex)],
+            repositories: 1,
+            workspaces: 1,
+            github: GitHubClient.Status(isInstalled: false, isAuthenticated: false)
+        )
+        #expect(missing.isReady)
+        #expect(missing.nextStep?.action == .githubInstall)
+
+        let signedOut = evaluate(
+            harnesses: [probe(.codex)],
+            repositories: 1,
+            workspaces: 1,
+            github: GitHubClient.Status(isInstalled: true, isAuthenticated: false)
+        )
+        #expect(signedOut.isReady)
+        #expect(signedOut.nextStep?.action == .githubSignIn)
+    }
+
+    @Test("GitHub CLI setup commands do not depend on a missing toolchain")
+    func githubCLICommands() {
+        #expect(GitHubCLISetup.installCommand == "brew install gh")
+        #expect(GitHubCLISetup.signInCommand.contains("gh auth login"))
+        #expect(GitHubCLISetup.downloadURL.hasPrefix("https://"))
     }
 }

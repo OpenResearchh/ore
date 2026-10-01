@@ -153,6 +153,13 @@ struct TelemetryPayloadTests {
         }
     }
 
+    @Test("A new harness id maps through the closed vocabulary")
+    func harnessTagCoversAntigravity() {
+        #expect(HarnessTag(rawHarness: "antigravity") == .antigravity)
+        #expect(HarnessTag(rawHarness: "agy") == .antigravity)
+        #expect(HarnessTag(rawHarness: "unknown-cli") == .other)
+    }
+
     @Test("Duration and day buckets are coarse enough to not fingerprint")
     func bucketBoundaries() {
         #expect(DurationBucket(seconds: 0) == .under5s)

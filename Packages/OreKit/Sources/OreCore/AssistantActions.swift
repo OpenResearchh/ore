@@ -1464,6 +1464,7 @@ extension InProcessCoreClient {
         case "claude", "claudecode", "claude-code": .claudeCode
         case "codex": .codex
         case "cursor", "cursor-agent", "agent": .cursorAgent
+        case "antigravity", "agy", "gemini": .antigravity
         default: HarnessKind(rawValue: reference)
         }
         guard let kind else {
@@ -1498,7 +1499,7 @@ extension InProcessCoreClient {
     /// turning a discovery gap into a hard outage for a caller that never asked
     /// for a specific harness.
     private func fallbackHarness() throws -> HarnessKind {
-        let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent]
+        let preferred: [HarnessKind] = [.claudeCode, .codex, .cursorAgent, .antigravity]
         if let usable = preferred.first(where: isHarnessUsable) { return usable }
         guard !harnessProbes.isEmpty else { return .claudeCode }
         throw AssistantActionError.badRequest(
@@ -1791,10 +1792,11 @@ extension InProcessCoreClient {
         var warnedProfiles: Set<String> = []
         for chat in chats where !chat.isClosed {
             let current = HarnessKind(rawValue: chat.harness)
+            let failed = assistantFailedHarnesses[chat.chatID] ?? []
             var seen: Set<HarnessKind> = []
             let candidates = ([current].compactMap { $0 }
                 + harnessProbes.filter(\.isReady).map(\.kind))
-                .filter { seen.insert($0).inserted }
+                .filter { !failed.contains($0) && seen.insert($0).inserted }
             let target = candidates.compactMap({ harness -> (
                 harness: HarnessKind, profile: AssistantManager.ModelProfile
             )? in
@@ -1877,6 +1879,7 @@ extension InProcessCoreClient {
         let current = HarnessKind(rawValue: chat.harness)
         var excluding = assistantFailedHarnesses[chatID] ?? []
         if let current { excluding.insert(current) }
+        assistantFailedHarnesses[chatID] = excluding
         guard let alternate = AssistantFailoverPolicy.nextHarness(
             current: current,
             excluding: excluding,

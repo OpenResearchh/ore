@@ -171,6 +171,15 @@ struct NewWorkspaceSheet: View {
                         Text(kind.displayName).tag(kind)
                     }
                 }
+                if !model.readyHarnesses.contains(harness) {
+                    Label(
+                        model.harnesses.first(where: { $0.kind == harness })?.runtimeFailure
+                            ?? "\(harness.displayName) is unavailable. Choose a ready agent.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
 
                 Picker("Model", selection: $modelName) {
                     Text("Default model").tag("")
@@ -225,7 +234,7 @@ struct NewWorkspaceSheet: View {
                 }
                     .buttonStyle(OrePrimaryButtonStyle())
                     .keyboardShortcut(.return)
-                    .disabled(!canCreate || isCreating)
+                    .disabled(!canCreate || isCreating || !model.readyHarnesses.contains(harness))
             }
         }
         .padding(OreTheme.Space.lg)
@@ -234,6 +243,10 @@ struct NewWorkspaceSheet: View {
         .task { await prepareDefaults() }
         .task(id: repositorySource) {
             if repositorySource == .github { await loadGitHub() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            guard repositorySource == .github else { return }
+            Task { await loadGitHub() }
         }
         .task(id: "\(repositoryPath)-\(seedKind.rawValue)") {
             await loadSeeds()
@@ -363,10 +376,12 @@ struct NewWorkspaceSheet: View {
                 Spacer()
                 if isLoadingGitHub || isAuthenticatingGitHub {
                     ProgressView().controlSize(.small)
+                } else if githubStatus?.isInstalled == false {
+                    Button("Install GitHub CLI") { model.installGitHubCLI() }
+                        .buttonStyle(.borderedProminent)
                 } else if githubStatus?.isAuthenticated != true {
                     Button("Sign in…") { Task { await authenticateGitHub() } }
                         .buttonStyle(.borderedProminent)
-                        .disabled(githubStatus?.isInstalled == false)
                 } else {
                     Button { Task { await loadGitHub() } } label: {
                         Image(systemName: "arrow.clockwise")
@@ -405,7 +420,7 @@ struct NewWorkspaceSheet: View {
     private func loadGitHub() async {
         isLoadingGitHub = true
         defer { isLoadingGitHub = false }
-        let status = await model.githubStatus()
+        let status = await model.refreshGitHubStatus()
         githubStatus = status
         guard status.isAuthenticated else { return }
         do {
@@ -550,6 +565,11 @@ struct NewWorkspaceSheet: View {
 
     private func create() async {
         operationError = nil
+        guard model.readyHarnesses.contains(harness) else {
+            operationError = model.harnesses.first(where: { $0.kind == harness })?.runtimeFailure
+                ?? "\(harness.displayName) is unavailable. Choose a ready agent."
+            return
+        }
         isCreating = true
         defer { isCreating = false }
 
@@ -937,7 +957,7 @@ extension AppModel {
     /// would produce a workspace that fails on its first message.
     var readyHarnesses: [HarnessKind] {
         let ready = harnesses.filter(\.isReady).map(\.kind)
-        return ready.isEmpty ? [.claudeCode, .codex] : ready
+        return ready.isEmpty && !hasProbedHarnesses ? [.claudeCode, .codex] : ready
     }
 
 }

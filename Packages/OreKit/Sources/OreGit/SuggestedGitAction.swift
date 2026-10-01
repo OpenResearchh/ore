@@ -137,6 +137,33 @@ public struct SuggestedGitStatus: Sendable, Hashable {
         self.pullRequest = pullRequest
         self.committedPullRequest = committedPullRequest
     }
+
+    /// GitHub URL to keep in the toolbar whenever this branch has a PR.
+    ///
+    /// Commit and Push used to hide the link because they are not "PR steps",
+    /// so Open PR left a tray with no way back to the request it just opened.
+    public var toolbarPullRequestURL: String? {
+        guard let url = pullRequest?.url, !url.isEmpty else { return nil }
+        return url
+    }
+
+    /// Merge remains available after Open PR even if Commit or Push is next.
+    ///
+    /// Leftover WIP and unpushed commits are still the primary local step —
+    /// they are not on GitHub yet — but the open request can still land.
+    /// Conflicts stay off this path; failing checks keep "Merge anyway".
+    public var secondaryMergeNumber: Int? {
+        guard let pullRequest, pullRequest.isOpen, !pullRequest.hasConflicts else {
+            return nil
+        }
+        switch action {
+        case .merge, .merged, .resolveConflicts, .retargetAfterParentMerged,
+             .waitForParentToMerge, .fixFailingChecks:
+            return nil
+        default:
+            return pullRequest.number
+        }
+    }
 }
 
 /// Composer text for shipping actions that the agent should carry out with its

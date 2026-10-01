@@ -245,6 +245,7 @@ struct ProtocolBoundaryTests {
     @Test func cursorAgentDoesNotAdvertiseReasoningEffort() {
         #expect(HarnessKind.claudeCode.supportsReasoningEffort)
         #expect(HarnessKind.codex.supportsReasoningEffort)
+        #expect(HarnessKind.antigravity.supportsReasoningEffort)
         #expect(!HarnessKind.cursorAgent.supportsReasoningEffort)
     }
 

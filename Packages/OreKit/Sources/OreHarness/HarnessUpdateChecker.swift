@@ -23,6 +23,9 @@ public enum HarnessUpdateChecker {
         /// Cursor publishes no version API; its install script names the build
         /// it is about to fetch, which is exactly what an upgrade would land.
         case cursorInstallScript
+        /// Antigravity's installer queries a platform manifest for the version
+        /// the next `curl | bash` (or self-update) would land.
+        case antigravityManifest
         case unknown
 
         public var url: URL? {
@@ -37,9 +40,33 @@ public enum HarnessUpdateChecker {
                 // cannot end up reporting a version from a different script
                 // than the one `nativeInstaller` runs.
                 return URL(string: HarnessKind.cursorAgent.nativeInstallerURL)
+            case .antigravityManifest:
+                return Self.antigravityManifestURL
             case .unknown:
                 return nil
             }
+        }
+
+        /// The installer queries `manifests/<os>_<arch>.json`. Match the
+        /// running machine so the advertised version is the one this Mac
+        /// would actually download.
+        static var antigravityManifestURL: URL? {
+            let os: String
+            #if os(macOS)
+            os = "darwin"
+            #elseif os(Linux)
+            os = "linux"
+            #else
+            os = "darwin"
+            #endif
+            #if arch(arm64)
+            let arch = "arm64"
+            #else
+            let arch = "amd64"
+            #endif
+            return URL(
+                string: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/\(os)_\(arch).json"
+            )
         }
 
         /// Homebrew splits packages across two API namespaces and both of ORE's
@@ -76,6 +103,7 @@ public enum HarnessUpdateChecker {
             // Cursor publishes no npm package; its install script is the
             // oracle for both the native installer and `agent update`.
             if kind == .cursorAgent { return .cursorInstallScript }
+            if kind == .antigravity { return .antigravityManifest }
             // `codex update` and `claude update` both pull from the same release
             // stream the npm package publishes, so npm is the version oracle
             // even when the upgrade itself goes through the CLI.
@@ -97,6 +125,7 @@ public enum HarnessUpdateChecker {
                 return .unknown
             }
             if kind == .cursorAgent { return .cursorInstallScript }
+            if kind == .antigravity { return .antigravityManifest }
             return kind.npmPackage.map(Source.npm(package:)) ?? .unknown
         }
     }
@@ -165,6 +194,9 @@ public enum HarnessUpdateChecker {
             guard let data = await fetch(url), let script = String(data: data, encoding: .utf8)
             else { return nil }
             return parseCursorInstallScript(script)
+        case .antigravityManifest:
+            guard let data = await fetch(url) else { return nil }
+            return parseAntigravityManifest(data)
         case .unknown:
             return nil
         }
@@ -195,6 +227,13 @@ public enum HarnessUpdateChecker {
         guard let range = script.range(of: "versions/[0-9][A-Za-z0-9._-]*", options: .regularExpression)
         else { return nil }
         return String(script[range].dropFirst("versions/".count))
+    }
+
+    /// The installer manifest is `{"version":"1.2.14","url":"…","sha512":"…"}`.
+    static func parseAntigravityManifest(_ data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return HarnessVersion.normalize(object["version"] as? String)
     }
 
     // MARK: - Transport

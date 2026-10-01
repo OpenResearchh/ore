@@ -8,6 +8,17 @@ import Testing
 /// so it's tested against bytes a real CLI actually produced rather than against
 /// hand-written ideals.
 struct ClaudeCodeTranslatorTests {
+    @Test func organizationSubscriptionDenialIsAFailedTurnEvenWithSuccessSubtype() {
+        let transcript = #"{"type":"result","subtype":"success","is_error":false,"result":"Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access","session_id":"s1"}"#
+        let results = ClaudeCodeTranscriptReplay.events(transcript: transcript).compactMap { event -> TurnResult? in
+            if case .turnCompleted(let result) = event { return result }
+            return nil
+        }
+        #expect(results.count == 1)
+        #expect(results.first?.outcome == .failed)
+        #expect(results.first?.errorMessage?.contains("disabled Claude subscription access") == true)
+    }
+
     @Test func sessionInitProducesSessionStarted() {
         let events = ClaudeCodeTranscriptReplay.events(transcript: Fixtures.load("simple-text"))
 

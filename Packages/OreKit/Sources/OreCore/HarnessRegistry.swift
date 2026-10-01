@@ -26,7 +26,8 @@ public struct HarnessRegistry: Sendable {
 
     /// Everything shipping today.
     ///
-    /// `cursorAllowUnprompted` and `allowAPIKeyFallback` are passed rather than
+    /// `cursorAllowUnprompted`, `antigravityAllowUnprompted` and
+    /// `allowAPIKeyFallback` are passed rather than
     /// read from defaults so the core stays free of UI storage; only the app
     /// knows the user answered yes. `allowAPIKeyFallback` reaches the
     /// harnesses' *probes*, which strip provider credentials by default and so
@@ -34,8 +35,9 @@ public struct HarnessRegistry: Sendable {
     /// authenticated; sessions have always taken it from
     /// `SessionConfiguration`.
     public static func standard(
-        enabledExperimental: Set<HarnessKind> = [.cursorAgent],
+        enabledExperimental: Set<HarnessKind> = [.cursorAgent, .antigravity],
         cursorAllowUnprompted: Bool = false,
+        antigravityAllowUnprompted: Bool = false,
         allowAPIKeyFallback: Bool = false
     ) -> HarnessRegistry {
         // Experimental harnesses are always registered so Settings can detect
@@ -46,6 +48,10 @@ public struct HarnessRegistry: Sendable {
             CodexHarness(allowAPIKeyFallback: allowAPIKeyFallback),
             CursorAgentHarness(
                 allowUnprompted: cursorAllowUnprompted,
+                allowAPIKeyFallback: allowAPIKeyFallback
+            ),
+            AntigravityHarness(
+                allowUnprompted: antigravityAllowUnprompted,
                 allowAPIKeyFallback: allowAPIKeyFallback
             ),
         ]

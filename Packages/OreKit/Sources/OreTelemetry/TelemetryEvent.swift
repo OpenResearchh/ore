@@ -56,7 +56,7 @@ public enum TelemetryValue: Sendable, Hashable {
 // MARK: - Closed vocabularies
 
 public enum HarnessTag: String, TelemetryVocabulary, CaseIterable {
-    case claudeCode, codex, cursorAgent, other
+    case claudeCode, codex, cursorAgent, antigravity, other
     public var telemetryToken: String { rawValue }
 
     /// Harness identifiers are ours, not user data, but they still arrive as
@@ -67,6 +67,7 @@ public enum HarnessTag: String, TelemetryVocabulary, CaseIterable {
         case "claude", "claudecode", "claude-code": self = .claudeCode
         case "codex": self = .codex
         case "cursor", "cursoragent", "cursor-agent": self = .cursorAgent
+        case "antigravity", "agy": self = .antigravity
         default: self = .other
         }
     }

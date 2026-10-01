@@ -1425,6 +1425,22 @@ public actor InProcessCoreClient: CoreClient {
         workspaceHarness: HarnessKind,
         isAssistant: Bool
     ) async {
+        if case .turnCompleted(let result) = event,
+           result.outcome == .failed,
+           let message = result.errorMessage,
+           ProviderErrorCopy.isClaudeSubscriptionBlocked(message),
+           let index = harnessProbes.firstIndex(where: { $0.kind == .claudeCode }) {
+            harnessProbes[index].runtimeFailure = ProviderErrorCopy.unwrap(message)
+            continuation.yield(.harnessProbeCompleted(harnessProbes))
+        } else if case .turnCompleted(let result) = event,
+                  result.outcome == .completed,
+                  let chat = try? await store.chat(chatID),
+                  chat.harness == HarnessKind.claudeCode.rawValue,
+                  let index = harnessProbes.firstIndex(where: { $0.kind == .claudeCode }),
+                  harnessProbes[index].runtimeFailure != nil {
+            harnessProbes[index].runtimeFailure = nil
+            continuation.yield(.harnessProbeCompleted(harnessProbes))
+        }
         await recordHarnessRateLimit(chatID: chatID, event: event)
         noteDreamHarnessRateLimit(harness: workspaceHarness, event: event)
         // The Assistant is the product's own agent. A rate-limited or dead CLI
@@ -2053,7 +2069,7 @@ struct HarnessDiscoveryCache: Codable, Sendable, Equatable {
     /// Only catalogs that cost a process: Codex starts an app-server and Cursor
     /// runs `--list-models`. Claude's list ships in this build, so caching it
     /// could only hide a newer one.
-    static let cachedCatalogKinds: Set<HarnessKind> = [.codex, .cursorAgent]
+    static let cachedCatalogKinds: Set<HarnessKind> = [.codex, .cursorAgent, .antigravity]
 
     func catalog(for kind: HarnessKind, harnessVersion: String?, now: Date) -> [AgentModel]? {
         guard Self.cachedCatalogKinds.contains(kind),

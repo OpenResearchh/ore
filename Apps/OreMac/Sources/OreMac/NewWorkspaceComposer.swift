@@ -247,7 +247,17 @@ struct NewWorkspaceComposer: View {
     /// left-to-right as statement then correction.
     private func footer(_ plan: WorkspaceLaunchPlan) -> some View {
         HStack(spacing: OreTheme.Space.sm) {
-            if let choice = plan.repository {
+            if case .harnessUnavailable(let harness)? = plan.blocker {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text(model.harnesses.first(where: { $0.kind == harness })?.runtimeFailure
+                    ?? plan.blockerMessage ?? "Agent unavailable")
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else if case .noHarness? = plan.blocker {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text(plan.blockerMessage ?? "No agent is ready")
+                    .foregroundStyle(.orange)
+            } else if let choice = plan.repository {
                 Image(systemName: choice.isSettled ? "folder" : "questionmark.circle")
                     .foregroundStyle(choice.isSettled ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
                 // A project ORE is unsure about is not announced as the

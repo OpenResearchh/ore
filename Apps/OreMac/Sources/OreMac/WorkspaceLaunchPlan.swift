@@ -19,6 +19,8 @@ struct WorkspaceLaunchPlan {
     enum Blocker: Equatable {
         /// A sentence that configures things but asks for no work.
         case noGoal
+        case noHarness
+        case harnessUnavailable(HarnessKind)
         /// Which project, because ORE cannot tell. Carries the name the user
         /// used when they named one ORE does not have.
         case chooseProject(unmatched: String?)
@@ -80,7 +82,7 @@ struct WorkspaceLaunchPlan {
         // nothing, and the chip and the request then disagreed.
         let firstReading = WorkspaceIntent.read(
             inputs.instruction,
-            harnesses: inputs.readyHarnesses,
+            harnesses: HarnessKind.allCases,
             models: [],
             repositoryNames: repositoryNames
         )
@@ -105,14 +107,14 @@ struct WorkspaceLaunchPlan {
         // time the request exists. Here it is still distinguishable.
         let harness = inputs.harnessOverride
             ?? firstReading.harness
-            ?? repositoryDefault
+            ?? repositoryDefault.flatMap { inputs.readyHarnesses.contains($0) ? $0 : nil }
             ?? inputs.readyHarnesses.first
             ?? .claudeCode
 
         let catalogue = inputs.models(harness)
         let intent = WorkspaceIntent.read(
             inputs.instruction,
-            harnesses: inputs.readyHarnesses,
+            harnesses: HarnessKind.allCases,
             models: catalogue,
             repositoryNames: repositoryNames
         )
@@ -217,6 +219,10 @@ struct WorkspaceLaunchPlan {
     }
 
     private static func blocker(for plan: WorkspaceLaunchPlan, inputs: Inputs) -> Blocker? {
+        guard !inputs.readyHarnesses.isEmpty else { return .noHarness }
+        guard inputs.readyHarnesses.contains(plan.harness) else {
+            return .harnessUnavailable(plan.harness)
+        }
         guard plan.intent.hasGoal else { return .noGoal }
         if let unknownBranch = plan.unknownBranch { return .unknownBranch(unknownBranch) }
         // No project at all is fine — Start creates one. A project ORE is
@@ -233,6 +239,10 @@ struct WorkspaceLaunchPlan {
         switch blocker {
         case .noGoal, nil:
             return nil
+        case .noHarness:
+            return "No agent is ready. Check agent settings, then refresh."
+        case .harnessUnavailable(let harness):
+            return "\(harness.displayName) is unavailable. Choose a ready agent."
         case .chooseProject(let unmatched?):
             return "No project called “\(unmatched)” on this Mac — choose one, or start a new project."
         case .chooseProject(nil):

@@ -53,6 +53,7 @@ private struct SettingsPanes: View {
     @AppStorage(AppModel.DefaultKey.reviewModel) private var reviewModel = ""
     @AppStorage("ore.branchPrefix") private var branchPrefix = "ore"
     @AppStorage("ore.cursorAllowUnprompted") private var cursorAllowUnprompted = false
+    @AppStorage("ore.antigravityAllowUnprompted") private var antigravityAllowUnprompted = false
     @AppStorage("ore.apiKeyFallback") private var apiKeyFallback = false
     @AppStorage("ore.notifications.enabled") private var notifications = true
     @AppStorage("ore.notifications.turnComplete") private var turnComplete = true
@@ -82,7 +83,6 @@ private struct SettingsPanes: View {
     @AppStorage(DreamSettingsStore.copySecrets) private var copySecrets = false
 
     @State private var selectedHarness: HarnessKind = .claudeCode
-    @State private var authenticatingHarness: HarnessKind?
     @State private var authenticationNotice: String?
     /// Mirrors the login-item state. See `refreshLaunchAtLogin` for why this is
     /// cached rather than read live.
@@ -663,21 +663,32 @@ private struct SettingsPanes: View {
                     // gives these users too.
                     if let installProbe = probe(for: selectedHarness),
                        !installProbe.isInstalled || installProbe.isUnlaunchable == true {
-                        Button {
-                            copyInstallCommand()
-                        } label: {
-                            Label(
-                                installProbe.isUnlaunchable == true
-                                    ? "Copy reinstall command" : "Copy install command",
-                                systemImage: "doc.on.doc"
-                            )
+                        HStack(spacing: 8) {
+                            Button {
+                                appModel.installHarness(selectedHarness)
+                                authenticationNotice =
+                                    "Terminal opened with the install command. Come back here and press Refresh when it finishes."
+                            } label: {
+                                Label(
+                                    installProbe.isUnlaunchable == true
+                                        ? "Reinstall in Terminal" : "Install in Terminal",
+                                    systemImage: "terminal"
+                                )
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button {
+                                copyInstallCommand()
+                            } label: {
+                                Label("Copy command", systemImage: "doc.on.doc")
+                            }
+                            .buttonStyle(.bordered)
                         }
-                        .buttonStyle(.borderedProminent)
                     }
                     if probe(for: selectedHarness)?.isInstalled == true,
                        probe(for: selectedHarness)?.isUnlaunchable != true,
-                       probe(for: selectedHarness)?.authState == .notAuthenticated {
-                        if authenticatingHarness == selectedHarness {
+                       probe(for: selectedHarness)?.runtimeFailure == nil,
+                       probe(for: selectedHarness)?.authState != .authenticated {
+                        if appModel.authenticatingHarness == selectedHarness {
                             // "Waiting for browser…" used to be the whole story
                             // for as long as the process lived, with no way out
                             // of it short of quitting ORE.
@@ -691,12 +702,14 @@ private struct SettingsPanes: View {
                                 beginHarnessAuthentication()
                             } label: {
                                 Label(
-                                    selectedHarness == .claudeCode ? "Copy sign-in command" : "Sign in…",
-                                    systemImage: selectedHarness == .claudeCode ? "doc.on.doc" : "person.crop.circle.badge.checkmark"
+                                    selectedHarness.requiresInteractiveSignIn
+                                        ? "Open Terminal to sign in" : "Sign in…",
+                                    systemImage: selectedHarness.requiresInteractiveSignIn
+                                        ? "terminal" : "person.crop.circle.badge.checkmark"
                                 )
                             }
                             .buttonStyle(.borderedProminent)
-                            .disabled(authenticatingHarness != nil)
+                            .disabled(appModel.authenticatingHarness != nil)
                         }
                     }
                 }
@@ -766,6 +779,14 @@ private struct SettingsPanes: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("Cursor's CLI has no approval channel. ORE normally lets Cursor's auto-review classifier decide each tool call; this runs every command instead, with no prompt, whenever the chat is in Bypass Permissions.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if selectedHarness == .antigravity {
+                    Toggle("Run tools unprompted in Bypass mode (restart required)", isOn: $antigravityAllowUnprompted)
+                    Label("Antigravity support is experimental", systemImage: "flask")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Antigravity's CLI has no live approval channel. File edits inside the workspace are auto-allowed; shell commands follow Ask unless this is on and the chat is in Bypass Permissions.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -1065,24 +1086,25 @@ private struct SettingsPanes: View {
     private func statusColor(_ probe: HarnessProbeResult?) -> Color {
         guard let probe else { return .secondary }
         if probe.isEnabled == false { return .secondary }
-        return probe.isReady ? .green : (probe.isInstalled ? .orange : .red)
+        return probe.authState == .authenticated && probe.isReady
+            ? .green : (probe.isInstalled ? .orange : .red)
     }
     private var agentStatusIcon: String {
         guard let probe = probe(for: selectedHarness) else { return "ellipsis.circle.fill" }
         if probe.isEnabled == false { return "pause.circle.fill" }
-        return probe.isReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+        if probe.authState == .authenticated && probe.isReady { return "checkmark.circle.fill" }
+        return "exclamationmark.circle.fill"
     }
     private var agentStatusTitle: String {
         guard let probe = probe(for: selectedHarness) else { return "Checking installation…" }
         if !probe.isInstalled { return "CLI not found" }
         if probe.isEnabled == false { return "Installed · enable to use" }
-        if probe.isReady { return "Connected and ready" }
-        // Before "Sign-in required", because a binary that will not start
-        // reports itself signed out and the probe now keeps its path — so this
-        // fell through to offering `claude auth login` against the very binary
-        // that cannot launch. `agentStatusDetail` below renders the probe's
-        // diagnostic, which names the path and the CLI's own reason.
         if probe.isUnlaunchable == true { return "Installed · won't launch" }
+        if probe.runtimeFailure != nil { return "Access blocked" }
+        if probe.authState == .authenticated { return "Connected and ready" }
+        if probe.authState == .unknown {
+            return "Installed · login not confirmed"
+        }
         return "Sign-in required"
     }
     private var agentStatusDetail: String {
@@ -1092,10 +1114,12 @@ private struct SettingsPanes: View {
         if probe.isEnabled == false {
             return "ORE detected the CLI, but this build has disabled the Cursor integration."
         }
-        return probe.diagnostic
-            ?? (probe.isReady
-                ? "Available to new and existing chats."
-                : "Install or authenticate the CLI, then refresh.")
+        return probe.runtimeFailure ?? probe.diagnostic
+            ?? (probe.authState == .unknown
+                ? "The CLI is on your PATH, but ORE could not confirm a login. Sign in if your first turn fails."
+                : (probe.isReady
+                    ? "Available to new and existing chats."
+                    : "Install or authenticate the CLI, then refresh."))
     }
     /// The duplicate-install sentence, or nil when there is one copy.
     ///
@@ -1123,17 +1147,23 @@ private struct SettingsPanes: View {
     private var authenticationStatusTitle: String {
         guard let probe = probe(for: selectedHarness) else { return "Checking CLI authentication…" }
         if probe.isEnabled == false { return "Integration disabled" }
-        return probe.isReady ? "CLI subscription connected" : "Provider sign-in needed"
+        if probe.authState == .authenticated { return "CLI subscription connected" }
+        if probe.authState == .unknown && probe.isLaunchable {
+            return "Login not confirmed"
+        }
+        return "Provider sign-in needed"
     }
     private var authenticationStatusIcon: String {
         guard let probe = probe(for: selectedHarness) else { return "ellipsis.circle.fill" }
         if probe.isEnabled == false { return "pause.circle.fill" }
-        return probe.isReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+        if probe.authState == .authenticated { return "checkmark.circle.fill" }
+        return "exclamationmark.circle.fill"
     }
     private var authenticationStatusColor: Color {
         guard let probe = probe(for: selectedHarness) else { return .secondary }
         if probe.isEnabled == false { return .secondary }
-        return probe.isReady ? .green : .orange
+        if probe.authState == .authenticated { return .green }
+        return .orange
     }
 
     /// Whether macOS has been told not to deliver ORE's notifications.
@@ -1165,21 +1195,13 @@ private struct SettingsPanes: View {
 
     private func beginHarnessAuthentication() {
         authenticationNotice = nil
-        if selectedHarness == .claudeCode {
-            let command = HarnessSetup.signInCommand(for: .claudeCode)
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(command, forType: .string)
-            authenticationNotice = "Copied `\(command)`. Run it in Terminal, finish the browser login, then press Refresh."
-            return
-        }
-
         let kind = selectedHarness
-        authenticatingHarness = kind
         Task {
-            defer { authenticatingHarness = nil }
             do {
-                try await appModel.authenticateHarness(kind)
-                authenticationNotice = "Sign-in completed. Refreshing \(kind.displayName)…"
+                try await appModel.startHarnessSignIn(kind)
+                authenticationNotice = kind.requiresInteractiveSignIn
+                    ? "Terminal opened with `\(HarnessSetup.signInCommand(for: kind))`. Finish the browser login, then press Refresh."
+                    : "Sign-in completed. Refreshing \(kind.displayName)…"
             } catch {
                 authenticationNotice = error.localizedDescription
             }

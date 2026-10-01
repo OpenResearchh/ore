@@ -1066,6 +1066,10 @@ struct AssistantModelPolicyTests {
             model: "composer-2.5",
             reasoningEffort: nil
         ))
+        #expect(AssistantManager.modelProfile(for: .antigravity) == .init(
+            model: "gemini-3.8-flash-medium",
+            reasoningEffort: .low
+        ))
     }
 
     @Test func aLiveCatalogCannotSilentlyPromoteTheAssistantToItsDefault() {
@@ -1196,6 +1200,7 @@ struct HarnessRegistryTests {
     @Test func experimentalHarnessesCanStillBeDisabledByRegistryPolicy() {
         let disabled = HarnessRegistry.standard(enabledExperimental: [])
         #expect(disabled.harness(for: .cursorAgent) == nil)
+        #expect(disabled.harness(for: .antigravity) == nil)
         #expect(disabled.available.allSatisfy { !$0.kind.isExperimental })
 
         let enabled = HarnessRegistry(
@@ -1211,6 +1216,7 @@ struct HarnessRegistryTests {
         #expect(registry.harness(for: .claudeCode) != nil)
         #expect(registry.harness(for: .codex) != nil)
         #expect(registry.harness(for: .cursorAgent) != nil)
+        #expect(registry.harness(for: .antigravity) != nil)
     }
 
     @Test func disabledExperimentalHarnessesAreDetectedButNotReady() async throws {

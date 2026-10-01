@@ -177,6 +177,7 @@ struct HarnessRepairTests {
             .claudeCode: "https://claude.ai/install.sh",
             .codex: "https://chatgpt.com/codex/install.sh",
             .cursorAgent: "https://cursor.com/install",
+            .antigravity: "https://antigravity.google/cli/install.sh",
         ]
         for (kind, url) in expected {
             let repair = try #require(HarnessRepair.forPermissionFailure(
@@ -202,6 +203,7 @@ struct HarnessRepairTests {
             (.claudeCode, .nativeUserBin, "/Users/me/.local/bin/claude"),
             (.codex, .unknown, nil),
             (.cursorAgent, .unknown, nil),
+            (.antigravity, .unknown, nil),
         ]
         for (kind, method, path) in cases {
             let repair = try #require(HarnessRepair.forPermissionFailure(
@@ -380,6 +382,9 @@ struct HarnessRepairTests {
         #expect((optedIn.harness(for: .codex) as? CodexHarness)?.allowAPIKeyFallback == true)
         #expect(
             (optedIn.harness(for: .cursorAgent) as? CursorAgentHarness)?.allowAPIKeyFallback == true
+        )
+        #expect(
+            (optedIn.harness(for: .antigravity) as? AntigravityHarness)?.allowAPIKeyFallback == true
         )
 
         let standard = HarnessRegistry.standard()

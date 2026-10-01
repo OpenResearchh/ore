@@ -4,6 +4,12 @@ import Testing
 @testable import OreProtocol
 
 struct ProviderErrorCopyTests {
+    @Test func organizationPolicyDenialIsSpecificToClaudeAccess() {
+        let refusal = "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"
+        #expect(ProviderErrorCopy.isClaudeSubscriptionBlocked(refusal))
+        #expect(!ProviderErrorCopy.isClaudeSubscriptionBlocked("Claude subscription access for Claude Code is explained in this document"))
+    }
+
     @Test func unwrapsCodexModelUpgradeJSON() {
         let raw = """
         {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}

@@ -1,5 +1,6 @@
 import AppKit
 import OreGit
+import OreProtocol
 import SwiftUI
 
 /// The onboarding surface: one thing to do, not a wall of setup.
@@ -16,16 +17,20 @@ import SwiftUI
 /// later, if an agent signs itself out months from now.
 struct NextStepCard: View {
     let readiness: Readiness
+    var harnesses: [HarnessProbeResult] = []
     var onAddProject: () -> Void
     var onNewWorkspace: () -> Void
+    var onGitHubStatusChanged: (() -> Void)? = nil
 
+    @Environment(AppModel.self) private var model
     @State private var isExpanded = false
     @State private var copied = false
+    @State private var setupError: String?
 
     var body: some View {
         // Nothing to say once the user can work — that silence is deliberate.
-        // The other one was not: see `fallbackStep`.
-        if let step = readiness.nextStep ?? Self.fallbackStep(for: readiness) {
+        // The other one was not: see `Readiness.fallbackStep`.
+        if let step = readiness.nextStep ?? readiness.fallbackStep {
             VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
                 header(step)
                 if !step.detail.isEmpty {
@@ -42,34 +47,24 @@ struct NextStepCard: View {
                 } else {
                     actionRow(step)
                 }
+                if let setupError, !setupError.isEmpty {
+                    Text(setupError)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+                if let url = model.harnessAuthenticationURL {
+                    signInLink(url)
+                }
                 if readiness.relevantSteps.count > 1 {
                     Divider().opacity(0.5)
                     checklistToggle
                     if isExpanded { checklist }
                 }
             }
-            .frame(maxWidth: 380, alignment: .leading)
+            .frame(maxWidth: 420, alignment: .leading)
             .oreCard(padding: 16, radius: 16)
         }
-    }
-
-    /// The step to show when `nextStep` has nothing.
-    ///
-    /// `Readiness.nextStep` returns nil while a *blocking* rung is still
-    /// `.unknown`, so the ladder never advises something it may have to retract
-    /// a moment later. The welcome screen read that nil as "nothing to say" and
-    /// drew nothing at all — and when a probe hung, or core start threw before
-    /// any probe was spawned, the emptiness was permanent: no card, no button,
-    /// no error, on the one screen a brand-new user has. The copy for this
-    /// state ("Checking for coding agents…") was already written in
-    /// `Readiness`; it had simply never been reachable.
-    ///
-    /// A `nonisolated static func` rather than a computed property so the
-    /// choice can be tested without a window — and without a main-actor hop,
-    /// since `View` conformance makes everything else on this type
-    /// `@MainActor`.
-    nonisolated static func fallbackStep(for readiness: Readiness) -> ReadinessStep? {
-        readiness.steps.first { $0.isBlocking && $0.status == .unknown }
     }
 
     private func header(_ step: ReadinessStep) -> some View {
@@ -94,28 +89,7 @@ struct NextStepCard: View {
             EmptyView()
 
         case .copyCommand(let command):
-            VStack(alignment: .leading, spacing: 8) {
-                // Show the command as well as offering to copy it. Setup ends
-                // in a terminal either way, and a user who can see the exact
-                // command can decide whether they trust it.
-                Text(command)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
-                Button(copied ? "Copied" : (step.actionTitle ?? "Copy")) {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(command, forType: .string)
-                    copied = true
-                    Task {
-                        try? await Task.sleep(for: .seconds(1.6))
-                        copied = false
-                    }
-                }
-                .buttonStyle(OrePrimaryButtonStyle())
-            }
+            commandBlock(command, primaryTitle: step.actionTitle ?? "Run in Terminal")
 
         case .addProject:
             Button(step.actionTitle ?? "Add project…", action: onAddProject)
@@ -125,8 +99,171 @@ struct NextStepCard: View {
             Button(step.actionTitle ?? "New workspace", action: onNewWorkspace)
                 .buttonStyle(OrePrimaryButtonStyle())
 
+        case .signIn(let kind):
+            VStack(alignment: .leading, spacing: 10) {
+                signInControls(kind)
+                alternativeInstalls(besides: kind)
+            }
+
+        case .installAgents:
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(HarnessSetup.offeredKinds(from: harnesses), id: \.self) { kind in
+                    harnessInstallRow(kind)
+                }
+            }
+
+        case .githubSignIn:
+            githubSignInControls()
+
+        case .githubInstall:
+            VStack(alignment: .leading, spacing: 8) {
+                Text(GitHubCLISetup.installCommand)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
+                HStack(spacing: 8) {
+                    Button("Install GitHub CLI") { model.installGitHubCLI() }
+                        .buttonStyle(OrePrimaryButtonStyle())
+                    Button("Copy") {
+                        ExternalTools.copyPath(GitHubCLISetup.installCommand)
+                    }
+                    .buttonStyle(.bordered)
+                    Button("Download page") {
+                        if let url = URL(string: GitHubCLISetup.downloadURL) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
         case .openSettings, .openURL:
             EmptyView()
+        }
+    }
+
+    private func commandBlock(_ command: String, primaryTitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Show the command as well as offering to run it. Setup ends
+            // in a terminal either way, and a user who can see the exact
+            // command can decide whether they trust it.
+            Text(command)
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
+            HStack(spacing: 8) {
+                Button(primaryTitle) {
+                    ExternalTools.copyAndRunInTerminal(command)
+                }
+                .buttonStyle(OrePrimaryButtonStyle())
+                Button(copied ? "Copied" : "Copy") {
+                    ExternalTools.copyPath(command)
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.6))
+                        copied = false
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func signInControls(_ kind: HarnessKind) -> some View {
+        if model.authenticatingHarness == kind {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for browser…")
+                Button("Cancel") { model.cancelHarnessAuthentication() }
+            }
+        } else {
+            Button(kind.requiresInteractiveSignIn ? "Open Terminal to sign in" : "Sign in…") {
+                Task { await signIn(kind) }
+            }
+            .buttonStyle(OrePrimaryButtonStyle())
+        }
+    }
+
+    private func harnessInstallRow(_ kind: HarnessKind) -> some View {
+        HStack(spacing: 8) {
+            HarnessMark(harness: kind, size: 16)
+            Text(kind.displayName)
+                .font(.system(size: 13, weight: .medium))
+            Spacer(minLength: 0)
+            Button("Install") {
+                model.installHarness(kind)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+    }
+
+    @ViewBuilder
+    private func alternativeInstalls(besides current: HarnessKind) -> some View {
+        let others = HarnessSetup.offeredKinds(from: harnesses).filter { kind in
+            kind != current && !(harnesses.first(where: { $0.kind == kind })?.isReady ?? false)
+        }
+        if !others.isEmpty {
+            Text("Or install a different agent — you only need one.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(others, id: \.self) { kind in
+                harnessInstallRow(kind)
+            }
+        }
+    }
+
+    private func githubSignInControls() -> some View {
+        Group {
+            if model.isAuthenticatingGitHub {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for GitHub…")
+                }
+            } else {
+                Button("Sign in…") {
+                    Task { await signInGitHub() }
+                }
+                .buttonStyle(OrePrimaryButtonStyle())
+            }
+        }
+    }
+
+    private func signInLink(_ url: String) -> some View {
+        HStack(spacing: 8) {
+            Text(url)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button("Copy link") { ExternalTools.copyPath(url) }
+                .buttonStyle(.borderless)
+        }
+    }
+
+    private func signIn(_ kind: HarnessKind) async {
+        setupError = nil
+        do {
+            try await model.startHarnessSignIn(kind)
+        } catch {
+            setupError = error.localizedDescription
+        }
+    }
+
+    private func signInGitHub() async {
+        setupError = nil
+        do {
+            try await model.authenticateGitHub()
+            onGitHubStatusChanged?()
+        } catch {
+            setupError = error.localizedDescription
         }
     }
 

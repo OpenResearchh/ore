@@ -25,9 +25,19 @@ struct HarnessSignInTests {
     /// Claude Code is the one that cannot be driven headlessly at all, so its
     /// error says so rather than offering a cancel on a process that would
     /// never have worked.
-    @Test func claudeCodeSignInSaysItIsInteractive() {
+    @Test func claudeCodeSignInOpensTerminalInsteadOfHanging() {
         let message = HarnessAuthenticationError.interactiveOnly.errorDescription ?? ""
         #expect(message.contains("interactive"))
+        #expect(message.contains("Terminal") || message.contains("copied"))
+        #expect(HarnessKind.claudeCode.requiresInteractiveSignIn)
+        #expect(HarnessKind.antigravity.requiresInteractiveSignIn)
+        #expect(!HarnessKind.codex.requiresInteractiveSignIn)
+    }
+
+    @Test func appleScriptQuotingSurvivesQuotesAndBackslashes() {
+        #expect(ExternalTools.appleScriptStringLiteral("echo \"hi\"") == "\"echo \\\"hi\\\"\"")
+        #expect(ExternalTools.appleScriptStringLiteral("a\\b") == "\"a\\\\b\"")
+        #expect(ExternalTools.posixQuoted("/tmp/O'Reilly") == "'/tmp/O'\\''Reilly'")
     }
 
     @Test func aPrintedURLIsExtractedFromLoginOutput() {

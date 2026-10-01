@@ -7,7 +7,7 @@ boundary builds and tests on Linux as well as macOS.
 ```
 OreProtocol     Codable commands, events and identifiers — the API boundary
 OreSupport      child processes, login-shell environment, Unix sockets
-OreHarness      agent CLI drivers: Claude Code, Codex, cursor-agent
+OreHarness      agent CLI drivers: Claude Code, Codex, cursor-agent, Antigravity
 OreGit          worktrees, status watching, diffs, checkpoints, the gh CLI
 OrePersistence  SQLite (GRDB): workspaces, transcripts, review state, search
 OreTelemetry    the anonymous usage events described in PRIVACY.md

@@ -20,11 +20,20 @@ struct SuggestedGitActionTests {
     ) -> GitHubClient.PullRequest {
         GitHubClient.PullRequest(
             number: number,
+            url: "https://github.com/example/ore/pull/\(number)",
             state: "OPEN",
             baseRefName: base,
             mergeable: mergeable,
             reviewDecision: reviewDecision,
             checks: checks
+        )
+    }
+
+    private func status(_ context: GitActionContext) -> SuggestedGitStatus {
+        SuggestedGitStatus(
+            action: SuggestedGitActionResolver.resolve(context),
+            pullRequest: context.pullRequest,
+            committedPullRequest: SuggestedGitActionResolver.committedPullRequest(from: context)
         )
     }
 
@@ -53,6 +62,17 @@ struct SuggestedGitActionTests {
         #expect(action.delegatesToAgent)
         #expect(action.agentDraftPrompt?.contains("3 files") == true)
         #expect(action.agentDraftPrompt?.contains("Do not push") == true)
+        let dirtyOpen = status(GitActionContext(
+            hasUncommittedChanges: true,
+            changedFileCount: 3,
+            insertions: 42,
+            deletions: 8,
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("build", "SUCCESS")])
+        ))
+        #expect(dirtyOpen.secondaryMergeNumber == 7)
+        #expect(dirtyOpen.toolbarPullRequestURL?.contains("/pull/7") == true)
+        #expect(dirtyOpen.committedPullRequest == nil)
     }
 
     @Test func anUnpublishedBranchGoesStraightToCreatePR() {
@@ -83,6 +103,36 @@ struct SuggestedGitActionTests {
         ))
         #expect(action == .push(commitCount: 3, isFirstPush: false))
         #expect(action.title == "Push 3 commits")
+        let updating = status(GitActionContext(
+            unpushedCommitCount: 3,
+            commitsAheadOfBase: 5,
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("build", "SUCCESS")])
+        ))
+        #expect(updating.secondaryMergeNumber == 7)
+        #expect(updating.toolbarPullRequestURL?.contains("/pull/7") == true)
+    }
+
+    @Test func aPrimaryMergeDoesNotDuplicateASecondaryOne() {
+        let ready = status(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("build", "SUCCESS")])
+        ))
+        #expect(ready.action == .merge(prNumber: 7, isStacked: false))
+        #expect(ready.secondaryMergeNumber == nil)
+
+        let failing = status(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(checks: [check("test", "FAILURE")])
+        ))
+        #expect(failing.action.mergeableDespiteChecks == 7)
+        #expect(failing.secondaryMergeNumber == nil)
+
+        let conflicted = status(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(mergeable: "CONFLICTING")
+        ))
+        #expect(conflicted.secondaryMergeNumber == nil)
     }
 
     @Test func failingChecksGoToTheAgentRatherThanToTheBrowser() {
@@ -156,6 +206,15 @@ struct SuggestedGitActionTests {
         ))
         #expect(action == .waitForChecks(running: 1, total: 2))
         #expect(!action.isActionable)
+        let waiting = status(GitActionContext(
+            hasUpstream: true,
+            pullRequest: openPR(checks: [
+                check("build", "SUCCESS"),
+                check("test", "IN_PROGRESS"),
+            ])
+        ))
+        #expect(waiting.secondaryMergeNumber == 7)
+        #expect(waiting.toolbarPullRequestURL?.contains("/pull/7") == true)
     }
 
     @Test func unknownMergeabilityIsNotTreatedAsAConflict() {

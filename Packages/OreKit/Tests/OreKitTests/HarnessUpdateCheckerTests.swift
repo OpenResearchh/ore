@@ -136,6 +136,16 @@ struct HarnessUpdateCheckerTests {
         #expect(HarnessUpdateChecker.Source.npm(package: "@openai/codex").fallbackURL == nil)
     }
 
+    @Test func antigravityReadsItsReleaseManifest() {
+        #expect(
+            HarnessUpdateChecker.source(
+                for: .antigravity, executablePath: "/Users/me/.local/bin/agy"
+            ) == .antigravityManifest
+        )
+        let payload = Data(#"{"version":"1.2.14","url":"https://example.com/agy","sha512":"abc"}"#.utf8)
+        #expect(HarnessUpdateChecker.parseAntigravityManifest(payload) == "1.2.14")
+    }
+
     /// Homebrew ships Claude Code as two casks. Reading the stable one for a
     /// user on `claude-code@latest` reports a release about a week behind what
     /// their own `brew upgrade` would fetch — so the oracle follows the cask

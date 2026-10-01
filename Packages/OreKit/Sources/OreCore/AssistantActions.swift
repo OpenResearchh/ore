@@ -438,8 +438,13 @@ extension InProcessCoreClient {
         case "CreateChat":
             let workspaceID = try requireWorkspace(arguments)
             let harness = try resolveExecutionHarness(arguments["harness"]?.stringValue)
+            let effort = arguments["effort"]?.stringValue
+                .flatMap(ReasoningEffort.init(rawValue:))
+            let aligned = alignedModel(
+                arguments["model"]?.stringValue, effort: effort, for: harness
+            )
             if let harness {
-                try validateModel(arguments["model"]?.stringValue, for: harness)
+                try validateModel(aligned.model, for: harness)
             }
             let mode = arguments["permissionMode"]?.stringValue
                 .flatMap(PermissionMode.init(rawValue:)) ?? .default
@@ -447,11 +452,10 @@ extension InProcessCoreClient {
                 workspaceID: workspaceID,
                 title: arguments["title"]?.stringValue,
                 harness: harness,
-                model: arguments["model"]?.stringValue,
+                model: aligned.model,
                 permissionMode: mode,
                 forkFrom: arguments["forkFrom"]?.stringValue.map(ChatID.init(rawValue:)),
-                reasoningEffort: arguments["effort"]?.stringValue
-                    .flatMap(ReasoningEffort.init(rawValue:))
+                reasoningEffort: aligned.effort
             ))
             markListMutation()
             continuation.yield(.chatAdded(chat))
@@ -545,8 +549,10 @@ extension InProcessCoreClient {
                   let harness = HarnessKind(rawValue: record.harness)
             else { throw AssistantActionError.badRequest("That chat does not exist in the workspace.") }
             try validateModel(arguments["model"]?.stringValue, for: harness)
-            let chat = try await engine(for: workspaceID).setModel(
-                chatID: chatID, model: arguments["model"]?.stringValue
+            let chat = try await applyChatModel(
+                workspaceID: workspaceID,
+                chatID: chatID,
+                model: arguments["model"]?.stringValue
             )
             return "Model on \"\(chat.title)\" is now \(chat.model ?? "the default")."
 
@@ -558,9 +564,17 @@ extension InProcessCoreClient {
                 throw AssistantActionError.badRequest("SwitchChatHarness needs a harness.")
             }
             try validateModel(arguments["model"]?.stringValue, for: harness)
-            let chat = try await engine(for: workspaceID).switchHarness(
+            var chat = try await engine(for: workspaceID).switchHarness(
                 chatID: chatID, harness: harness, model: arguments["model"]?.stringValue
             )
+            if let encoded = ModelVariantCatalog.family(
+                containing: chat.model,
+                in: modelCatalog[chat.harness] ?? []
+            )?.encodedEffort(of: chat.model), encoded != chat.reasoningEffort {
+                chat = try await applyChatEffort(
+                    workspaceID: workspaceID, chatID: chatID, effort: encoded
+                )
+            }
             return "\"\(chat.title)\" is on \(chat.harness.displayName)"
                 + (chat.model.map { " / \($0)" } ?? "") + "."
 
@@ -585,9 +599,13 @@ extension InProcessCoreClient {
             let chatID = try requireChat(arguments)
             let effort = arguments["effort"]?.stringValue
                 .flatMap(ReasoningEffort.init(rawValue:))
-            let chat = try await engine(for: workspaceID).setEffort(chatID: chatID, effort: effort)
+            let chat = try await applyChatEffort(
+                workspaceID: workspaceID, chatID: chatID, effort: effort
+            )
             return "Effort on \"\(chat.title)\" is now "
-                + (effort?.displayName ?? "the default") + "."
+                + (effort?.displayName ?? "the default")
+                + (chat.model.map { " (\($0))" } ?? "")
+                + "."
 
         case "RenameChat":
             let workspaceID = try requireWorkspace(arguments)
@@ -1563,15 +1581,15 @@ extension InProcessCoreClient {
                 if let version = probe.version { line += " (v\(version))" }
                 let models = modelCatalog[probe.kind] ?? []
                 if !models.isEmpty {
-                    let described = models.map { model in
-                        var value = model.id + (model.isDefault ? " (default)" : "")
-                        if !model.description.isEmpty { value += " [\(model.description)]" }
-                        if !model.supportedReasoningEfforts.isEmpty {
-                            value += " {effort=\(model.supportedReasoningEfforts.joined(separator: "/"))}"
+                    let described = ModelVariantCatalog.families(from: models).map { family in
+                        if family.encodedEfforts.isEmpty, family.variants.count == 1 {
+                            return catalogModelSummary(family.variants[0])
                         }
-                        if !model.supportedServiceTiers.isEmpty {
-                            value += " {tiers=\(model.supportedServiceTiers.joined(separator: "/"))}"
-                        }
+                        var value = family.displayName + (family.isDefault ? " (default)" : "")
+                        if !family.description.isEmpty { value += " [\(family.description)]" }
+                        value += " {encoded-effort=\(family.encodedEfforts.map(\.rawValue).joined(separator: "/"))"
+                        if family.supportsFast { value += "; fast" }
+                        value += "}"
                         return value
                     }
                     line += " — models: " + described.joined(separator: ", ")
@@ -1708,16 +1726,7 @@ extension InProcessCoreClient {
                 )
             } else {
                 lines.append("models:")
-                for model in models {
-                    var row = "- id=\(model.id); name=\(model.displayName)"
-                    if model.isDefault { row += "; default=yes" }
-                    if !model.description.isEmpty { row += "; strengths=\(model.description)" }
-                    row += "; efforts=" + (model.supportedReasoningEfforts.isEmpty
-                        ? "provider default" : model.supportedReasoningEfforts.joined(separator: ","))
-                    row += "; service-tiers=" + (model.supportedServiceTiers.isEmpty
-                        ? "provider default" : model.supportedServiceTiers.joined(separator: ","))
-                    lines.append(row)
-                }
+                lines.append(contentsOf: executionModelLines(models))
             }
         }
 
@@ -1728,10 +1737,55 @@ extension InProcessCoreClient {
             "- Exclude harnesses that are not ready or have an active exhausted report. A warning is usable but favors a healthy fallback for long work.",
             "- For an existing conversation, preserve its current configuration when it remains capable; for a new independent tab, choose the best fit for this task.",
             "- Match task needs to model strengths and harness capabilities. Use only exact model ids and supported effort/service-tier values shown above.",
+            "- When a family lists encoded-effort=yes, effort (and Fast) live in the variant id. Pick the family, then the depth, then pass one of that family's variant ids. SetChatEffort remaps the stored id on an existing tab. Cursor Agent has no separate --effort flag.",
+            "- Claude Code and Codex keep a single id plus a separate effort chip: pass that id and SetChatEffort / CreateChat.effort.",
+            "- Choose depth from the task, not from a habit. Low or Fast: short lookups, formatting, 'just do this quickly'. Medium / the default family: everyday implementation. High or Extra High: multi-file design, hard bugs, careful review. Auto when the work is routine or unspecified.",
+            "- High (or above) only for genuinely hard work; Fast when latency matters more than depth. Never invent an id or an effort the family does not list.",
             "- Keep one fallback on a different usable provider. If execution rejects the choice or availability changes, call GetExecutionOptions again and retry with that fallback.",
             "- Briefly state the chosen harness/model and the task-specific reason before orchestrating.",
         ])
         return lines.joined(separator: "\n")
+    }
+
+    private func catalogModelSummary(_ model: AgentModel) -> String {
+        var value = model.id + (model.isDefault ? " (default)" : "")
+        if !model.description.isEmpty { value += " [\(model.description)]" }
+        if !model.supportedReasoningEfforts.isEmpty {
+            value += " {effort=\(model.supportedReasoningEfforts.joined(separator: "/"))}"
+        }
+        if !model.supportedServiceTiers.isEmpty {
+            value += " {tiers=\(model.supportedServiceTiers.joined(separator: "/"))}"
+        }
+        return value
+    }
+
+    private func executionModelLines(_ models: [AgentModel]) -> [String] {
+        ModelVariantCatalog.families(from: models).flatMap { family -> [String] in
+            if family.encodedEfforts.isEmpty, family.variants.count == 1 {
+                return [executionModelRow(family.variants[0])]
+            }
+            var row = "- family=\(family.displayName); default-id=\(family.defaultVariant.id)"
+            if family.isDefault { row += "; default=yes" }
+            if !family.description.isEmpty { row += "; strengths=\(family.description)" }
+            row += "; encoded-effort=yes"
+            row += "; efforts=" + family.encodedEfforts.map(\.rawValue).joined(separator: ",")
+            row += "; fast=" + (family.supportsFast ? "yes" : "no")
+            return [
+                row,
+                "  variants: " + family.variants.map(\.id).joined(separator: ", "),
+            ]
+        }
+    }
+
+    private func executionModelRow(_ model: AgentModel) -> String {
+        var row = "- id=\(model.id); name=\(model.displayName)"
+        if model.isDefault { row += "; default=yes" }
+        if !model.description.isEmpty { row += "; strengths=\(model.description)" }
+        row += "; efforts=" + (model.supportedReasoningEfforts.isEmpty
+            ? "provider default" : model.supportedReasoningEfforts.joined(separator: ","))
+        row += "; service-tiers=" + (model.supportedServiceTiers.isEmpty
+            ? "provider default" : model.supportedServiceTiers.joined(separator: ","))
+        return row
     }
 
     private func harnessCapabilityText(_ value: HarnessCapabilities) -> String {

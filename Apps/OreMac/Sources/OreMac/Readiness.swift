@@ -96,6 +96,22 @@ struct Readiness: Equatable {
     /// the card should get out of the way as soon as the user can work, not
     /// wait for a perfect score.
     var isReady: Bool { !steps.contains { $0.isBlocking && $0.status == .unmet } }
+
+    /// What the welcome card shows when `nextStep` is nil because a blocking
+    /// rung is still `.unknown`.
+    ///
+    /// `nextStep` stays silent until a blocking probe answers, so the ladder
+    /// never advises something it may have to retract a moment later. The
+    /// welcome screen used to read that nil as "nothing to say" and drew
+    /// nothing at all — permanently if the probe hung. The copy for this
+    /// state ("Checking for coding agents…") was already on the unknown
+    /// rung; this is how the card can actually show it.
+    ///
+    /// Kept here, not on the SwiftUI card, so tests can assert it without
+    /// touching a `@MainActor` `View` from a background testing thread.
+    var fallbackStep: ReadinessStep? {
+        steps.first { $0.isBlocking && $0.status == .unknown }
+    }
 }
 
 // MARK: - Evaluation

@@ -29,8 +29,8 @@ struct NextStepCard: View {
 
     var body: some View {
         // Nothing to say once the user can work — that silence is deliberate.
-        // The other one was not: see `fallbackStep`.
-        if let step = readiness.nextStep ?? Self.fallbackStep(for: readiness) {
+        // The other one was not: see `Readiness.fallbackStep`.
+        if let step = readiness.nextStep ?? readiness.fallbackStep {
             VStack(alignment: .leading, spacing: OreTheme.Space.sm) {
                 header(step)
                 if !step.detail.isEmpty {
@@ -65,25 +65,6 @@ struct NextStepCard: View {
             .frame(maxWidth: 420, alignment: .leading)
             .oreCard(padding: 16, radius: 16)
         }
-    }
-
-    /// The step to show when `nextStep` has nothing.
-    ///
-    /// `Readiness.nextStep` returns nil while a *blocking* rung is still
-    /// `.unknown`, so the ladder never advises something it may have to retract
-    /// a moment later. The welcome screen read that nil as "nothing to say" and
-    /// drew nothing at all — and when a probe hung, or core start threw before
-    /// any probe was spawned, the emptiness was permanent: no card, no button,
-    /// no error, on the one screen a brand-new user has. The copy for this
-    /// state ("Checking for coding agents…") was already written in
-    /// `Readiness`; it had simply never been reachable.
-    ///
-    /// A `nonisolated static func` rather than a computed property so the
-    /// choice can be tested without a window — and without a main-actor hop,
-    /// since `View` conformance makes everything else on this type
-    /// `@MainActor`.
-    nonisolated static func fallbackStep(for readiness: Readiness) -> ReadinessStep? {
-        readiness.steps.first { $0.isBlocking && $0.status == .unknown }
     }
 
     private func header(_ step: ReadinessStep) -> some View {

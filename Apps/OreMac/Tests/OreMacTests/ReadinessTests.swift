@@ -236,7 +236,7 @@ struct ReadinessTests {
         #expect(first.isBlocking)
         #expect(!first.title.isEmpty)
 
-        #expect(NextStepCard.fallbackStep(for: readiness) == first)
+        #expect(readiness.fallbackStep == first)
     }
 
     /// The bug: a quarantined or non-executable CLI probes as "no usable

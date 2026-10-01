@@ -499,6 +499,61 @@ struct TranscriptDisplayTests {
         #expect(openTurn.contains { $0.id == "think1" })
     }
 
+    @Test func aLongLiveTurnFoldsCompletedStepsAndKeepsTheInFlightRow() {
+        let turn = TurnID(rawValue: "t1")
+        func edit(_ id: String, complete: Bool = true) -> TranscriptRow {
+            TranscriptRow(
+                id: id, turnID: turn, kind: .toolCall, text: "Edit",
+                toolName: "Edit", isComplete: complete
+            )
+        }
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "fix it"),
+            edit("e1"), edit("e2"), edit("e3"), edit("e4"),
+            TranscriptRow(
+                id: "think", turnID: turn, kind: .thinking,
+                text: "Checking the last file.", isComplete: false
+            ),
+        ]
+
+        let displayed = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(displayed.contains { $0.kind == .activityGroup && $0.text == "5 steps" })
+        #expect(!displayed.contains { $0.id == "e1" })
+        #expect(!displayed.contains { $0.id == "e4" })
+        #expect(displayed.contains { $0.id == "think" })
+        #expect(!displayed.contains { $0.kind == .turnFooter })
+
+        let revealed = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: ["activity-t1"],
+            memo: TranscriptDisplay.Memo()
+        )
+        #expect(revealed.contains { $0.id == "e1" })
+        #expect(revealed.contains { $0.id == "think" })
+    }
+
+    @Test func aShortLiveTurnDoesNotFold() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "go"),
+            TranscriptRow(
+                id: "e1", turnID: turn, kind: .toolCall, text: "Edit",
+                toolName: "Edit", isComplete: true
+            ),
+            TranscriptRow(
+                id: "e2", turnID: turn, kind: .toolCall, text: "Edit",
+                toolName: "Edit", isComplete: true
+            ),
+        ]
+        let displayed = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(!displayed.contains { $0.kind == .activityGroup })
+        #expect(displayed.contains { $0.id == "e1" })
+        #expect(displayed.contains { $0.id == "e2" })
+    }
+
     @Test func sourceSignatureIsIndependentOfPayloadBytes() {
         var row = TranscriptRow(
             id: "t", turnID: TurnID(rawValue: "1"), kind: .toolCall, text: "Edit"

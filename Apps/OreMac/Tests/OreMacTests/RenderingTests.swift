@@ -733,6 +733,36 @@ struct UserMessageAttachmentTests {
         #expect(TranscriptCell.attributedText(for: list).string.contains("List"))
     }
 
+    @Test func anEditWithoutAPathDoesNotRepeatTheTitleAsAChip() {
+        let row = TranscriptRow(
+            id: "tool-edit-bare",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Edit",
+            toolName: "Edit",
+            toolCallID: ToolCallID(rawValue: "c-bare"),
+            toolInput: .object([:])
+        )
+        let chip = TranscriptCell.processChip(for: row)
+        #expect(chip.title == "Edit")
+        #expect(chip.subject == nil)
+    }
+
+    @Test func editRowsReadACapitalPath() {
+        let row = TranscriptRow(
+            id: "tool-edit-path",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Edit",
+            toolName: "Edit",
+            toolCallID: ToolCallID(rawValue: "c-path"),
+            toolInput: .object(["Path": .string("HarnessIcons/antigravity.svg")])
+        )
+        let chip = TranscriptCell.processChip(for: row)
+        #expect(chip.title == "Edit")
+        #expect(chip.subject == "antigravity.svg")
+    }
+
     @Test func fetchChipsNameTheUrlAndSearchChipsNameTheQuery() {
         let fetch = TranscriptRow(
             id: "tool-fetch",

@@ -4374,12 +4374,23 @@ final class AppModel {
             ]
         case .antigravity:
             // Fallback only — `agy models` is the account's real catalogue.
-            // These documented slugs keep the picker useful before discovery.
+            // Keep this list aligned with a signed-in `agy models` so a failed
+            // discovery still shows the full picker, not a four-item stub.
             [
                 AgentModel(id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)", description: "Daily-driver Gemini in Antigravity", isDefault: true, supportedReasoningEfforts: antigravityEfforts),
                 AgentModel(id: "gemini-3.8-flash-medium", displayName: "Gemini 3.8 Flash (Medium)", description: "Faster Flash with less reasoning", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)", description: "Lowest-latency Flash", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.7-flash-high", displayName: "Gemini 3.7 Flash (High)", description: "Previous Flash generation", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.7-flash-medium", displayName: "Gemini 3.7 Flash (Medium)", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.7-flash-low", displayName: "Gemini 3.7 Flash (Low)", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.6-flash-high", displayName: "Gemini 3.6 Flash (High)", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.6-flash-medium", displayName: "Gemini 3.6 Flash (Medium)", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.6-flash-low", displayName: "Gemini 3.6 Flash (Low)", supportedReasoningEfforts: antigravityEfforts),
                 AgentModel(id: "gemini-3.1-pro-high", displayName: "Gemini 3.1 Pro (High)", description: "Long-horizon Gemini reasoning", supportedReasoningEfforts: antigravityEfforts),
-                AgentModel(id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", description: "Claude via Antigravity", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gemini-3.1-pro-low", displayName: "Gemini 3.1 Pro (Low)", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)", description: "Claude via Antigravity", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "claude-opus-4-6-thinking", displayName: "Claude Opus 4.6 (Thinking)", description: "Opus via Antigravity", supportedReasoningEfforts: antigravityEfforts),
+                AgentModel(id: "gpt-oss-120b-medium", displayName: "GPT-OSS 120B (Medium)", description: "Open-weight model via Antigravity", supportedReasoningEfforts: antigravityEfforts),
             ]
         }
         return AgentModelCatalog.merge(

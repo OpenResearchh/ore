@@ -250,7 +250,7 @@ public actor InProcessCoreClient: CoreClient {
             continuation.yield(.chatUpdated(chat))
 
         case .setChatModel(let workspaceID, let chatID, let model):
-            let chat = try await engine(for: workspaceID).setModel(chatID: chatID, model: model)
+            let chat = try await applyChatModel(workspaceID: workspaceID, chatID: chatID, model: model)
             continuation.yield(.chatUpdated(chat))
 
         case .setChatDraft(let workspaceID, let chatID, let text):
@@ -271,7 +271,7 @@ public actor InProcessCoreClient: CoreClient {
             try await engine(for: id).setPermissionMode(mode, chatID: chatID)
 
         case .setChatEffort(let id, let chatID, let effort):
-            let chat = try await engine(for: id).setEffort(chatID: chatID, effort: effort)
+            let chat = try await applyChatEffort(workspaceID: id, chatID: chatID, effort: effort)
             continuation.yield(.chatUpdated(chat))
 
         case .resolvePermission(let id, let requestID, let decision):
@@ -1318,6 +1318,63 @@ public actor InProcessCoreClient: CoreClient {
         // worktree stays until the user presses Archive.
         try await github.merge(number: pr.number, method: mergeMethod, deleteBranch: false)
         try await resync(id)
+    }
+
+    /// Persist effort and, when the catalog bakes it into the model id,
+    /// switch to the matching variant. Cursor has no `--effort`; the suffix
+    /// is the whole setting.
+    func applyChatEffort(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        effort: ReasoningEffort?
+    ) async throws -> ChatSummary {
+        let engine = try await engine(for: workspaceID)
+        let current = try await engine.chatSummaries(includeClosed: true)
+            .first { $0.id == chatID }
+        guard let current else { throw OreCoreError.chatNotFound(chatID) }
+        let aligned = ModelVariantCatalog.align(
+            model: current.model,
+            effort: effort,
+            in: modelCatalog[current.harness] ?? []
+        )
+        if aligned.model != current.model {
+            let remapped = try await engine.setModel(chatID: chatID, model: aligned.model)
+            if remapped.reasoningEffort == aligned.effort { return remapped }
+        }
+        return try await engine.setEffort(chatID: chatID, effort: aligned.effort)
+    }
+
+    /// Persist a model id and, when it encodes an effort, keep the stored
+    /// effort chip in sync with that suffix.
+    func applyChatModel(
+        workspaceID: WorkspaceID,
+        chatID: ChatID,
+        model: String?
+    ) async throws -> ChatSummary {
+        let engine = try await engine(for: workspaceID)
+        let chat = try await engine.setModel(chatID: chatID, model: model)
+        let family = ModelVariantCatalog.family(
+            containing: chat.model,
+            in: modelCatalog[chat.harness] ?? []
+        )
+        guard let family, !family.encodedEfforts.isEmpty,
+              let encoded = family.encodedEffort(of: chat.model),
+              encoded != chat.reasoningEffort
+        else { return chat }
+        return try await engine.setEffort(chatID: chatID, effort: encoded)
+    }
+
+    func alignedModel(
+        _ model: String?,
+        effort: ReasoningEffort?,
+        for harness: HarnessKind?
+    ) -> (model: String?, effort: ReasoningEffort?) {
+        guard let harness else { return (model, effort) }
+        return ModelVariantCatalog.align(
+            model: model,
+            effort: effort,
+            in: modelCatalog[harness] ?? []
+        )
     }
 
     // MARK: - Engines

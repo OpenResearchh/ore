@@ -91,6 +91,62 @@ struct AntigravityCatalogTests {
         #expect(models.last?.displayName == "Claude Sonnet 4.6")
     }
 
+    @Test func liveJSONWrapperParsesNestedLabelledModels() throws {
+        let json = """
+        {"conversation_id":"","status":"SUCCESS","response":"gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\nclaude-opus-4-6-thinking\\tClaude Opus 4.6 (Thinking)\\n","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"models","data":{"models":[{"id":"gemini-3.8-flash-high","label":"Gemini 3.8 Flash (High)"},{"id":"gemini-3.7-flash-low","label":"Gemini 3.7 Flash (Low)"},{"id":"claude-opus-4-6-thinking","label":"Claude Opus 4.6 (Thinking)"},{"id":"gpt-oss-120b-medium","label":"GPT-OSS 120B (Medium)"}]}}}
+        """
+        let models = try #require(AntigravityHarness.parseModels(json))
+        #expect(models.map(\.id) == [
+            "gemini-3.8-flash-high",
+            "gemini-3.7-flash-low",
+            "claude-opus-4-6-thinking",
+            "gpt-oss-120b-medium",
+        ])
+        #expect(models.first?.displayName == "Gemini 3.8 Flash (High)")
+        #expect(models.last?.displayName == "GPT-OSS 120B (Medium)")
+    }
+
+    @Test func tabSeparatedListingParsesFullCatalogue() {
+        let text = """
+        Fetching available models...
+        gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+        gemini-3.8-flash-low	Gemini 3.8 Flash (Low)
+        claude-opus-4-6-thinking	Claude Opus 4.6 (Thinking)
+        gpt-oss-120b-medium	GPT-OSS 120B (Medium)
+        """
+        let models = AntigravityHarness.parseModels(text) ?? []
+        #expect(models.map(\.id) == [
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "claude-opus-4-6-thinking",
+            "gpt-oss-120b-medium",
+        ])
+        #expect(models.first?.displayName == "Gemini 3.8 Flash (High)")
+    }
+
+    @Test func permissionArgumentsDefaultToAcceptEditsBecauseThereIsNoTTY() {
+        #expect(
+            AntigravityHarness.permissionArguments(mode: .default, allowUnprompted: false)
+                == ["--mode", "accept-edits"]
+        )
+        #expect(
+            AntigravityHarness.permissionArguments(mode: .acceptEdits, allowUnprompted: false)
+                == ["--mode", "accept-edits"]
+        )
+        #expect(
+            AntigravityHarness.permissionArguments(mode: .plan, allowUnprompted: false)
+                == ["--mode", "plan"]
+        )
+        #expect(
+            AntigravityHarness.permissionArguments(mode: .bypassPermissions, allowUnprompted: false)
+                == ["--mode", "accept-edits"]
+        )
+        #expect(
+            AntigravityHarness.permissionArguments(mode: .bypassPermissions, allowUnprompted: true)
+                == ["--dangerously-skip-permissions"]
+        )
+    }
+
     @Test func effortMapsOntoTheThreeCLIValues() {
         #expect(AntigravityHarness.cliEffort(.low) == "low")
         #expect(AntigravityHarness.cliEffort(.none) == "low")

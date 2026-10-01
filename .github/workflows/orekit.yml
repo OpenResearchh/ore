@@ -83,7 +83,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Test
-        run: swift test
+        # The macOS app suite exercises AppKit/TextKit rendering paths that are
+        # not reliably safe under Swift Testing's concurrent scheduler on hosted
+        # macOS runners; failures show up as test-helper signal 11 crashes with
+        # no per-test assertion. Keep the app job deterministic.
+        run: swift test --no-parallel
 
       # When the test process itself crashes rather than a test failing,
       # SwiftPM only says "unexpected signal code 11" and prints no backtrace.

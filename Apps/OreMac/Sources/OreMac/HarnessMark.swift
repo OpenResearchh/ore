@@ -36,9 +36,9 @@ struct HarnessMark: View {
             case .antigravity:
                 ZStack {
                     RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
-                        .fill(Color(red: 0.10, green: 0.18, blue: 0.42).opacity(isMuted ? 0.65 : 1))
+                        .fill(Color.black.opacity(isMuted ? 0.65 : 1))
                     brandImage(HarnessBrandAssets.antigravity)
-                        .padding(size * 0.18)
+                        .padding(size * 0.16)
                 }
             }
         }
@@ -88,17 +88,14 @@ enum HarnessBrandAssets {
             let shape = NSBezierPath(roundedRect: rect, xRadius: 3.3, yRadius: 3.3)
             shape.addClip()
             if harness != .claudeCode {
-                if harness == .antigravity {
-                    NSColor(red: 0.10, green: 0.18, blue: 0.42, alpha: 1).setFill()
-                } else {
-                    NSColor.black.setFill()
-                }
+                NSColor.black.setFill()
                 shape.fill()
             }
             let inset: CGFloat = switch harness {
             case .claudeCode: 0
             case .codex: size * 0.13
-            case .cursorAgent, .antigravity: size * 0.2
+            case .antigravity: size * 0.16
+            case .cursorAgent: size * 0.2
             }
             source.draw(in: rect.insetBy(dx: inset, dy: inset))
             mark.unlockFocus()

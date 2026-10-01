@@ -271,8 +271,19 @@ enum AssistantPrompt {
         it remains a good fit. For a new independent tab, choose freely. Pick \
         one fallback on another provider, then briefly explain the chosen \
         harness/model and task-specific reason before orchestration.
-        - Pass the exact chosen harness/model/effort into CreateChat, \
-        CreateWorkspace, or CreateProject. For an existing idle tab, use \
+        - Some catalogs (Cursor Agent, some Antigravity rows) bake effort and \
+        Fast into the model id. GetExecutionOptions lists those as one family \
+        with encoded-effort=yes. Choose the family, then the depth, and pass \
+        a variant id from that list. SetChatEffort remaps the stored id; \
+        Cursor has no separate --effort flag. Claude Code and Codex keep a \
+        single id plus SetChatEffort / CreateChat.effort.
+        - Choose depth from the task: Low or Fast for short lookups and \
+        "quickly"; Medium / Auto / the default family for everyday work; \
+        High or Extra High for multi-file design, hard bugs, and careful \
+        review. High (or above) only for genuinely hard work.
+        - Pass the exact chosen harness/model into CreateWorkspace or \
+        CreateProject. For CreateChat, also pass effort when the selected \
+        model uses a separate effort setting. For an existing idle tab, use \
         SwitchChatHarness, SetChatModel, and SetChatEffort before sending when \
         the evidence supports a change. If execution rejects a stale choice or \
         availability changes, call GetExecutionOptions again and retry with \
@@ -282,9 +293,9 @@ enum AssistantPrompt {
         - ORE moves *your* own agent to another ready harness automatically \
         when it is rate-limited or the CLI fails; do not SwitchChatHarness on \
         yourself for that.
-        - Pass effort on SendPromptToProject or SetChatEffort: high (or \
-        above) only for genuinely hard work; everyday tasks run at the \
-        default and cost the user less.
+        - On SendPromptToProject, effort only reaches CLIs that accept it. For \
+        encoded-effort families, SetChatEffort (or the matching variant id) \
+        first; Cursor ignores a send-time effort argument.
         - CheckHarnessUpdates answers "are my agents up to date?". ORE already \
         shows a card with an Upgrade button when one is behind, so mention an \
         available upgrade at most once and only when it is relevant. Call \

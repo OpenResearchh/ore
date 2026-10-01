@@ -795,11 +795,29 @@ struct ChatPane: View {
             let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
             if let stored = chatSummary?.reasoningEffort {
                 reasoningEffort = stored
+            } else if let tab = chatSummary,
+                      let family = ModelVariantCatalog.family(
+                        containing: tab.model,
+                        in: model.knownModels(for: tab.harness)
+                      ),
+                      let encoded = family.encodedEffort(of: tab.model) {
+                reasoningEffort = encoded
             } else if let raw = UserDefaults.standard.string(forKey: key),
                let effort = ReasoningEffort(rawValue: raw) { reasoningEffort = effort }
             if let tab = chatSummary { clampEffort(to: tab) }
-            let fastKey = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
-            fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
+            if let tab = chatSummary {
+                let choices = model.knownModels(for: tab.harness)
+                if let family = ModelVariantCatalog.family(containing: tab.model, in: choices),
+                   family.supportsFast {
+                    fastModeEnabled = family.isFast(tab.model)
+                } else {
+                    let fastKey = "ore.fastMode.\(tab.id.rawValue)"
+                    fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
+                }
+            } else {
+                let fastKey = "ore.fastMode.\(workspace.id.rawValue)"
+                fastModeEnabled = UserDefaults.standard.bool(forKey: fastKey)
+            }
         }
         .onChange(of: reasoningEffort) { _, effort in
             persistEffort(effort)
@@ -823,6 +841,7 @@ struct ChatPane: View {
         .onChange(of: fastModeEnabled) { _, enabled in
             let key = "ore.fastMode.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
             UserDefaults.standard.set(enabled, forKey: key)
+            if let tab = chatSummary { applyEncodedSpeed(enabled, to: tab) }
         }
         .task(id: workspace.id) {
             workspaceFileIndex = AgentFileReferenceResolver.flatten(await model.workspaceFiles(for: workspace))
@@ -1620,15 +1639,17 @@ struct ChatPane: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Codex processing tier. Fast increases speed and credit use.")
+            .help("Faster processing at higher credit use")
         }
     }
 
     private func supportsFastMode(_ tab: ChatSummary) -> Bool {
-        guard tab.harness == .codex else { return false }
         let choices = model.knownModels(for: tab.harness)
-        // Same rule as effort: an unknown/remapped model id must not inherit
-        // the default model's tiers.
+        if let family = ModelVariantCatalog.family(containing: tab.model, in: choices),
+           family.supportsFast {
+            return true
+        }
+        guard tab.harness == .codex else { return false }
         let selected: AgentModel?
         if let id = tab.model {
             selected = choices.first { $0.id == id }
@@ -1699,6 +1720,8 @@ struct ChatPane: View {
             ModelChooser(
                 currentHarness: tab.harness,
                 currentModel: tab.model,
+                currentEffort: reasoningEffort,
+                preferFast: fastModeEnabled,
                 harnesses: model.readyHarnesses,
                 models: { model.knownModels(for: $0) }
             ) { harness, selectedModel in
@@ -1795,6 +1818,9 @@ struct ChatPane: View {
 
     private func modelDisplayName(for tab: ChatSummary) -> String {
         let models = model.knownModels(for: tab.harness)
+        if let family = ModelVariantCatalog.family(containing: tab.model, in: models) {
+            return family.displayName
+        }
         guard let selected = tab.model else {
             return models.first(where: \.isDefault)?.displayName
                 ?? models.first?.displayName
@@ -1900,9 +1926,13 @@ struct ChatPane: View {
         modelID: String? = nil
     ) -> [ReasoningEffort] {
         let kind = harness ?? tab.harness
-        guard kind.supportsReasoningEffort else { return [] }
         let choices = model.knownModels(for: kind)
         let requestedID = modelID ?? tab.model
+        if let family = ModelVariantCatalog.family(containing: requestedID, in: choices),
+           family.encodedEfforts.count > 1 {
+            return family.encodedEfforts
+        }
+        guard kind.supportsReasoningEffort else { return [] }
         let selected: AgentModel?
         if let requestedID {
             selected = choices.first { $0.id == requestedID }
@@ -1925,6 +1955,18 @@ struct ChatPane: View {
         let efforts = availableEfforts(for: tab)
         if efforts.contains(reasoningEffort) { return reasoningEffort }
         return preferredEffort(in: efforts)
+    }
+
+    /// Codex Fast is a service tier. Cursor Fast is a `-fast` model suffix,
+    /// already applied by `applyEncodedSpeed` — do not also send `serviceTier`.
+    private func resolvedServiceTier(for tab: ChatSummary?) -> String? {
+        guard let tab, supportsFastMode(tab), fastModeEnabled else { return nil }
+        let choices = model.knownModels(for: tab.harness)
+        if let family = ModelVariantCatalog.family(containing: tab.model, in: choices),
+           family.supportsFast {
+            return nil
+        }
+        return "fast"
     }
 
     private func clampEffort(
@@ -1950,11 +1992,34 @@ struct ChatPane: View {
         }
     }
 
+    private func applyEncodedEffort(_ effort: ReasoningEffort, to tab: ChatSummary) {
+        let choices = model.knownModels(for: tab.harness)
+        guard let family = ModelVariantCatalog.family(containing: tab.model, in: choices),
+              !family.encodedEfforts.isEmpty else { return }
+        let resolved = family.resolve(effort: effort, fast: family.isFast(tab.model))
+        if resolved.id != tab.model {
+            model.setModel(resolved.id, for: tab)
+        }
+    }
+
+    private func applyEncodedSpeed(_ fast: Bool, to tab: ChatSummary) {
+        let choices = model.knownModels(for: tab.harness)
+        guard let family = ModelVariantCatalog.family(containing: tab.model, in: choices),
+              family.supportsFast else { return }
+        let resolved = family.resolve(effort: reasoningEffort, fast: fast)
+        if resolved.id != tab.model {
+            model.setModel(resolved.id, for: tab)
+        }
+    }
+
     private func persistEffort(_ effort: ReasoningEffort) {
         let key = "ore.reasoningEffort.\(chatSummary?.id.rawValue ?? workspace.id.rawValue)"
         UserDefaults.standard.set(effort.rawValue, forKey: key)
-        if let tab = chatSummary, tab.reasoningEffort != effort {
-            model.setEffort(effort, for: tab)
+        if let tab = chatSummary {
+            if tab.reasoningEffort != effort {
+                model.setEffort(effort, for: tab)
+            }
+            applyEncodedEffort(effort, to: tab)
         }
     }
 
@@ -2555,7 +2620,7 @@ struct ChatPane: View {
             text,
             attachments: outgoing,
             effort: resolvedEffort(for: chatSummary),
-            serviceTier: chatSummary.map { supportsFastMode($0) } == true && fastModeEnabled ? "fast" : nil,
+            serviceTier: resolvedServiceTier(for: chatSummary),
             to: workspace.id
         )
         draft = ""
@@ -4128,6 +4193,8 @@ private extension VoiceChange {
 private struct ModelChooser: View {
     let currentHarness: HarnessKind
     let currentModel: String?
+    let currentEffort: ReasoningEffort
+    let preferFast: Bool
     let harnesses: [HarnessKind]
     let models: (HarnessKind) -> [AgentModel]
     let onSelect: (HarnessKind, String?) -> Void
@@ -4141,58 +4208,81 @@ private struct ModelChooser: View {
                 .textFieldStyle(.roundedBorder)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
+                LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(harnesses, id: \.self) { harness in
-                        Text(harness.displayName.uppercased())
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 8)
-                        if search.isEmpty {
-                            modelRow(harness, nil)
-                        }
-                        ForEach(filteredModels(for: harness)) { choice in
-                            modelRow(harness, choice)
+                        let families = filteredFamilies(for: harness)
+                        if search.isEmpty || !families.isEmpty {
+                            HStack(spacing: 8) {
+                                HarnessMark(harness: harness, size: 14)
+                                Text(harness.displayName.uppercased())
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.top, 10)
+                            if search.isEmpty {
+                                modelRow(harness, family: nil, variantID: nil)
+                            }
+                            ForEach(families) { family in
+                                modelRow(
+                                    harness,
+                                    family: family,
+                                    variantID: family.resolve(
+                                        effort: currentEffort,
+                                        fast: preferFast && family.supportsFast
+                                    ).id
+                                )
+                            }
                         }
                     }
                 }
             }
         }
         .padding(16)
-        .frame(width: 410, height: 520)
+        .frame(width: 380, height: 460)
     }
 
-    private func filteredModels(for harness: HarnessKind) -> [AgentModel] {
-        models(harness).filter {
+    private func filteredFamilies(for harness: HarnessKind) -> [ModelFamily] {
+        ModelVariantCatalog.families(from: models(harness)).filter { family in
             search.isEmpty
-                || $0.displayName.localizedCaseInsensitiveContains(search)
-                || $0.id.localizedCaseInsensitiveContains(search)
-                || $0.description.localizedCaseInsensitiveContains(search)
+                || family.displayName.localizedCaseInsensitiveContains(search)
+                || family.description.localizedCaseInsensitiveContains(search)
+                || family.variants.contains {
+                    $0.id.localizedCaseInsensitiveContains(search)
+                        || $0.displayName.localizedCaseInsensitiveContains(search)
+                }
         }
     }
 
-    private func modelRow(_ harness: HarnessKind, _ model: AgentModel?) -> some View {
-        let key = harness.rawValue + ":" + (model?.id ?? "default")
-        return Button { onSelect(harness, model?.id) } label: {
+    private func modelRow(
+        _ harness: HarnessKind,
+        family: ModelFamily?,
+        variantID: String?
+    ) -> some View {
+        let key = harness.rawValue + ":" + (family?.id ?? "default")
+        let familySelected = family.map { group in
+            currentHarness == harness
+                && currentModel.map { id in group.variants.contains { $0.id == id } } == true
+        } ?? false
+        let isOn = family == nil
+            ? (currentHarness == harness && currentModel == nil)
+            : familySelected
+        return Button { onSelect(harness, variantID) } label: {
             HStack(spacing: 10) {
-                Image(systemName: currentHarness == harness && currentModel == model?.id
-                    ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(currentHarness == harness && currentModel == model?.id
-                        ? Color.accentColor : Color.secondary)
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(model?.displayName ?? "Default model").fontWeight(.medium)
-                    Text(model?.description.isEmpty == false
-                        ? model?.description ?? ""
-                        : modelDetail(model?.id, harness: harness))
+                    Text(family?.displayName ?? "Default model").fontWeight(.medium)
+                    Text(rowCaption(harness: harness, family: family))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if model?.isDefault == true {
+                if family?.isDefault == true {
                     Text("DEFAULT")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 8).frame(minHeight: 48)
+            .padding(.horizontal, 8).frame(minHeight: 40)
             .background(
                 hoveredModelKey == key ? OreTheme.subduedFill : .clear,
                 in: RoundedRectangle(cornerRadius: 9)
@@ -4204,6 +4294,16 @@ private struct ModelChooser: View {
             if hovering { hoveredModelKey = key }
             else if hoveredModelKey == key { hoveredModelKey = nil }
         }
+    }
+
+    private func rowCaption(harness: HarnessKind, family: ModelFamily?) -> String {
+        guard let family else { return "Use the harness default" }
+        if !family.description.isEmpty { return family.description }
+        if family.encodedEfforts.count > 1 {
+            let ladder = family.encodedEfforts.map(\.displayName).joined(separator: " · ")
+            return family.supportsFast ? "\(ladder) · Fast" : ladder
+        }
+        return modelDetail(family.defaultVariant.id, harness: harness)
     }
 
     private func modelDetail(_ name: String?, harness: HarnessKind) -> String {

@@ -51,11 +51,12 @@ enum TranscriptDisplay {
     /// - Parameter revision: `ChatState.rowsRevision`, or `nil` to opt out of the
     ///   whole-result cache. Callers that mutate `source` directly (tests) must
     ///   pass `nil`, since without a revision there is no way to notice.
-    /// - Parameter keepLiveTurnExpanded: When true, the newest turn stays fully
-    ///   visible (no activity-group fold). Pass `ChatState.isTurnActive`, not
-    ///   `isBusy` — a turn blocked on a permission is not "busy" for the
-    ///   composer, but collapsing its thinking behind a permission card is what
-    ///   made the transcript jump.
+    /// - Parameter keepLiveTurnExpanded: When true, the newest turn is live.
+    ///   A short process list stays fully visible — collapsing one or two
+    ///   thoughts behind a permission card is what made the transcript jump.
+    ///   A long list still folds completed steps into the activity group, with
+    ///   any in-flight row kept in view (progressive disclosure: Nielsen, Apple
+    ///   HIG). Pass `ChatState.isTurnActive`, not `isBusy`.
     /// - Parameter structuralRevision: `ChatState.structuralRevision`, alongside
     ///   `revision`. When it has not moved since the last call, only the last
     ///   row's text changed, and that one row is replaced instead of
@@ -174,10 +175,9 @@ enum TranscriptDisplay {
 
     /// The streaming fast path: nothing but the last source row's text changed
     /// since the memo's output, and that row is the last one drawn, top-level
-    /// prose in the live turn. Such a row passes through turn layout untouched
-    /// (the live turn is not grouped, and only rows with a parent or a tool
-    /// call id are nested), so replacing it is exactly what re-deriving gives.
-    /// Returns false, changing nothing, whenever that can't be shown cheaply.
+    /// prose (or peeked in-flight thinking) in the live turn. That row is not
+    /// nested, so replacing it is exactly what re-deriving gives. Returns false,
+    /// changing nothing, whenever that can't be shown cheaply.
     private static func replaceStreamingRow(
         from source: [TranscriptRow],
         key: Memo.CacheKey,
@@ -221,21 +221,32 @@ enum TranscriptDisplay {
 
     // MARK: - Turn layout
 
+    /// Completed process rows a live turn keeps open before the rest fold.
+    /// Below this, a permission prompt would hide the thinking that produced it.
+    static let liveFoldMinimum = 3
+
     static func present(
         turn rows: [TranscriptRow],
         isActive: Bool,
         expanded: Set<String>
     ) -> [TranscriptRow] {
-        guard !isActive, let turnID = rows.first?.turnID else { return rows }
+        guard let turnID = rows.first?.turnID else { return rows }
 
         let answer = rows.lastIndex {
             $0.kind == .assistantText
                 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         let collapsible = rows.indices.filter { isCollapsible(rows[$0], isAnswer: $0 == answer) }
-        guard let firstCollapsibleIndex = collapsible.first else { return rows }
+        guard !collapsible.isEmpty else { return rows }
+        let collapsibleSet = Set(collapsible)
 
-        let hidden = Set(collapsible)
+        let peekCount = isActive
+            ? trailingIncompleteCount(in: rows, collapsible: collapsible)
+            : 0
+        let foldCount = collapsible.count - peekCount
+        if isActive, foldCount < liveFoldMinimum { return rows }
+
+        let foldIndices = Set(collapsible.dropLast(peekCount))
         let collapsed = collapsible.map { rows[$0] }
         let groupID = "activity-\(turnID.rawValue)"
         let groupExpanded = expanded.contains(groupID)
@@ -252,34 +263,59 @@ enum TranscriptDisplay {
         group.sealDerivedContent()
 
         var result: [TranscriptRow] = []
-        result.reserveCapacity(rows.count - hidden.count + 2)
+        result.reserveCapacity(rows.count - foldCount + 2)
+        var didEmitGroup = false
         for (offset, row) in rows.enumerated() {
-            if offset == firstCollapsibleIndex {
-                result.append(group)
-                if groupExpanded {
-                    result.append(contentsOf: collapsed.map { child in
-                        var item = child
-                        item.isExpanded = expanded.contains(child.id)
-                        return item
-                    })
+            if collapsibleSet.contains(offset) {
+                if !didEmitGroup {
+                    result.append(group)
+                    didEmitGroup = true
+                    if groupExpanded {
+                        result.append(contentsOf: collapsed.map { child in
+                            var item = child
+                            item.isExpanded = expanded.contains(child.id)
+                            return item
+                        })
+                    }
                 }
+                if groupExpanded { continue }
+                if foldIndices.contains(offset) { continue }
+                var peek = row
+                peek.isExpanded = expanded.contains(row.id)
+                result.append(peek)
                 continue
             }
-            guard !hidden.contains(offset) else { continue }
             result.append(row)
         }
 
-        var footer = TranscriptRow(
-            id: "footer-\(turnID.rawValue)",
-            turnID: turnID,
-            kind: .turnFooter,
-            text: "",
-            groupedRows: rows
-        )
-        footer.createdAt = rows.last?.createdAt ?? Date()
-        footer.sealDerivedContent()
-        result.append(footer)
+        if !isActive {
+            var footer = TranscriptRow(
+                id: "footer-\(turnID.rawValue)",
+                turnID: turnID,
+                kind: .turnFooter,
+                text: "",
+                groupedRows: rows
+            )
+            footer.createdAt = rows.last?.createdAt ?? Date()
+            footer.sealDerivedContent()
+            result.append(footer)
+        }
         return result
+    }
+
+    /// In-flight process rows at the end of the turn — the step the agent is
+    /// on right now. Kept visible under a collapsed group so the fold hides
+    /// history, not the live action.
+    private static func trailingIncompleteCount(
+        in rows: [TranscriptRow],
+        collapsible: [Int]
+    ) -> Int {
+        var count = 0
+        for index in collapsible.reversed() {
+            guard !rows[index].isComplete else { break }
+            count += 1
+        }
+        return count
     }
 
     static func nestSubagents(

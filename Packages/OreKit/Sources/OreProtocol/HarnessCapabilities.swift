@@ -37,8 +37,8 @@ public enum HarnessKind: String, Sendable, Codable, CaseIterable {
     }
 
     /// Cursor bakes thinking level into the model id (`cursor-grok-4.6-high`)
-    /// and `cursor-agent` has no `--effort` flag. Offering a chip would look
-    /// like a setting and then silently do nothing.
+    /// and `cursor-agent` has no `--effort` flag. The composer still offers an
+    /// effort chip by remapping that id; this flag only gates the CLI argument.
     public var supportsReasoningEffort: Bool { self != .cursorAgent }
 
     /// Provider login that cannot be driven with stdin closed. Claude's

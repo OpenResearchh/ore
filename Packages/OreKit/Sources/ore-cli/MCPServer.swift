@@ -565,7 +565,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "GetExecutionOptions",
-                "description": "Decision support for choosing an agent. Returns every registered harness and currently discovered model with connection/auth readiness, observed rate-limit state and reset, strengths, constraints, capabilities, reasoning efforts, service tiers, and optional current-tab continuity context. It does not preselect a winner: reason over the full user goal, choose the best usable fit plus a cross-provider fallback, then pass exact ids to the orchestration tools. Call again after an availability or rate-limit failure.",
+                "description": "Decision support for choosing an agent. Returns every registered harness and currently discovered model family with connection/auth readiness, observed rate-limit state and reset, strengths, constraints, capabilities, reasoning efforts, service tiers, and optional current-tab continuity context. Families that bake effort into the model id are grouped (encoded-effort=yes) with their variant ids. It does not preselect a winner: reason over the full user goal, choose the best usable fit plus a cross-provider fallback, then pass exact ids to the orchestration tools. Call again after an availability or rate-limit failure.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -647,7 +647,7 @@ private final class AssistantToolServer {
             ],
             [
                 "name": "SetChatEffort",
-                "description": "Persist the reasoning-effort chip for a tab so later sends use it. Runs without confirmation.",
+                "description": "Persist the reasoning-effort chip for a tab so later sends use it. On Cursor and other encoded-effort families, this also remaps the model id to the matching variant. Runs without confirmation.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [

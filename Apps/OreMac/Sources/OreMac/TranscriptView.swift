@@ -4204,9 +4204,7 @@ final class TranscriptCell: NSTableCellView {
             )
         }
 
-        let directPath = input?["file_path"]?.stringValue
-            ?? input?["path"]?.stringValue
-            ?? input?[0]?["path"]?.stringValue
+        let directPath = filePath(in: input)
         let patchText = input?["patch"]?.stringValue
             ?? input?["diff"]?.stringValue
             ?? input?["input"]?.stringValue
@@ -4238,13 +4236,23 @@ final class TranscriptCell: NSTableCellView {
                 changeKind: changeKind,
                 isWrite: isWrite
             )
+            let title = isWrite ? "Write" : "Edit"
+            let subject: String?
+            if patchPaths.count > 1 {
+                subject = "\(patchPaths.count) files"
+            } else if let fileName {
+                subject = fileName
+            } else {
+                let fallback = compact(row.text)
+                subject = fallback.caseInsensitiveCompare(title) == .orderedSame ? nil : fallback
+            }
             return ProcessPresentation(
                 icon: isWrite ? "doc.badge.plus" : "pencil.line",
-                title: isWrite ? "Write" : "Edit",
+                title: title,
                 detail: diff.isEmpty ? (content ?? resultText) : diff,
                 tint: row.isError ? .systemRed : (isWrite ? .systemGreen : .systemOrange),
                 fileIdentity: path.map { FileVisualIdentity(path: $0) },
-                subject: patchPaths.count > 1 ? "\(patchPaths.count) files" : fileName ?? compact(row.text),
+                subject: subject,
                 filePath: patchPaths.count <= 1 ? path : nil,
                 insertions: counts.insertions, deletions: counts.deletions, isDiff: true
             )
@@ -4408,6 +4416,14 @@ final class TranscriptCell: NSTableCellView {
     private static func meaningful(_ text: String) -> Bool {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !value.isEmpty && !["null", "nil", "<null>", "(null)", "\"null\""].contains(value)
+    }
+
+    private static func filePath(in input: JSONValue?) -> String? {
+        guard let input else { return nil }
+        for key in ["file_path", "path", "Path", "target_file", "targetFile"] {
+            if let value = input[key]?.stringValue, !value.isEmpty { return value }
+        }
+        return input[0]?["path"]?.stringValue
     }
 
     private static func compact(_ text: String, limit: Int = 110) -> String {

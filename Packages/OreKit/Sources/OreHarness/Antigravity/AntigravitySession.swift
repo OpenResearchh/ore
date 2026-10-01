@@ -171,6 +171,7 @@ actor AntigravitySession: AgentSession {
 
     private func makeArguments(effort: ReasoningEffort?) -> [String] {
         var arguments = [
+            "-p",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
         ]
@@ -185,9 +186,10 @@ actor AntigravitySession: AgentSession {
         } else if case .resume(let id) = configuration.resume {
             arguments += ["--conversation", id]
         }
-        if allowUnprompted, permissionMode == .bypassPermissions {
-            arguments.append("--dangerously-skip-permissions")
-        }
+        arguments += AntigravityHarness.permissionArguments(
+            mode: permissionMode,
+            allowUnprompted: allowUnprompted
+        )
         arguments += configuration.extraArguments
         return arguments
     }

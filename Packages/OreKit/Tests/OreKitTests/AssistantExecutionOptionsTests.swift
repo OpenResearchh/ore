@@ -294,6 +294,71 @@ struct AssistantExecutionOptionsTests {
         #expect(chat.reasoningEffort == ReasoningEffort.high.rawValue)
     }
 
+    @Test func encodedEffortDoesNotPersistIfBusyModelRemapFails() async throws {
+        let store = try OreStore()
+        let cursor = FakeHarness(
+            kind: .cursorAgent,
+            models: [
+                AgentModel(id: "gpt-5.3-codex", displayName: "Codex 5.3", isDefault: true),
+                AgentModel(id: "gpt-5.3-codex-high", displayName: "Codex 5.3 High"),
+            ]
+        )
+        cursor.rejectsModelChange = true
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(
+                harnesses: [cursor],
+                enabledExperimental: [.cursorAgent]
+            )
+        )
+        await client.send(.probeHarnesses)
+
+        let workspaceID = WorkspaceID.generate()
+        let chatID = ChatID.generate()
+        try await store.addRepository(RepositoryRecord(
+            path: "/tmp/cursor-busy-effort.git",
+            name: "Cursor busy effort",
+            defaultBranch: "main"
+        ))
+        try await store.saveWorkspace(WorkspaceRecord(
+            id: workspaceID,
+            name: "Cursor busy effort",
+            repositoryPath: "/tmp/cursor-busy-effort.git",
+            worktreePath: "/tmp/cursor-busy-effort",
+            branch: "main",
+            baseBranch: "main",
+            harness: .cursorAgent,
+            model: "gpt-5.3-codex"
+        ))
+        try await store.saveChat(ChatRecord(
+            id: chatID,
+            workspaceID: workspaceID,
+            title: "Implementation",
+            harness: .cursorAgent,
+            model: "gpt-5.3-codex"
+        ))
+
+        await client.send(.sendMessage(SendMessageRequest(
+            workspaceID: workspaceID,
+            chatID: chatID,
+            text: "keep this turn open"
+        )))
+
+        let response = await client.handleAssistantRequest(AssistantBridgeRequest(
+            id: UUID().uuidString,
+            tool: "SetChatEffort",
+            arguments: .object([
+                "workspaceID": .string(workspaceID.rawValue),
+                "chatID": .string(chatID.rawValue),
+                "effort": .string("high"),
+            ])
+        ))
+        #expect(!response.ok)
+        let chat = try #require(try await store.chat(chatID))
+        #expect(chat.model == "gpt-5.3-codex")
+        #expect(chat.reasoningEffort == nil)
+    }
+
     private func executionOptions(
         _ client: InProcessCoreClient,
         task: String,

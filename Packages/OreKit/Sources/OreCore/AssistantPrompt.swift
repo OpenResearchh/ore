@@ -281,8 +281,9 @@ enum AssistantPrompt {
         "quickly"; Medium / Auto / the default family for everyday work; \
         High or Extra High for multi-file design, hard bugs, and careful \
         review. High (or above) only for genuinely hard work.
-        - Pass the exact chosen harness/model/effort into CreateChat, \
-        CreateWorkspace, or CreateProject. For an existing idle tab, use \
+        - Pass the exact chosen harness/model into CreateWorkspace or \
+        CreateProject. For CreateChat, also pass effort when the selected \
+        model uses a separate effort setting. For an existing idle tab, use \
         SwitchChatHarness, SetChatModel, and SetChatEffort before sending when \
         the evidence supports a change. If execution rejects a stale choice or \
         availability changes, call GetExecutionOptions again and retry with \

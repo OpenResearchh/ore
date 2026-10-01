@@ -1329,17 +1329,19 @@ public actor InProcessCoreClient: CoreClient {
         effort: ReasoningEffort?
     ) async throws -> ChatSummary {
         let engine = try await engine(for: workspaceID)
-        let chat = try await engine.setEffort(chatID: chatID, effort: effort)
-        guard let next = ModelVariantCatalog.remappedID(
-            current: chat.model,
+        let current = try await engine.chatSummaries(includeClosed: true)
+            .first { $0.id == chatID }
+        guard let current else { throw OreCoreError.chatNotFound(chatID) }
+        let aligned = ModelVariantCatalog.align(
+            model: current.model,
             effort: effort,
-            in: modelCatalog[chat.harness] ?? []
-        ) else { return chat }
-        do {
-            return try await engine.setModel(chatID: chatID, model: next)
-        } catch OreCoreError.modelChangeRequiresIdle {
-            return chat
+            in: modelCatalog[current.harness] ?? []
+        )
+        if aligned.model != current.model {
+            let remapped = try await engine.setModel(chatID: chatID, model: aligned.model)
+            if remapped.reasoningEffort == aligned.effort { return remapped }
         }
+        return try await engine.setEffort(chatID: chatID, effort: aligned.effort)
     }
 
     /// Persist a model id and, when it encodes an effort, keep the stored

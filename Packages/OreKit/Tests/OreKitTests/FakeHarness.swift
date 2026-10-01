@@ -23,6 +23,7 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
     /// argument: the session rejects the change and the engine has to make it
     /// real some other way.
     var rejectsPermissionModeChange = false
+    var rejectsModelChange = false
 
     init(
         kind: HarnessKind = .claudeCode,
@@ -60,7 +61,8 @@ final class FakeHarness: AgentHarness, @unchecked Sendable {
         let session = FakeSession(
             id: SessionID.generate(), kind: kind,
             capabilities: capabilities, configuration: configuration,
-            rejectsPermissionModeChange: rejectsPermissionModeChange
+            rejectsPermissionModeChange: rejectsPermissionModeChange,
+            rejectsModelChange: rejectsModelChange
         )
         sessions.withLock { $0.append(session) }
         return session
@@ -91,19 +93,22 @@ actor FakeSession: AgentSession {
     var providerSessionID: String?
 
     private let rejectsPermissionModeChange: Bool
+    private let rejectsModelChange: Bool
 
     init(
         id: SessionID,
         kind: HarnessKind,
         capabilities: HarnessCapabilities,
         configuration: SessionConfiguration,
-        rejectsPermissionModeChange: Bool = false
+        rejectsPermissionModeChange: Bool = false,
+        rejectsModelChange: Bool = false
     ) {
         self.id = id
         self.harness = kind
         self.capabilities = capabilities
         self.configuration = configuration
         self.rejectsPermissionModeChange = rejectsPermissionModeChange
+        self.rejectsModelChange = rejectsModelChange
 
         let (stream, continuation) = AsyncStream<AgentEvent>.makeStream(
             bufferingPolicy: .unbounded
@@ -136,7 +141,12 @@ actor FakeSession: AgentSession {
         permissionMode = mode
     }
 
-    func setModel(_ model: String?) async throws { selectedModel = model }
+    func setModel(_ model: String?) async throws {
+        if rejectsModelChange {
+            throw HarnessError.unsupportedCapability("model changes")
+        }
+        selectedModel = model
+    }
 
     func resolvePermission(
         _ id: PermissionRequestID,

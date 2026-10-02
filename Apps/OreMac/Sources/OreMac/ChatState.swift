@@ -1037,6 +1037,7 @@ final class ChatState {
 
     /// A short live phrase for the composer, so "running a tool" can name the file.
     static func runningToolPhrase(name: String, displayName: String?) -> String {
+        let name = ToolCallShape.canonicalName(name)
         let subject = displayName.flatMap { value -> String? in
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
@@ -1068,13 +1069,27 @@ final class ChatState {
             }
             return "Searching the web"
         default:
+            if ToolCallShape.isWait(name) {
+                return displayName.map { "Waiting \($0)" } ?? "Waiting"
+            }
+            if ToolCallShape.isGenerateImage(name) {
+                return displayName.map { "Generating \($0)" } ?? "Generating an image"
+            }
+            if name == "Screenshot" || ToolCallShape.isBrowser(name) {
+                let title = ToolCallShape.chipTitle(name)
+                return displayName.map { "\(title) · \($0)" } ?? title
+            }
             if let mcp = ToolMCPActivity.classify(tool: name, input: nil),
                let displayName, !displayName.isEmpty {
                 let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
                 return "\(mcp.title) · \(trimmed)"
             }
-            if let displayName, !displayName.isEmpty { return "\(name) · \(displayName)" }
-            return name
+            let title = ToolCallShape.chipTitle(name)
+            if let displayName, !displayName.isEmpty,
+               !ToolCallShape.looksLikeToolCodename(displayName) {
+                return "\(title) · \(displayName)"
+            }
+            return title
         }
     }
 }

@@ -170,11 +170,7 @@ actor AntigravitySession: AgentSession {
     }
 
     private func makeArguments(effort: ReasoningEffort?) -> [String] {
-        var arguments = [
-            "-p",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-        ]
+        var arguments = AntigravityHarness.printModeArguments
         if let model = configuration.model {
             arguments += ["--model", model]
         }

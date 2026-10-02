@@ -3989,19 +3989,38 @@ final class TranscriptCell: NSTableCellView {
     }
 
     private static func processPresentation(for row: TranscriptRow) -> ProcessPresentation {
+        var item = classifiedProcessPresentation(for: row)
+        if row.kind != .thinking, row.isError || row.kind == .error {
+            item.detail = ToolCallShape.sanitizedError(item.detail)
+            item.tint = .systemRed
+        }
+        return item
+    }
+
+    private static func classifiedProcessPresentation(for row: TranscriptRow) -> ProcessPresentation {
         if row.kind == .thinking {
             let detail = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let preview = compact(detail.split(separator: "\n").first.map(String.init) ?? "Reasoning")
             return ProcessPresentation(icon: "brain.head.profile", title: preview.isEmpty ? "Thinking" : "Thinking · \(preview)", detail: detail, tint: .secondaryLabelColor)
         }
-        if row.kind == .error || (row.isError && meaningful(row.resultText ?? row.text)) {
-            let detail = (row.resultText?.isEmpty == false ? row.resultText : row.text) ?? row.text
-            return ProcessPresentation(icon: "exclamationmark.triangle.fill", title: "Error", detail: detail, tint: .systemRed)
+        // Standalone error events stay Error. A failed toolCall keeps its
+        // Read/Bash/… chip so a missing Agent.swift still reads as Read, not
+        // a generic triangle plus the CLI's permission dump.
+        if row.kind == .error {
+            let raw = (row.resultText?.isEmpty == false ? row.resultText : row.text) ?? row.text
+            return ProcessPresentation(
+                icon: "exclamationmark.triangle.fill",
+                title: "Error",
+                detail: ToolCallShape.sanitizedError(raw),
+                tint: .systemRed
+            )
         }
 
-        let tool = (row.toolName ?? "").lowercased()
-        let key = ((row.toolName ?? "") + " " + row.text).lowercased()
-        let input = row.toolInput
+        let rawTool = row.toolName ?? ""
+        let input = row.toolInput.map { ToolCallShape.normalized($0, tool: rawTool) }
+        let canonical = ToolCallShape.resolvedName(rawTool, input: input ?? .object([:]))
+        let tool = canonical.lowercased()
+        let key = (canonical + " " + row.text).lowercased()
 
         // The agent's own checklist. These used to fall through to the generic
         // gear, so a row said "TaskUpdate" and nothing else — the one thing it
@@ -4054,6 +4073,42 @@ final class TranscriptCell: NSTableCellView {
                 // row says what the agent was created for without expanding.
                 purpose: SubagentBrief.purpose(from: input, distinctFrom: subject)
             )
+        }
+
+        if ToolCallShape.isWait(rawTool) || ToolCallShape.isWait(canonical) {
+            return ProcessPresentation(
+                icon: "clock",
+                title: "Wait",
+                detail: row.resultText ?? row.text,
+                tint: .secondaryLabelColor,
+                subject: ToolCallShape.waitLabel(from: input, tool: rawTool)
+                    ?? ToolCallShape.chipSubject(tool: rawTool, input: input, fallback: row.text)
+            )
+        }
+        if tool.contains("screenshot") || canonical == "Screenshot" {
+            return ProcessPresentation(
+                icon: "camera",
+                title: "Screenshot",
+                detail: row.resultText ?? row.text,
+                tint: .systemPurple,
+                subject: ToolCallShape.chipSubject(
+                    tool: rawTool, input: input, fallback: row.text
+                )
+            )
+        }
+        if ToolCallShape.isGenerateImage(rawTool) || ToolCallShape.isGenerateImage(canonical) {
+            return ProcessPresentation(
+                icon: "photo",
+                title: "Image",
+                detail: row.resultText ?? row.text,
+                tint: .systemPurple,
+                subject: ToolCallShape.chipSubject(
+                    tool: rawTool, input: input, fallback: row.text
+                )
+            )
+        }
+        if let browser = browserPresentation(tool: tool, rawTool: rawTool, row: row, input: input) {
+            return browser
         }
 
         // Todo/plan checklists the agent maintains as it works.
@@ -4155,7 +4210,7 @@ final class TranscriptCell: NSTableCellView {
         }
 
         if let web = ToolWebActivity.classify(
-            tool: row.toolName ?? "",
+            tool: canonical,
             input: input,
             fallback: row.text
         ) {
@@ -4187,7 +4242,7 @@ final class TranscriptCell: NSTableCellView {
         }
 
         if let mcp = ToolMCPActivity.classify(
-            tool: row.toolName ?? "",
+            tool: canonical,
             input: input,
             fallback: row.text
         ) {
@@ -4209,7 +4264,9 @@ final class TranscriptCell: NSTableCellView {
             ?? input?["diff"]?.stringValue
             ?? input?["input"]?.stringValue
         let patchPaths = patchText.map(patchFilePaths) ?? []
-        let path = directPath ?? patchPaths.first
+        let path = directPath
+            ?? patchPaths.first
+            ?? ToolCallShape.filePath(inError: row.resultText)
         let fileName = path.map { ($0 as NSString).lastPathComponent }
         let resultText = row.resultText ?? ""
 
@@ -4282,12 +4339,20 @@ final class TranscriptCell: NSTableCellView {
                 )
             }
             if looksLikeRead, let commandPath {
-                let lineCount = resultText.isEmpty ? nil : resultText.split(separator: "\n").count
+                let lineCount = row.isError || resultText.isEmpty
+                    ? nil
+                    : resultText.split(separator: "\n").count
+                let title: String
+                if let lineCount {
+                    title = lineCount == 1 ? "Read 1 line" : "Read \(lineCount) lines"
+                } else {
+                    title = "Read"
+                }
                 return ProcessPresentation(
                     icon: "doc.text",
-                    title: lineCount.map { "Read \($0) lines" } ?? "Read",
+                    title: title,
                     detail: resultText.isEmpty ? command : resultText,
-                    tint: .systemBlue,
+                    tint: row.isError ? .systemRed : .systemBlue,
                     fileIdentity: FileVisualIdentity(path: commandPath),
                     subject: commandFileName,
                     filePath: commandPath
@@ -4319,15 +4384,34 @@ final class TranscriptCell: NSTableCellView {
             )
         }
         if key.contains("read") || key.contains("file") {
-            let lineCount = resultText.isEmpty ? input?["limit"]?.intValue : resultText.split(separator: "\n").count
-            let count = lineCount.map { "\($0) lines " } ?? ""
+            let lineCount = row.isError ? nil : readLineCount(resultText: resultText, input: input)
+            let title: String
+            if let lineCount {
+                title = lineCount == 1 ? "Read 1 line" : "Read \(lineCount) lines"
+            } else {
+                title = "Read"
+            }
+            let subject: String?
+            if let fileName {
+                subject = fileName
+            } else {
+                let fallback = compact(row.text)
+                subject = fallback.caseInsensitiveCompare(title) == .orderedSame
+                    || ToolCallShape.looksLikeToolCodename(fallback) ? nil : fallback
+            }
+            let detail: String
+            if row.isError {
+                detail = ToolCallShape.sanitizedError(resultText.isEmpty ? row.text : resultText)
+            } else {
+                detail = resultText.isEmpty ? (path ?? row.text) : resultText
+            }
             return ProcessPresentation(
                 icon: "doc.text",
-                title: "Read \(count)".trimmingCharacters(in: .whitespaces),
-                detail: resultText.isEmpty ? (path ?? row.text) : resultText,
-                tint: .systemBlue,
+                title: title,
+                detail: detail,
+                tint: row.isError ? .systemRed : .systemBlue,
                 fileIdentity: path.map { FileVisualIdentity(path: $0) },
-                subject: fileName ?? compact(row.text),
+                subject: subject,
                 filePath: path
             )
         }
@@ -4335,7 +4419,17 @@ final class TranscriptCell: NSTableCellView {
             let query = input?["query"]?.stringValue ?? input?["q"]?.stringValue ?? input?["pattern"]?.stringValue ?? row.text
             return ProcessPresentation(icon: "magnifyingglass", title: "Search", detail: resultText, tint: .systemPurple, subject: compact(query))
         }
-        return ProcessPresentation(icon: "gearshape", title: row.text, detail: resultText, tint: row.isError ? .systemRed : .secondaryLabelColor)
+        let title = ToolCallShape.chipTitle(rawTool)
+        let subject = ToolCallShape.chipSubject(
+            tool: rawTool, input: input, fallback: row.text
+        )
+        return ProcessPresentation(
+            icon: "gearshape",
+            title: title,
+            detail: resultText.isEmpty ? (subject ?? row.text) : resultText,
+            tint: row.isError ? .systemRed : .secondaryLabelColor,
+            subject: subject
+        )
     }
 
     /// Visible to tests so a Fetch chip can assert the URL it named, not just
@@ -4344,6 +4438,12 @@ final class TranscriptCell: NSTableCellView {
     static func processChip(for row: TranscriptRow) -> (title: String, subject: String?) {
         let item = processPresentation(for: row)
         return (item.title, item.subject)
+    }
+
+    /// Expanded-row body, so tests can assert a failed Read names the Unix
+    /// reason instead of Antigravity's cortex permission dump.
+    static func processDetail(for row: TranscriptRow) -> String {
+        processPresentation(for: row).detail
     }
 
     /// Hover preview for image chips and pasted-text dumps in tool rows.
@@ -4413,17 +4513,145 @@ final class TranscriptCell: NSTableCellView {
         }
     }
 
-    private static func meaningful(_ text: String) -> Bool {
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !value.isEmpty && !["null", "nil", "<null>", "(null)", "\"null\""].contains(value)
+    private static func filePath(in input: JSONValue?) -> String? {
+        ToolCallShape.filePath(in: input)
     }
 
-    private static func filePath(in input: JSONValue?) -> String? {
-        guard let input else { return nil }
-        for key in ["file_path", "path", "Path", "target_file", "targetFile"] {
-            if let value = input[key]?.stringValue, !value.isEmpty { return value }
+    /// Claude dumps file contents, so counting result lines is the size of
+    /// the read. Antigravity reports `3 lines, 32 bytes` on one line — that
+    /// is a summary, not the file, and treating it as "1 line" is how every
+    /// view_file chip used to say "Read 1 lines".
+    private static func readLineCount(resultText: String, input: JSONValue?) -> Int? {
+        let trimmed = resultText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return input?["limit"]?.intValue ?? input?["Limit"]?.intValue
         }
-        return input[0]?["path"]?.stringValue
+        if let count = summarizedLineCount(in: trimmed) { return count }
+        if !trimmed.contains("\n"), trimmed.count < 80 { return nil }
+        return trimmed.split(separator: "\n", omittingEmptySubsequences: false).count
+    }
+
+    private static func summarizedLineCount(in text: String) -> Int? {
+        let prefix = text.prefix(while: { $0.isNumber })
+        guard let count = Int(prefix), count > 0 else { return nil }
+        let rest = text.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+        guard rest.lowercased().hasPrefix("line") else { return nil }
+        return count
+    }
+
+    /// Browser-native Antigravity tools (`browser_click_element`,
+    /// `capture_browser_screenshot`, …) are not Reads or Fetches. Name the
+    /// action and pull the selector / URL / key from the payload.
+    private static func browserPresentation(
+        tool: String,
+        rawTool: String,
+        row: TranscriptRow,
+        input: JSONValue?
+    ) -> ProcessPresentation? {
+        guard ToolCallShape.isBrowser(rawTool) || ToolCallShape.isBrowser(tool) else {
+            return nil
+        }
+        let key = tool.replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        let output = row.resultText ?? ""
+        let subject = ToolCallShape.chipSubject(
+            tool: rawTool, input: input, fallback: row.text
+        )
+        let detail = output.isEmpty ? (subject ?? row.text) : output
+        if key.contains("screenshot") {
+            return ProcessPresentation(
+                icon: "camera", title: "Screenshot", detail: detail,
+                tint: .systemPurple, subject: subject
+            )
+        }
+        if key.contains("click") {
+            return ProcessPresentation(
+                icon: "cursorarrow.click", title: "Click", detail: detail,
+                tint: .systemOrange, subject: subject
+            )
+        }
+        if key.contains("input") || key.contains("type") {
+            return ProcessPresentation(
+                icon: "keyboard", title: "Type", detail: detail,
+                tint: .systemTeal, subject: subject
+            )
+        }
+        if key.contains("scroll") {
+            return ProcessPresentation(
+                icon: "arrow.up.arrow.down", title: "Scroll", detail: detail,
+                tint: .systemBlue, subject: subject
+            )
+        }
+        if key.contains("presskey") || key.hasSuffix("key") {
+            return ProcessPresentation(
+                icon: "keyboard", title: "Key", detail: detail,
+                tint: .systemTeal, subject: subject
+            )
+        }
+        if key.contains("network") {
+            return ProcessPresentation(
+                icon: "network", title: "Network", detail: detail,
+                tint: .systemCyan, subject: subject
+            )
+        }
+        if key.contains("javascript") || key.contains("script") {
+            return ProcessPresentation(
+                icon: "chevron.left.forwardslash.chevron.right", title: "Script",
+                detail: detail, tint: .systemIndigo, subject: subject
+            )
+        }
+        if key.contains("dom") {
+            return ProcessPresentation(
+                icon: "doc.plaintext", title: "DOM", detail: detail,
+                tint: .systemBlue, subject: subject
+            )
+        }
+        if key.contains("pages") {
+            return ProcessPresentation(
+                icon: "macwindow.on.rectangle", title: "Pages", detail: detail,
+                tint: .systemBlue, subject: subject
+            )
+        }
+        if key.contains("refresh") {
+            return ProcessPresentation(
+                icon: "arrow.clockwise", title: "Refresh", detail: detail,
+                tint: .systemBlue, subject: subject
+            )
+        }
+        if key.contains("resize") {
+            return ProcessPresentation(
+                icon: "arrow.up.left.and.arrow.down.right", title: "Resize",
+                detail: detail, tint: .systemBlue, subject: subject
+            )
+        }
+        if key.contains("drag") {
+            return ProcessPresentation(
+                icon: "hand.draw", title: "Drag", detail: detail,
+                tint: .systemOrange, subject: subject
+            )
+        }
+        if key.contains("mouse") {
+            return ProcessPresentation(
+                icon: "cursorarrow", title: "Mouse", detail: detail,
+                tint: .systemOrange, subject: subject
+            )
+        }
+        if key.contains("select") {
+            return ProcessPresentation(
+                icon: "list.bullet", title: "Select", detail: detail,
+                tint: .systemOrange, subject: subject
+            )
+        }
+        if key.contains("console") || key.contains("log") {
+            return ProcessPresentation(
+                icon: "text.alignleft", title: "Logs", detail: detail,
+                tint: .systemTeal, subject: subject
+            )
+        }
+        return ProcessPresentation(
+            icon: "globe", title: "Browser", detail: detail,
+            tint: .systemCyan, subject: subject
+        )
     }
 
     private static func compact(_ text: String, limit: Int = 110) -> String {

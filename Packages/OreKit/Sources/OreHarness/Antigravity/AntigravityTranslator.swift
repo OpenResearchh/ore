@@ -22,10 +22,20 @@ struct AntigravityTranslator {
     private var model: String?
     private var textBlockID: BlockID?
     private var streamedText = ""
+    private var childText: [ToolCallID: (blockID: BlockID, text: String)] = [:]
     private var reportedToolCallIDs: Set<ToolCallID> = []
     private var inFlightToolCalls = 0
     private var didReportResult = false
     private var backgroundTasks: [AgentBackgroundTask] = []
+    /// Child conversation id → the `invoke_subagent` (Task) call that launched it.
+    private var subagentByConversation: [String: ToolCallID] = [:]
+    /// Most recent Task call, used when a child conversation appears before
+    /// `subagent_info` names it.
+    private var lastSubagentCallID: ToolCallID?
+    /// Task calls we advertised as background work before `subagent_info`
+    /// arrived. Cleared once the payload takes over, or when the call ends
+    /// without ever naming a child.
+    private var placeholderSubagentCalls: Set<ToolCallID> = []
     private var lastUsage: UsageReport?
 
     init(sessionID: SessionID) {
@@ -73,7 +83,7 @@ struct AntigravityTranslator {
             }
             return output
         }
-        flushText(turnID: turnID, to: &output)
+        flushAllText(turnID: turnID, to: &output)
         if !didReportResult {
             let failure = exitCode == 0 ? nil : classifyFailure(exitCode: exitCode, stderr: stderr)
             let (summary, narration) = NarrationTag.extract(from: streamedText)
@@ -117,6 +127,7 @@ struct AntigravityTranslator {
             providerSessionID = conversationID
         }
         let turnID = ensureTurn(&output)
+        let parent = parentToolCallID(for: step)
         let stepType = step["step_type"]?.stringValue
         let state = step["state"]?.stringValue
         if let usage = usage(from: step["usage"], turnID: turnID) {
@@ -128,17 +139,21 @@ struct AntigravityTranslator {
         case "user_input":
             break
         case "agent_response":
-            applyText(step["text_delta"]?.stringValue, turnID: turnID, to: &output)
-            if state == "DONE" { flushText(turnID: turnID, to: &output) }
+            applyText(
+                step["text_delta"]?.stringValue, turnID: turnID, parent: parent, to: &output
+            )
+            if state == "DONE" { flushText(turnID: turnID, parent: parent, to: &output) }
         case "tool":
-            applyTool(step, turnID: turnID, to: &output)
+            applyTool(step, turnID: turnID, parent: parent, to: &output)
         default:
             if let text = step["text_delta"]?.stringValue {
-                applyText(text, turnID: turnID, to: &output)
+                applyText(text, turnID: turnID, parent: parent, to: &output)
             }
-            if let subagents = step["subagent_info"]?["subagents"]?.arrayValue {
-                applySubagents(subagents, to: &output)
-            }
+        }
+        // After the tool so `invoke_subagent` is already the last Task and
+        // child conversation ids bind to it.
+        if let subagents = step["subagent_info"]?["subagents"]?.arrayValue {
+            applySubagents(subagents, to: &output)
         }
     }
 
@@ -147,7 +162,7 @@ struct AntigravityTranslator {
             providerSessionID = conversationID
         }
         let turnID = currentTurnID ?? ensureTurn(&output)
-        flushText(turnID: turnID, to: &output)
+        flushAllText(turnID: turnID, to: &output)
         if let usage = usage(from: result["usage"], turnID: turnID) {
             lastUsage = usage
             output.events.append(.usage(usage))
@@ -196,18 +211,52 @@ struct AntigravityTranslator {
         textBlockID = nil
         reportedToolCallIDs.removeAll()
         inFlightToolCalls = 0
+        lastSubagentCallID = nil
+        placeholderSubagentCalls.removeAll()
+        childText.removeAll()
     }
 
-    private mutating func applyText(_ delta: String?, turnID: TurnID, to output: inout Output) {
+    private mutating func applyText(
+        _ delta: String?,
+        turnID: TurnID,
+        parent: ToolCallID?,
+        to output: inout Output
+    ) {
         guard let delta, !delta.isEmpty else { return }
-        if textBlockID == nil { textBlockID = BlockID(rawValue: "agy-text-\(turnID.rawValue.prefix(8))") }
+        append(status: .requesting, to: &output)
+        if let parent {
+            var stream = childText[parent] ?? (
+                blockID: BlockID(rawValue: "agy-text-\(parent.rawValue)"),
+                text: ""
+            )
+            stream.text += delta
+            childText[parent] = stream
+            output.events.append(.textDelta(BlockDelta(
+                turnID: turnID, blockID: stream.blockID, text: delta, parentToolCallID: parent
+            )))
+            return
+        }
+        if textBlockID == nil {
+            textBlockID = BlockID(rawValue: "agy-text-\(turnID.rawValue.prefix(8))")
+        }
         guard let blockID = textBlockID else { return }
         streamedText += delta
-        append(status: .requesting, to: &output)
         output.events.append(.textDelta(BlockDelta(turnID: turnID, blockID: blockID, text: delta)))
     }
 
-    private mutating func flushText(turnID: TurnID, to output: inout Output) {
+    private mutating func flushText(
+        turnID: TurnID,
+        parent: ToolCallID?,
+        to output: inout Output
+    ) {
+        if let parent {
+            guard let stream = childText.removeValue(forKey: parent) else { return }
+            output.events.append(.blockCompleted(BlockCompleted(
+                turnID: turnID, blockID: stream.blockID, kind: .text, text: stream.text,
+                parentToolCallID: parent
+            )))
+            return
+        }
         guard let blockID = textBlockID else { return }
         output.events.append(.blockCompleted(BlockCompleted(
             turnID: turnID, blockID: blockID, kind: .text, text: streamedText
@@ -215,35 +264,65 @@ struct AntigravityTranslator {
         textBlockID = nil
     }
 
-    private mutating func applyTool(_ step: JSONValue, turnID: TurnID, to output: inout Output) {
+    private mutating func flushAllText(turnID: TurnID, to output: inout Output) {
+        flushText(turnID: turnID, parent: nil, to: &output)
+        for parent in Array(childText.keys) {
+            flushText(turnID: turnID, parent: parent, to: &output)
+        }
+    }
+
+    private mutating func applyTool(
+        _ step: JSONValue,
+        turnID: TurnID,
+        parent: ToolCallID?,
+        to output: inout Output
+    ) {
         let info = step["tool_info"] ?? .object([:])
-        let name = step["tool_name"]?.stringValue
+        let rawName = step["tool_name"]?.stringValue
             ?? info["name"]?.stringValue
             ?? "tool"
-        let index = step["step_index"]?.intValue.map(String.init) ?? UUID().uuidString
-        let toolCallID = ToolCallID(rawValue: "agy-tool-\(index)")
-        let input = info["parameters"] ?? .object([:])
+        if ToolCallShape.isHidden(rawName) { return }
+        let input = ToolCallShape.normalized(
+            info["parameters"] ?? .object([:]),
+            tool: rawName
+        )
+        let name = ToolCallShape.resolvedName(rawName, input: input)
+        let toolCallID = Self.toolCallID(step: step, session: providerSessionID)
         let state = step["state"]?.stringValue
         let isNew = reportedToolCallIDs.insert(toolCallID).inserted
         if isNew {
-            flushText(turnID: turnID, to: &output)
+            flushText(turnID: turnID, parent: parent, to: &output)
             inFlightToolCalls += 1
             append(status: .runningTool, to: &output)
-            output.events.append(.toolCall(ToolCall(
-                turnID: turnID,
-                id: toolCallID,
-                name: name,
-                displayName: Self.displayName(tool: name, input: input),
-                input: input
-            )))
         }
-        if state == "DONE" {
+        let isSubagent = SubagentBrief.isSubagentTool(name)
+        if isSubagent {
+            lastSubagentCallID = toolCallID
+            if let childID = Self.conversationID(in: input) {
+                subagentByConversation[childID] = toolCallID
+            }
+            if isNew, step["subagent_info"]?["subagents"] == nil {
+                advertisePlaceholderSubagent(
+                    id: toolCallID, input: input, to: &output
+                )
+            }
+        }
+        output.events.append(.toolCall(ToolCall(
+            turnID: turnID,
+            id: toolCallID,
+            name: name,
+            displayName: Self.displayName(tool: name, input: input),
+            input: input,
+            parentToolCallID: parent
+        )))
+        let isTerminal = state == "DONE" || state == "ERROR" || state == "FAILED"
+        if isTerminal {
             let error = info["error"]?["message"]?.stringValue ?? info["error"]?.stringValue
             let text = info["output"]?.stringValue ?? error ?? ""
             output.events.append(.toolResult(ToolResult(
                 turnID: turnID,
                 toolCallID: toolCallID,
-                isError: error != nil,
+                isError: error != nil || state == "ERROR" || state == "FAILED",
                 text: text,
                 metadata: info["error"]
             )))
@@ -251,21 +330,97 @@ struct AntigravityTranslator {
             if inFlightToolCalls == 0 {
                 append(status: .requesting, to: &output)
             }
+            if isSubagent { dropPlaceholderSubagent(id: toolCallID, to: &output) }
         }
     }
 
     private mutating func applySubagents(_ subagents: [JSONValue], to output: inout Output) {
-        backgroundTasks = subagents.compactMap { item in
-            let id = item["conversation_id"]?.stringValue
+        placeholderSubagentCalls.removeAll()
+        let tasks: [AgentBackgroundTask] = subagents.compactMap { item in
+            let id = Self.conversationID(in: item)
                 ?? item["type_name"]?.stringValue
+                ?? item["typeName"]?.stringValue
             guard let id else { return nil }
+            if let parent = lastSubagentCallID {
+                subagentByConversation[id] = parent
+            }
+            let description = item["role"]?.stringValue
+                ?? item["Role"]?.stringValue
+                ?? item["description"]?.stringValue
+                ?? item["Description"]?.stringValue
+                ?? item["task"]?.stringValue
+                ?? "Subagent"
             return AgentBackgroundTask(
                 id: id,
-                kind: item["type_name"]?.stringValue,
-                description: item["role"]?.stringValue ?? "Subagent"
+                kind: item["type_name"]?.stringValue ?? item["typeName"]?.stringValue,
+                description: description
             )
         }
+        guard tasks != backgroundTasks else { return }
+        backgroundTasks = tasks
         output.events.append(.backgroundTasksChanged(backgroundTasks))
+    }
+
+    private mutating func advertisePlaceholderSubagent(
+        id: ToolCallID,
+        input: JSONValue,
+        to output: inout Output
+    ) {
+        placeholderSubagentCalls.insert(id)
+        let description = SubagentBrief.label(from: input)
+            ?? SubagentBrief.purpose(from: input)
+            ?? "Subagent"
+        let taskID = Self.conversationID(in: input) ?? id.rawValue
+        let task = AgentBackgroundTask(id: taskID, kind: "subagent", description: description)
+        if backgroundTasks.contains(where: { $0.id == task.id }) { return }
+        backgroundTasks.append(task)
+        output.events.append(.backgroundTasksChanged(backgroundTasks))
+    }
+
+    private mutating func dropPlaceholderSubagent(id: ToolCallID, to output: inout Output) {
+        guard placeholderSubagentCalls.remove(id) != nil else { return }
+        let before = backgroundTasks
+        backgroundTasks.removeAll { $0.id == id.rawValue }
+        if backgroundTasks != before {
+            output.events.append(.backgroundTasksChanged(backgroundTasks))
+        }
+    }
+
+    /// Child steps carry their own `conversation_id` (and sometimes
+    /// `parent_conversation_id`) so they can nest under the Task that launched
+    /// them. Main-session steps stay top-level.
+    private mutating func parentToolCallID(for step: JSONValue) -> ToolCallID? {
+        let conversation = Self.conversationID(in: step)
+        if let conversation, conversation != providerSessionID {
+            if let known = subagentByConversation[conversation] { return known }
+            if let lastSubagentCallID {
+                subagentByConversation[conversation] = lastSubagentCallID
+                return lastSubagentCallID
+            }
+        }
+        if let parentConversation = step["parent_conversation_id"]?.stringValue
+            ?? step["parentConversationId"]?.stringValue,
+           parentConversation == providerSessionID {
+            return lastSubagentCallID
+        }
+        return nil
+    }
+
+    private static func conversationID(in value: JSONValue) -> String? {
+        value["conversation_id"]?.stringValue
+            ?? value["conversationId"]?.stringValue
+            ?? value["ConversationId"]?.stringValue
+            ?? value["ConversationID"]?.stringValue
+    }
+
+    private static func toolCallID(step: JSONValue, session: String?) -> ToolCallID {
+        let index = step["step_index"]?.intValue.map(String.init) ?? UUID().uuidString
+        let conversation = conversationID(in: step)
+        if let conversation, conversation != session, !conversation.isEmpty {
+            let prefix = conversation.prefix(8)
+            return ToolCallID(rawValue: "agy-tool-\(prefix)-\(index)")
+        }
+        return ToolCallID(rawValue: "agy-tool-\(index)")
     }
 
     // MARK: - Helpers
@@ -277,6 +432,7 @@ struct AntigravityTranslator {
         didReportResult = false
         streamedText = ""
         textBlockID = nil
+        childText.removeAll()
         reportedToolCallIDs.removeAll()
         inFlightToolCalls = 0
         lastUsage = nil
@@ -333,19 +489,12 @@ struct AntigravityTranslator {
     }
 
     static func displayName(tool: String, input: JSONValue) -> String? {
-        switch tool {
-        case "run_command":
-            return input["CommandLine"]?.stringValue
-                ?? input["command"]?.stringValue
-                ?? input["command_line"]?.stringValue
-        case "write_to_file", "write_file", "view_file", "replace_file_content":
-            let path = input["Path"]?.stringValue
-                ?? input["path"]?.stringValue
-                ?? input["file_path"]?.stringValue
-            return path.map { URL(fileURLWithPath: $0).lastPathComponent }
-        default:
-            return ClaudeToolSemantics.displayName(tool: tool, input: input)
+        let name = ToolCallShape.canonicalName(tool)
+        let payload = ToolCallShape.normalized(input, tool: tool)
+        if let label = ClaudeToolSemantics.displayName(tool: name, input: payload) {
+            return label
         }
+        return ToolCallShape.chipSubject(tool: tool, input: payload)
     }
 }
 

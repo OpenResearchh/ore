@@ -1563,7 +1563,7 @@ struct ChatPane: View {
             )
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
-                modelChooserButton(for: tab, density: density)
+                modelChooserButton(for: tab)
                 if showsEffort {
                     effortButton(for: tab, density: density)
                 }
@@ -1718,13 +1718,15 @@ struct ChatPane: View {
         .help("Add files or references")
     }
 
-    private func modelChooserButton(for tab: ChatSummary, density: ComposerToolbarDensity) -> some View {
+    /// No width frame here: `maxWidth` is "fill up to", so capping the chip at
+    /// the row's leftover stretched the capsule past its text and left a long
+    /// empty highlight. The chip hugs its label; when the row runs short the
+    /// stack squeezes this one flexible child and the name truncates.
+    private func modelChooserButton(for tab: ChatSummary) -> some View {
         Button { handleModelChipTap(for: tab) } label: {
-            modelChipLabel(for: tab, density: density)
+            modelChipLabel(for: tab)
         }
         .buttonStyle(OrePressableButtonStyle())
-        .frame(maxWidth: density.modelMaxWidth, alignment: .leading)
-        .layoutPriority(1)
         .overlay {
             // Scroll over the chip to switch harness (to each one's default
             // model) — the same gesture, animation, and haptics as the effort
@@ -1778,7 +1780,7 @@ struct ChatPane: View {
         showModelChooser.toggle()
     }
 
-    private func modelChipLabel(for tab: ChatSummary, density: ComposerToolbarDensity) -> some View {
+    private func modelChipLabel(for tab: ChatSummary) -> some View {
         HStack(spacing: 6) {
             HarnessMark(harness: voicePendingModel?.harness ?? tab.harness, size: 17)
             Text(voicePendingModel?.displayName ?? modelDisplayName(for: tab))
@@ -1789,7 +1791,6 @@ struct ChatPane: View {
             Color.clear.frame(width: 7, height: 1)
         }
         .padding(.horizontal, 8)
-        .frame(maxWidth: density.modelMaxWidth, alignment: .leading)
         .frame(height: 26)
         .background(
             voicePendingModel == nil ? AnyShapeStyle(OreTheme.subduedFill)

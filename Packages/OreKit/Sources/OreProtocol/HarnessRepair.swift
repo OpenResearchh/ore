@@ -31,6 +31,47 @@ public enum HarnessUpdateFailure {
             || lower.contains("not writable")
             || lower.contains("read-only file system")
     }
+
+    /// The path an `EACCES` line names, from either the CLI's raw dump
+    /// (`permission denied, mkdir '/…'`) or the sentence ORE shows for it.
+    public static func deniedPath(in text: String) -> String? {
+        let patterns = [
+            #"permission denied,\s*[A-Za-z]+\s+'([^']+)'"#,
+            #"permission denied creating '([^']+)'"#,
+        ]
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            guard let match = expression.firstMatch(in: text, range: range),
+                  match.numberOfRanges > 1,
+                  let captured = Range(match.range(at: 1), in: text)
+            else { continue }
+            let path = String(text[captured])
+            if path.hasPrefix("/") { return path }
+        }
+        return nil
+    }
+
+    /// `claude update` stages the new binary under the user's cache. A
+    /// previous `sudo` update leaves that directory owned by root, and the
+    /// next update fails there — not on the install itself.
+    public static func isCacheOrStaging(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        return lower.contains("/.cache/") || lower.contains("/staging/")
+    }
+
+    /// `Fix: Run: npm -g uninstall @scope/pkg` as the CLI printed it.
+    public static func leftoverUninstallCommand(in text: String) -> String? {
+        let pattern = #"npm\s+-g\s+uninstall\s+\S+"#
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(
+                in: text, range: NSRange(text.startIndex..., in: text)
+              ),
+              let range = Range(match.range, in: text)
+        else { return nil }
+        return String(text[range])
+    }
 }
 
 /// What to run when updating an agent CLI failed because something on disk
@@ -100,8 +141,19 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
         executablePath: String?,
         npmPrefix: String? = nil,
         brewPrefix: String? = nil,
-        brewToken: String? = nil
+        brewToken: String? = nil,
+        failureText: String? = nil
     ) -> HarnessRepair? {
+        if let failureText,
+           let denied = HarnessUpdateFailure.deniedPath(in: failureText),
+           HarnessUpdateFailure.isCacheOrStaging(denied) {
+            return forUnwritableCache(
+                kind: kind,
+                deniedPath: denied,
+                executablePath: executablePath,
+                failureText: failureText
+            )
+        }
         switch method {
         case .homebrew:
             // Homebrew declines to run as root, so a Cellar owned by someone
@@ -203,6 +255,35 @@ public struct HarnessRepair: Sendable, Equatable, Codable, Hashable {
             return nil
         } ?? "Cellar"
         return "\(prefix)/\(container)/\(token)"
+    }
+
+    /// The updater could not create a file under the user's cache. Chown the
+    /// nearest directory that already exists — the leaf usually does not —
+    /// and stop at home, so a missing cache never becomes `chown -R $HOME`.
+    private static func forUnwritableCache(
+        kind: HarnessKind,
+        deniedPath: String,
+        executablePath: String?,
+        failureText: String
+    ) -> HarnessRepair {
+        let update = executablePath.map { "\(quote($0)) update" }
+            ?? "\(kind.defaultExecutableName) update"
+        var commands = [
+            "target=\(quote(deniedPath))",
+            "home=\"$HOME\"",
+            "while [ ! -e \"$target\" ] && [ \"$target\" != / ] && [ \"$target\" != \"$home\" ]; do target=$(dirname \"$target\"); done",
+            "if [ -e \"$target\" ] && [ \"$target\" != / ] && [ \"$target\" != \"$home\" ]; then sudo chown -R \"$(whoami)\" \"$target\"; fi",
+        ]
+        if let uninstall = HarnessUpdateFailure.leftoverUninstallCommand(in: failureText) {
+            commands.append(uninstall)
+        }
+        commands.append(update)
+        return HarnessRepair(
+            reason: "\(kind.displayName) could not create \(deniedPath). "
+                + "The cache is not writable by this account, usually because an earlier update ran as root.",
+            commands: commands + verification(for: kind),
+            needsRoot: true
+        )
     }
 
     /// When the channel this install came from cannot be used, reinstall

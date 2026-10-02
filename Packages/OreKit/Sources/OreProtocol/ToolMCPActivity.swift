@@ -147,16 +147,7 @@ public struct ToolMCPActivity: Equatable, Sendable {
     /// Built-in harness tools already have their own chip. Matching them here
     /// would steal Glob/Grep/Bash and turn them into a puzzle piece.
     private static func isHarnessPrimitive(_ key: String) -> Bool {
-        let value = key.lowercased()
-        switch value {
-        case "bash", "shell", "read", "write", "edit", "multiedit", "notebookedit",
-             "glob", "grep", "ls", "list", "delete", "remove", "readlints",
-             "webfetch", "websearch", "task", "agent", "todowrite", "todoread",
-             "createplan", "exitplanmode", "bashoutput", "killshell", "killbash":
-            return true
-        default:
-            return false
-        }
+        ToolCallShape.isHarnessPrimitive(key)
     }
 
     private static func isNamespaced(_ tool: String) -> Bool {
@@ -232,7 +223,8 @@ public struct ToolMCPActivity: Equatable, Sendable {
     }
 
     private static func filePath(from input: JSONValue?) -> String? {
-        field(input, "filePath")
+        ToolCallShape.filePath(in: input)
+            ?? field(input, "filePath")
             ?? field(input, "file_path")
             ?? field(input, "path")
             ?? field(input, "notebook_path")

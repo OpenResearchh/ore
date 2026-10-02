@@ -25,6 +25,15 @@ struct SpokenToolClassTests {
         #expect(activity == ToolActivity(kind: .read, subject: "ChatPane"))
     }
 
+    @Test func antigravityViewFileSpeaksAsARead() {
+        let activity = SpokenToolClass.classify(
+            name: "view_file",
+            displayName: "sample.txt",
+            input: .object(["AbsolutePath": .string("/tmp/sample.txt")])
+        )
+        #expect(activity == ToolActivity(kind: .read, subject: "sample"))
+    }
+
     @Test func readLintsIsNotAFileRead() {
         // "ReadLints" contains "read"; the lint matcher must win.
         let activity = SpokenToolClass.classify(

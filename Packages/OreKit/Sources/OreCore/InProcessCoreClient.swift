@@ -2083,10 +2083,15 @@ public actor InProcessCoreClient: CoreClient {
     /// Asked for only after a failure, because answering it costs two short
     /// shell calls (`npm config get prefix`, `brew --prefix`) and the answer
     /// is only useful once there is something to repair.
-    public func harnessPermissionRepair(_ kind: HarnessKind) async -> HarnessRepair? {
+    public func harnessPermissionRepair(
+        _ kind: HarnessKind,
+        failureText: String? = nil
+    ) async -> HarnessRepair? {
         let path = harnessProbes.first(where: { $0.kind == kind })?.executablePath
             ?? ShellEnvironment.locate(kind.defaultExecutableName)
-        return await HarnessCLIUpdater.permissionRepair(for: kind, executablePath: path)
+        return await HarnessCLIUpdater.permissionRepair(
+            for: kind, executablePath: path, failureText: failureText
+        )
     }
 
     public struct WorkspaceEnvironment: Sendable, Hashable {

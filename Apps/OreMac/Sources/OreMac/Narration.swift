@@ -177,8 +177,9 @@ enum SpokenToolClass {
         displayName: String?,
         input: JSONValue?
     ) -> ToolActivity? {
-        let tool = name.lowercased()
-        let key = (name + " " + (displayName ?? "")).lowercased()
+        let tool = ToolCallShape.canonicalName(name).lowercased()
+        let key = (ToolCallShape.canonicalName(name) + " " + (displayName ?? "")).lowercased()
+        let input = input.map { ToolCallShape.normalized($0, tool: name) }
 
         // Checklist bookkeeping narrates through the todo path, not per call.
         if ["taskcreate", "taskupdate", "tasklist", "taskget"].contains(where: tool.hasSuffix)
@@ -249,7 +250,8 @@ enum SpokenToolClass {
     /// The file a call touches, as it should be spoken: base name, no
     /// extension — "ChatPane", not "slash Apps slash … ChatPane dot swift".
     static func spokenFileName(from input: JSONValue?) -> String? {
-        let path = input?["file_path"]?.stringValue
+        let path = ToolCallShape.filePath(in: input)
+            ?? input?["file_path"]?.stringValue
             ?? input?["path"]?.stringValue
             ?? input?[0]?["path"]?.stringValue
         return path.map(spokenFileName(fromPath:))

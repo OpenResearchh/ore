@@ -104,8 +104,7 @@ public enum ModelVariantCatalog {
             }
             if variants.count == 1 { efforts = [] }
             efforts.sort { ladderIndex($0) < ladderIndex($1) }
-            let names = parsed.map(\.familyName)
-            let displayName = mostCommon(names) ?? parse(first).familyName
+            let displayName = stableDisplayName(for: variants) ?? parse(first).familyName
             let description = variants.first(where: { !$0.description.isEmpty })?.description ?? ""
             return ModelFamily(
                 id: key,
@@ -169,9 +168,23 @@ public enum ModelVariantCatalog {
     public static func parseIdentifier(_ id: String) -> (family: String, effort: ReasoningEffort?, fast: Bool) {
         var rest = id
         var fast = false
-        if rest.lowercased().hasSuffix("-fast") {
-            fast = true
-            rest.removeLast(5)
+        var thinking = false
+        // Cursor puts effort on either side of `-thinking` (`…-high-thinking`,
+        // `…-thinking-high-fast`). Peel the flags from the tail first so both
+        // shapes share one family and the effort is still readable.
+        while !rest.isEmpty {
+            let lower = rest.lowercased()
+            if lower.hasSuffix("-fast") {
+                fast = true
+                rest.removeLast(5)
+                continue
+            }
+            if lower.hasSuffix("-thinking") {
+                thinking = true
+                rest.removeLast("-thinking".count)
+                continue
+            }
+            break
         }
         let suffixes: [(String, ReasoningEffort)] = [
             ("-extra-high", .xhigh),
@@ -182,47 +195,89 @@ public enum ModelVariantCatalog {
             ("-max", .max),
             ("-none", .none),
         ]
+        var effort: ReasoningEffort?
         let lower = rest.lowercased()
-        for (suffix, effort) in suffixes {
+        for (suffix, value) in suffixes {
             if lower.hasSuffix(suffix) {
                 rest.removeLast(suffix.count)
-                return (rest, effort, fast)
+                effort = value
+                break
             }
         }
-        return (rest, nil, fast)
+        if thinking, !rest.isEmpty { rest += "-thinking" }
+        if rest.isEmpty { rest = id }
+        return (rest, effort, fast)
     }
 
     static func stripDisplayName(_ name: String) -> String {
-        var rest = name.trimmingCharacters(in: .whitespaces)
-        if rest.lowercased().hasSuffix(" fast") {
-            rest = String(rest.dropLast(5)).trimmingCharacters(in: .whitespaces)
+        var rest = collapseSpaces(name)
+        var held: [String] = []
+        // Fast is a speed flag. Parentheticals that aren't effort labels
+        // (`(NO ZDR)`, `(Thinking)`) stay on the family name.
+        _ = peel(" fast", from: &rest)
+        while let suffix = trailingParenthetical(in: rest), !isEffortLabel(suffix) {
+            held.insert(suffix, at: 0)
+            rest = String(rest.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
         }
-        let parenthetical = [
-            " (Extra High)", " (X High)", " (High)", " (Medium)", " (Low)", " (Max)", " (None)",
-        ]
-        for suffix in parenthetical {
-            if rest.lowercased().hasSuffix(suffix.lowercased()) {
-                rest = String(rest.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
-                break
-            }
+        var thinking = false
+        if peel(" thinking", from: &rest) { thinking = true }
+        for suffix in [" (Extra High)", " (X High)", " (High)", " (Medium)", " (Low)", " (Max)", " (None)"] {
+            if peel(suffix, from: &rest) { break }
         }
-        let trailing = [" Extra High", " X High", " High", " Medium", " Low", " Max", " None"]
-        for suffix in trailing {
-            if rest.lowercased().hasSuffix(suffix.lowercased()) {
-                rest = String(rest.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
-                break
-            }
+        for suffix in [" Extra High", " X High", " High", " Medium", " Low", " Max", " None"] {
+            if peel(suffix, from: &rest) { break }
         }
+        if thinking { rest += " Thinking" }
+        if !held.isEmpty { rest += held.joined() }
+        rest = collapseSpaces(rest)
         return rest.isEmpty ? name : rest
+    }
+
+    /// The name a person should see for a family. Cursor's fast rows often drop
+    /// "1M" while the standard rows keep it, and a plain frequency tie used to
+    /// follow Dictionary order, so the same row renamed itself between renders.
+    private static func stableDisplayName(for variants: [AgentModel]) -> String? {
+        let labeled = variants.map { (name: stripDisplayName($0.displayName), fast: parse($0).fast) }
+        let standard = labeled.filter { !$0.fast && !$0.name.isEmpty }
+        let source = standard.isEmpty ? labeled.filter { !$0.name.isEmpty } : standard
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for item in source {
+            if counts[item.name] == nil { order.append(item.name) }
+            counts[item.name, default: 0] += 1
+        }
+        return order.max { lhs, rhs in
+            let left = counts[lhs] ?? 0
+            let right = counts[rhs] ?? 0
+            if left != right { return left < right }
+            if lhs.count != rhs.count { return lhs.count < rhs.count }
+            return lhs > rhs
+        }
+    }
+
+    private static func peel(_ suffix: String, from text: inout String) -> Bool {
+        guard text.lowercased().hasSuffix(suffix.lowercased()) else { return false }
+        text = String(text.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+        return true
+    }
+
+    private static func trailingParenthetical(in text: String) -> String? {
+        guard text.hasSuffix(")"), let open = text.range(of: " (", options: .backwards) else { return nil }
+        return String(text[open.lowerBound...])
+    }
+
+    private static func isEffortLabel(_ parenthetical: String) -> Bool {
+        let value = parenthetical
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ()"))
+            .lowercased()
+        return ["extra high", "x high", "high", "medium", "low", "max", "none"].contains(value)
+    }
+
+    private static func collapseSpaces(_ text: String) -> String {
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
     private static func ladderIndex(_ effort: ReasoningEffort) -> Int {
         ReasoningEffort.allCases.firstIndex(of: effort) ?? 0
-    }
-
-    private static func mostCommon(_ names: [String]) -> String? {
-        var counts: [String: Int] = [:]
-        for name in names where !name.isEmpty { counts[name, default: 0] += 1 }
-        return counts.max { $0.value < $1.value }?.key
     }
 }

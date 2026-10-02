@@ -81,6 +81,45 @@ struct HarnessCLIUpdaterTests {
         #expect(!message.contains("brew install"), "the channel is the repair's business")
     }
 
+    /// The native updater stages under `~/.cache/claude`. A root-owned cache
+    /// is not a root-owned install, and the card must not chown the version
+    /// directory while telling the user it is often an npm package.
+    @Test func aCacheStagingFailureNamesTheCacheAndTheLeftoverNpmInstall() {
+        let raw = """
+        Warning: Leftover npm global installation at /usr/local/bin/claude
+        Fix: Run: npm -g uninstall @anthropic-ai/claude-code
+        Error: EACCES: permission denied, mkdir \
+        '/Users/tusharojha/.cache/claude/staging/2.1.287.34043'
+        """
+        let error = HarnessCLIUpdater.UpdateError.commandFailed(
+            kind: .claudeCode,
+            command: "'/Users/tusharojha/.local/bin/claude' update",
+            exitCode: 1,
+            output: raw
+        )
+        let message = error.errorDescription ?? ""
+        #expect(message.contains(
+            "permission denied creating '/Users/tusharojha/.cache/claude/staging/2.1.287.34043'"
+        ))
+        #expect(message.contains("npm -g uninstall @anthropic-ai/claude-code"))
+        #expect(!message.contains("not writable by your user"))
+
+        let repair = HarnessRepair.forPermissionFailure(
+            kind: .claudeCode,
+            method: .nativeUserBin,
+            executablePath: "/Users/tusharojha/.local/share/claude/versions/2.1.272",
+            failureText: message
+        )
+        let script = repair?.script ?? ""
+        #expect(script.contains("'/Users/tusharojha/.cache/claude/staging/2.1.287.34043'"))
+        #expect(script.contains("sudo chown -R \"$(whoami)\" \"$target\""))
+        #expect(script.contains("!= \"$home\""))
+        #expect(!script.contains("chown -R \"$(whoami)\" '/Users/tusharojha/.local/share/claude/versions'"))
+        #expect(script.contains("npm -g uninstall @anthropic-ai/claude-code"))
+        #expect(script.contains("'/Users/tusharojha/.local/share/claude/versions/2.1.272' update"))
+        #expect(repair?.reason.contains(".cache/claude/staging") == true)
+    }
+
     @Test func aPermissionFailureIsRecognisedHoweverItIsWorded() {
         for output in [
             "npm error code EACCES",

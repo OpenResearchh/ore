@@ -150,6 +150,11 @@ actor AntigravitySession: AgentSession {
                 providerSessionID = started.providerSessionID
             }
             if case .turnCompleted = event {
+                // Cleared *before* the yield, and that ordering is load-bearing:
+                // the engine drains queued messages the moment it sees this
+                // event, and the drained send must find the gate already open.
+                // Cursor's session kept its gate closed until process exit and
+                // ate the drained message; see `turnHasReportedResult` there.
                 isTurnInFlight = false
             }
             continuation.yield(event)
@@ -170,11 +175,7 @@ actor AntigravitySession: AgentSession {
     }
 
     private func makeArguments(effort: ReasoningEffort?) -> [String] {
-        var arguments = [
-            "-p",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-        ]
+        var arguments = AntigravityHarness.printModeArguments
         if let model = configuration.model {
             arguments += ["--model", model]
         }

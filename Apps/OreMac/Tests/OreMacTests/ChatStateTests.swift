@@ -499,7 +499,7 @@ struct TranscriptDisplayTests {
         #expect(openTurn.contains { $0.id == "think1" })
     }
 
-    @Test func aLongLiveTurnFoldsCompletedStepsAndKeepsTheInFlightRow() {
+    @Test func aLongLiveTurnKeepsEveryStepVisible() {
         let turn = TurnID(rawValue: "t1")
         func edit(_ id: String, complete: Bool = true) -> TranscriptRow {
             TranscriptRow(
@@ -519,18 +519,50 @@ struct TranscriptDisplayTests {
         let displayed = TranscriptDisplay.rows(
             from: rows, keepLiveTurnExpanded: true, expanded: [], memo: TranscriptDisplay.Memo()
         )
-        #expect(displayed.contains { $0.kind == .activityGroup && $0.text == "5 steps" })
-        #expect(!displayed.contains { $0.id == "e1" })
-        #expect(!displayed.contains { $0.id == "e4" })
-        #expect(displayed.contains { $0.id == "think" })
+        #expect(!displayed.contains { $0.kind == .activityGroup })
+        #expect(displayed.map(\.id) == ["u1", "e1", "e2", "e3", "e4", "think"])
         #expect(!displayed.contains { $0.kind == .turnFooter })
 
-        let revealed = TranscriptDisplay.rows(
-            from: rows, keepLiveTurnExpanded: true, expanded: ["activity-t1"],
+        let finished = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [],
             memo: TranscriptDisplay.Memo()
         )
-        #expect(revealed.contains { $0.id == "e1" })
-        #expect(revealed.contains { $0.id == "think" })
+        #expect(finished.contains { $0.kind == .activityGroup && $0.text == "5 steps" })
+        #expect(!finished.contains { $0.id == "e1" })
+        #expect(!finished.contains { $0.id == "think" })
+    }
+
+    @Test func aLiveAnswerStaysAboveItsSteps() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "look"),
+            TranscriptRow(
+                id: "e1", turnID: turn, kind: .toolCall, text: "Read",
+                toolName: "Read", isComplete: true
+            ),
+            TranscriptRow(
+                id: "a1", turnID: turn, kind: .assistantText,
+                text: "The card is blaming the install."
+            ),
+            TranscriptRow(
+                id: "think", turnID: turn, kind: .thinking,
+                text: "The screenshots show repair commands.", isComplete: false
+            ),
+        ]
+        let live = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: true, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(live.map(\.id) == ["u1", "a1", "e1", "think"])
+        #expect(!live.contains { $0.kind == .activityGroup })
+
+        let done = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: TranscriptDisplay.Memo()
+        )
+        #expect(done.first { $0.kind == .activityGroup }?.text == "2 steps")
+        let answerIndex = done.firstIndex { $0.id == "a1" }
+        let groupIndex = done.firstIndex { $0.kind == .activityGroup }
+        #expect(groupIndex != nil && answerIndex != nil && groupIndex! < answerIndex!)
+        #expect(!done.contains { $0.id == "e1" || $0.id == "think" })
     }
 
     @Test func aShortLiveTurnDoesNotFold() {

@@ -763,6 +763,295 @@ struct UserMessageAttachmentTests {
         #expect(chip.subject == "antigravity.svg")
     }
 
+    @Test func antigravityViewFileChipsNameTheFileNotTheTool() {
+        let live = TranscriptRow(
+            id: "tool-view-live",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "sample.txt",
+            toolName: "Read",
+            toolCallID: ToolCallID(rawValue: "c-view-live"),
+            toolInput: .object(["file_path": .string("/tmp/sample.txt")]),
+            resultText: "3 lines, 32 bytes",
+            isComplete: true
+        )
+        let liveChip = TranscriptCell.processChip(for: live)
+        #expect(liveChip.title == "Read 3 lines")
+        #expect(liveChip.subject == "sample.txt")
+
+        let raw = TranscriptRow(
+            id: "tool-view-raw",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "view_file",
+            toolName: "view_file",
+            toolCallID: ToolCallID(rawValue: "c-view"),
+            toolInput: .object(["AbsolutePath": .string("/tmp/agy-tools/sample.txt")]),
+            resultText: "3 lines, 32 bytes",
+            isComplete: true
+        )
+        let rawChip = TranscriptCell.processChip(for: raw)
+        #expect(rawChip.title == "Read 3 lines")
+        #expect(rawChip.subject == "sample.txt")
+    }
+
+    @Test func aFailedAntigravityReadKeepsTheFileChip() {
+        let dump = """
+        declaring permissions: cortex tool view_file: convert tool call \
+        for permissions: model output error: invalid tool call error \
+        (invalid_args) failed to read file: stat \
+        /Users/me/src/Agent.swift: no such file or directory
+        """
+        var named = TranscriptRow(
+            id: "tool-view-fail-named",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "view_file",
+            toolName: "view_file",
+            toolCallID: ToolCallID(rawValue: "c-fail-named"),
+            toolInput: .object(["AbsolutePath": .string("/Users/me/src/Agent.swift")]),
+            resultText: dump,
+            isComplete: true
+        )
+        named.isError = true
+        let namedChip = TranscriptCell.processChip(for: named)
+        #expect(namedChip.title == "Read")
+        #expect(namedChip.subject == "Agent.swift")
+        #expect(TranscriptCell.processDetail(for: named) == "No such file or directory: Agent.swift")
+        #expect(!TranscriptCell.processDetail(for: named).contains("cortex"))
+
+        var buried = TranscriptRow(
+            id: "tool-view-fail-buried",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "view_file",
+            toolName: "view_file",
+            toolCallID: ToolCallID(rawValue: "c-fail-buried"),
+            resultText: dump,
+            isComplete: true
+        )
+        buried.isError = true
+        let buriedChip = TranscriptCell.processChip(for: buried)
+        #expect(buriedChip.title == "Read")
+        #expect(buriedChip.subject == "Agent.swift")
+
+        let oneLine = TranscriptRow(
+            id: "tool-bash-read-one",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Bash",
+            toolName: "Bash",
+            toolCallID: ToolCallID(rawValue: "c-cat-one"),
+            toolInput: .object(["command": .string("cat /tmp/one.swift")]),
+            resultText: "hello",
+            isComplete: true
+        )
+        let oneChip = TranscriptCell.processChip(for: oneLine)
+        #expect(oneChip.title == "Read 1 line")
+        #expect(oneChip.subject == "one.swift")
+    }
+
+    @Test func antigravityToolsMapOntoTheSameChipsAsClaude() {
+        let list = TranscriptRow(
+            id: "tool-list",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "src",
+            toolName: "list_dir",
+            toolCallID: ToolCallID(rawValue: "c-list"),
+            toolInput: .object(["AbsolutePath": .string("/tmp/src")])
+        )
+        let grep = TranscriptRow(
+            id: "tool-grep",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "hello",
+            toolName: "grep_search",
+            toolCallID: ToolCallID(rawValue: "c-grep"),
+            toolInput: .object(["Query": .string("hello")])
+        )
+        let find = TranscriptRow(
+            id: "tool-find",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "*.swift",
+            toolName: "find_by_name",
+            toolCallID: ToolCallID(rawValue: "c-find"),
+            toolInput: .object(["Pattern": .string("*.swift")])
+        )
+        let edit = TranscriptRow(
+            id: "tool-replace",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "app.swift",
+            toolName: "replace_file_content",
+            toolCallID: ToolCallID(rawValue: "c-edit"),
+            toolInput: .object(["AbsolutePath": .string("/tmp/src/app.swift")])
+        )
+        let bash = TranscriptRow(
+            id: "tool-bash",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "echo PONG",
+            toolName: "run_command",
+            toolCallID: ToolCallID(rawValue: "c-bash"),
+            toolInput: .object(["CommandLine": .string("echo PONG")])
+        )
+        let search = TranscriptRow(
+            id: "tool-web",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "WebSearch",
+            toolName: "search_web",
+            toolCallID: ToolCallID(rawValue: "c-web"),
+            toolInput: .object(["Query": .string("antigravity cli stream-json")])
+        )
+
+        #expect(TranscriptCell.processChip(for: list) == ("List", "src"))
+        #expect(TranscriptCell.processChip(for: grep) == ("Search", "hello"))
+        #expect(TranscriptCell.processChip(for: find) == ("Find", "*.swift"))
+        #expect(TranscriptCell.processChip(for: edit) == ("Edit", "app.swift"))
+        #expect(TranscriptCell.processChip(for: bash) == ("Bash", "echo PONG"))
+        #expect(TranscriptCell.processChip(for: search) == ("Search", "antigravity cli stream-json"))
+    }
+
+    @Test func antigravityBrowserWaitAndImageChipsUseHarnessPayload() {
+        let click = TranscriptRow(
+            id: "tool-click",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "browser_click_element",
+            toolName: "browser_click_element",
+            toolCallID: ToolCallID(rawValue: "c-click"),
+            toolInput: .object(["Selector": .string("#submit")])
+        )
+        let type = TranscriptRow(
+            id: "tool-type",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "browser_input",
+            toolName: "browser_input",
+            toolCallID: ToolCallID(rawValue: "c-type"),
+            toolInput: .object(["Text": .string("hello world")])
+        )
+        let shot = TranscriptRow(
+            id: "tool-shot",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "capture_browser_screenshot",
+            toolName: "capture_browser_screenshot",
+            toolCallID: ToolCallID(rawValue: "c-shot"),
+            toolInput: .object(["Url": .string("https://example.com/app")])
+        )
+        let wait = TranscriptRow(
+            id: "tool-wait",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "wait_5_seconds",
+            toolName: "wait_5_seconds",
+            toolCallID: ToolCallID(rawValue: "c-wait"),
+            toolInput: .object([:])
+        )
+        let image = TranscriptRow(
+            id: "tool-image",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "generate_image",
+            toolName: "generate_image",
+            toolCallID: ToolCallID(rawValue: "c-image"),
+            toolInput: .object(["Prompt": .string("a red cube on a table")])
+        )
+        let fetch = TranscriptRow(
+            id: "tool-open",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "open_browser_url",
+            toolName: "open_browser_url",
+            toolCallID: ToolCallID(rawValue: "c-open"),
+            toolInput: .object(["Url": .string("https://docs.python.org/3/")])
+        )
+        let write = TranscriptRow(
+            id: "tool-write",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "write_to_file",
+            toolName: "write_to_file",
+            toolCallID: ToolCallID(rawValue: "c-write"),
+            toolInput: .object([
+                "AbsolutePath": .string("/tmp/src/hello.swift"),
+                "Contents": .string("print(1)"),
+            ])
+        )
+
+        #expect(TranscriptCell.processChip(for: click) == ("Click", "#submit"))
+        #expect(TranscriptCell.processChip(for: type) == ("Type", "hello world"))
+        #expect(TranscriptCell.processChip(for: shot) == ("Screenshot", "example.com/app"))
+        #expect(TranscriptCell.processChip(for: wait) == ("Wait", "5s"))
+        #expect(TranscriptCell.processChip(for: image) == ("Image", "a red cube on a table"))
+        #expect(TranscriptCell.processChip(for: fetch) == ("Fetch", "docs.python.org/3"))
+        #expect(TranscriptCell.processChip(for: write) == ("Write", "hello.swift"))
+    }
+
+    @Test func antigravityCatalogChipsNeverShowSnakeCaseToolNames() {
+        let samples: [(String, JSONValue)] = [
+            ("view_file", .object(["AbsolutePath": .string("/tmp/sample.txt")])),
+            ("write_to_file", .object(["AbsolutePath": .string("/tmp/out.txt")])),
+            ("replace_file_content", .object(["AbsolutePath": .string("/tmp/app.swift")])),
+            ("multi_replace_file_content", .object(["AbsolutePath": .string("/tmp/app.swift")])),
+            ("sed_file", .object(["AbsolutePath": .string("/tmp/app.swift")])),
+            ("run_command", .object(["CommandLine": .string("ls")])),
+            ("command_status", .object(["CommandLine": .string("ls")])),
+            ("send_command_input", .object(["CommandLine": .string("y")])),
+            ("grep_search", .object(["Query": .string("TODO")])),
+            ("find_by_name", .object(["Pattern": .string("*.swift")])),
+            ("list_dir", .object(["AbsolutePath": .string("/tmp/src")])),
+            ("search_web", .object(["Query": .string("agy cli")])),
+            ("read_url_content", .object(["Url": .string("https://example.com")])),
+            ("open_browser_url", .object(["Url": .string("https://example.com")])),
+            ("read_browser_page", .object(["Url": .string("https://example.com")])),
+            ("browser_click_element", .object(["Selector": .string("#go")])),
+            ("browser_input", .object(["Text": .string("hi")])),
+            ("browser_scroll", .object([:])),
+            ("browser_press_key", .object(["Key": .string("Enter")])),
+            ("capture_browser_screenshot", .object([:])),
+            ("click_browser_pixel", .object(["PixelX": .integer(10), "PixelY": .integer(20)])),
+            ("execute_browser_javascript", .object(["Javascript": .string("document.title")])),
+            ("list_browser_pages", .object([:])),
+            ("wait", .object(["WaitMs": .integer(500)])),
+            ("wait_5_seconds", .object([:])),
+            ("generate_image", .object(["Prompt": .string("cat")])),
+            ("ask_question", .object(["Question": .string("Which branch?")])),
+            ("manage_task", .object(["Name": .string("Ship chips")])),
+            ("invoke_subagent", .object(["Description": .string("Explore the repo")])),
+            ("call_mcp_tool", .object(["ServerName": .string("github"), "ToolName": .string("get_issue")])),
+            ("manage_inbox", .object([:])),
+            ("run_workflow", .object(["Name": .string("deploy")])),
+            ("list_resources", .object([:])),
+            ("read_resource", .object(["Uri": .string("file://notes.md")])),
+            ("notebook_edit", .object(["AbsolutePath": .string("/tmp/n.ipynb")])),
+        ]
+        for (index, sample) in samples.enumerated() {
+            let row = TranscriptRow(
+                id: "catalog-\(index)",
+                turnID: TurnID(rawValue: "t1"),
+                kind: .toolCall,
+                text: sample.0,
+                toolName: sample.0,
+                toolCallID: ToolCallID(rawValue: "c-\(index)"),
+                toolInput: sample.1
+            )
+            let chip = TranscriptCell.processChip(for: row)
+            #expect(
+                !ToolCallShape.looksLikeToolCodename(chip.title),
+                "\(sample.0) title stayed a codename: \(chip.title)"
+            )
+            #expect(chip.title != sample.0)
+            if let subject = chip.subject {
+                #expect(subject != sample.0, "\(sample.0) used its own name as the pill")
+            }
+        }
+    }
+
     @Test func fetchChipsNameTheUrlAndSearchChipsNameTheQuery() {
         let fetch = TranscriptRow(
             id: "tool-fetch",

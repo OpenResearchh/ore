@@ -129,8 +129,19 @@ actor FakeSession: AgentSession {
     }
 
     func send(_ message: UserMessage) async throws {
+        if rejectNextSend {
+            rejectNextSend = false
+            rejectedSendCount += 1
+            throw HarnessError.unsupportedCapability("sending while a turn is running")
+        }
         sentMessages.append(message)
     }
+
+    /// Arms a one-shot rejection, standing in for a CLI whose process is still
+    /// exiting when the next send arrives.
+    func failNextSend() { rejectNextSend = true }
+    private var rejectNextSend = false
+    private(set) var rejectedSendCount = 0
 
     func interrupt() async throws { interruptCount += 1 }
 

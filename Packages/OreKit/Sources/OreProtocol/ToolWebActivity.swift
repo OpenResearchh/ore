@@ -153,7 +153,12 @@ public struct ToolWebActivity: Equatable, Sendable {
         let value = key.lowercased()
         if value.contains("search") && !value.contains("fetch") { return false }
         if value.contains("fetch") { return true }
-        if value.contains("browse") || value.contains("browser") { return true }
+        if value.contains("browse") || value.contains("browser") {
+            // Page-level fetch/open, not clicks, screenshots, or DOM probes.
+            return value.contains("url") || value.contains("page")
+                || value.contains("navigate") || value.contains("open")
+                || value.contains("fetch") || value.contains("read")
+        }
         if value.contains("open_page") || value.contains("openpage") { return true }
         if value.contains("open_url") || value.contains("openurl") { return true }
         if value.contains("read_url") || value.contains("readurl") { return true }

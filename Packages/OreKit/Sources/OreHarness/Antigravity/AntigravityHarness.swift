@@ -129,6 +129,18 @@ public struct AntigravityHarness: AgentHarness {
         )
     }
 
+    /// Headless stream-json launch flags.
+    ///
+    /// `agy -p` always consumes the next argv as the prompt. A bare `-p`
+    /// therefore swallows `--input-format` (or whatever follows) and the CLI
+    /// exits before reading stdin. `-p=` is the empty-prompt form the CLI
+    /// documents, so messages come from NDJSON on stdin.
+    static let printModeArguments = [
+        "-p=",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+    ]
+
     /// Maps ORE's effort ladder onto the values `agy --effort` accepts.
     static func cliEffort(_ effort: ReasoningEffort) -> String {
         switch effort {
@@ -163,7 +175,7 @@ public struct AntigravityHarness: AgentHarness {
     private func probeAuthState(executablePath: String) async -> HarnessProbeResult.AuthState {
         let outcome = await CommandProbe.run(
             executablePath: executablePath,
-            arguments: ["-p", "/usage", "--output-format", "json", "--print-timeout", "15s"],
+            arguments: ["-p=/usage", "--output-format", "json", "--print-timeout", "15s"],
             timeout: .seconds(20),
             allowAPIKeyFallback: allowAPIKeyFallback
         )

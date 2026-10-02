@@ -333,7 +333,7 @@ struct StreamingChatStateTests {
         #expect(state.rows.map(\.text) == ["Hello"])
     }
 
-    @Test func streamingIntoTheLastRowReplacesOnlyThatDisplayRow() {
+    @Test func streamingIntoTheAnswerReplacesOnlyThatDisplayRow() {
         let state = ChatState()
         state.apply(.turnStarted(TurnStarted(turnID: turn)))
         state.apply(.toolCall(ToolCall(
@@ -361,7 +361,9 @@ struct StreamingChatStateTests {
         #expect(streamed.map(\.id) == full.map(\.id))
         #expect(streamed.map(\.text) == full.map(\.text))
         #expect(streamed.map(\.contentRevision) == full.map(\.contentRevision))
-        #expect(streamed.last?.text == "Hello")
+        // A live turn draws its steps *below* the streaming answer, so the
+        // answer is not the last display row — find it by kind.
+        #expect(streamed.first { $0.kind == .assistantText }?.text == "Hello")
 
         // Anything structural takes the full path again.
         state.apply(.toolCall(ToolCall(

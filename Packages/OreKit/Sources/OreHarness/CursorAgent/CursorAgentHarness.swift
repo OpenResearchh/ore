@@ -249,6 +249,11 @@ public actor CursorAgentSession: AgentSession {
     private var permissionMode: PermissionMode
     private var currentProcess: ChildProcess?
     private var turnTask: Task<Void, Never>?
+    /// The CLI prints its `result` record before the process exits, and the
+    /// engine drains queued messages the moment it sees that turn completion.
+    /// This flag marks the gap so `send` can wait out the exiting process
+    /// instead of rejecting the drained message as a mid-turn send.
+    private var turnHasReportedResult = false
     private var isStopping = false
     /// Set while the user's own interrupt is tearing the process down, so its
     /// non-zero exit isn't misread as a failure.
@@ -289,6 +294,13 @@ public actor CursorAgentSession: AgentSession {
 
     public func send(_ message: UserMessage) async throws {
         guard !isStopping else { throw HarnessError.sessionEnded }
+        if currentProcess != nil, turnHasReportedResult {
+            // The turn already announced its result; the process is only
+            // winding down. A message raced into this window — usually the
+            // queue draining on turn completion — waits the beat out rather
+            // than failing as a mid-turn send.
+            await turnTask?.value
+        }
         guard currentProcess == nil else {
             // No steering: a running turn owns the process until it exits.
             throw HarnessError.unsupportedCapability("sending while a turn is running")
@@ -385,12 +397,16 @@ public actor CursorAgentSession: AgentSession {
             if case .sessionStarted(let started) = event {
                 providerSessionID = started.providerSessionID
             }
+            if case .turnCompleted = event {
+                turnHasReportedResult = true
+            }
             continuation.yield(event)
         }
     }
 
     private func finishTurn(status: Int32, stderr: String) {
         currentProcess = nil
+        turnHasReportedResult = false
         // A process the user killed exits non-zero by definition. Classifying
         // that would raise an error banner for a deliberate stop, so the turn
         // is closed as if it had ended cleanly.

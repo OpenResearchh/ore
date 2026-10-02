@@ -47,8 +47,9 @@ struct PermissionPresentation: Equatable {
     var hiddenLineCount: Int
 
     init(request: PermissionRequest) {
-        let tool = request.toolName
-        let subject = Self.subject(tool: tool, input: request.input)
+        let tool = ToolCallShape.canonicalName(request.toolName)
+        let input = ToolCallShape.normalized(request.input, tool: request.toolName)
+        let subject = Self.subject(tool: tool, input: input)
         let named = Self.actionName(tool: tool)
 
         let summary = request.summary.flatMap(Self.nonEmpty)

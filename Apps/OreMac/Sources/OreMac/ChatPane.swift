@@ -1546,34 +1546,48 @@ struct ChatPane: View {
     }
 
     /// `tab` is the active chat's summary: the toolbar only exists when there is one.
+    ///
+    /// One row, always. As the chat column shrinks the chips compress in order —
+    /// drop the context meter, then hide labels on permission / mode / effort,
+    /// then truncate the model name — so send stays reachable without wrapping.
     private func composerToolbar(for tab: ChatSummary, chat: ChatState) -> some View {
-        ViewThatFits(in: .horizontal) {
+        let showsEffort = supportsEffort(for: tab)
+        let showsFast = supportsFastMode(tab)
+        let showsMeter = (chat.usage ?? tab.contextUsage)?.contextWindow != nil
+        return GeometryReader { geo in
+            let density = ComposerToolbarDensity.resolve(
+                availableWidth: geo.size.width,
+                showsEffort: showsEffort,
+                showsFast: showsFast,
+                showsMeter: showsMeter
+            )
             HStack(spacing: OreTheme.Space.xs) {
                 attachmentMenu
                 modelChooserButton(for: tab)
-                if supportsEffort(for: tab) {
-                    effortButton(for: tab)
+                if showsEffort {
+                    effortButton(for: tab, density: density)
                 }
-                permissionChip(chat: chat, chatSummary: tab)
-                modeControls(for: tab)
-                ComposerContextMeter(chat: chat, tab: tab)
-                Spacer(minLength: OreTheme.Space.md)
+                permissionChip(chat: chat, chatSummary: tab, density: density)
+                modeControls(for: tab, density: density)
+                if showsMeter, density.showsContextMeter {
+                    ComposerContextMeter(chat: chat, tab: tab, compact: density.compactsContextMeter)
+                }
+                Spacer(minLength: OreTheme.Space.xs)
                 composerSendCluster(chat: chat, chatSummary: tab)
+                    .fixedSize()
+                    .layoutPriority(2)
             }
-
-            HStack(spacing: OreTheme.Space.xs) {
-                attachmentMenu
-                modelChooserButton(for: tab)
-                permissionChip(chat: chat, chatSummary: tab)
-                modeControls(for: tab)
-                Spacer(minLength: OreTheme.Space.md)
-                composerSendCluster(chat: chat, chatSummary: tab)
-            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .leading)
         }
-        .frame(minHeight: 34)
+        .frame(height: 34)
+        .frame(maxWidth: .infinity)
     }
 
-    private func permissionChip(chat: ChatState, chatSummary: ChatSummary?) -> some View {
+    private func permissionChip(
+        chat: ChatState,
+        chatSummary: ChatSummary?,
+        density: ComposerToolbarDensity
+    ) -> some View {
         let current = chatSummary?.permissionMode ?? workspace.permissionMode
         // Switching is always allowed in an open chat. On a harness that binds
         // its policy per turn the change lands on the next one, and saying so
@@ -1597,13 +1611,17 @@ struct ChatPane: View {
                 Text("Applies from the next turn")
             }
         } label: {
-            chipLabel(current.displayName, systemImage: "shield.lefthalf.filled")
+            if density.showsPermissionLabel {
+                chipLabel(current.displayName, systemImage: "shield.lefthalf.filled")
+            } else {
+                iconChip("shield.lefthalf.filled")
+            }
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
         .help(landsNextTurn
             ? "Permission mode — \(chatSummary?.harness.displayName ?? "this agent") applies it from the next turn"
-            : "Permission mode")
+            : "Permission mode: \(current.displayName)")
     }
 
     /// Generic Allow/Deny is the wrong surface when a dedicated card already
@@ -1617,7 +1635,7 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
-    private func modeControls(for tab: ChatSummary) -> some View {
+    private func modeControls(for tab: ChatSummary, density: ComposerToolbarDensity) -> some View {
         if supportsFastMode(tab) {
             Menu {
                 Button {
@@ -1634,12 +1652,15 @@ struct ChatPane: View {
                 ComposerModeTag(
                     title: fastModeEnabled ? "Fast" : "Standard",
                     systemImage: fastModeEnabled ? "bolt.fill" : "speedometer",
-                    tint: fastModeEnabled ? .orange : .secondary
+                    tint: fastModeEnabled ? .orange : .secondary,
+                    iconOnly: !density.showsModeLabel
                 )
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Faster processing at higher credit use")
+            .help(fastModeEnabled
+                ? "Fast mode — higher credit use"
+                : "Standard mode")
         }
     }
 
@@ -1697,12 +1718,15 @@ struct ChatPane: View {
         .help("Add files or references")
     }
 
+    /// No width frame here: `maxWidth` is "fill up to", so capping the chip at
+    /// the row's leftover stretched the capsule past its text and left a long
+    /// empty highlight. The chip hugs its label; when the row runs short the
+    /// stack squeezes this one flexible child and the name truncates.
     private func modelChooserButton(for tab: ChatSummary) -> some View {
         Button { handleModelChipTap(for: tab) } label: {
             modelChipLabel(for: tab)
         }
         .buttonStyle(OrePressableButtonStyle())
-        .fixedSize()
         .overlay {
             // Scroll over the chip to switch harness (to each one's default
             // model) — the same gesture, animation, and haptics as the effort
@@ -1720,10 +1744,13 @@ struct ChatPane: View {
             ModelChooser(
                 currentHarness: tab.harness,
                 currentModel: tab.model,
-                currentEffort: reasoningEffort,
+                effort: $reasoningEffort,
                 preferFast: fastModeEnabled,
                 harnesses: model.readyHarnesses,
-                models: { model.knownModels(for: $0) }
+                models: { model.knownModels(for: $0) },
+                efforts: { harness, modelID in
+                    availableEfforts(for: tab, harness: harness, modelID: modelID)
+                }
             ) { harness, selectedModel in
                 if harness == tab.harness { model.setModel(selectedModel, for: tab) }
                 else { model.switchHarness(harness, model: selectedModel, for: tab) }
@@ -1759,6 +1786,7 @@ struct ChatPane: View {
             Text(voicePendingModel?.displayName ?? modelDisplayName(for: tab))
                 .font(.system(size: OreTheme.Font.body))
                 .lineLimit(1)
+                .truncationMode(.tail)
                 .contentTransition(.numericText())
             Color.clear.frame(width: 7, height: 1)
         }
@@ -1829,10 +1857,10 @@ struct ChatPane: View {
         return models.first { $0.id == selected }?.displayName ?? selected
     }
 
-    private func effortButton(for tab: ChatSummary) -> some View {
+    private func effortButton(for tab: ChatSummary, density: ComposerToolbarDensity) -> some View {
         let efforts = availableEfforts(for: tab)
         return Button { showEffortChooser.toggle() } label: {
-            effortChipLabel
+            effortChipLabel(showsLabel: density.showsEffortLabel)
         }
         .buttonStyle(OrePressableButtonStyle())
         .fixedSize()
@@ -1857,22 +1885,24 @@ struct ChatPane: View {
             : "Reasoning effort: \(reasoningEffort.displayName). Scroll to adjust.")
     }
 
-    private var effortChipLabel: some View {
+    private func effortChipLabel(showsLabel: Bool) -> some View {
         HStack(spacing: 5) {
             Image(systemName: "chart.bar.fill")
                 .font(.system(size: 11))
                 .symbolEffect(.bounce, value: effortStepPulse)
-            Text(reasoningEffort.displayName)
-                .font(.system(size: OreTheme.Font.body))
-                .lineLimit(1)
-                .contentTransition(.numericText())
-            Image(systemName: "chevron.down")
-                .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .opacity(effortScrollProgress == 0 ? 1 : 0)
+            if showsLabel {
+                Text(reasoningEffort.displayName)
+                    .font(.system(size: OreTheme.Font.body))
+                    .lineLimit(1)
+                    .contentTransition(.numericText())
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .opacity(effortScrollProgress == 0 ? 1 : 0)
+            }
         }
-        .padding(.horizontal, 9)
-        .frame(height: 26)
+        .padding(.horizontal, showsLabel ? 9 : 0)
+        .frame(width: showsLabel ? nil : 26, height: 26)
         .background(OreTheme.subduedFill, in: Capsule())
         .overlay {
             Capsule().stroke(
@@ -1886,7 +1916,7 @@ struct ChatPane: View {
             Image(systemName: effortScrollProgress >= 0 ? "chevron.up" : "chevron.down")
                 .font(.system(size: 7, weight: .bold))
                 .foregroundStyle(Color.accentColor)
-                .padding(.trailing, 9)
+                .padding(.trailing, showsLabel ? 9 : 5)
                 .opacity(min(1, abs(effortScrollProgress) * 1.6))
                 .offset(y: reduceMotion ? 0 : -effortScrollProgress * 1.5)
         }
@@ -3668,6 +3698,7 @@ struct StatusClockSchedule: TimelineSchedule {
 private struct ComposerContextMeter: View {
     let chat: ChatState
     let tab: ChatSummary
+    var compact: Bool = false
 
     var body: some View {
         if let usage = chat.usage ?? tab.contextUsage,
@@ -3676,7 +3707,8 @@ private struct ComposerContextMeter: View {
                 used: usage.totalContextTokens,
                 window: window,
                 usage: usage,
-                modelName: tab.model
+                modelName: tab.model,
+                compact: compact
             )
         }
     }
@@ -4193,22 +4225,33 @@ private extension VoiceChange {
 private struct ModelChooser: View {
     let currentHarness: HarnessKind
     let currentModel: String?
-    let currentEffort: ReasoningEffort
+    @Binding var effort: ReasoningEffort
     let preferFast: Bool
     let harnesses: [HarnessKind]
     let models: (HarnessKind) -> [AgentModel]
+    let efforts: (HarnessKind, String?) -> [ReasoningEffort]
     let onSelect: (HarnessKind, String?) -> Void
     @State private var search = ""
     @State private var hoveredModelKey: String?
+
+    private var currentEfforts: [ReasoningEffort] {
+        efforts(currentHarness, currentModel)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Choose model").font(.headline)
             TextField("Search models", text: $search)
                 .textFieldStyle(.roundedBorder)
+            if currentEfforts.count > 1 {
+                effortBar
+            }
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                // A lazy stack reused rows while scrolling and painted the
+                // previous Cursor title onto the next one. This list is short
+                // enough to lay out in full.
+                VStack(alignment: .leading, spacing: 2) {
                     ForEach(harnesses, id: \.self) { harness in
                         let families = filteredFamilies(for: harness)
                         if search.isEmpty || !families.isEmpty {
@@ -4219,6 +4262,7 @@ private struct ModelChooser: View {
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.top, 10)
+                            .id(harness.rawValue + ":header")
                             if search.isEmpty {
                                 modelRow(harness, family: nil, variantID: nil)
                             }
@@ -4227,7 +4271,7 @@ private struct ModelChooser: View {
                                     harness,
                                     family: family,
                                     variantID: family.resolve(
-                                        effort: currentEffort,
+                                        effort: effort,
                                         fast: preferFast && family.supportsFast
                                     ).id
                                 )
@@ -4239,6 +4283,37 @@ private struct ModelChooser: View {
         }
         .padding(16)
         .frame(width: 380, height: 460)
+    }
+
+    private var effortBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Effort")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(currentEfforts, id: \.self) { option in
+                        Button {
+                            effort = option
+                        } label: {
+                            Text(option.displayName)
+                                .font(.system(size: 11, weight: effort == option ? .semibold : .regular))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .foregroundStyle(effort == option ? Color.accentColor : .primary)
+                                .background(
+                                    effort == option
+                                        ? Color.accentColor.opacity(0.16)
+                                        : OreTheme.subduedFill,
+                                    in: Capsule()
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help(option.displayName)
+                    }
+                }
+            }
+        }
     }
 
     private func filteredFamilies(for harness: HarnessKind) -> [ModelFamily] {
@@ -4290,6 +4365,7 @@ private struct ModelChooser: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(OrePressableButtonStyle())
+        .id(key)
         .onHover { hovering in
             if hovering { hoveredModelKey = key }
             else if hoveredModelKey == key { hoveredModelKey = nil }
@@ -4315,6 +4391,128 @@ private struct ModelChooser: View {
         if harness == .cursorAgent { return "Available through Cursor" }
         if harness == .antigravity { return "Available through Google Antigravity" }
         return "General-purpose model"
+    }
+}
+
+/// Progressive compression for the composer chip row. Always one line: secondary
+/// chips lose labels first, and the model chip is capped to whatever width is
+/// left so the send cluster never leaves the column.
+struct ComposerToolbarDensity: Equatable {
+    enum Kind: Equatable {
+        case roomy, regular, compact, tight
+    }
+
+    var kind: Kind
+    var showsContextMeter: Bool
+    var compactsContextMeter: Bool
+    var showsPermissionLabel: Bool
+    var showsModeLabel: Bool
+    var showsEffortLabel: Bool
+    /// Hard cap so a long family name truncates instead of shoving send away.
+    var modelMaxWidth: CGFloat
+
+    private static let spacing: CGFloat = 4
+    private static let attachmentWidth: CGFloat = 28
+    private static let sendClusterWidth: CGFloat = 112
+    private static let minModelWidth: CGFloat = 88
+    private static let labeledEffortWidth: CGFloat = 78
+    private static let labeledPermissionWidth: CGFloat = 86
+    private static let labeledModeWidth: CGFloat = 90
+    private static let iconChipWidth: CGFloat = 26
+    private static let fullMeterWidth: CGFloat = 118
+    private static let compactMeterWidth: CGFloat = 72
+
+    /// Picks the roomiest chip style whose non-model budget still leaves room
+    /// for a readable model chip. `modelMaxWidth` is always the leftover.
+    static func resolve(
+        availableWidth: CGFloat,
+        showsEffort: Bool,
+        showsFast: Bool,
+        showsMeter: Bool
+    ) -> ComposerToolbarDensity {
+        let candidates: [(Kind, Bool, Bool, Bool, Bool, Bool)] = [
+            // kind, showMeter, compactMeter, permissionLabel, modeLabel, effortLabel
+            (.roomy, true, false, true, true, true),
+            (.regular, true, true, true, true, true),
+            (.regular, false, true, true, true, true),
+            (.compact, false, true, false, false, true),
+            (.tight, false, true, false, false, false),
+        ]
+
+        for (kind, wantMeter, compactMeter, permissionLabel, modeLabel, effortLabel) in candidates {
+            let meter = showsMeter && wantMeter
+            let reserved = reservedWidth(
+                showsEffort: showsEffort,
+                showsFast: showsFast,
+                showsMeter: meter,
+                compactMeter: compactMeter,
+                permissionLabel: permissionLabel,
+                modeLabel: modeLabel,
+                effortLabel: effortLabel
+            )
+            let leftover = availableWidth - reserved
+            if leftover >= minModelWidth {
+                return ComposerToolbarDensity(
+                    kind: kind,
+                    showsContextMeter: meter,
+                    compactsContextMeter: compactMeter || !meter,
+                    showsPermissionLabel: permissionLabel,
+                    showsModeLabel: modeLabel,
+                    showsEffortLabel: effortLabel,
+                    modelMaxWidth: leftover
+                )
+            }
+        }
+
+        let reserved = reservedWidth(
+            showsEffort: showsEffort,
+            showsFast: showsFast,
+            showsMeter: false,
+            compactMeter: true,
+            permissionLabel: false,
+            modeLabel: false,
+            effortLabel: false
+        )
+        return ComposerToolbarDensity(
+            kind: .tight,
+            showsContextMeter: false,
+            compactsContextMeter: true,
+            showsPermissionLabel: false,
+            showsModeLabel: false,
+            showsEffortLabel: false,
+            modelMaxWidth: max(64, availableWidth - reserved)
+        )
+    }
+
+    /// Width claimed by everything except the model chip (including spacings
+    /// and the trailing send cluster).
+    static func reservedWidth(
+        showsEffort: Bool,
+        showsFast: Bool,
+        showsMeter: Bool,
+        compactMeter: Bool,
+        permissionLabel: Bool,
+        modeLabel: Bool,
+        effortLabel: Bool
+    ) -> CGFloat {
+        var parts: [CGFloat] = [attachmentWidth, sendClusterWidth]
+        if showsEffort {
+            parts.append(effortLabel ? labeledEffortWidth : iconChipWidth)
+        }
+        parts.append(permissionLabel ? labeledPermissionWidth : iconChipWidth)
+        if showsFast {
+            parts.append(modeLabel ? labeledModeWidth : iconChipWidth)
+        }
+        if showsMeter {
+            parts.append(compactMeter ? compactMeterWidth : fullMeterWidth)
+        }
+        // attach + model + optionals + spacer + send
+        var views = 4 // attachment, model, spacer, send
+        if showsEffort { views += 1 }
+        views += 1 // permission
+        if showsFast { views += 1 }
+        if showsMeter { views += 1 }
+        return parts.reduce(0, +) + spacing * CGFloat(views - 1)
     }
 }
 
@@ -4352,6 +4550,7 @@ private struct ContextMeter: View {
     let window: Int
     var usage: UsageReport?
     var modelName: String?
+    var compact: Bool = false
 
     @State private var hovering = false
 
@@ -4361,12 +4560,14 @@ private struct ContextMeter: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            Text("Context")
-                .font(.system(size: OreTheme.Font.caption, weight: .medium))
-                .foregroundStyle(.secondary)
+            if !compact {
+                Text("Context")
+                    .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
             ProgressView(value: fraction)
                 .progressViewStyle(.linear)
-                .frame(width: 48)
+                .frame(width: compact ? 36 : 48)
                 .tint(fraction > 0.9 ? .orange : .accentColor)
             Text("\(Int(fraction * 100))%")
                 .font(.system(size: OreTheme.Font.caption, design: .rounded).monospacedDigit())
@@ -5130,16 +5331,25 @@ private struct ComposerModeTag: View {
     let title: String
     let systemImage: String
     let tint: Color
+    var iconOnly: Bool = false
 
     var body: some View {
-        Label(title, systemImage: systemImage)
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 8)
-            .frame(height: 24)
-            .background(tint.opacity(0.09), in: Capsule())
-            .overlay(Capsule().stroke(tint.opacity(0.18), lineWidth: 1))
-            .accessibilityLabel("\(title) mode")
+        Group {
+            if iconOnly {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 26, height: 24)
+            } else {
+                Label(title, systemImage: systemImage)
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+            }
+        }
+        .foregroundStyle(tint)
+        .background(tint.opacity(0.09), in: Capsule())
+        .overlay(Capsule().stroke(tint.opacity(0.18), lineWidth: 1))
+        .accessibilityLabel("\(title) mode")
     }
 }
 

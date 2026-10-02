@@ -85,10 +85,21 @@ public enum HarnessCLIUpdater {
         /// the install actually on disk.
         static func permissionDeniedMessage(for kind: HarnessKind, in detail: String) -> String? {
             guard HarnessUpdateFailure.isPermissionProblem(detail) else { return nil }
-            return """
-            Could not update \(kind.displayName): this install is not writable \
-            by your user (often a root-owned `/usr/local` npm package).
-            """
+            var lines: [String] = []
+            if let path = HarnessUpdateFailure.deniedPath(in: detail),
+               HarnessUpdateFailure.isCacheOrStaging(path) {
+                lines.append(
+                    "Could not update \(kind.displayName): permission denied creating '\(path)'."
+                )
+            } else {
+                lines.append(
+                    "Could not update \(kind.displayName): this install is not writable by your user (often a root-owned `/usr/local` npm package)."
+                )
+            }
+            if let uninstall = HarnessUpdateFailure.leftoverUninstallCommand(in: detail) {
+                lines.append("A leftover npm install is still on PATH. The CLI says to run `\(uninstall)`.")
+            }
+            return lines.joined(separator: "\n")
         }
     }
 
@@ -284,7 +295,8 @@ public enum HarnessCLIUpdater {
     /// rather than a plausible-looking guess.
     public static func permissionRepair(
         for kind: HarnessKind,
-        executablePath: String?
+        executablePath: String?,
+        failureText: String? = nil
     ) async -> HarnessRepair? {
         let method = installMethod(for: kind, executablePath: executablePath)
         // Read off the path, not assumed: the repair ends in `brew upgrade`,
@@ -300,7 +312,8 @@ public enum HarnessCLIUpdater {
             executablePath: executablePath.map(resolvingSymlinks),
             npmPrefix: await npmPrefix,
             brewPrefix: await brewPrefix,
-            brewToken: resolvedBrewToken
+            brewToken: resolvedBrewToken,
+            failureText: failureText
         )
     }
 

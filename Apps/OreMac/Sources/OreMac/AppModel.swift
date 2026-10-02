@@ -3730,7 +3730,7 @@ final class AppModel {
             // happened: working out the repair asks the shell where npm and
             // Homebrew keep their prefixes.
             if HarnessUpdateFailure.isPermissionProblem(message) {
-                let repair = await client.harnessPermissionRepair(kind)
+                let repair = await client.harnessPermissionRepair(kind, failureText: message)
                 // Still the same failure, and not superseded by a retry.
                 if harnessCLIUpdate?.kind == kind, harnessCLIUpdate?.error == message {
                     harnessCLIUpdate?.repair = repair

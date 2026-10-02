@@ -324,6 +324,50 @@ struct WorkspaceEngineTests {
         ).isEmpty)
     }
 
+    @Test func aDrainedMessageTheSessionRejectsGoesBackInTheQueue() async throws {
+        // cursor-agent prints its result record before the process exits, and
+        // the drain runs on that completion event. When the send raced into
+        // that window the session refused it as mid-turn and the user's text
+        // was simply gone — dequeued, never delivered, "The agent hit an
+        // error" as the only trace.
+        let harness = try await makeEngine()
+        let defaultChatID = ChatID(rawValue: harness.workspaceID.rawValue)
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "first"
+        ))
+        let session = try #require(harness.harness.latestSession)
+        session.emit(.turnStarted(TurnStarted(turnID: TurnID(rawValue: "t1"))))
+        try await Task.sleep(for: .milliseconds(150))
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID, text: "second"
+        ))
+        await session.failNextSend()
+        session.emit(.turnCompleted(TurnResult(
+            turnID: TurnID(rawValue: "t1"), outcome: .completed
+        )))
+
+        // The drain ran, the session refused, and the message is back in the
+        // queue instead of lost. Waiting on the rejection itself keeps the
+        // check honest: the store holding one row is also true before the
+        // drain has run at all.
+        #expect(await waitUntil { await session.rejectedSendCount == 1 })
+        #expect(await waitUntil {
+            (try? await harness.store.queuedMessages(
+                workspaceID: harness.workspaceID
+            ))?.count == 1
+        })
+        #expect(await session.messageTexts() == ["first"])
+
+        // The next drain delivers it — here, a model change while idle.
+        _ = try await harness.engine.setModel(chatID: defaultChatID, model: "opus")
+        #expect(await waitUntil { await session.messageTexts() == ["first", "second"] })
+        #expect(try await harness.store.queuedMessages(
+            workspaceID: harness.workspaceID
+        ).isEmpty)
+    }
+
     @Test func switchingModelAfterStoppingSendsWhatWasQueued() async throws {
         // Stopping the agent and picking a different model is the natural way
         // out of a bad model choice. The message queued behind the stopped turn

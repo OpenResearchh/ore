@@ -1353,7 +1353,11 @@ public actor WorkspaceEngine {
         guard !runtime.isTurnActive else { return }
         guard let next = try? await store.dequeueMessage(chatID: runtime.record.chatID) else { return }
         runtime.queuedMessageCount = max(0, runtime.queuedMessageCount - 1)
-        _ = try? await send(SendMessageRequest(
+        // `send` reports a turn that never started as `false` (it surfaces the
+        // session error itself rather than throwing). Either way the message
+        // was typed by a person, so a failed handoff puts it back in the queue
+        // for the next drain instead of deleting it.
+        let sent = (try? await send(SendMessageRequest(
             workspaceID: workspaceID,
             chatID: runtime.record.chatID,
             text: next.text,
@@ -1371,7 +1375,11 @@ public actor WorkspaceEngine {
             submissionID: next.submissionID.isEmpty
                 ? UUID().uuidString
                 : next.submissionID
-        ))
+        ))) ?? false
+        if !sent {
+            try? await store.enqueueMessage(next)
+            runtime.queuedMessageCount += 1
+        }
         // `send` doesn't publish on its success path, and the drain can run
         // after the caller's own publish, so the count the queue card watches
         // has to be republished here or the card outlives the message.

@@ -86,6 +86,41 @@ struct ModelVariantCatalogTests {
         ) == nil)
     }
 
+    @Test func cursorThinkingEffortsShareOneStableName() {
+        let models = [
+            AgentModel(id: "claude-4.6-opus-high", displayName: "Claude Opus 4.6 1M"),
+            AgentModel(id: "claude-4.6-opus-max", displayName: "Claude Opus 4.6 1M Max"),
+            AgentModel(
+                id: "claude-4.6-opus-high-thinking",
+                displayName: "Claude Opus 4.6 1M Thinking"
+            ),
+            AgentModel(
+                id: "claude-4.6-opus-max-thinking",
+                displayName: "Claude Opus 4.6 1M Max Thinking"
+            ),
+            AgentModel(id: "gpt-5.5-medium", displayName: "GPT-5.5 1M"),
+            AgentModel(id: "gpt-5.5-medium-fast", displayName: "GPT-5.5 Fast"),
+            AgentModel(id: "gpt-5.5-high", displayName: "GPT-5.5 1M High"),
+            AgentModel(id: "gpt-5.5-high-fast", displayName: "GPT-5.5 High Fast"),
+            AgentModel(id: "grok-4.7-low", displayName: "Grok 4.7  Low"),
+            AgentModel(id: "grok-4.7-high", displayName: "Grok 4.7  High"),
+        ]
+        let families = ModelVariantCatalog.families(from: models)
+        let names = families.map(\.displayName)
+        #expect(names == [
+            "Claude Opus 4.6 1M",
+            "Claude Opus 4.6 1M Thinking",
+            "GPT-5.5 1M",
+            "Grok 4.7",
+        ])
+        let thinking = families[1]
+        #expect(thinking.id == "claude-4.6-opus-thinking")
+        #expect(thinking.encodedEfforts == [.high, .max])
+        #expect(thinking.resolve(effort: .max, fast: false).id == "claude-4.6-opus-max-thinking")
+        // Same catalog twice must not swap the tied GPT-5.5 title.
+        #expect(ModelVariantCatalog.families(from: models).map(\.displayName) == names)
+    }
+
     @Test func alignLeavesASingleClaudeIdAlone() {
         let models = [
             AgentModel(

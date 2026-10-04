@@ -39,15 +39,18 @@ struct FinishPhraseModel: Codable, Equatable, Sendable {
     ]
 
     /// What to feed the recognizer's contextual-strings biasing.
+    ///
+    /// Full phrases only. Single short tokens ("yip", "app", "tip") pull the
+    /// general English model toward hearing the finish phrase in ordinary
+    /// speech, which is how assistant dictation loses real words.
     var vocabulary: [String] {
         var seen = Set<String>()
         var out: [String] = []
-        for token in canonicalTokens + slotAlternatives.flatMap({ $0 })
-            + enrolledVariants.flatMap({ $0 }) {
-            if seen.insert(token).inserted { out.append(token) }
-        }
         for phrase in [spoken] + enrolledVariants.map({ $0.joined(separator: " ") }) {
-            if seen.insert(phrase).inserted { out.append(phrase) }
+            let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = trimmed.split { $0.isWhitespace }
+            guard parts.count >= 2 || trimmed.count >= 6 else { continue }
+            if seen.insert(trimmed.lowercased()).inserted { out.append(trimmed) }
         }
         return out
     }

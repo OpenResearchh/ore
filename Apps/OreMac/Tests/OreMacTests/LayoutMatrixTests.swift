@@ -200,7 +200,11 @@ private struct LayoutRender {
         let defaults = UserDefaults.standard
         let previousReview = defaults.object(forKey: "ore.showsReview")
         defaults.set(scene.showsReview, forKey: "ore.showsReview")
-        defer { defaults.set(previousReview, forKey: "ore.showsReview") }
+        ChromeLayoutStore.shared.reloadFromDefaults()
+        defer {
+            defaults.set(previousReview, forKey: "ore.showsReview")
+            ChromeLayoutStore.shared.reloadFromDefaults()
+        }
 
         let model = AppModel(client: InProcessCoreClient(store: try OreStore()))
         model.apply(.snapshot(CoreSnapshot(workspaces: scene.workspaces, harnesses: [])))

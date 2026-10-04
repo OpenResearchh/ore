@@ -22,6 +22,12 @@
 	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
 	<true/>
 
+	<!-- SpeechAnalyzer and FluidAudio compile CoreML models at load. Hardened
+	     runtime blocks MAP_JIT unless this is set; without it the on-device
+	     STT asset never installs and the neural voice never loads. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+
 	<!-- The child processes ORE spawns inherit its environment deliberately —
 	     that is how a user's version managers and PATH reach the agent CLI. -->
 	<key>com.apple.security.inherit</key>

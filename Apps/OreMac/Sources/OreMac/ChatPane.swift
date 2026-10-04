@@ -31,6 +31,7 @@ struct ChatPane: View {
     @State private var isSearching = false
     @State private var effectiveSearchQuery = ""
     @State private var searchFocusRequest = 0
+    @State private var showChatHistory = false
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
     /// Attachment relative paths that live as inline chips in the draft (pasted
@@ -84,6 +85,7 @@ struct ChatPane: View {
     /// matcher skips these paths for the rest of the session, which restores
     /// the spoken words to the quote and keeps the tag from committing.
     @State private var voiceCanceledFilePaths: Set<String> = []
+    @State private var voiceFinalizeGeneration = 0
     /// The floating dock's measured height, fed into the transcript's bottom
     /// content inset so rows can scroll clear of the glass above them.
     ///
@@ -179,8 +181,10 @@ struct ChatPane: View {
                     renameChatTarget: $renameChatTarget,
                     renameChatText: $renameChatText,
                     isSearching: $isSearching,
-                    searchFocusRequest: $searchFocusRequest
+                    searchFocusRequest: $searchFocusRequest,
+                    showChatHistory: $showChatHistory
                 )
+                ChromePaneListener(workspaceID: workspace.id) { applyChromePaneRequest($0) }
                 // No scrim. A full-width gradient here ended in hard
                 // rectangular edges — the "square shadow" against the
                 // inspector's seam. Legibility over scrolled rows is the tabs'
@@ -936,6 +940,7 @@ struct ChatPane: View {
         @Binding var renameChatText: String
         @Binding var isSearching: Bool
         @Binding var searchFocusRequest: Int
+        @Binding var showChatHistory: Bool
         @State private var hoveredTabKey: String?
 
         var body: some View {
@@ -1248,34 +1253,82 @@ struct ChatPane: View {
             .disabled(model.chatCreationsInFlight.contains(workspace.id))
             .help("New tab (⌘T)")
 
-            Menu {
+            Button { showChatHistory.toggle() } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .popover(isPresented: $showChatHistory, arrowEdge: .bottom) {
+                chatHistoryMenu(revertableTurns: revertableTurns)
+            }
+            .help("Chat and checkpoint history")
+        }
+    }
+
+        @ViewBuilder
+        private func chatHistoryMenu(revertableTurns: [TurnID]) -> some View {
+            VStack(alignment: .leading, spacing: 2) {
+                let closed = model.chats(for: workspace.id, includeClosed: true).filter(\.isClosed)
                 if !revertableTurns.isEmpty {
-                    Section("Checkpoints") {
-                        ForEach(Array(revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
-                            Button("Before turn \(index + 1)") { revertTarget = turn }
+                    Text("CHECKPOINTS")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.top, 6)
+                    ForEach(Array(revertableTurns.enumerated().reversed()), id: \.offset) { index, turn in
+                        Button("Before turn \(index + 1)") {
+                            revertTarget = turn
+                            showChatHistory = false
                         }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .frame(minHeight: 28)
                     }
                 }
-                let closed = model.chats(for: workspace.id, includeClosed: true).filter(\.isClosed)
                 if !closed.isEmpty {
-                    Section("Closed chats") {
-                        ForEach(closed) { tab in
-                            Button(tab.title) { model.reopenChat(tab.id, in: workspace.id) }
+                    Text("CLOSED CHATS")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 8)
+                        .padding(.top, 6)
+                    ForEach(closed) { tab in
+                        Button(tab.title) {
+                            model.reopenChat(tab.id, in: workspace.id)
+                            showChatHistory = false
                         }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .frame(minHeight: 28)
                     }
                 }
                 if revertableTurns.isEmpty && closed.isEmpty {
                     Text("No history yet")
+                        .foregroundStyle(.secondary)
+                        .padding(12)
                 }
-            } label: {
-                Image(systemName: "clock.arrow.circlepath")
-                    .frame(width: 26, height: 26)
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Chat and checkpoint history")
+            .padding(.bottom, 6)
+            .frame(minWidth: 220)
         }
     }
+
+    private struct ChromePaneListener: View {
+        @Environment(AppModel.self) private var model
+        let workspaceID: WorkspaceID
+        var apply: (ChromePaneRequest) -> Void
+        private let chrome = ChromeLayoutStore.shared
+
+        var body: some View {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .onChange(of: chrome.paneRequestID) { _, id in
+                    guard id > 0, model.selectedWorkspaceID == workspaceID,
+                          let request = chrome.consumePaneRequest(where: { $0.isComposerControl })
+                    else { return }
+                    apply(request)
+                }
+        }
     }
 
     // MARK: - Composer
@@ -2230,6 +2283,7 @@ struct ChatPane: View {
         voicePendingModel = nil
         voiceChanges = []
         voiceCanceledFilePaths = []
+        voiceFinalizeGeneration += 1
         withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
             voiceQuote = ""
         }
@@ -2280,14 +2334,19 @@ struct ChatPane: View {
             voiceAttachedClipboard = false
             return
         }
-        let finalText = finalizeVoiceIntents(spoken: spoken)
-        switch VoiceTurnCommit.resolve(disposition, prefix: draft, spokenFormatted: finalText) {
-        case .send(let text):
-            holdThenSend(VoiceSettledTurn(quote: finalText, combined: text, spoken: spoken))
-        case .updateDraft(let text):
-            draft = text
-        case .none:
-            break
+        voiceFinalizeGeneration += 1
+        let generation = voiceFinalizeGeneration
+        Task { @MainActor in
+            let finalText = await finalizeVoiceIntents(spoken: spoken)
+            guard generation == voiceFinalizeGeneration else { return }
+            switch VoiceTurnCommit.resolve(disposition, prefix: draft, spokenFormatted: finalText) {
+            case .send(let text):
+                holdThenSend(VoiceSettledTurn(quote: finalText, combined: text, spoken: spoken))
+            case .updateDraft(let text):
+                draft = text
+            case .none:
+                break
+            }
         }
     }
 
@@ -2397,6 +2456,8 @@ struct ChatPane: View {
     ///
     /// Effort and mode are applied immediately — they are local state. The model
     /// is only *shown*; committing it is deferred to `finalizeVoiceIntents`.
+    /// Window chrome is the assistant's job, not the composer's: dictation here
+    /// only fills the prompt.
     private func applyLiveVoiceIntents(spoken: String) {
         let intents = voiceIntents(from: spoken)
 
@@ -2438,7 +2499,8 @@ struct ChatPane: View {
     }
 
     /// The transcript with settings clauses stripped and spoken breaks applied,
-    /// without any of the end-of-session side effects.
+    /// without any of the end-of-session side effects. Composer dictation does
+    /// not peel window chrome — those words stay in the prompt.
     private func formattedVoiceText(spoken: String) -> String {
         VoiceDictationFormatter.format(voiceIntents(from: spoken).rewritten)
     }
@@ -2450,7 +2512,7 @@ struct ChatPane: View {
         guard !incoming.isEmpty else { return }
         var merged = voiceChanges
         for change in incoming {
-            let index = change.kind == .file
+            let index = (change.kind == .file || change.kind == .chrome)
                 ? merged.firstIndex(where: { $0.id == change.id })
                 : merged.firstIndex(where: { $0.kind == change.kind })
             if let index {
@@ -2485,7 +2547,7 @@ struct ChatPane: View {
                 voiceChanges.removeAll { $0.id == change.id }
             }
             applyLiveVoiceIntents(spoken: voice.transcript)
-        case .effort, .mode, .clipboard:
+        case .effort, .mode, .clipboard, .chrome:
             break
         }
     }
@@ -2523,7 +2585,7 @@ struct ChatPane: View {
     /// every partial transcript. Spoken filenames are left for the agent.
     /// Returns the formatted, intent-stripped text ready to send or park in
     /// the draft; settings commit even when nothing sendable was said.
-    private func finalizeVoiceIntents(spoken: String) -> String {
+    private func finalizeVoiceIntents(spoken: String) async -> String {
         let intents = voiceIntents(from: spoken)
         var rewritten = intents.rewritten
 
@@ -2628,6 +2690,30 @@ struct ChatPane: View {
             : "\(chat.draftComments.count) review comment"
                 + (chat.draftComments.count == 1 ? "" : "s")
                 + " will be sent with this message"
+    }
+
+    private func applyChromePaneRequest(_ request: ChromePaneRequest) {
+        switch request {
+        case .find:
+            isSearching = true
+            searchFocusRequest += 1
+        case .attach:
+            chooseFiles()
+        case .modelChooser:
+            showModelChooser = true
+        case .effortChooser:
+            showEffortChooser = true
+        case .send:
+            send()
+        case .history:
+            showChatHistory = true
+        case .setFast(let enabled):
+            fastModeEnabled = enabled
+        case .setEffort(let effort):
+            reasoningEffort = effort
+        default:
+            break
+        }
     }
 
     private func send() {
@@ -4218,6 +4304,7 @@ private extension VoiceChange {
         case .mode: "lock.shield"
         case .clipboard: "doc.on.clipboard"
         case .file: "doc.text"
+        case .chrome: "macwindow"
         }
     }
 }

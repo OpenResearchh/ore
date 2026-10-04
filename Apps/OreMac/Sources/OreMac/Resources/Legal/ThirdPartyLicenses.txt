@@ -1393,3 +1393,14 @@ ORE's optional neural narration voice uses FluidInference's Core ML
 conversion of the model (https://huggingface.co/FluidInference/pocket-tts-coreml).
 The weights are downloaded on demand when that voice is chosen and are not
 part of the app download.
+
+------------------------------------------------------------------------------
+Laya (on-device decision model)
+https://github.com/NandhaKishorM/laya
+https://huggingface.co/convaiinnovations/laya
+------------------------------------------------------------------------------
+
+Laya by Convai Innovations, licensed under the Apache License 2.0.
+The optional English checkpoint is downloaded on demand when on-device
+decisions are enabled and is not part of the app download. ORE talks to it
+only on this Mac (a local System One runner on loopback, never TypeSafe's API).

@@ -31,6 +31,9 @@ their own licenses:
   The optional neural narration voice downloads FluidInference's Core ML
   conversion (https://huggingface.co/FluidInference/pocket-tts-coreml) on
   demand; the model weights are not distributed with ORE.
+- Laya (https://github.com/NandhaKishorM/laya) by Convai Innovations — Apache License 2.0.
+  The optional on-device decision model is downloaded on demand; the weights
+  are not distributed with ORE.
 
 The full license texts ship inside the app (Settings › About) and in
 Apps/OreMac/Sources/OreMac/Resources/Legal/ThirdPartyLicenses.txt.

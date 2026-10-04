@@ -127,8 +127,7 @@ struct OreMacApp: App {
     @State private var isShowingFilePalette = false
     @State private var isShowingShortcuts = false
     // Mirror RootView's pane flags so the menu shortcuts can toggle them.
-    @AppStorage("ore.showsSidebar") private var showsSidebar = true
-    @AppStorage("ore.showsReview") private var showsReview = true
+    private var chrome: ChromeLayoutStore { ChromeLayoutStore.shared }
 
     init() {
         // Before anything reads a preference, so "never set" and "set to the
@@ -354,13 +353,13 @@ struct OreMacApp: App {
 
                 Divider()
 
-                Button(showsSidebar ? "Hide Sidebar" : "Show Sidebar") {
-                    showsSidebar.toggle()
+                Button(chrome.showsSidebar ? "Hide Sidebar" : "Show Sidebar") {
+                    chrome.showsSidebar.toggle()
                 }
                 .keyboardShortcut("b", modifiers: .command)
 
-                Button(showsReview ? "Hide Review" : "Show Review") {
-                    showsReview.toggle()
+                Button(chrome.showsReview ? "Hide Review" : "Show Review") {
+                    chrome.showsReview.toggle()
                 }
                 .keyboardShortcut("b", modifiers: [.command, .option])
 
@@ -646,12 +645,10 @@ struct RootView: View {
     var launchFailure: String?
     @Binding var isShowingShortcuts: Bool
 
-    // Persisted, so the app comes back the way it was left. A layout that
-    // resets on every launch makes the terminal feel like a thing you have to
-    // re-open rather than a pane that is simply there.
-    @AppStorage("ore.showsReview") private var showsReview = true
-    @AppStorage("ore.showsSidebar") private var showsSidebar = true
-    @AppStorage("ore.bottomPane") private var bottomPaneRaw = BottomPane.none.rawValue
+    // Persisted through ChromeLayoutStore so voice writes move the same panes
+    // the menus and toolbar do — `@AppStorage` did not refresh on UserDefaults
+    // writes from the assistant.
+    private let chrome = ChromeLayoutStore.shared
     @AppStorage("ore.reviewWidth") private var reviewWidth = 340.0
     @State private var reviewDragStart: CGFloat?
     /// The presence strip's usage card (limits, tokens, spend).
@@ -681,8 +678,8 @@ struct RootView: View {
     }
 
     private var bottomPane: BottomPane {
-        get { BottomPane(rawValue: bottomPaneRaw) ?? .none }
-        nonmutating set { bottomPaneRaw = newValue.rawValue }
+        get { chrome.showsTerminal ? .terminal : .none }
+        nonmutating set { chrome.showsTerminal = newValue == .terminal }
     }
 
     enum BottomPane: String, CaseIterable {
@@ -766,7 +763,10 @@ struct RootView: View {
         .sheet(isPresented: $isShowingPalette) { CommandPalette() }
         .sheet(isPresented: $isShowingFilePalette) {
             if let workspace = model.selectedWorkspace {
-                FilePalette(workspace: workspace)
+                FilePalette(
+                    workspace: workspace,
+                    initialQuery: ChromeLayoutStore.shared.pendingFileQuery ?? ""
+                )
             }
         }
         .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
@@ -843,14 +843,14 @@ struct RootView: View {
                 }
             }
             ToolbarItem(placement: .primaryAction) {
-                Button { showsReview.toggle() } label: {
+                Button { chrome.showsReview.toggle() } label: {
                     Label(
-                        showsReview ? "Hide Review" : "Show Review",
+                        chrome.showsReview ? "Hide Review" : "Show Review",
                         systemImage: "sidebar.right"
                     )
-                    .symbolVariant(showsReview ? .fill : .none)
+                    .symbolVariant(chrome.showsReview ? .fill : .none)
                 }
-                .help(showsReview ? "Hide the review pane" : "Show the review pane")
+                .help(chrome.showsReview ? "Hide the review pane" : "Show the review pane")
                 .keyboardShortcut("r", modifiers: [.command, .option])
             }
         }
@@ -861,8 +861,8 @@ struct RootView: View {
     // without introducing a second source of truth.
     private var sidebarVisibility: Binding<NavigationSplitViewVisibility> {
         Binding(
-            get: { showsSidebar ? .all : .detailOnly },
-            set: { showsSidebar = ($0 != .detailOnly) }
+            get: { chrome.showsSidebar ? .all : .detailOnly },
+            set: { chrome.showsSidebar = ($0 != .detailOnly) }
         )
     }
 
@@ -886,6 +886,9 @@ struct RootView: View {
             .background {
                 GitDiffPrefetch(workspace: workspace)
             }
+            .background {
+                FilePaletteChromeListener(isShowing: $isShowingFilePalette)
+            }
         } else {
             welcome
         }
@@ -894,7 +897,7 @@ struct RootView: View {
     private func workspaceMain(_ workspace: WorkspaceSummary) -> some View {
         GeometryReader { geometry in
             Group {
-                if showsReview {
+                if chrome.showsReview {
                     let minimumChatWidth = min(420, max(300, geometry.size.width * 0.52))
                     let maximumReviewWidth = max(195, geometry.size.width - minimumChatWidth - 5)
                     let minimumReviewWidth = min(280, maximumReviewWidth)
@@ -1391,10 +1394,30 @@ private struct KeyboardShortcutsView: View {
     }
 }
 
+/// Voice ⌘P / open-named-file. Kept off RootView's modifier chain so the
+/// type checker can still finish the window.
+private struct FilePaletteChromeListener: View {
+    @Binding var isShowing: Bool
+    private let chrome = ChromeLayoutStore.shared
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: chrome.paneRequestID) { _, id in
+                guard id > 0,
+                      chrome.consumePaneRequest(where: { $0.isFilePalette }) != nil
+                else { return }
+                isShowing = true
+            }
+    }
+}
+
 private struct FilePalette: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let workspace: WorkspaceSummary
+    var initialQuery: String = ""
 
     @State private var files: [WorkspaceFileNode] = []
     @State private var query = ""
@@ -1455,6 +1478,10 @@ private struct FilePalette: View {
         .frame(width: 620, height: 470)
         .background(.regularMaterial)
         .task {
+            if query.isEmpty, !initialQuery.isEmpty {
+                query = initialQuery
+                ChromeLayoutStore.shared.pendingFileQuery = nil
+            }
             files = await model.workspaceFiles(for: workspace)
             selection = matches.first?.path
             focused = true

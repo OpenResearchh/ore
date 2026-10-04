@@ -218,7 +218,7 @@ struct VoiceHoldRoutingTests {
     }
 
     @Test func holdToTalkOpensTheMicAtTheThresholdAndSendsOnRelease() {
-        #expect(kinds(.armed, .holdToTalk) == [.arm, .start])
+        #expect(kinds(.armed, .holdToTalk) == [.start])
         #expect(kinds(.activated, .holdToTalk) == [.stop])
         #expect(kinds(.cancelled, .holdToTalk) == [.cancel])
     }
@@ -258,6 +258,24 @@ struct VoiceHoldRoutingTests {
         _ mode: VoiceHoldMode
     ) -> [VoiceCommand.Kind] {
         VoiceHoldRouting.commands(for: event, mode: mode).map(\.kind)
+    }
+}
+
+struct VoiceHoldToTalkPreferenceTests {
+    @Test func missingKeyUsesTheHoldToTalkDefault() {
+        let name = "ore.tests.holdToTalk.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        #expect(defaults.object(forKey: VoiceHotkeyMonitor.holdToTalkKey) == nil)
+        #expect(VoiceHotkeyMonitor.isHoldToTalkEnabled(in: defaults) == true)
+    }
+
+    @Test func anExplicitOffStaysHandsFree() {
+        let name = "ore.tests.holdToTalk.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(false, forKey: VoiceHotkeyMonitor.holdToTalkKey)
+        #expect(VoiceHotkeyMonitor.isHoldToTalkEnabled(in: defaults) == false)
     }
 }
 

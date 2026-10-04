@@ -60,6 +60,7 @@ let package = Package(
                 // LICENSE, NOTICE and every dependency's license text, so the
                 // notices travel with the binary (Scripts/generate-legal-resources.sh).
                 .copy("Resources/Legal"),
+                .copy("Resources/Laya"),
             ],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])

@@ -96,6 +96,7 @@ final class AssistantVoiceHUD {
             _ = model.tabNeedsYou
             _ = controller.phase
             _ = controller.failure
+            _ = controller.hudChromeTick
             _ = model.narration.currentSpokenText
         } onChange: {
             Task { @MainActor in
@@ -324,6 +325,37 @@ enum HUDVoiceSource: Equatable {
     }
 }
 
+/// What the pill should stream after Laya (or aliases) has already taken
+/// some of the utterance. The leftover is a suffix of live speech, not the
+/// whole sentence Laya already acted on.
+enum HUDVoiceRemainder {
+    static func text(spoken: String, chrome: VoiceChromeIntents, actedOn: String) -> String {
+        let spoken = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let acted = actedOn.trimmingCharacters(in: .whitespacesAndNewlines)
+        let leftover = chrome.rewritten.trimmingCharacters(in: .whitespacesAndNewlines)
+        if chrome.actions.isEmpty { return spoken }
+        if spoken.isEmpty { return leftover }
+        if spoken.compare(acted, options: .caseInsensitive) == .orderedSame { return leftover }
+        if !acted.isEmpty, let rest = extra(in: spoken, after: acted) {
+            if leftover.isEmpty { return rest }
+            if rest.isEmpty { return leftover }
+            return leftover + " " + rest
+        }
+        if !leftover.isEmpty, let range = spoken.range(of: leftover, options: [.caseInsensitive, .backwards]) {
+            return String(spoken[range.lowerBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return leftover
+    }
+
+    private static func extra(in spoken: String, after acted: String) -> String? {
+        guard let range = spoken.range(of: acted, options: [.caseInsensitive, .anchored])
+                ?? spoken.range(of: acted, options: .caseInsensitive)
+        else { return nil }
+        return String(spoken[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 private struct AssistantHUDView: View {
     var controller: VoiceAssistantController
     var model: AppModel?
@@ -346,6 +378,7 @@ private struct AssistantHUDView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.easeOut(duration: 0.2), value: display.showsActions)
         .animation(.easeOut(duration: 0.2), value: controller.phase)
+        .animation(.easeOut(duration: 0.15), value: controller.hudChromeTick)
     }
 
     private var stack: some View {
@@ -367,9 +400,15 @@ private struct AssistantHUDView: View {
 
     private var voicePill: some View {
         HStack(spacing: 12) {
-            Image(systemName: voiceIcon)
+            Image(systemName: controller.hudChromeTick ? "checkmark" : voiceIcon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(showsFailure ? Color.orange : Color.accentColor)
+                .foregroundStyle(
+                    controller.hudChromeTick
+                        ? AnyShapeStyle(Color.green)
+                        : AnyShapeStyle(showsFailure ? Color.orange : Color.accentColor)
+                )
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 16, height: 16)
 
             WaveformBars(mode: waveform, level: { controller.audioLevel })
                 .frame(width: 34, height: 20)
@@ -461,10 +500,10 @@ private struct AssistantHUDView: View {
 
     private var waveform: WaveformBars.Mode {
         switch controller.phase {
-        case .listening, .answering: .listening
-        case .speaking: .speaking
-        case .armed, .thinking: .thinking
-        case .idle: isNarrating ? .speaking : .thinking
+        case .listening, .answering: return .listening
+        case .speaking: return .speaking
+        case .armed, .thinking: return .thinking
+        case .idle: return isNarrating ? .speaking : .thinking
         }
     }
 
@@ -490,7 +529,10 @@ private struct AssistantHUDView: View {
 
     private var placeholder: String {
         switch controller.phase {
-        case .armed: "Armed — release ⇧⌥ to speak"
+        case .armed:
+            controller.usesFinishPhrase
+                ? "Armed — release ⇧⌥ to speak"
+                : "Speak — keep holding ⇧⌥"
         case .listening: "Listening…"
         case .answering: controller.answerPlaceholder
         case .thinking: "Thinking…"
@@ -796,12 +838,17 @@ private struct StreamingTranscript: View {
     /// edge mid-animation.
     private static let tailID = "tail"
 
-    private static func words(in text: String) -> [(id: Int, text: String)] {
-        // Any whitespace, not just spaces: a recognizer's partial results and a
-        // narration line can both carry a newline, and one long "word" the
-        // width of the pill would freeze the scroll.
-        text.split(whereSeparator: \.isWhitespace)
-            .enumerated().map { ($0.offset, String($0.element)) }
+    private static func words(in text: String) -> [(id: String, text: String)] {
+        // Occurrence ids so a leftover suffix keeps identity when Laya
+        // peels the chrome prefix — "add tests" stays the same two views
+        // instead of remapping to 0, 1 and popping in as new words.
+        var seen: [String: Int] = [:]
+        return text.split(whereSeparator: \.isWhitespace).map { raw in
+            let word = String(raw)
+            let n = seen[word, default: 0]
+            seen[word] = n + 1
+            return ("\(word)#\(n)", word)
+        }
     }
 
     var body: some View {
@@ -833,7 +880,13 @@ private struct StreamingTranscript: View {
                     Text(placeholder)
                 } else {
                     ForEach(words, id: \.id) { word in
-                        Text(word.text).transition(.opacity)
+                        Text(word.text)
+                            .transition(
+                                .asymmetric(
+                                    insertion: .opacity,
+                                    removal: .move(edge: .leading).combined(with: .opacity)
+                                )
+                            )
                     }
                 }
                 Color.clear.frame(width: 1, height: 1).id(Self.tailID)

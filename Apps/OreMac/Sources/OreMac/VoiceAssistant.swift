@@ -190,6 +190,30 @@ enum VoiceFinishPhrase {
         )
     }
 
+    /// After the recognizer has flushed, prefer that transcript (it may have
+    /// caught the last words) and strip the finish phrase from it. The
+    /// override is the snapshot at match time — use it only when flush is empty
+    /// or shorter, so a slow Dev analyzer cannot drop the tail.
+    static func heardAfterFlush(
+        flushed: String,
+        override: String?,
+        model: FinishPhraseModel = .standard
+    ) -> String {
+        let live = flushed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let snapshot = (override ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let strippedLive = live.isEmpty ? "" : strippedRequest(in: live, model: model)
+        if strippedLive.isEmpty { return snapshot }
+        if snapshot.isEmpty { return strippedLive }
+        let liveCount = FinishPhraseMatching.words(in: strippedLive).count
+        let snapshotCount = FinishPhraseMatching.words(in: snapshot).count
+        return liveCount >= snapshotCount ? strippedLive : snapshot
+    }
+
+    private static func strippedRequest(in text: String, model: FinishPhraseModel) -> String {
+        if let match = match(in: text, model: model) { return match.request }
+        return strippingTrailingPhraseArtifacts(text, model: model)
+    }
+
     /// The transcript with trailing phrase debris removed — used when a
     /// silence auto-finish fires after a garbled, unmatched finish attempt,
     /// so "run the tests yip yap" sends "run the tests", not the noise.
@@ -564,6 +588,8 @@ final class VoiceAssistantController {
     var liveTranscript: String { voice.transcript }
     var audioLevel: Double { voice.audioLevel }
     private(set) var answerPlaceholder = "Yes or no?"
+    /// Green tick on the HUD mic after Laya (or aliases) actually clicked.
+    private(set) var hudChromeTick = false
     /// The last voice failure, held for the HUD to say.
     ///
     /// The hands-free watcher used to read `.error` off the recognizer, drop
@@ -577,6 +603,7 @@ final class VoiceAssistantController {
     /// the two to disagree.
     private(set) var failure: String?
     private var failureClearTask: Task<Void, Never>?
+    private var hudChromeTickTask: Task<Void, Never>?
 
     /// Long enough to read a sentence naming a System Settings pane, short
     /// enough that a pill floating over somebody else's app moves on.
@@ -596,7 +623,7 @@ final class VoiceAssistantController {
     /// Hands-free send uses a spoken finish phrase. Hold-to-talk sends on
     /// release, so the HUD and the recognizer must not wait for one.
     var usesFinishPhrase: Bool {
-        !UserDefaults.standard.bool(forKey: VoiceHotkeyMonitor.holdToTalkKey)
+        !VoiceHotkeyMonitor.isHoldToTalkEnabled()
     }
 
     /// The phrase the HUD should tell the user to say — tuned or stock.
@@ -618,6 +645,22 @@ final class VoiceAssistantController {
     weak var model: AppModel?
 
     private let voice = VoiceInputController()
+    /// Chrome already executed this listening session.
+    private var chromeExecuted: Set<ChromeCommand> = []
+    private var liveChrome = LiveChromeReducer()
+    private var chromeLiveTask: Task<Void, Never>?
+    /// Polls confirmed speech for chrome while the mic is open. Independent of
+    /// the finish-phrase watcher, so hold-to-talk still clicks as you speak.
+    private var chromeWatchTask: Task<Void, Never>?
+    /// Last confirmed transcript we scheduled chrome against — stops the 100ms
+    /// watcher from re-entering Laya on the same words.
+    private var chromeSeenConfirmed = ""
+    private var lastChromeSpoken = ""
+    private var lastChromeIntents = VoiceChromeIntents.empty
+    /// Residual last sent to Laya. Grows independently of alias hits so
+    /// "hide the sidebar and tuck the files" actually asks the model about
+    /// "tuck the files" instead of re-matching the sidebar clause.
+    private var lastLayaResidual = ""
     /// The finish-phrase rules for the session currently listening, loaded
     /// when the mic opens.
     private var handsFreePhraseModel: FinishPhraseModel = .standard
@@ -629,6 +672,7 @@ final class VoiceAssistantController {
     private var finishLogEntries: [FinishPhraseDebugLog.Entry] = []
     private var startTask: Task<Void, Never>?
     private var handsFreeTask: Task<Void, Never>?
+    private var finishTask: Task<Void, Never>?
     private var stillWorkingTask: Task<Void, Never>?
     private var answerWindowTask: Task<Void, Never>?
     private var speechWatchdogTask: Task<Void, Never>?
@@ -739,6 +783,9 @@ final class VoiceAssistantController {
         stillWorkingTask = nil
         handsFreeTask?.cancel()
         handsFreeTask = nil
+        finishTask?.cancel()
+        finishTask = nil
+        stopChromeWatchers()
 
         switch phase {
         case .armed:
@@ -788,6 +835,12 @@ final class VoiceAssistantController {
     }
 
     private func begin() {
+        // Hold-to-talk publishes .start at the threshold with no .arm, so
+        // idle has to open the mic the same way an armed hands-free release
+        // does. Otherwise the HUD sits on "Armed — release ⇧⌥ to speak".
+        if phase == .idle {
+            armTrigger()
+        }
         guard let model, phase == .armed else { return }
         guard !voice.isActive else { return }
         startTask?.cancel()
@@ -814,6 +867,8 @@ final class VoiceAssistantController {
         let phraseModel = FinishPhraseStore.load() ?? .standard
         handsFreePhraseModel = phraseModel
         finishHint = nil
+        hudChromeTick = false
+        hudChromeTickTask?.cancel()
         finishLogEnabled = FinishPhraseDebugLog.isEnabled
         finishLogStartedAt = nil
         finishLogEntries = []
@@ -822,12 +877,26 @@ final class VoiceAssistantController {
         if usesFinishPhrase { names += phraseModel.vocabulary }
         voice.vocabulary = names
         phase = .listening
+        chromeExecuted = []
+        liveChrome = LiveChromeReducer()
+        chromeSeenConfirmed = ""
+        lastChromeSpoken = ""
+        lastChromeIntents = .empty
+        lastLayaResidual = ""
+        finishTask?.cancel()
+        finishTask = nil
+        stopChromeWatchers()
         // Ducking: the assistant must not talk over the user, and its TTS
-        // must not leak into the transcription.
+        // must not leak into the transcription. Do not start Laya here —
+        // MPS and SpeechAnalyzer share the GPU, and a cold Dev analyzer
+        // already loses words when the runner spins up under the first
+        // syllable.
         model.narration.setMicActive(true)
         voice.start()
+        watchLiveChrome()
         // Hold-to-talk sends on release; a finish-phrase watcher would steal the
-        // utterance or time out while the chord is still down.
+        // utterance or time out while the chord is still down. Chrome still
+        // runs via `watchLiveChrome` so the layout moves as the user speaks.
         if usesFinishPhrase { watchHandsFreeSession() }
     }
 
@@ -998,11 +1067,29 @@ final class VoiceAssistantController {
         startTask = nil
         handsFreeTask?.cancel()
         handsFreeTask = nil
-        guard isListening else { return }
-        let heard = (spokenOverride ?? voice.transcript)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let spoken = VoiceVocabulary(names: projectNames()).corrected(heard)
-        if voice.isActive { voice.stop() }
+        stopChromeWatchers()
+        guard isListening, finishTask == nil else { return }
+        let token = cancelToken
+        let phraseModel = handsFreePhraseModel
+        finishTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.finishTask = nil }
+            let flushed = await self.voice.commit()
+            guard self.cancelToken == token, self.phase == .listening else { return }
+            self.deliverFinishedSpeech(
+                VoiceFinishPhrase.heardAfterFlush(
+                    flushed: flushed,
+                    override: spokenOverride,
+                    model: phraseModel
+                )
+            )
+        }
+    }
+
+    private func deliverFinishedSpeech(_ heard: String) {
+        let spoken = VoiceVocabulary(names: projectNames()).corrected(
+            heard.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         model?.narration.setMicActive(false)
 
         guard let model, !spoken.isEmpty else {
@@ -1065,6 +1152,28 @@ final class VoiceAssistantController {
             phase = .idle
             return
         }
+
+        Task { @MainActor [weak self] in
+            guard let self, self.phase == .listening else { return }
+            let remainder = await self.chromeRemainderForSend(spoken)
+            guard self.phase == .listening else { return }
+            self.sendSpokenRemainder(remainder, model: model, assistant: assistant)
+        }
+    }
+
+    private func sendSpokenRemainder(
+        _ remainder: String,
+        model: AppModel,
+        assistant: WorkspaceSummary
+    ) {
+        guard !remainder.isEmpty else {
+            // Chrome-only speech already moved the panes; starting an agent
+            // turn on the leftover politeness (or nothing) would be a stall.
+            phase = .idle
+            playCue(named: "Pop", volume: 0.16)
+            return
+        }
+
         phase = .thinking
         // A fresh reply gets a fresh opening sentence.
         openerBuffer = ""
@@ -1072,7 +1181,7 @@ final class VoiceAssistantController {
         // The chat the message actually reached, rather than whichever is
         // active by the time the answer arrives. Its turn is adopted when the
         // agent starts one.
-        awaitingSpokenTurn = model.send(spoken, to: assistant.id)
+        awaitingSpokenTurn = model.send(remainder, to: assistant.id)
             .map { VoiceSpokenTurn(chatID: $0) }
         // A spoken "On it." talks over whatever the user is listening to.
         // The HUD already says Thinking…; a quiet close-mic cue is enough.
@@ -1083,11 +1192,234 @@ final class VoiceAssistantController {
     private func closeListeningWithoutSending(playCue shouldPlay: Bool) {
         handsFreeTask?.cancel()
         handsFreeTask = nil
+        stopChromeWatchers()
         if voice.isActive { voice.stop() }
         model?.narration.setMicActive(false)
         finishHint = nil
         phase = .idle
         if shouldPlay { playCue(named: "Pop", volume: 0.18) }
+    }
+
+    private func stopChromeWatchers() {
+        chromeWatchTask?.cancel()
+        chromeWatchTask = nil
+        chromeLiveTask?.cancel()
+        chromeLiveTask = nil
+    }
+
+    private func watchLiveChrome() {
+        chromeWatchTask?.cancel()
+        chromeWatchTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let self, self.phase == .listening else { return }
+                self.applyLiveChrome()
+            }
+        }
+    }
+
+    private func applyLiveChrome() {
+        let spoken = LiveChromeSpeech.source(
+            confirmed: voice.confirmedTranscript,
+            transcript: voice.transcript
+        )
+        guard !spoken.isEmpty, spoken != chromeSeenConfirmed else { return }
+
+        if VoiceActionGate.aliasesEnabled {
+            let aliases = liveChrome.consumeAliases(spoken)
+            if !aliases.actions.isEmpty {
+                chromeLiveTask?.cancel()
+                lastChromeSpoken = spoken
+                lastChromeIntents = aliases
+                applyChrome(aliases)
+                if LayaEngine.shared.decisionClient == nil {
+                    LayaEngine.shared.prewarm()
+                }
+            }
+        } else if LayaEngine.shared.decisionClient == nil {
+            LayaEngine.shared.prewarm()
+        }
+
+        guard LiveChromeAsk.question(
+            spoken: spoken,
+            lastResidual: lastLayaResidual,
+            chrome: lastChromeIntents,
+            actedOn: lastChromeSpoken
+        ) != nil else {
+            chromeSeenConfirmed = spoken
+            return
+        }
+
+        if LayaEngine.shared.decisionClient == nil {
+            LayaEngine.shared.prewarm()
+            return
+        }
+
+        chromeSeenConfirmed = spoken
+        chromeLiveTask?.cancel()
+        chromeLiveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: LiveChromeDebounce.delay(for: spoken))
+            guard !Task.isCancelled, let self, self.phase == .listening else { return }
+            var snapshot = LiveChromeSpeech.source(
+                confirmed: self.voice.confirmedTranscript,
+                transcript: self.voice.transcript
+            )
+            var residual = LiveChromeAsk.question(
+                spoken: snapshot,
+                lastResidual: self.lastLayaResidual,
+                chrome: self.lastChromeIntents,
+                actedOn: self.lastChromeSpoken
+            ) ?? LiveChromeAsk.residual(in: snapshot)
+            while !Task.isCancelled, !residual.isEmpty {
+                let intents = await VoiceDecision.refine(
+                    spoken: residual,
+                    available: self.chromeAvailability(),
+                    engine: LayaEngine.shared.decisionClient,
+                    budget: VoiceDecision.liveBudget
+                )
+                guard !Task.isCancelled, self.phase == .listening else { return }
+                if intents.fromModel {
+                    self.lastLayaResidual = residual
+                }
+                if !intents.actions.isEmpty {
+                    self.lastChromeSpoken = snapshot
+                    self.lastChromeIntents = intents
+                    self.applyChrome(intents)
+                    let latest = LiveChromeSpeech.source(
+                        confirmed: self.voice.confirmedTranscript,
+                        transcript: self.voice.transcript
+                    )
+                    snapshot = latest
+                    let leftover = HUDVoiceRemainder.text(
+                        spoken: latest, chrome: intents, actedOn: self.lastChromeSpoken
+                    )
+                    guard leftover != residual else { return }
+                    residual = leftover
+                    continue
+                }
+                let latest = LiveChromeSpeech.source(
+                    confirmed: self.voice.confirmedTranscript,
+                    transcript: self.voice.transcript
+                )
+                let latestResidual = LiveChromeAsk.question(
+                    spoken: latest,
+                    lastResidual: residual,
+                    chrome: self.lastChromeIntents,
+                    actedOn: self.lastChromeSpoken
+                )
+                guard let latestResidual else { return }
+                snapshot = latest
+                residual = latestResidual
+            }
+        }
+    }
+
+    /// Send-time rewrite only. Commands already ran live; this peels those
+    /// words out of the agent prompt. Reuses the live Laya result when the
+    /// transcript hasn't grown, so finish doesn't pay a second model call.
+    private func chromeRemainderForSend(_ spoken: String) async -> String {
+        let aliases = VoiceActionGate.consume(spoken, usingAliases: true)
+        applyChrome(aliases)
+        var leftover = aliases.actions.isEmpty
+            ? HUDVoiceRemainder.text(
+                spoken: spoken,
+                chrome: lastChromeIntents,
+                actedOn: lastChromeSpoken
+            )
+            : aliases.rewritten
+        if lastChromeIntents.actions.isEmpty, aliases.actions.isEmpty {
+            leftover = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        for _ in 0..<8 {
+            let trimmed = leftover.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { break }
+            let chrome = await VoiceDecision.refine(
+                spoken: trimmed,
+                available: chromeAvailability(),
+                engine: LayaEngine.shared.decisionClient,
+                budget: VoiceDecision.commitBudget
+            )
+            if chrome.actions.isEmpty {
+                if chrome.fromModel {
+                    leftover = chrome.rewritten
+                    break
+                }
+                continue
+            }
+            applyChrome(chrome)
+            lastChromeSpoken = trimmed
+            lastChromeIntents = chrome
+            leftover = chrome.rewritten
+        }
+        return Self.assistantPrompt(
+            leftover, spoken: spoken, chromeRan: !chromeExecuted.isEmpty
+        )
+    }
+
+    /// The coding agent never sees window commands, leftover wrappers, or
+    /// the original chrome sentence Laya left intact.
+    nonisolated static func assistantPrompt(
+        _ remainder: String,
+        spoken: String,
+        chromeRan: Bool
+    ) -> String {
+        var text = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let peeled = VoiceActionGate.consume(text, usingAliases: true)
+        if !peeled.actions.isEmpty { text = peeled.rewritten }
+        guard !text.isEmpty else { return "" }
+        if chromeRan, text.compare(spoken, options: .caseInsensitive) == .orderedSame {
+            return ""
+        }
+        return text
+    }
+
+    private func chromeAvailability() -> ChromeAvailability {
+        guard let model else {
+            return ChromeAvailability.snapshot(tabCount: 0, muted: false)
+        }
+        let workspaceID = model.selectedWorkspaceID
+        let tabs = workspaceID.map { model.chats(for: $0).count } ?? 0
+        let chat = workspaceID.flatMap { model.activeChat(for: $0) }
+        let fastKey = "ore.fastMode.\(chat?.id.rawValue ?? workspaceID?.rawValue ?? "none")"
+        let supportsFast: Bool = {
+            guard let chat else { return true }
+            let choices = model.knownModels(for: chat.harness)
+            return ModelVariantCatalog.family(containing: chat.model, in: choices)?.supportsFast == true
+        }()
+        return ChromeAvailability.snapshot(
+            tabCount: tabs,
+            muted: model.narration.isMuted,
+            permissionMode: chat?.permissionMode ?? .default,
+            effort: chat?.reasoningEffort ?? .high,
+            fastMode: UserDefaults.standard.bool(forKey: fastKey),
+            supportsFast: supportsFast
+        )
+    }
+
+    private func applyChrome(_ intents: VoiceChromeIntents) {
+        guard let model, !intents.actions.isEmpty else { return }
+        if intents.actions.contains(.openNamedFile) {
+            ChromeLayoutStore.shared.pendingFileQuery = intents.spokenFile
+        }
+        if let on = intents.toggleOn {
+            ChromeLayoutStore.shared.pendingToggleOn = on
+        }
+        var ran = false
+        for command in intents.actions where chromeExecuted.insert(command).inserted {
+            model.perform(command)
+            ran = true
+        }
+        if ran { flashHUDChromeTick() }
+    }
+
+    private func flashHUDChromeTick() {
+        hudChromeTick = true
+        hudChromeTickTask?.cancel()
+        hudChromeTickTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1400))
+            guard !Task.isCancelled else { return }
+            self?.hudChromeTick = false
+        }
     }
 
     /// One nudge, once, and only if the turn is genuinely still open — silence

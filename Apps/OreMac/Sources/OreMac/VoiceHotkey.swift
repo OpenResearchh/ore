@@ -168,7 +168,9 @@ enum VoiceHoldRouting {
             case .handsFree:
                 return [(.arm, target)]
             case .holdToTalk:
-                return [(.arm, target), (.start, target)]
+                // Open the mic at the threshold. Publishing .arm first left
+                // the HUD on "release to speak" — the hands-free step.
+                return [(.start, target)]
             }
         case .activated:
             switch mode {
@@ -234,9 +236,16 @@ final class VoiceHotkeyMonitor {
     /// focused composer (pulling ORE frontmost). Off by default now that hold
     /// belongs to the assistant; the Settings toggle brings it back.
     static let legacyHoldDictationKey = "ore.voice.holdDictatesComposer"
-    /// Assistant mic stays open only while ⇧⌥ is held. Off by default; the
-    /// hands-free finish phrase is the default send.
-    static let holdToTalkKey = "ore.voice.holdToTalk"
+    /// Assistant mic stays open only while ⇧⌥ is held. On by default: hold
+    /// is talk, release is send. Hands-free (finish phrase) is the opt-in.
+    nonisolated static let holdToTalkKey = "ore.voice.holdToTalk"
+    nonisolated static let holdToTalkDefault = true
+
+    /// `bool(forKey:)` is false when the key is missing, which would ignore
+    /// both `register(defaults:)` until it has run and the Settings default.
+    nonisolated static func isHoldToTalkEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: holdToTalkKey) as? Bool ?? holdToTalkDefault
+    }
 
     private var legacyHoldDictation: Bool {
         UserDefaults.standard.bool(forKey: Self.legacyHoldDictationKey)
@@ -244,7 +253,7 @@ final class VoiceHotkeyMonitor {
 
     private var holdMode: VoiceHoldMode {
         if legacyHoldDictation { return .composer }
-        if UserDefaults.standard.bool(forKey: Self.holdToTalkKey) { return .holdToTalk }
+        if Self.isHoldToTalkEnabled() { return .holdToTalk }
         return .handsFree
     }
 

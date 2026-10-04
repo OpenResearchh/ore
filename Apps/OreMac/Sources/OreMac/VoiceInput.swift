@@ -18,6 +18,12 @@ struct VoiceTranscriptAssembler: Equatable, Sendable {
         remainder(afterIgnoring: ignoredPrefix, in: confirmed + volatile)
     }
 
+    /// Confirmed speech only — the chrome gate executes against this, never
+    /// the volatile hypothesis, so a revision cannot click things.
+    var confirmedText: String {
+        remainder(afterIgnoring: ignoredPrefix, in: confirmed)
+    }
+
     mutating func applySegment(_ segment: String, isFinal: Bool) {
         if isFinal {
             confirmed += segment
@@ -36,6 +42,27 @@ struct VoiceTranscriptAssembler: Equatable, Sendable {
             confirmed = ""
             volatile = utterance
         }
+    }
+
+    /// SpeechAnalyzer sometimes reports the current phrase (segment) and
+    /// sometimes the whole transcript so far (utterance). Appending a
+    /// whole-transcript final onto `confirmed` duplicates everything already
+    /// heard, which is how a session can look like it "missed" the real words.
+    mutating func applyAnalyzerResult(_ text: String, isFinal: Bool) {
+        guard !text.isEmpty else { return }
+        if isWholeTranscript(text) {
+            applyUtterance(text, isFinal: isFinal)
+            return
+        }
+        applySegment(text, isFinal: isFinal)
+    }
+
+    private func isWholeTranscript(_ text: String) -> Bool {
+        let prefix = confirmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return false }
+        let incoming = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if incoming.count < prefix.count { return false }
+        return incoming.lowercased().hasPrefix(prefix.lowercased())
     }
 
     /// The user edited or cleared the composer while we were still listening.
@@ -361,6 +388,9 @@ final class VoiceInputController {
     /// payload would break every one of them.
     private(set) var errorSettingsLink: SystemSettingsLink?
     private(set) var transcript: String = ""
+    /// Confirmed prefix of `transcript`. Empty on the `SFSpeechRecognizer`
+    /// path until the utterance finalizes, which is when chrome may fire.
+    private(set) var confirmedTranscript: String = ""
     private(set) var recognizerRoute: RecognizerRoute?
     private(set) var contextualBiasApplied = false
     /// Every dictation surface owns a controller, but macOS exposes one input
@@ -389,6 +419,9 @@ final class VoiceInputController {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var analyzerStop: (@Sendable () async -> Void)?
+    /// Set when SpeechAnalyzer could not start, so the fallback recognizer
+    /// uses Apple's speech service instead of the older on-device engine.
+    private var speechAnalyzerUnavailable = false
 
     /// Names the recognizer should be primed to hear — workspace and repo
     /// names, which are exactly the words general English models get wrong,
@@ -419,8 +452,10 @@ final class VoiceInputController {
         Self.activeOwner = owner
         assembler.reset()
         transcript = ""
+        confirmedTranscript = ""
         recognizerRoute = nil
         contextualBiasApplied = false
+        speechAnalyzerUnavailable = false
         audioLevel = 0
         errorSettingsLink = nil
         status = .requestingPermission
@@ -435,6 +470,32 @@ final class VoiceInputController {
         releaseMicrophoneLease()
         if case .error = status { return }
         status = .idle
+    }
+
+    /// End the microphone and wait for the recognizer to drain remaining
+    /// audio into `transcript`. `stop()` cancels that tail; send paths must
+    /// not, or the last words never land — especially on a cold Dev analyzer.
+    func commit() async -> String {
+        guard isActive else { return transcript }
+        capture?.stop()
+        recognitionRequest?.endAudio()
+        let task = runTask
+        let watchdog = Task { @MainActor [weak self] in
+            try await Task.sleep(for: .milliseconds(1_200))
+            self?.runTask?.cancel()
+        }
+        await task?.value
+        watchdog.cancel()
+        runTask = nil
+        audioLevel = 0
+        if case .error = status { return transcript }
+        status = .idle
+        return transcript
+    }
+
+    private func publishTranscript() {
+        transcript = assembler.text
+        confirmedTranscript = assembler.confirmedText
     }
 
     /// Called from the audio tap (via the main actor) roughly 12×/second.
@@ -482,8 +543,11 @@ final class VoiceInputController {
                         status = .idle
                         return
                     }
-                    // Fall through to the older recognizer so a missing on-device
-                    // model doesn't leave the mic button dead.
+                    // SpeechAnalyzer failed (missing asset, a spent prewarm,
+                    // locale held by another ORE). Fall through so the mic
+                    // still works; the fallback must not force the older
+                    // on-device engine — that is the Dev-quality cliff.
+                    speechAnalyzerUnavailable = true
                 }
             }
 
@@ -516,6 +580,22 @@ final class VoiceInputController {
 
     @available(macOS 26.0, *)
     private func runOnDeviceDictation() async throws {
+        do {
+            try await runSpeechAnalyzerSession()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // A prewarmed analyzer is one-shot and often spent by the time
+            // the assistant actually opens the mic. Build a fresh pipeline
+            // once before giving up on the on-device model.
+            SpeechAssetKeeper.reset()
+            _ = DictationPrewarm.take()
+            try await runSpeechAnalyzerSession()
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private func runSpeechAnalyzerSession() async throws {
         recognizerRoute = .speechAnalyzer
         let transcriber: DictationTranscriber
         let analyzer: SpeechAnalyzer
@@ -592,8 +672,8 @@ final class VoiceInputController {
                     let segment = String(result.text.characters)
                     await MainActor.run {
                         guard let self else { return }
-                        self.assembler.applySegment(segment, isFinal: result.isFinal)
-                        self.transcript = self.assembler.text
+                        self.assembler.applyAnalyzerResult(segment, isFinal: result.isFinal)
+                        self.publishTranscript()
                     }
                 }
             } catch is CancellationError {
@@ -606,8 +686,16 @@ final class VoiceInputController {
         }
 
         status = .listening
-        try await analyzer.start(inputSequence: input)
-        try? await analyzer.finalizeAndFinishThroughEndOfInput()
+        do {
+            try await analyzer.start(inputSequence: input)
+            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+            // Let the last finals land before cancelling the results loop.
+            try? await Task.sleep(for: .milliseconds(200))
+        } catch {
+            resultsTask.cancel()
+            bufferTask.cancel()
+            throw error
+        }
         resultsTask.cancel()
         bufferTask.cancel()
     }
@@ -652,7 +740,11 @@ final class VoiceInputController {
             request.contextualStrings = vocabulary
             contextualBiasApplied = true
         }
-        if recognizer.supportsOnDeviceRecognition {
+        // Prefer on-device when SpeechAnalyzer never got a chance (older
+        // macOS). After a SpeechAnalyzer failure the older on-device engine
+        // is a quality cliff — Settings already describe Apple's speech
+        // service as that fallback.
+        if recognizer.supportsOnDeviceRecognition, !speechAnalyzerUnavailable {
             request.requiresOnDeviceRecognition = true
         }
         recognitionRequest = request
@@ -691,7 +783,7 @@ final class VoiceInputController {
                                 result.bestTranscription.formattedString,
                                 isFinal: result.isFinal
                             )
-                            self.transcript = self.assembler.text
+                            self.publishTranscript()
                         }
                     }
                     if let error {
@@ -872,6 +964,12 @@ enum SpeechAssetKeeper {
             try await request.downloadAndInstall()
         }
         assetsReady = true
+    }
+
+    /// The next press should ask AssetInventory again — a failed analyzer
+    /// start must not pin "already installed" for the rest of the process.
+    static func reset() {
+        assetsReady = false
     }
 }
 

@@ -19,3 +19,47 @@ struct HUDVoiceSourceTests {
         #expect(HUDVoiceSource.current(isAssistantActive: false, narrationText: nil) == .none)
     }
 }
+
+struct HUDVoiceRemainderTests {
+    @Test func untouchedSpeechIsShownWhole() {
+        #expect(
+            HUDVoiceRemainder.text(spoken: "add tests", chrome: .empty, actedOn: "")
+                == "add tests"
+        )
+    }
+
+    @Test func chromeOnlySpeechClearsTheLine() {
+        let chrome = VoiceChromeIntents(actions: [.sidebarHide], rewritten: "", changes: [])
+        #expect(
+            HUDVoiceRemainder.text(
+                spoken: "tuck the file list away",
+                chrome: chrome,
+                actedOn: "tuck the file list away"
+            ).isEmpty
+        )
+    }
+
+    @Test func leftoverWorkStaysAfterChrome() {
+        let chrome = VoiceChromeIntents(
+            actions: [.sidebarHide], rewritten: "add tests", changes: []
+        )
+        #expect(
+            HUDVoiceRemainder.text(
+                spoken: "tuck the file list away and add tests",
+                chrome: chrome,
+                actedOn: "tuck the file list away and add tests"
+            ) == "add tests"
+        )
+    }
+
+    @Test func wordsAfterADoneActionStayOnThePill() {
+        let chrome = VoiceChromeIntents(actions: [.sidebarHide], rewritten: "", changes: [])
+        #expect(
+            HUDVoiceRemainder.text(
+                spoken: "tuck the file list away and add tests",
+                chrome: chrome,
+                actedOn: "tuck the file list away"
+            ) == "and add tests"
+        )
+    }
+}

@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ORE × Laya decision tree</title>
+  <style>
+    :root {
+      --bg: #0f1117; --panel: #171a22; --ink: #e8edf7; --muted: #8b93a7;
+      --line: rgba(232, 237, 247, 0.1); --amber: #f59e0b; --green: #34d399;
+      --rose: #fb7185; --hit: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    body { padding: 20px 22px 48px; }
+    h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.03em; margin: 0 0 4px; }
+    .lede { color: var(--muted); margin: 0 0 16px; max-width: 92ch; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.2fr) 380px; gap: 14px; }
+    @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
+    .label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+    textarea { width: 100%; min-height: 68px; resize: vertical; border: 1px solid var(--line); background: #10131a; color: var(--ink); border-radius: 10px; padding: 8px 10px; font: inherit; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    button { border: 0; border-radius: 999px; padding: 7px 12px; font: inherit; cursor: pointer; background: var(--amber); color: #1a1203; font-weight: 650; }
+    button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); font-weight: 500; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .status { margin-top: 8px; color: var(--muted); min-height: 1.3em; }
+    .status.live { color: var(--green); } .status.sim { color: var(--amber); }
+
+    .stage { position: relative; min-height: 400px; }
+    .window {
+      --left: 132px; --right: 210px;
+      display: grid; grid-template-columns: var(--left) minmax(0, 1fr) var(--right);
+      grid-template-rows: 34px 26px minmax(0, 1fr) 86px 28px;
+      height: 400px; border-radius: 12px; overflow: hidden; background: #1b2230;
+      border: 1px solid var(--line); transition: grid-template-columns .45s ease, grid-template-rows .45s ease;
+    }
+    .window.no-left { --left: 0px; } .window.no-right { --right: 0px; }
+    .window.no-term { grid-template-rows: 34px 26px minmax(0, 1fr) 86px 0px; }
+    .window.no-left .left, .window.no-right .review { opacity: 0; padding: 0; border: 0; }
+    .window.no-term .terminal { display: none; }
+    .window.behind { filter: saturate(0.7) brightness(0.72); }
+    .titlebar, .tabs, .terminal { display: flex; align-items: center; gap: 6px; padding: 0 8px; background: #222a3a; }
+    .titlebar { grid-column: 1 / -1; border-bottom: 1px solid var(--line); font-size: 11px; }
+    .dots { display: flex; gap: 4px; } .dots i { width: 8px; height: 8px; border-radius: 50%; background: #5a6272; }
+    .ctrl { border: 1px solid var(--line); background: #2a3346; color: var(--ink); border-radius: 7px; padding: 2px 7px; font-size: 10px; white-space: nowrap; position: relative; }
+    .ctrl.amber { background: #f59e0b; color: #1a1203; border: 0; font-weight: 700; }
+    .ctrl.hit { outline: 2px solid var(--hit); outline-offset: -1px; }
+    .ctrl.did::after { content: "✓"; position: absolute; top: -6px; right: -6px; width: 13px; height: 13px; border-radius: 50%; background: var(--green); color: #052e1a; font-size: 9px; font-weight: 800; display: flex; align-items: center; justify-content: center; }
+    .title { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+    .left { grid-column: 1; grid-row: 2 / 5; background: #151b27; border-right: 1px solid var(--line); padding: 8px; overflow: hidden; }
+    .file { color: var(--muted); font-size: 10px; }
+    .tabs { grid-column: 2; grid-row: 2; border-bottom: 1px solid var(--line); background: #1a2130; }
+    .tab { font-size: 10px; padding: 2px 8px; border-radius: 8px; background: #2a3346; }
+    .tab.on { background: #3b455c; }
+    .transcript { grid-column: 2; grid-row: 3; padding: 8px 10px; overflow: hidden; }
+    .bubble { max-width: 78%; font-size: 11px; padding: 6px 8px; border-radius: 10px; margin: 0 0 6px; background: #2a3346; }
+    .bubble.you { margin-left: auto; background: #31405c; }
+    .composer { grid-column: 2; grid-row: 4; margin: 0 8px 6px; border-radius: 10px; background: #121826; border: 1px solid var(--line); padding: 6px 8px; }
+    .ph { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .review { grid-column: 3; grid-row: 2 / 5; background: #141a26; border-left: 1px solid var(--line); padding: 8px; overflow: hidden; }
+    .seg { display: flex; gap: 4px; margin-bottom: 6px; }
+    .terminal { grid-column: 1 / -1; grid-row: 5; background: #10151f; border-top: 1px solid var(--line); font-size: 11px; }
+    .layout-state { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 0; font-size: 11px; color: var(--muted); }
+    .layout-state span { border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+    .layout-state .off { color: var(--rose); border-color: rgba(251, 113, 133, 0.35); }
+    .layout-state .on { color: var(--green); border-color: rgba(52, 211, 153, 0.35); }
+    .layout-state .front { color: var(--hit); border-color: rgba(251, 191, 36, 0.4); }
+
+    .float {
+      position: absolute; display: none; z-index: 4; border-radius: 12px;
+      background: #161922; border: 1px solid var(--line);
+      box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+    }
+    .float.show { display: grid; }
+    .settings-win {
+      right: 10px; top: 22px; width: min(520px, 78%); height: 78%;
+      grid-template-columns: 148px 1fr; overflow: hidden;
+    }
+    .settings-win header.brand { grid-column: 1; padding: 12px 12px 8px; font-size: 12px; border-bottom: 1px solid var(--line); }
+    .settings-win nav { grid-column: 1; grid-row: 2; background: #10131a; padding: 8px; overflow: auto; }
+    .settings-win nav .pane { display: block; width: 100%; text-align: left; border-radius: 8px; padding: 7px 8px; margin: 0 0 3px; background: transparent; color: var(--ink); font-weight: 500; border: 0; }
+    .settings-win nav .pane.on { background: #3d3420; }
+    .settings-win .body { grid-column: 2; grid-row: 1 / 3; padding: 16px 18px; overflow: auto; }
+    .settings-win h3 { margin: 0 0 2px; font-size: 20px; }
+    .settings-win .detail { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+    .scard { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; background: #1a1e28; }
+    .scard h4 { margin: 0 0 8px; font-size: 12px; font-weight: 650; }
+    .ctl { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0; font-size: 12px; }
+    .ctl.hit { outline: 2px solid var(--hit); outline-offset: 3px; border-radius: 8px; }
+    .ctl input[type="checkbox"] { width: 16px; height: 16px; }
+    .ctl input[type="text"] { width: 88px; background: #10131a; border: 1px solid var(--line); color: var(--ink); border-radius: 6px; padding: 4px 6px; }
+    .palette-win { left: 18%; right: 18%; top: 18%; height: 58%; grid-template-rows: 48px 1fr; }
+    .palette-win .bar { display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--line); }
+    .palette-win .bar input { flex: 1; background: transparent; border: 0; color: var(--ink); font: 16px/1.3 inherit; outline: none; }
+    .palette-win ul { list-style: none; margin: 0; padding: 8px; overflow: auto; }
+    .palette-win li { padding: 8px 10px; border-radius: 8px; color: var(--muted); }
+    .palette-win li.hit { background: #243044; color: var(--hit); }
+    .toast {
+      position: absolute; left: 16px; bottom: 40px; display: none; z-index: 5;
+      background: #1c2333; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4); font-size: 12px;
+    }
+    .toast.show { display: block; }
+    .toast b { color: var(--hit); }
+
+    .tree-tools { display: flex; gap: 6px; margin-bottom: 8px; }
+    .node { margin-left: 10px; border-left: 1px solid var(--line); padding-left: 8px; }
+    .node.root { margin: 0; border: 0; padding: 0; }
+    .qname { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 6px 0 3px; cursor: pointer; }
+    .qname:hover { color: var(--ink); }
+    .opt { display: flex; justify-content: space-between; gap: 8px; padding: 3px 6px; border-radius: 6px; cursor: pointer; }
+    .opt:hover { background: #1e2430; }
+    .opt.on { background: #243044; color: var(--hit); }
+    .opt .p { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .kids { display: none; } .kids.open { display: block; }
+    .ask-card { margin-top: 10px; padding: 8px; border-radius: 8px; background: #10151f; border: 1px solid var(--line); color: var(--muted); }
+    .ask-card em { color: var(--amber); font-style: normal; }
+    .rounds { margin-top: 12px; display: grid; gap: 8px; }
+    .round { border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--panel); }
+    .round b { color: var(--hit); }
+    .final { margin-top: 10px; padding: 10px; border-radius: 10px; background: #10151f; border: 1px solid var(--line); }
+    .empty { color: var(--green); }
+  </style>
+</head>
+<body>
+  <h1>ORE × Laya decision tree</h1>
+  <p class="lede">
+    Named files are peeled first so they never compete with the review file list.
+    After that, one small choice names the chrome region, the assistant, or neither.
+    Click ▸ to explore. Each Laya ask is still one small choice.
+  </p>
+
+  <div class="layout">
+    <section class="card">
+      <div class="label">Workspace · Settings is a separate window · ⌘P is a palette</div>
+      <div class="stage">
+        <div class="window" id="window">
+          <div class="titlebar">
+            <span class="dots"><i></i><i></i><i></i></span>
+            <span class="ctrl" data-hit="sidebarToggle">sidebar</span>
+            <span class="title">Hideki Yukawa · ore/hideki-yukawa → master</span>
+            <span class="ctrl" data-hit="openFilePalette">⌘P</span>
+            <span class="ctrl" data-hit="openSettings">Settings</span>
+            <span class="ctrl" data-hit="workspaceReview">Review</span>
+            <span class="ctrl amber" data-hit="gitCommit">Commit 47 files</span>
+            <span class="ctrl" data-hit="gitShip">PR</span>
+          </div>
+          <div class="left" id="sidebar">
+            <div>ore</div>
+            <div class="file">hideki-yukawa</div>
+            <div class="file ctrl" data-hit="revealInFinder">Reveal in Finder</div>
+          </div>
+          <div class="tabs">
+            <span class="tab" data-hit="chatTabPrevious">Meson Theory</span>
+            <span class="tab on" data-hit="chatTabNext">Nuclear Forces</span>
+            <span style="flex:1"></span>
+            <span class="ctrl" data-hit="findInTranscript">Find</span>
+            <span class="ctrl" data-hit="chatTabCreate">+</span>
+            <span class="ctrl" data-hit="chatHistory">History</span>
+          </div>
+          <div class="transcript">
+            <div class="bubble">Verified the rendered preview and passed 28 focused tests.</div>
+            <div class="bubble you">relaunch the ore dev that’s running</div>
+            <div class="bubble">Rebuilt and relaunched ORE Dev.</div>
+          </div>
+          <div class="composer">
+            <div class="ph">Ask the agent to do something…</div>
+            <div class="chips">
+              <span class="ctrl" data-hit="attachFiles">paperclip</span>
+              <span class="ctrl" data-hit="openModelChooser">GPT-6-Astra</span>
+              <span class="ctrl" data-hit="openEffortChooser">Medium</span>
+              <span class="ctrl" data-hit="permissionAsk">Ask</span>
+              <span class="ctrl" data-hit="composerFast">Fast</span>
+              <span class="ctrl" data-hit="assistantMute">mic</span>
+              <span class="ctrl amber" data-hit="composerSend">send</span>
+            </div>
+          </div>
+          <div class="review" id="review">
+            <div class="seg">
+              <span class="ctrl" data-hit="reviewAllFiles">All files</span>
+              <span class="ctrl" data-hit="reviewChanges">Changes 47</span>
+              <span class="ctrl" data-hit="reviewRequests">Requests</span>
+            </div>
+            <div class="file">Find in workspace</div>
+            <div class="file">Apps</div>
+          </div>
+          <div class="terminal" id="terminal">
+            <span class="ctrl" data-hit="terminalCollapse">hide</span>
+            <span class="tab on" id="termTab0">Terminal</span>
+            <span id="termExtraTabs"></span>
+            <span class="ctrl" data-hit="terminalTabCreate">+</span>
+            <span class="ctrl" data-hit="revealInFinder">Finder</span>
+            <span class="ctrl" data-hit="terminalRun">Run</span>
+            <span style="flex:1;color:var(--muted)">$ _</span>
+          </div>
+        </div>
+
+        <div class="float settings-win" id="settings">
+          <header class="brand">ORE<br><span class="file">Settings</span></header>
+          <nav id="settingsNav"></nav>
+          <div class="body">
+            <h3 id="settingsTitle">General</h3>
+            <div class="detail" id="settingsDetail"></div>
+            <div id="settingsBody"></div>
+          </div>
+        </div>
+        <div class="float palette-win" id="palette">
+          <div class="bar">
+            <span>⌘P</span>
+            <input id="paletteQuery" placeholder="Open file in hideki-yukawa" />
+          </div>
+          <ul id="paletteList"></ul>
+        </div>
+        <div class="toast" id="finderToast"><b>Finder</b><div id="finderPath">hideki-yukawa</div></div>
+      </div>
+      <div class="layout-state" id="layoutState"></div>
+      <div class="label" style="margin-top:12px">Spoken leftover</div>
+      <textarea id="speech">open settings and turn on liquid glass then open a new terminal tab and reveal this folder in finder. open CONTRIBUTING.md</textarea>
+      <div class="row">
+        <button id="run">Walk the tree with Laya</button>
+        <button class="ghost" id="presetPanes" type="button">Hide panes ramble</button>
+        <button class="ghost" id="reset" type="button">Reset</button>
+      </div>
+      <div class="status" id="status">Click branches on the right to explore. Walk sends each hop to local Laya.</div>
+      <div class="rounds" id="rounds"></div>
+      <div class="final" id="final">Assistant prompt: <span class="empty">nothing yet</span></div>
+    </section>
+
+    <section class="card">
+      <div class="label">Decision tree — click to expand</div>
+      <div class="tree-tools">
+        <button class="ghost" id="expandAll" type="button">Expand all</button>
+        <button class="ghost" id="collapseAll" type="button">Collapse all</button>
+      </div>
+      <div id="tree"></div>
+      <div class="ask-card" id="liveAsk">Waiting to ask.</div>
+    </section>
+  </div>
+
+<script>
+const L = (id, label, extra = {}) => ({ id, label, ...extra });
+const branch = (id, prompt, options) => ({ id, prompt, options });
+
+const PANE_META = {
+  general: { title: "General", detail: "Workspace behavior, notifications, and everyday defaults." },
+  appearance: { title: "Appearance", detail: "ORE follows the visual and accessibility choices of this Mac." },
+  models: { title: "Default Models", detail: "How new conversations begin." },
+  projects: { title: "Projects", detail: "Per-project ore.toml." },
+  agents: { title: "Agents", detail: "Harnesses, authentication, and models." },
+  environment: { title: "Environment", detail: "Where work lives." },
+  dreams: { title: "Dreams", detail: "Overnight research. Off by default." },
+  privacy: { title: "Privacy", detail: "What ORE sends and what it never sends." },
+  about: { title: "About", detail: "License and open-source notices." },
+};
+
+const SETTINGS_PANES = {
+  general: [
+    { card: "Workspace defaults", items: [{ id: "settingsBranchPrefix", label: "Branch prefix", kind: "field", value: "ore" }] },
+    { card: "Agent permissions", items: [{ id: "settingsAutoTerminal", label: "Automatically allow routine terminal commands", kind: "toggle" }] },
+    { card: "Always on", items: [
+      { id: "settingsLaunchAtLogin", label: "Start ORE at login", kind: "toggle" },
+      { id: "settingsQuitAsk", label: "Ask before quitting with ⌘Q", kind: "toggle", on: true },
+      { id: "settingsProactive", label: "Proactive updates from the assistant", kind: "toggle", on: true },
+    ] },
+    { card: "Notifications", items: [
+      { id: "settingsNotifyORE", label: "Notify me in ORE", kind: "toggle", on: true },
+      { id: "settingsNotifyTurn", label: "Notify when a turn completes", kind: "toggle", on: true },
+      { id: "settingsSound", label: "Play completion sounds", kind: "toggle", on: true },
+    ] },
+    { card: "Launch briefing", items: [
+      { id: "settingsGreet", label: "Greet me at launch", kind: "toggle", on: true },
+      { id: "settingsGreetVoice", label: "Speak the briefing aloud", kind: "toggle", on: true },
+    ] },
+    { card: "Spoken narration", items: [
+      { id: "settingsNarration", label: "Allow spoken narration", kind: "toggle", on: true },
+      { id: "settingsFleetNarration", label: "Announce every workspace's milestones", kind: "toggle", on: true },
+    ] },
+    { card: "Voice input", items: [
+      { id: "settingsLaya", label: "Laya on-device decisions", kind: "button" },
+      { id: "settingsVoiceAsks", label: "Open the mic when an agent asks a question", kind: "toggle", on: true },
+      { id: "settingsQuietMode", label: "Keep the assistant quiet while you listen to music", kind: "toggle" },
+      { id: "settingsHoldToTalk", label: "Hold ⇧⌥ to talk", kind: "toggle", on: true },
+      { id: "settingsFinishPhrase", label: "Finish phrase", kind: "button" },
+      { id: "settingsSilenceSend", label: "Send after 3 seconds of silence", kind: "toggle" },
+      { id: "settingsLegacyHold", label: "Hold ⇧⌥ dictates into the composer instead", kind: "toggle" },
+    ] },
+  ],
+  appearance: [
+    { card: "Liquid Glass", items: [{ id: "settingsLiquidGlass", label: "Use Liquid Glass", kind: "toggle" }] },
+  ],
+  models: [
+    { card: "New chats", items: [
+      { id: "settingsDefaultAgent", label: "Default agent", kind: "button" },
+      { id: "settingsDefaultModel", label: "Default model", kind: "button" },
+    ] },
+    { card: "Review button", items: [
+      { id: "settingsReviewAgent", label: "Review agent", kind: "button" },
+      { id: "settingsReviewModel", label: "Review model", kind: "button" },
+    ] },
+  ],
+  projects: [
+    { card: "ore.toml", items: [
+      { id: "settingsProjectFiles", label: "Files to copy", kind: "button" },
+      { id: "settingsProjectScripts", label: "Scripts", kind: "button" },
+      { id: "settingsProjectDefaults", label: "Default agent", kind: "button" },
+    ] },
+  ],
+  agents: [
+    { card: "Harnesses", items: [
+      { id: "settingsAgentAuth", label: "Sign in", kind: "button" },
+      { id: "settingsApiKeyFallback", label: "Allow API-key fallback", kind: "toggle" },
+      { id: "settingsUnpromptedCursor", label: "Run tools unprompted in Cursor Bypass", kind: "toggle" },
+      { id: "settingsUnpromptedAntigravity", label: "Run tools unprompted in Antigravity Bypass", kind: "toggle" },
+    ] },
+  ],
+  environment: [
+    { card: "Effective paths", items: [{ id: "settingsEnvPaths", label: "~/ore/workspaces", kind: "button" }] },
+  ],
+  dreams: [
+    { card: "Overnight research", items: [{ id: "settingsDreamEnable", label: "Enable Dream Mode", kind: "toggle" }] },
+    { card: "Sleep", items: [
+      { id: "settingsDreamAwake", label: "Keep Mac awake on AC during quiet hours", kind: "toggle" },
+      { id: "settingsDreamPlugged", label: "Only dream while plugged in", kind: "toggle", on: true },
+    ] },
+    { card: "When", items: [
+      { id: "settingsDreamHours", label: "Quiet hours", kind: "button" },
+      { id: "settingsDreamIdle", label: "Idle for 20 min", kind: "button" },
+    ] },
+    { card: "Budget", items: [{ id: "settingsDreamBudget", label: "Night token cap", kind: "field", value: "50000" }] },
+    { card: "Safety", items: [{ id: "settingsDreamSecrets", label: "Copy .env into dream worktrees", kind: "toggle" }] },
+  ],
+  privacy: [
+    { card: "Analytics", items: [
+      { id: "settingsAnalytics", label: "Share anonymous usage data", kind: "toggle" },
+      { id: "settingsInstallID", label: "Copy install ID", kind: "button" },
+    ] },
+  ],
+  about: [
+    { card: "ORE", items: [
+      { id: "settingsWebsite", label: "Website", kind: "button" },
+      { id: "settingsLicense", label: "View license", kind: "button" },
+      { id: "settingsNotice", label: "View notice", kind: "button" },
+    ] },
+  ],
+};
+
+function paneLeaves(pane) {
+  return SETTINGS_PANES[pane].flatMap((card) =>
+    card.items.map((item) => L(item.id, item.label))
+  );
+}
+
+function withNone(options) {
+  return options.concat([L("none", "not one of these controls — skip")]);
+}
+
+const PALETTE_NODE = branch("paletteControl", "Open the empty ⌘P picker, or the file named in this clause?", withNone([
+  L("openFilePalette", "empty ⌘P / command palette, no filename spoken"),
+  L("openNamedFile", "open the specific file named in this clause"),
+]));
+
+const SETTINGS_NODE = branch(
+  "settingsPane",
+  "Which Settings action? Turning a preference on or off is a pane, not closing the window.",
+  [
+    L("openSettings", "open or show the Settings window itself"),
+    L("closeSettings", "dismiss the Settings window itself — not turning a toggle off"),
+    L("general", "General: branch prefix, login, quit ask, notifications, greeting, narration, voice, Laya, hold to talk", { children: branch("generalControl", "Which General control?", withNone(paneLeaves("general"))) }),
+    L("appearance", "Appearance: Liquid Glass, native materials, turn glass on or off", { children: branch("appearanceControl", "Which Appearance control?", withNone(paneLeaves("appearance"))) }),
+    L("models", "Default Models: new-chat agent and Review model", { children: branch("modelsControl", "Which Default Models control?", withNone(paneLeaves("models"))) }),
+    L("projects", "Projects: ore.toml files, scripts, defaults", { children: branch("projectsControl", "Which Projects control?", withNone(paneLeaves("projects"))) }),
+    L("agents", "Agents: sign in, API-key fallback, unprompted tools", { children: branch("agentsControl", "Which Agents control?", withNone(paneLeaves("agents"))) }),
+    L("environment", "Environment: workspace and database paths", { children: branch("environmentControl", "Which Environment control?", withNone(paneLeaves("environment"))) }),
+    L("dreams", "Dreams: Dream Mode, quiet hours, budget, secrets", { children: branch("dreamsControl", "Which Dreams control?", withNone(paneLeaves("dreams"))) }),
+    L("privacy", "Privacy: analytics, install ID", { children: branch("privacyControl", "Which Privacy control?", withNone(paneLeaves("privacy"))) }),
+    L("about", "About: website, license, notice", { children: branch("aboutControl", "Which About control?", withNone(paneLeaves("about"))) }),
+  ]
+);
+
+const TERMINAL_NODE = branch(
+  "terminalScope",
+  "Whole terminal dock, or a terminal tab? Close/shut the terminal (no word tab) is the dock.",
+  withNone([
+    L("dock", "the whole terminal pane: hide, show, shut, close the terminal, collapse, don't want to see it — they did not say tab", {
+      children: branch("dockControl", "Which dock action?", withNone([
+        L("terminalCollapse", "hide / shut / don't want to see the dock"),
+        L("terminalOpen", "show the dock"),
+        L("terminalToggle", "toggle the dock"),
+      ])),
+    }),
+    L("tab", "they said tab: new tab, plus, another shell, close this tab, next tab, previous tab", {
+      children: branch("tabControl", "Which terminal-tab action?", withNone([
+        L("terminalTabCreate", "new terminal tab / plus / another shell"),
+        L("terminalTabClose", "close this terminal tab only"),
+        L("terminalTabNext", "next terminal tab"),
+        L("terminalTabPrevious", "previous terminal tab"),
+      ])),
+    }),
+    L("terminalRun", "Run the project script"),
+    L("revealInFinder", "reveal or open this folder in Finder from the terminal"),
+  ])
+);
+
+const TARGET_NODE = branch(
+  "target",
+  "This clause is one target. Settings toggles (Liquid Glass, Dream Mode), terminal tabs, and Finder are chrome. Agent work is write/fix/test/change code — not turning preferences on or off.",
+  [
+    L("left_sidebar", "left workspace list / file list / left sidebar", {
+      children: branch("leftControl", "Hide, show, or toggle the left sidebar? Shut and close mean hide.", [
+        L("sidebarHide", "shut / hide / close / collapse / tuck"),
+        L("sidebarShow", "show / open / expand / bring back"),
+        L("sidebarToggle", "toggle / switch / flip"),
+      ]),
+    }),
+    L("right_review", "right review pane / inspector / All files Changes Requests — not the Review toolbar button", {
+      children: branch("reviewScope", "Hide/show the pane, or a review tab?", [
+        L("visibility", "hide, show, shut, close, or toggle the right review pane", {
+          children: branch("reviewVisibility", "Hide, show, or toggle? Shut and close mean hide.", [
+            L("reviewHide", "shut / hide / close / collapse / tuck"),
+            L("reviewShow", "show / open / expand / bring back"),
+            L("reviewToggle", "toggle / switch / flip"),
+          ]),
+        }),
+        L("reviewAllFiles", "All files tab"),
+        L("reviewChanges", "Changes tab"),
+        L("reviewRequests", "Requests tab"),
+      ]),
+    }),
+    L("terminal", "bottom terminal dock: hide/show, new tab, close tab, Run, Finder", { children: TERMINAL_NODE }),
+    L("titlebar", "window toolbar: Review, Commit, PR, sidebar toggle, Settings, ⌘P", {
+      children: branch("titlebarControl", "Which titlebar control?", withNone([
+        L("workspaceReview", "Review toolbar button"),
+        L("gitCommit", "Commit toolbar button"),
+        L("gitShip", "Create Pull Request"),
+        L("sidebarToggle", "titlebar sidebar toggle"),
+        L("openSettings", "open Settings"),
+        L("openFilePalette", "open the ⌘P file palette"),
+      ])),
+    }),
+    L("tabs", "conversation tabs, new chat, find, history", {
+      children: branch("chatTabControl", "Which chat-tab control?", withNone([
+        L("chatTabCreate", "new conversation tab"),
+        L("chatTabNext", "next chat tab"),
+        L("chatTabPrevious", "previous chat tab"),
+        L("chatHistory", "history clock"),
+        L("findInTranscript", "find in transcript"),
+      ])),
+    }),
+    L("composer", "ask box: paperclip, model, effort, Ask/Plan, Fast, mic, send", {
+      children: branch("composerControl", "Which composer control?", withNone([
+        L("attachFiles", "paperclip / attach files"),
+        L("openModelChooser", "model chip"),
+        L("openEffortChooser", "effort picker"),
+        L("effortLow", "effort Low"), L("effortMedium", "effort Medium"),
+        L("effortHigh", "effort High"), L("effortXhigh", "effort Extra High"),
+        L("permissionAsk", "Ask"), L("permissionAcceptEdits", "Accept Edits"),
+        L("permissionPlan", "Plan"), L("permissionBypass", "Bypass"),
+        L("composerStandard", "Standard"), L("composerFast", "Fast"),
+        L("composerSend", "send arrow"),
+        L("assistantMute", "mute"), L("assistantUnmute", "unmute"),
+      ])),
+    }),
+    L("file_palette", "empty ⌘P / command palette with no filename spoken", { children: PALETTE_NODE }),
+    L("settings", "Settings window or any preference: Liquid Glass, Dream Mode, hold to talk, narration, login, branch prefix, notifications, Laya, privacy, default model", { children: SETTINGS_NODE }),
+    L("finder", "macOS Finder — reveal or open a folder, not an ORE pane", {
+      children: branch("finderControl", "Which Finder action?", withNone([
+        L("revealInFinder", "reveal the current file or folder in Finder"),
+        L("openFinder", "open Finder on the workspace"),
+      ])),
+    }),
+    L("assistant", "write, fix, test, or change source code — not chrome, not Settings, not Liquid Glass, not Finder, not open/hide", { leaf: "assistant" }),
+    L("none", "greeting, filler, or already done — drop it", { leaf: "drop" }),
+  ]
+);
+
+const TREE = branch(
+  "fileGate",
+  "Does this clause open a named editor file or the command palette? Settings, terminal tabs, Finder, and coding work are other.",
+  [
+    L("named_file", "open a document by filename or extension (.md .swift .py .txt .toml .json) or ⌘P / command palette", { children: PALETTE_NODE }),
+    L("other", "not opening a named document: panes, Settings toggles, terminal, Finder, coding work, filler", { children: TARGET_NODE }),
+  ]
+);
+
+const expanded = new Set(["fileGate"]);
+const visited = new Set(["fileGate"]);
+const PANE_HIDE = { sidebarHide: "sidebar", reviewHide: "review", terminalCollapse: "terminal" };
+const PANE_SHOW = { sidebarShow: "sidebar", reviewShow: "review", terminalOpen: "terminal" };
+const SKIP_COMMANDS = new Set(["none", "drop", "ui", "assistant"]);
+const toggleState = {};
+let termTabCount = 1;
+let finderTimer = 0;
+
+function flattenItems() {
+  const out = [];
+  for (const [pane, cards] of Object.entries(SETTINGS_PANES)) {
+    for (const card of cards) for (const item of card.items) out.push({ pane, ...item });
+  }
+  return out;
+}
+
+function collectIds(node, into = []) {
+  into.push(node.id);
+  for (const opt of node.options) if (opt.children) collectIds(opt.children, into);
+  return into;
+}
+
+function renderTree(path = {}, root = TREE) {
+  document.getElementById("tree").innerHTML = renderNode(root, path, true);
+  document.querySelectorAll("[data-toggle]").forEach((el) => {
+    el.onclick = () => {
+      const id = el.getAttribute("data-toggle");
+      if (!id) return;
+      if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+      renderTree(path);
+    };
+  });
+}
+
+function renderNode(node, path, isRoot) {
+  const open = expanded.has(node.id);
+  const picked = path[node.id];
+  const probs = path.probs?.[node.id] || {};
+  const kids = node.options.map((opt) => {
+    const on = picked === opt.id ? " on" : "";
+    const p = probs[opt.id];
+    const nested = opt.children && open ? renderNode(opt.children, path, false) : "";
+    return `<div class="opt${on}" data-toggle="${opt.children ? opt.children.id : ""}">
+      <span>${opt.id}</span><span class="p">${p != null ? Number(p).toFixed(2) : ""}</span>
+    </div>${nested}`;
+  }).join("");
+  return `<div class="node ${isRoot ? "root" : ""}">
+    <div class="qname" data-toggle="${node.id}">${open ? "▾" : "▸"} ${node.id} · ${node.prompt}</div>
+    <div class="kids ${open ? "open" : ""}">${kids}</div>
+  </div>`;
+}
+
+function tidyClause(s) {
+  let t = s.trim();
+  const lead = /^(hello|hi|hey|so|please|just|quickly|and|then|also|plus|i want to|i wanted to|,)+\b[\s,]*/i;
+  const trail = /[\s,]+(and|then|also|plus|so|please|quickly|as well)+$/i;
+  for (let i = 0; i < 6; i++) {
+    const next = t.replace(lead, "").replace(trail, "").trim();
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
+function clauses(spoken) {
+  const raw = spoken.split(/(?:[.?!;:](?:\s+|$))|\b(?:and then|and also|then also|and|then|also)\b/i);
+  const chunks = raw.map(tidyClause).filter((s) => s.length > 3);
+  const verbs = /\b(?:close|shut|hide|collapse|open|show|tuck|turn on|turn off|reveal|enable|disable)\b/gi;
+  const out = [];
+  for (const chunk of chunks) {
+    const hits = [...chunk.matchAll(verbs)];
+    if (hits.length <= 1) {
+      out.push(chunk);
+      continue;
+    }
+    let start = 0;
+    for (let i = 1; i < hits.length; i++) {
+      const piece = chunk.slice(start, hits[i].index).trim();
+      if (piece.length > 3) out.push(piece);
+      start = hits[i].index;
+    }
+    const last = chunk.slice(start).trim();
+    if (last.length > 3) out.push(last);
+  }
+  return out.map(tidyClause).filter((s) => s.length > 3);
+}
+
+function pick(answer) {
+  const probs = answer?.probabilities || {};
+  const strength = Object.values(probs).length ? Math.max(...Object.values(probs)) : (answer?.confidence ?? 0);
+  return { choice: answer?.choice, strength, probs };
+}
+
+async function systemOne(message, name, instructions, criteria) {
+  document.getElementById("liveAsk").innerHTML = `Asking <b>${name}</b> on leftover <em>${message}</em>`;
+  const res = await fetch("/v1/systemone", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      state: { message },
+      questions: { [name]: { type: "choice", instructions, criteria } },
+      model: "laya:en",
+    }),
+  });
+  if (!res.ok) throw new Error(`Laya HTTP ${res.status}`);
+  const body = await res.json();
+  return body.answers?.[name] || body[name];
+}
+
+function foreground() {
+  const s = document.getElementById("settings").classList.contains("show");
+  const p = document.getElementById("palette").classList.contains("show");
+  if (s) return "settings";
+  if (p) return "palette";
+  return "workspace";
+}
+
+function layoutState() {
+  const win = document.getElementById("window");
+  const fg = foreground();
+  win.classList.toggle("behind", fg !== "workspace");
+  const item = (on, label, front) =>
+    `<span class="${front ? "front" : on ? "on" : "off"}">${label}: ${front ? "front" : on ? "shown" : "hidden"}</span>`;
+  document.getElementById("layoutState").innerHTML =
+    item(!win.classList.contains("no-left"), "Left sidebar", false) +
+    item(!win.classList.contains("no-right"), "Right review", false) +
+    item(!win.classList.contains("no-term"), "Terminal", false) +
+    item(fg === "settings", "Settings", fg === "settings") +
+    item(fg === "palette", "⌘P palette", fg === "palette");
+}
+
+function renderControl(item) {
+  const on = toggleState[item.id] ?? item.on ?? false;
+  if (item.kind === "toggle") {
+    return `<div class="ctl" data-hit="${item.id}"><span>${item.label}</span><input type="checkbox" ${on ? "checked" : ""} disabled></div>`;
+  }
+  if (item.kind === "field") {
+    return `<div class="ctl" data-hit="${item.id}"><span>${item.label}</span><input type="text" value="${item.value || ""}" disabled></div>`;
+  }
+  return `<div class="ctl" data-hit="${item.id}"><span>${item.label}</span><button class="ghost" type="button" disabled>Open</button></div>`;
+}
+
+function showSettings(pane) {
+  document.getElementById("palette").classList.remove("show");
+  document.getElementById("settings").classList.add("show");
+  const nav = document.getElementById("settingsNav");
+  nav.innerHTML = Object.entries(PANE_META).map(([id, meta]) =>
+    `<button class="pane ${id === pane ? "on" : ""}" type="button">${meta.title}</button>`
+  ).join("");
+  document.getElementById("settingsTitle").textContent = PANE_META[pane].title;
+  document.getElementById("settingsDetail").textContent = PANE_META[pane].detail;
+  document.getElementById("settingsBody").innerHTML = SETTINGS_PANES[pane].map((card) =>
+    `<div class="scard"><h4>${card.card}</h4>${card.items.map(renderControl).join("")}</div>`
+  ).join("");
+  layoutState();
+}
+
+function showPalette(query) {
+  document.getElementById("settings").classList.remove("show");
+  document.getElementById("palette").classList.add("show");
+  document.getElementById("paletteQuery").value = query || "";
+  const files = ["CONTRIBUTING.md", "README.md", "Apps/OreMac/Package.swift", "NOTICE", "SECURITY.md"];
+  const q = (query || "").toLowerCase();
+  document.getElementById("paletteList").innerHTML = files.map((f) =>
+    `<li class="${q && f.toLowerCase().includes(q.split("/").pop()) ? "hit" : ""}">${f}</li>`
+  ).join("");
+  layoutState();
+}
+
+function showFinder(path) {
+  document.getElementById("finderPath").textContent = path;
+  const toast = document.getElementById("finderToast");
+  toast.classList.add("show");
+  clearTimeout(finderTimer);
+  finderTimer = setTimeout(() => toast.classList.remove("show"), 2200);
+}
+
+function paneForCommand(command) {
+  if (command in PANE_META) return command;
+  return flattenItems().find((item) => item.id === command)?.pane || null;
+}
+
+function markHit(command, clause) {
+  if (!command || SKIP_COMMANDS.has(command)) return;
+  document.querySelectorAll("[data-hit]").forEach((el) => el.classList.remove("hit"));
+  document.querySelectorAll(`[data-hit="${command}"]`).forEach((el) => el.classList.add("hit", "did"));
+  const win = document.getElementById("window");
+  if (PANE_HIDE[command] === "sidebar") win.classList.add("no-left");
+  if (PANE_HIDE[command] === "review") win.classList.add("no-right");
+  if (PANE_HIDE[command] === "terminal") win.classList.add("no-term");
+  if (PANE_SHOW[command] === "sidebar") win.classList.remove("no-left");
+  if (PANE_SHOW[command] === "review") win.classList.remove("no-right");
+  if (PANE_SHOW[command] === "terminal") win.classList.remove("no-term");
+  if (command === "sidebarToggle") win.classList.toggle("no-left");
+  if (command === "reviewToggle") win.classList.toggle("no-right");
+  if (command === "terminalToggle") win.classList.toggle("no-term");
+
+  if (command === "openSettings") showSettings("general");
+  if (command === "closeSettings") document.getElementById("settings").classList.remove("show");
+  const settingsPane = paneForCommand(command);
+  if (settingsPane) {
+    if (command.startsWith("settings") || command in PANE_META) {
+      const item = flattenItems().find((i) => i.id === command);
+      if (item?.kind === "toggle") {
+        const on = /\b(turn on|enable|use)\b/i.test(clause);
+        const off = /\b(turn off|disable)\b/i.test(clause);
+        if (on) toggleState[command] = true;
+        else if (off) toggleState[command] = false;
+        else toggleState[command] = !(toggleState[command] ?? item.on ?? false);
+      }
+      showSettings(settingsPane);
+      document.querySelectorAll(`#settingsBody [data-hit="${command}"]`).forEach((el) => el.classList.add("hit"));
+    }
+  }
+
+  if (command === "openFilePalette") showPalette("");
+  if (command === "openNamedFile") {
+    const name = (clause.match(/[\w./-]+\.\w+/) || [clause.replace(/^open\s+/i, "").trim()])[0];
+    showPalette(name);
+  }
+  if (command === "terminalTabCreate") {
+    win.classList.remove("no-term");
+    termTabCount += 1;
+    const extra = document.getElementById("termExtraTabs");
+    extra.insertAdjacentHTML("beforeend", `<span class="tab on" data-hit="terminalTabCreate">zsh ${termTabCount}</span>`);
+  }
+  if (command === "revealInFinder" || command === "openFinder") {
+    showFinder("ore/hideki-yukawa");
+  }
+  layoutState();
+}
+
+function resetUI() {
+  const win = document.getElementById("window");
+  win.classList.remove("no-left", "no-right", "no-term", "behind");
+  document.getElementById("settings").classList.remove("show");
+  document.getElementById("palette").classList.remove("show");
+  document.getElementById("finderToast").classList.remove("show");
+  document.getElementById("termExtraTabs").innerHTML = "";
+  termTabCount = 1;
+  for (const key of Object.keys(toggleState)) delete toggleState[key];
+  document.querySelectorAll(".ctrl, .tab, .ctl").forEach((el) => el.classList.remove("hit", "did"));
+  document.getElementById("rounds").innerHTML = "";
+  document.getElementById("final").innerHTML = `Assistant prompt: <span class="empty">nothing yet</span>`;
+  expanded.clear();
+  expanded.add("fileGate");
+  visited.clear();
+  visited.add("fileGate");
+  renderTree();
+  layoutState();
+  document.getElementById("liveAsk").textContent = "Waiting to ask. Click any ▸ branch to inspect its options.";
+}
+
+function outcome(opt) {
+  if (!opt) return { command: null, hasWork: false };
+  // Intermediate hops (named_file, other, dock, tab, visibility, …) must
+  // keep walking. Skipping them here left the window untouched.
+  if (opt.children) return null;
+  if (opt.leaf === "assistant") return { command: null, hasWork: true };
+  if (opt.leaf === "drop" || SKIP_COMMANDS.has(opt.id)) return { command: null, hasWork: false };
+  return null;
+}
+
+async function walkNode(node, leftover, path) {
+  visited.add(node.id);
+  expanded.add(node.id);
+  const criteria = {};
+  for (const opt of node.options) criteria[opt.id] = opt.label;
+  const ans = await systemOne(leftover, node.id, node.prompt, criteria);
+  const chosen = pick(ans);
+  path[node.id] = chosen.choice;
+  path.probs = path.probs || {};
+  path.probs[node.id] = chosen.probs;
+  renderTree(path);
+  const opt = node.options.find((o) => o.id === chosen.choice);
+  const early = outcome(opt);
+  if (early) return { ...early, path };
+  if (opt?.children) {
+    visited.add(opt.children.id);
+    expanded.add(opt.children.id);
+    return walkNode(opt.children, leftover, path);
+  }
+  if (!opt || SKIP_COMMANDS.has(opt.id)) return { command: null, hasWork: false, path };
+  return { command: opt.id, hasWork: false, path };
+}
+
+async function run() {
+  const spoken = document.getElementById("speech").value.trim();
+  const status = document.getElementById("status");
+  const runBtn = document.getElementById("run");
+  resetUI();
+  runBtn.disabled = true;
+  let assistant = "";
+  const parts = clauses(spoken);
+  let lastPath = {};
+  const clicks = [];
+  document.body.dataset.walk = "running";
+  try {
+    for (let n = 0; n < parts.length; n++) {
+      const clause = parts[n];
+      status.textContent = `Clause ${n + 1}/${parts.length}: ${clause}`;
+      const step = await walkNode(TREE, clause, {});
+      lastPath = step.path;
+      const hops = Object.entries(step.path).filter(([k]) => k !== "probs").map(([k, v]) => `${k}→${v}`).join(" · ");
+      let end = "skip";
+      if (step.command) end = `click <b>${step.command}</b>`;
+      else if (step.hasWork) end = "assistant";
+      const card = document.createElement("div");
+      card.className = "round";
+      card.innerHTML = `<div class="label">Clause ${n + 1}</div>
+        leftover: <em style="color:var(--amber)">${clause}</em><br>${hops}
+        → ${end}`;
+      document.getElementById("rounds").appendChild(card);
+      if (step.command) {
+        clicks.push(step.command);
+        markHit(step.command, clause);
+        await new Promise((r) => setTimeout(r, 400));
+      } else if (step.hasWork) {
+        assistant = [assistant, clause].filter(Boolean).join(" ");
+      }
+    }
+    visited.forEach((id) => expanded.add(id));
+    renderTree(lastPath);
+    document.getElementById("final").innerHTML = assistant
+      ? `Assistant prompt: <span>${assistant}</span>`
+      : `Assistant prompt: <span class="empty">empty — chrome skipped, no agent turn</span>`;
+    status.className = "status live";
+    status.textContent = "Tree walk finished. Clicks: " + (clicks.join(" → ") || "none") + ".";
+    document.body.dataset.clicks = clicks.join(",");
+    document.body.dataset.assistant = assistant;
+    document.body.dataset.palette = document.getElementById("palette").classList.contains("show") ? "1" : "0";
+    document.body.dataset.settings = document.getElementById("settings").classList.contains("show") ? "1" : "0";
+    document.body.dataset.tabs = String(termTabCount);
+    document.body.dataset.glass = toggleState.settingsLiquidGlass ? "1" : "0";
+    document.body.dataset.walk = "ok";
+  } catch (err) {
+    status.className = "status sim";
+    status.textContent = "Could not reach Laya (" + err.message + ").";
+    document.body.dataset.walk = "error:" + err.message;
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+renderTree();
+layoutState();
+document.getElementById("run").onclick = run;
+document.getElementById("reset").onclick = resetUI;
+document.getElementById("presetPanes").onclick = () => {
+  document.getElementById("speech").value = "Hello, so I want to close the right side bar quickly and then also shut the left side bar close the right one as well and in the terminal I don't want to see the terminal. close the terminal shut the terminal.";
+};
+document.getElementById("expandAll").onclick = () => {
+  collectIds(TREE).forEach((id) => expanded.add(id));
+  renderTree();
+};
+document.getElementById("collapseAll").onclick = () => {
+  expanded.clear();
+  expanded.add("fileGate");
+  renderTree();
+};
+if (new URLSearchParams(location.search).has("autowalk")) {
+  run();
+}
+</script>
+</body>
+</html>

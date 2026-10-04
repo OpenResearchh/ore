@@ -67,6 +67,7 @@ private struct SettingsPanes: View {
     @AppStorage(VoiceAssistantController.silenceAutoSendKey) private var silenceAutoSend = false
     @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
+    @Bindable private var glass = OreGlassSettings.shared
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage(QuitConfirmation.suppressedKey) private var quitWithoutAsking = false
     @AppStorage(AppModel.automaticRoutinePermissionsKey)
@@ -485,6 +486,12 @@ private struct SettingsPanes: View {
                 Label("ORE follows your Mac’s appearance, accent colour, contrast, text size, and Reduce Motion settings.", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.secondary)
                 Text("Navigation and the composer use system materials so Liquid Glass automatically adapts across displays and accessibility modes.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            SettingsCard(title: "Liquid Glass", icon: "cube.transparent") {
+                Toggle("Use Liquid Glass", isOn: $glass.isEnabled)
+                Text("Frosted refraction on chrome, cards, and buttons. Turn it off for a flatter material look.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

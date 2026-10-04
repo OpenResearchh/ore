@@ -465,7 +465,7 @@ struct OreGlassSurface: ViewModifier {
                     shape.strokeBorder(OreTheme.hairline, lineWidth: 1)
                         .allowsHitTesting(false)
                 }
-        } else if #available(macOS 26.0, *) {
+        } else if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             // Behind the content, not wrapping it. `glassEffect` on a
             // container that *holds* buttons intercepts those clicks on
             // macOS 26 — the Update / Later prompt, harness cards, Settings
@@ -537,6 +537,29 @@ struct OreGlassSurface: ViewModifier {
         if let tint { glass = glass.tint(tint) }
         if interactive { glass = glass.interactive() }
         return glass
+    }
+}
+
+/// User-facing Liquid Glass switch. Default on; off draws the material
+/// stand-in even on macOS 26 so chrome, cards, and buttons go flat.
+@MainActor
+@Observable
+final class OreGlassSettings {
+    static let shared = OreGlassSettings()
+    static let enabledKey = "ore.liquidGlass"
+
+    var isEnabled: Bool {
+        didSet { UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey) }
+    }
+
+    private init() {
+        isEnabled = Self.storedEnabled()
+    }
+
+    /// Missing key means on — `bool(forKey:)` is false when nothing is stored.
+    static func storedEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: enabledKey) != nil else { return true }
+        return defaults.bool(forKey: enabledKey)
     }
 }
 
@@ -612,7 +635,7 @@ struct OreComposerSurface: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             content
                 .padding(padding)
                 .background { glow(cornerRadius: Self.glassRadius) }
@@ -799,7 +822,7 @@ struct OreNavigationSelection: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             // A whisper of accent in the selected pill's glass — the "you are
             // here" marker; strong enough to pick out at a glance, weak enough
             // that the one loud accent in the pane stays the primary action.
@@ -824,7 +847,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             configuration.label
                 .font(.system(size: OreTheme.Font.body, weight: .semibold))
                 .foregroundStyle(.white)
@@ -856,7 +879,7 @@ struct OrePrimaryButtonStyle: ButtonStyle {
 struct OreSecondaryButtonStyle: ButtonStyle {
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             configuration.label
                 .font(.system(size: OreTheme.Font.body, weight: .medium))
                 .padding(.horizontal, 12)
@@ -901,7 +924,7 @@ struct OreGitActionButtonStyle: ButtonStyle {
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             configuration.label
                 .font(.system(size: OreTheme.Font.body, weight: .semibold))
                 .foregroundStyle(.white)

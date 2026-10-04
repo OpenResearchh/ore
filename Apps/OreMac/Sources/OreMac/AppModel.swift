@@ -66,6 +66,7 @@ final class AppModel {
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             automaticRoutinePermissionsKey: automaticRoutinePermissionsDefault,
+            OreGlassSettings.enabledKey: true,
         ])
     }
     private(set) var workspaces: [WorkspaceSummary] = [] {

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import OreMac
 
@@ -35,5 +36,15 @@ struct OreGlassTests {
         #expect(OreGlassShape.rect(cornerRadius: 12) == .rect(cornerRadius: 12))
         #expect(OreGlassShape.rect(cornerRadius: 12) != .rect(cornerRadius: 16))
         #expect(OreGlassShape.capsule != .rect(cornerRadius: 16))
+    }
+
+    @Test @MainActor func liquidGlassDefaultsOnWhenUnset() {
+        let defaults = UserDefaults(suiteName: "ore.glass.preference.test")!
+        defaults.removePersistentDomain(forName: "ore.glass.preference.test")
+        #expect(OreGlassSettings.storedEnabled(in: defaults))
+        defaults.set(false, forKey: OreGlassSettings.enabledKey)
+        #expect(!OreGlassSettings.storedEnabled(in: defaults))
+        defaults.set(true, forKey: OreGlassSettings.enabledKey)
+        #expect(OreGlassSettings.storedEnabled(in: defaults))
     }
 }

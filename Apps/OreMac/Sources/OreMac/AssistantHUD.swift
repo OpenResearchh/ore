@@ -751,7 +751,7 @@ private struct HUDActionButtonStyle: ButtonStyle {
             .padding(.horizontal, 12)
             .frame(height: 26)
 
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             // Real glass buttons, resting on the glass card and blending with it
             // through the HUD's GlassEffectContainer: the prominent action takes
             // an accent tint, the rest stay clear so one answer leads.

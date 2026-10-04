@@ -897,6 +897,18 @@ struct MarkdownRenderer {
                 ofSize: baseFont.pointSize - 1, weight: .regular
             )
             visitedFences += 1
+            let language = codeBlock.language?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if (language == "mermaid" || language == nil || language == ""),
+               let chart = Flowchart.parse(code) {
+                let attachment = FlowchartAttachment()
+                // Keep the source with the attachment for copy/export clients.
+                attachment.fileWrapper = FileWrapper(regularFileWithContents: Data(code.utf8))
+                attachment.fileWrapper?.preferredFilename = "flowchart.mmd"
+                attachment.image = chart.image(font: baseFont, textColor: textColor)
+                let result = NSMutableAttributedString(attachment: attachment)
+                result.append(NSAttributedString(string: "\n\n", attributes: [.font: baseFont]))
+                return result
+            }
             let cache = !(skipCachingLastFence && visitedFences == fenceCount)
             let highlighted = highlighter?.highlight(
                 code, language: codeBlock.language, font: font, cache: cache

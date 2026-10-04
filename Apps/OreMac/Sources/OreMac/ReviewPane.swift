@@ -1353,7 +1353,7 @@ private struct MarkdownPreview: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView()
+        let textView = FlowchartTextView(usingTextLayoutManager: false)
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false

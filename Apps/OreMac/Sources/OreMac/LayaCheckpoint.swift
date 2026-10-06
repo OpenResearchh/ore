@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import OrePersistence
 
@@ -7,7 +8,15 @@ import OrePersistence
 /// an empty marker and Settings treated that as "already downloaded".
 enum LayaCheckpoint {
     static let repoID = "convaiinnovations/laya"
-    static let revision = "main"
+    /// Immutable Hugging Face snapshot. The runner imports Python helpers from
+    /// this checkout, so never follow mutable branches here.
+    static let revision = "fe2b7719c095b82cdb2bfeedefc1fee30e506c21"
+
+    static let trustedExecutableHashes: [String: String] = [
+        "email_utils.py": "1b1c0a6e23251ac8cae81e723bc98a31ca5483522c742937e263c2ecee42f343",
+        "rl_agent_api.py": "be3b46819c9999c3ef88e0f2ecf6d3ab1cdfed1d9a8b466fc89811e34d44031b",
+        "rl_common.py": "8d83611d480c971d640a7b7d3aa2f2219c5e8455e9cc2329fd073681bd8be23e",
+    ]
 
     static var cacheDirectory: URL {
         OreHome.directory.appending(path: "models/laya/en", directoryHint: .isDirectory)
@@ -89,6 +98,19 @@ enum LayaCheckpoint {
         return false
     }
 
+    static func verifyTrustedExecutableFiles(in directory: URL = cacheDirectory) throws {
+        for (path, expected) in trustedExecutableHashes {
+            let url = directory.appending(path: path)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw LayaInstallError.untrustedExecutable(path: path, reason: "missing")
+            }
+            let actual = try sha256Hex(of: url)
+            guard actual == expected else {
+                throw LayaInstallError.untrustedExecutable(path: path, reason: "SHA-256 mismatch")
+            }
+        }
+    }
+
     /// Hugging Face `/tree/` JSON: an array of file/dir entries.
     static func parseTree(_ data: Data) throws -> TreeListing {
         let object = try JSONSerialization.jsonObject(with: data)
@@ -145,12 +167,18 @@ enum LayaCheckpoint {
         if let number = value as? Double { return Int64(number) }
         return nil
     }
+
+    private static func sha256Hex(of url: URL) throws -> String {
+        let digest = SHA256.hash(data: try Data(contentsOf: url))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 enum LayaInstallError: LocalizedError, Equatable {
     case listing(String)
     case emptySnapshot
     case http(path: String, status: Int)
+    case untrustedExecutable(path: String, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -160,6 +188,8 @@ enum LayaInstallError: LocalizedError, Equatable {
             return "The Laya repository listed no model files to download."
         case .http(let path, let status):
             return "Couldn't download \(path) (HTTP \(status))."
+        case .untrustedExecutable(let path, let reason):
+            return "The pinned Laya runner file \(path) could not be trusted: \(reason)."
         }
     }
 }

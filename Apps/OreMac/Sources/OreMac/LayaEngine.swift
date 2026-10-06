@@ -35,7 +35,8 @@ final class LayaEngine {
     private(set) var readiness: Readiness = .unavailable
     private var installTask: Task<Void, Never>?
     private var ensureTask: Task<Void, Never>?
-    private var http = SystemOneHTTPClient()
+    private let runnerToken: String
+    private var http: SystemOneHTTPClient
     private var serverProcess: Process?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -65,6 +66,9 @@ final class LayaEngine {
     }
 
     init() {
+        let token = UUID().uuidString
+        runnerToken = token
+        http = SystemOneHTTPClient(authToken: token)
         // Do not probe the network or the daemon here. First paint of
         // Settings will call `refresh()`, and dictation calls `prewarm()`.
         if Self.weightsArePresent() {
@@ -107,7 +111,7 @@ final class LayaEngine {
 
     private func ensureRunning(installDependencies: Bool) async {
         if case .downloading = readiness, !installDependencies { return }
-        if await SystemOneHTTPClient.probe() {
+        if await http.probe() {
             await applyDecidePing()
             return
         }
@@ -140,7 +144,7 @@ final class LayaEngine {
 
     /// `/v1/models` is not enough — Ready means a System One question returned.
     private func applyDecidePing() async {
-        if await SystemOneHTTPClient.pingDecide() {
+        if await http.pingDecide() {
             readiness = .ready
         } else {
             readiness = .failed("The runner is up but Laya is not answering questions.")
@@ -149,7 +153,7 @@ final class LayaEngine {
 
     private func runInstall() async {
         readiness = .downloading(fraction: 0)
-        if await SystemOneHTTPClient.probe() {
+        if await http.probe() {
             await applyDecidePing()
             return
         }
@@ -194,6 +198,7 @@ final class LayaEngine {
             )
         }
         guard Self.weightsArePresent() else { throw LayaInstallError.emptySnapshot }
+        try LayaCheckpoint.verifyTrustedExecutableFiles()
         readiness = .downloading(fraction: 0.7)
     }
 
@@ -313,8 +318,9 @@ final class LayaEngine {
     }
 
     private func startServer() async throws {
-        if await SystemOneHTTPClient.probe() { return }
+        if await http.probe() { return }
         if let running = serverProcess, running.isRunning { return }
+        try LayaCheckpoint.verifyTrustedExecutableFiles()
         try installServeScript()
         let python = LayaCheckpoint.venvPython
         guard FileManager.default.isExecutableFile(atPath: python.path) else {
@@ -327,6 +333,7 @@ final class LayaEngine {
             "--model-dir", LayaCheckpoint.modelDirectory.path,
             "--host", "127.0.0.1",
             "--port", "11435",
+            "--token", runnerToken,
         ]
         process.currentDirectoryURL = LayaCheckpoint.cacheDirectory
         process.environment = ShellEnvironment.childEnvironment()
@@ -382,11 +389,11 @@ final class LayaEngine {
         let steps = Int(seconds / 0.5)
         for _ in 0..<steps {
             if Task.isCancelled { return false }
-            if await SystemOneHTTPClient.probe() { return true }
+            if await http.probe() { return true }
             if let process = serverProcess, !process.isRunning { return false }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        return await SystemOneHTTPClient.probe()
+        return await http.probe()
     }
 
     private func runDetached(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError, HTTPError
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 HTML = ROOT / "laya-flow.html"
 LAYA = "http://127.0.0.1:11435"
+LAYA_TOKEN = os.environ.get("LAYA_TOKEN")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,11 +44,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def proxy(self, method: str, raw: bytes):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if LAYA_TOKEN:
+            headers["Authorization"] = "Bearer " + LAYA_TOKEN
         req = Request(
             LAYA + self.path.split("?", 1)[0],
             data=raw if method == "POST" else None,
             method=method,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=headers,
         )
         try:
             with urlopen(req, timeout=60) as resp:

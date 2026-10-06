@@ -33,37 +33,41 @@ def load_agent(model_dir: Path):
 class Handler(BaseHTTPRequestHandler):
     agent = None
     model_id = "laya:en"
+    token = None
     infer_lock = threading.Lock()
 
     def log_message(self, format, *args):
         sys.stderr.write("laya-serve: " + (format % args) + "\n")
 
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _authorized(self) -> bool:
+        if not self.token:
+            return True
+        return self.headers.get("Authorization") == "Bearer " + self.token
 
     def _send(self, status: int, body: dict):
         payload = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self._cors()
         self.end_headers()
         self.wfile.write(payload)
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.end_headers()
+        self._send(404, {"error": "not found"})
 
     def do_GET(self):
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
+            return
         if self.path.split("?", 1)[0] == "/v1/models":
             self._send(200, {"object": "list", "data": [{"id": self.model_id}]})
             return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
+            return
         path = self.path.split("?", 1)[0]
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
@@ -95,12 +99,14 @@ def main():
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11435)
+    parser.add_argument("--token", required=True)
     args = parser.parse_args()
     model_dir = Path(args.model_dir)
     if not (model_dir / "model.safetensors").is_file():
         sys.stderr.write("laya-serve: missing model.safetensors in %s\n" % model_dir)
         sys.exit(2)
     Handler.agent = load_agent(model_dir)
+    Handler.token = args.token
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     sys.stdout.write("LAYA_READY\n")
     sys.stdout.flush()

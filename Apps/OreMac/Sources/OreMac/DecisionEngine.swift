@@ -165,15 +165,18 @@ struct SystemOneHTTPClient: DecisionEngine {
     var baseURL: URL
     var model: String
     var timeout: TimeInterval
+    var authToken: String?
 
     init(
         baseURL: URL = LayaRuntime.loopbackURL,
         model: String = LayaRuntime.model,
-        timeout: TimeInterval = 20
+        timeout: TimeInterval = 20,
+        authToken: String? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
         self.timeout = timeout
+        self.authToken = authToken
     }
 
     func decide(_ request: SystemOneRequest) async -> SystemOneResponse? {
@@ -182,6 +185,7 @@ struct SystemOneHTTPClient: DecisionEngine {
         var urlRequest = URLRequest(url: baseURL.appending(path: "/v1/systemone"))
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        authorize(&urlRequest)
         urlRequest.timeoutInterval = timeout
         urlRequest.httpBody = try? payload.jsonData()
         do {
@@ -195,8 +199,9 @@ struct SystemOneHTTPClient: DecisionEngine {
     }
 
     /// Cheap liveness check used by Settings and prewarm. Does not download.
-    static func probe(baseURL: URL = LayaRuntime.loopbackURL) async -> Bool {
+    func probe() async -> Bool {
         var request = URLRequest(url: baseURL.appending(path: "/v1/models"))
+        authorize(&request)
         request.timeoutInterval = 0.2
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
@@ -209,8 +214,9 @@ struct SystemOneHTTPClient: DecisionEngine {
 
     /// `/v1/models` only proves the HTTP server is up. Settings Ready needs
     /// a real System One answer.
-    static func pingDecide(baseURL: URL = LayaRuntime.loopbackURL) async -> Bool {
-        let client = SystemOneHTTPClient(baseURL: baseURL, timeout: 20)
+    func pingDecide() async -> Bool {
+        var client = self
+        client.timeout = 20
         let response = await client.decide(
             LayaChromeQuestions.request(
                 transcript: "hide the sidebar",
@@ -218,5 +224,18 @@ struct SystemOneHTTPClient: DecisionEngine {
             )
         )
         return response != nil
+    }
+
+    static func probe(baseURL: URL = LayaRuntime.loopbackURL) async -> Bool {
+        await SystemOneHTTPClient(baseURL: baseURL).probe()
+    }
+
+    static func pingDecide(baseURL: URL = LayaRuntime.loopbackURL) async -> Bool {
+        await SystemOneHTTPClient(baseURL: baseURL, timeout: 20).pingDecide()
+    }
+
+    private func authorize(_ request: inout URLRequest) {
+        guard let authToken, !authToken.isEmpty else { return }
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
     }
 }

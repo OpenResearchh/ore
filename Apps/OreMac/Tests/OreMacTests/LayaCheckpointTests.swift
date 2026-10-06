@@ -55,6 +55,29 @@ struct LayaCheckpointTests {
         #expect(LayaCheckpoint.shouldDownload("onnx/model.onnx"))
     }
 
+    @Test func layaRevisionIsPinnedToACommit() {
+        #expect(LayaCheckpoint.revision != "main")
+        #expect(LayaCheckpoint.revision.count == 40)
+    }
+
+    @Test func executablePythonFilesMustMatchPinnedHashes() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "laya-trust-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for path in LayaCheckpoint.trustedExecutableHashes.keys {
+            try Data("not the pinned file".utf8).write(to: root.appending(path: path))
+        }
+        do {
+            try LayaCheckpoint.verifyTrustedExecutableFiles(in: root)
+            Issue.record("expected pinned hash verification to fail")
+        } catch let error as LayaInstallError {
+            if case .untrustedExecutable = error {} else {
+                Issue.record("wrong error: \(error)")
+            }
+        }
+    }
+
     @Test func typedDecisionsWinsWhenPresent() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "laya-modeldir-\(UUID().uuidString)", directoryHint: .isDirectory)

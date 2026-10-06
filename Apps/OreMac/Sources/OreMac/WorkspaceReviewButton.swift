@@ -58,21 +58,10 @@ struct WorkspaceReviewButton: View {
     }
 
     private func startAIReview(reviewerModel: String? = nil, instructions: String? = nil) {
-        var prompt = """
-        Review the current workspace diff. Look for correctness, security, tests, and maintainability. \
-        Use GetWorkspaceDiff and GetDiffComments, then post each finding with PostDiffComment \
-        (filePath, startLine, endLine, body) so they land as numbered anchored comments — not as prose. \
-        After posting, list the findings as "1. … 2. …" so the user can say "fix 2 and 4".
-        """
-        if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            prompt += "\n\nAdditional instructions:\n\(instructions)"
-        }
-        model.createChat(
+        model.startWorkspaceReview(
             in: workspace.id,
-            initialMessage: prompt,
-            defaults: reviewDefaults,
-            model: reviewerModel,
-            isReview: true
+            reviewerModel: reviewerModel,
+            instructions: instructions
         )
     }
 

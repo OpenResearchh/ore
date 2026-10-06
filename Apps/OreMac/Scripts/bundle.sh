@@ -159,6 +159,12 @@ sign() {
   shift
   if [[ "$IDENTITY" == "-" ]]; then
     codesign --force --sign "$IDENTITY" "$@" "$target"
+  elif [[ "$CONFIGURATION" == "debug" && "$IDENTITY" == "$DEV_IDENTITY" ]]; then
+    # The local debug cert exists so TCC records survive rebuilds. Hardened
+    # runtime is a Gatekeeper/notarization requirement, not a TCC one, and
+    # applying it here is stricter than the ad-hoc /Applications build —
+    # CoreML then refuses the speech model and the neural voice.
+    codesign --force --sign "$IDENTITY" "$@" "$target"
   else
     codesign --force --sign "$IDENTITY" --options runtime --timestamp "$@" "$target"
   fi

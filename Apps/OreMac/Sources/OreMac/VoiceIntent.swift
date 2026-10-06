@@ -27,7 +27,7 @@ struct VoiceFileTag: Equatable, Sendable {
 /// The composer animates these: the chip pulses, the consumed clause strikes out.
 struct VoiceChange: Equatable, Sendable, Identifiable {
     enum Kind: String, Sendable, Equatable {
-        case model, effort, mode, clipboard, file
+        case model, effort, mode, clipboard, file, chrome
     }
 
     var kind: Kind
@@ -844,6 +844,17 @@ enum VoiceIntentExtractor {
         let lower = tokens[span.lowerBound].range.lowerBound
         let upper = tokens[span.upperBound - 1].range.upperBound
         return lower..<upper
+    }
+
+    /// Cuts claimed token spans out of the spoken text and tidies the seams.
+    /// Shared with the chrome gate so mixed utterances lose the UI command
+    /// without a second rewriter.
+    static func strippingClauses(
+        _ spans: [Range<Int>],
+        from spoken: String,
+        tokens: [VoiceToken]
+    ) -> String {
+        rewrite(spans.map { ($0, "") }, in: spoken, tokens: tokens)
     }
 
     /// Applies the claimed spans back to the spoken text: settings clauses are

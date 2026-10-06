@@ -125,6 +125,11 @@ prompts, or anything that identifies you:
   library downloads the model weights from Hugging Face once and caches them
   in `~/.cache/fluidaudio`. The phrases ORE synthesizes with it are cached in
   `~/Library/Caches/dev.ore.OreMac`.
+- **Decision model.** When on-device decisions are enabled, ORE downloads Laya
+  (an English System One checkpoint) on demand and caches it under
+  `~/ore/models/laya`. Spoken text is evaluated only on this Mac, against a
+  local loopback runner. It is never sent to TypeSafe, to ORE, or to your
+  agent provider.
 
 ## Where it goes
 

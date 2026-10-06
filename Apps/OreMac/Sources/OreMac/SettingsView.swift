@@ -65,8 +65,10 @@ private struct SettingsPanes: View {
     @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
     @AppStorage(VoiceAssistantController.quietModeKey) private var quietMode = false
     @AppStorage(VoiceAssistantController.silenceAutoSendKey) private var silenceAutoSend = false
-    @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = false
+    @AppStorage(VoiceHotkeyMonitor.holdToTalkKey) private var holdToTalk = VoiceHotkeyMonitor.holdToTalkDefault
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
+    @Bindable private var layaEngine = LayaEngine.shared
+    @Bindable private var glass = OreGlassSettings.shared
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage(QuitConfirmation.suppressedKey) private var quitWithoutAsking = false
     @AppStorage(AppModel.automaticRoutinePermissionsKey)
@@ -322,6 +324,52 @@ private struct SettingsPanes: View {
         return "Tap ⇧⌥ in ORE to dictate. For the assistant, hold until the cue, release, speak, then say “\(finishPhraseSpoken).”"
     }
 
+    private var layaDetail: String {
+        switch layaEngine.readiness {
+        case .ready:
+            return "Laya answered a System One question on this Mac."
+        case .installed:
+            return "Checkpoint is on this Mac. Press Start to load Laya locally — nothing is sent off this Mac."
+        case .downloading:
+            return "Downloading the English checkpoint from Hugging Face. Dictation aliases still work."
+        case .failed(let message):
+            return message
+        case .unavailable:
+            return "Optional. Fetches Laya for spoken chrome the alias catalog cannot match. Never sent off this Mac."
+        }
+    }
+
+    @ViewBuilder
+    private var layaStatus: some View {
+        switch layaEngine.readiness {
+        case .ready:
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .labelStyle(.titleAndIcon)
+        case .installed:
+            VStack(alignment: .trailing, spacing: 4) {
+                Label("Downloaded", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+                Button("Start") { layaEngine.install() }
+                    .buttonStyle(.bordered)
+            }
+        case .downloading(let fraction):
+            VStack(alignment: .trailing, spacing: 4) {
+                ProgressView(value: fraction)
+                    .frame(width: 80)
+                Button("Cancel") { layaEngine.cancelInstall() }
+                    .buttonStyle(.link)
+            }
+        case .failed:
+            Button("Retry") { layaEngine.install() }
+                .buttonStyle(.bordered)
+        case .unavailable:
+            Button("Download") { layaEngine.install() }
+                .buttonStyle(.bordered)
+        }
+    }
+
     private var general: some View {
         VStack(alignment: .leading, spacing: 18) {
             SettingsCard(title: "Workspace defaults", icon: "square.stack.3d.up") {
@@ -415,6 +463,16 @@ private struct SettingsPanes: View {
                 Text("The composer mic (⌥⌘M) transcribes English into the prompt. Recognition prefers an on-device model; if one isn't available it falls back to Apple's speech service. Audio is never sent to ORE or to your agent provider.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Divider()
+                SettingsRow(
+                    "On-device decisions",
+                    detail: layaDetail
+                ) {
+                    layaStatus
+                }
+                Text("Laya answers typed questions locally (sidebar, terminal, tabs) when a spoken command isn't an exact alias. Nothing is sent to TypeSafe or to ORE. Download fetches the English checkpoint, then Start loads it in a loopback runner on this Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Open the mic when an agent asks a question", isOn: $voiceAsks)
                 Text("When an agent asks you something with options, ORE speaks the question, plays a soft chime, and listens for your answer — say an option or your own words.")
                     .font(.caption)
@@ -470,7 +528,10 @@ private struct SettingsPanes: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .onAppear { hotkey.refreshTrust() }
+            .onAppear {
+                hotkey.refreshTrust()
+                layaEngine.refresh()
+            }
             .sheet(isPresented: $showsPhraseTuning) {
                 finishPhraseSpoken = FinishPhraseStore.currentSpoken
             } content: {
@@ -485,6 +546,12 @@ private struct SettingsPanes: View {
                 Label("ORE follows your Mac’s appearance, accent colour, contrast, text size, and Reduce Motion settings.", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.secondary)
                 Text("Navigation and the composer use system materials so Liquid Glass automatically adapts across displays and accessibility modes.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            SettingsCard(title: "Liquid Glass", icon: "cube.transparent") {
+                Toggle("Use Liquid Glass", isOn: $glass.isEnabled)
+                Text("Frosted refraction on chrome, cards, and buttons. Turn it off for a flatter material look.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

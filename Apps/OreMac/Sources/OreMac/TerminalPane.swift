@@ -98,6 +98,19 @@ final class TerminalRegistry {
         return terminal
     }
 
+    func cycleTab(for workspaceID: WorkspaceID, offset: Int) {
+        let open = tabs[workspaceID] ?? []
+        guard open.count > 1, let current = activeTab(for: workspaceID),
+              let index = open.firstIndex(where: { $0.id == current }) else { return }
+        let next = (index + offset + open.count) % open.count
+        activeTabIDs[workspaceID] = open[next].id
+    }
+
+    func closeActiveTab(for workspaceID: WorkspaceID) {
+        guard let id = activeTab(for: workspaceID) else { return }
+        closeTab(id, for: workspaceID)
+    }
+
     func closeTab(_ tabID: UUID, for workspaceID: WorkspaceID) {
         let next = TabCloseSelection.replacement(
             closing: tabID,

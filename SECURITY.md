@@ -106,7 +106,8 @@ knowing:
     `install-channel` marker
 
   Outside it: neural voice model weights in `~/.cache/fluidaudio`, synthesized
-  narration phrases in `~/Library/Caches/dev.ore.OreMac`, and preferences in
+  narration phrases in `~/Library/Caches/dev.ore.OreMac`, optional Laya
+  decision weights in `~/ore/models/laya`, and preferences in
   the `dev.ore.OreMac` defaults domain.
 
 For what ORE reports about usage, see [PRIVACY.md](PRIVACY.md).

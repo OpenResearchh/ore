@@ -38,6 +38,31 @@ struct VoiceFinishPhraseTests {
         }
     }
 
+    @Test func finishPhraseVocabularyIsThePhraseNotEverydayShortTokens() {
+        let vocab = FinishPhraseModel.standard.vocabulary
+        #expect(vocab.contains("yip yap yip yip"))
+        #expect(!vocab.contains("app"))
+        #expect(!vocab.contains("tip"))
+        #expect(!vocab.contains("yip"))
+        #expect(!vocab.contains("yap"))
+    }
+
+    @Test func flushedTranscriptKeepsWordsTheMatchSnapshotDropped() {
+        let heard = VoiceFinishPhrase.heardAfterFlush(
+            flushed: "Please run the focused tests now. Yip yap yip yip.",
+            override: "Please run the focused tests."
+        )
+        #expect(heard == "Please run the focused tests now.")
+    }
+
+    @Test func emptyFlushKeepsTheMatchSnapshot() {
+        let heard = VoiceFinishPhrase.heardAfterFlush(
+            flushed: "",
+            override: "Please run the focused tests."
+        )
+        #expect(heard == "Please run the focused tests.")
+    }
+
     // MARK: Fuzzy tier — one recognizer slip, always with a request in front.
 
     @Test func mergedTokensMatchFuzzilyByJoinedEditDistance() throws {

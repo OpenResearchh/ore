@@ -66,6 +66,8 @@ final class AppModel {
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             automaticRoutinePermissionsKey: automaticRoutinePermissionsDefault,
+            VoiceHotkeyMonitor.holdToTalkKey: VoiceHotkeyMonitor.holdToTalkDefault,
+            OreGlassSettings.enabledKey: true,
         ])
     }
     private(set) var workspaces: [WorkspaceSummary] = [] {
@@ -2558,6 +2560,223 @@ final class AppModel {
         let index = tabs.firstIndex { $0.id == current } ?? 0
         let next = (index + offset + tabs.count) % tabs.count
         selectChat(tabs[next].id, in: workspaceID)
+    }
+
+    /// Applies a chrome command the voice gate extracted from dictation.
+    /// Layout flags write the same UserDefaults keys the window already
+    /// observes, so the panes move without a second source of truth.
+    func perform(_ command: ChromeCommand) {
+        switch command {
+        case .sidebarShow: ChromeLayout.showsSidebar = true
+        case .sidebarHide: ChromeLayout.showsSidebar = false
+        case .sidebarToggle: ChromeLayout.showsSidebar.toggle()
+        case .reviewShow: ChromeLayout.showsReview = true
+        case .reviewHide: ChromeLayout.showsReview = false
+        case .reviewToggle: ChromeLayout.showsReview.toggle()
+        case .terminalOpen: ChromeLayout.showsTerminal = true
+        case .terminalCollapse: ChromeLayout.showsTerminal = false
+        case .terminalToggle: ChromeLayout.showsTerminal.toggle()
+        case .chatTabCreate:
+            if let id = selectedWorkspaceID { createChat(in: id) }
+        case .chatTabNext:
+            if let id = selectedWorkspaceID { cycleChat(in: id, offset: 1) }
+        case .chatTabPrevious:
+            if let id = selectedWorkspaceID { cycleChat(in: id, offset: -1) }
+        case .assistantMute:
+            narration.setMuted(true)
+        case .assistantUnmute:
+            narration.setMuted(false)
+        case .assistantMuteToggle:
+            narration.setMuted(!narration.isMuted)
+        case .workspaceReview:
+            if let id = selectedWorkspaceID { startWorkspaceReview(in: id) }
+        case .gitCommit:
+            if let id = selectedWorkspaceID { commitWithAgent(in: id) }
+        case .gitShip:
+            if let id = selectedWorkspaceID { shipWithAgent(in: id) }
+        case .findInTranscript:
+            ChromeLayout.request(.find)
+        case .chatHistory:
+            ChromeLayout.request(.history)
+        case .attachFiles:
+            ChromeLayout.request(.attach)
+        case .openModelChooser:
+            ChromeLayout.request(.modelChooser)
+        case .openEffortChooser:
+            ChromeLayout.request(.effortChooser)
+        case .composerSend:
+            ChromeLayout.request(.send)
+        case .permissionAsk, .permissionAcceptEdits, .permissionPlan, .permissionBypass:
+            if let id = selectedWorkspaceID, let mode = command.permissionMode {
+                setPermissionMode(mode, for: id)
+            }
+        case .composerStandard:
+            ChromeLayout.request(.setFast(false))
+        case .composerFast:
+            ChromeLayout.request(.setFast(true))
+        case .effortLow, .effortMedium, .effortHigh, .effortXhigh:
+            if let effort = command.reasoningEffort {
+                ChromeLayout.request(.setEffort(effort))
+            }
+        case .openSettings:
+            UserDefaults.standard.set("General", forKey: "ore.settingsSection")
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        case .closeSettings:
+            for window in NSApp.windows where window.title.localizedCaseInsensitiveContains("settings") {
+                window.close()
+            }
+        case .openFilePalette:
+            ChromeLayoutStore.shared.pendingFileQuery = nil
+            ChromeLayout.request(.openFilePalette)
+        case .openNamedFile:
+            ChromeLayout.request(.openFilePalette)
+        case .revealInFinder, .openFinder:
+            if let path = selectedWorkspace?.worktreePath {
+                ExternalTools.revealInFinder(path)
+            }
+        case .terminalTabCreate:
+            ChromeLayout.showsTerminal = true
+            if let workspace = selectedWorkspace {
+                TerminalRegistry.shared.addTab(
+                    for: workspace.id,
+                    workingDirectory: workspace.worktreePath
+                )
+            }
+        case .terminalTabClose:
+            if let id = selectedWorkspaceID {
+                TerminalRegistry.shared.closeActiveTab(for: id)
+            }
+        case .terminalTabNext:
+            if let id = selectedWorkspaceID {
+                TerminalRegistry.shared.cycleTab(for: id, offset: 1)
+            }
+        case .terminalTabPrevious:
+            if let id = selectedWorkspaceID {
+                TerminalRegistry.shared.cycleTab(for: id, offset: -1)
+            }
+        case .terminalRun:
+            ChromeLayout.showsTerminal = true
+            if let workspace = selectedWorkspace {
+                Task { await runWorkspaceScript(in: workspace) }
+            }
+        case .reviewAllFiles:
+            ChromeLayout.showsReview = true
+            ChromeLayout.request(.reviewTabAllFiles)
+        case .reviewChanges:
+            ChromeLayout.showsReview = true
+            ChromeLayout.request(.reviewTabChanges)
+        case .reviewRequests:
+            ChromeLayout.showsReview = true
+            ChromeLayout.request(.reviewTabRequests)
+        case .settingsLiquidGlass:
+            applyGlassToggle()
+            openSettingsPane("Appearance")
+        case .settingsDreamEnable:
+            applyBoolToggle(DreamSettingsStore.enabled, defaultOn: false)
+            openSettingsPane("Dreams")
+        case .settingsHoldToTalk:
+            applyBoolToggle(VoiceHotkeyMonitor.holdToTalkKey, defaultOn: VoiceHotkeyMonitor.holdToTalkDefault)
+            openSettingsPane("General")
+        case .settingsLaya:
+            openSettingsPane("General")
+        case .settingsSilenceSend:
+            applyBoolToggle(VoiceAssistantController.silenceAutoSendKey, defaultOn: false)
+            openSettingsPane("General")
+        case .settingsLaunchAtLogin:
+            openSettingsPane("General")
+        case .settingsQuitAsk:
+            applyBoolToggle(QuitConfirmation.suppressedKey, invert: true, defaultOn: false)
+            openSettingsPane("General")
+        case .settingsNarration:
+            applyBoolToggle(NarrationEngine.masterSwitchKey, defaultOn: true)
+            openSettingsPane("General")
+        case .settingsGreet:
+            applyBoolToggle(AppModel.greetingEnabledKey, defaultOn: true)
+            openSettingsPane("General")
+        case .settingsFleetNarration:
+            applyBoolToggle(NarrationEngine.fleetSwitchKey, defaultOn: true)
+            openSettingsPane("General")
+        case .settingsAnalytics:
+            applyBoolToggle(TelemetryConsent.analyticsKey, defaultOn: TelemetryConsent.analyticsDefault)
+            openSettingsPane("Privacy")
+        case .settingsNotifyORE:
+            applyBoolToggle("ore.notifications.enabled", defaultOn: true)
+            openSettingsPane("General")
+        case .settingsNotifyTurn:
+            applyBoolToggle("ore.notifications.turnComplete", defaultOn: true)
+            openSettingsPane("General")
+        case .settingsSound:
+            applyBoolToggle("ore.notifications.sound", defaultOn: true)
+            openSettingsPane("General")
+        case .settingsDefaultModel, .settingsDefaultAgent:
+            openSettingsPane("Default Models")
+        }
+    }
+
+    private func openSettingsPane(_ section: String) {
+        UserDefaults.standard.set(section, forKey: "ore.settingsSection")
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
+
+    private func applyGlassToggle() {
+        let glass = OreGlassSettings.shared
+        if let on = ChromeLayoutStore.shared.pendingToggleOn {
+            glass.isEnabled = on
+            ChromeLayoutStore.shared.pendingToggleOn = nil
+        } else {
+            glass.isEnabled.toggle()
+        }
+    }
+
+    private func applyBoolToggle(_ key: String, invert: Bool = false, defaultOn: Bool) {
+        let store = ChromeLayoutStore.shared
+        if let on = store.pendingToggleOn {
+            UserDefaults.standard.set(invert ? !on : on, forKey: key)
+            store.pendingToggleOn = nil
+        } else {
+            let current = UserDefaults.standard.object(forKey: key) as? Bool ?? defaultOn
+            UserDefaults.standard.set(!current, forKey: key)
+        }
+    }
+
+    private func runWorkspaceScript(in workspace: WorkspaceSummary) async {
+        guard let environment = await workspaceEnvironment(for: workspace.id),
+              let script = environment.runScript else { return }
+        if let approval = environment.runScriptApproval {
+            requestScriptApproval(approval)
+        } else {
+            TerminalRegistry.shared.run(
+                script,
+                in: workspace.id,
+                workingDirectory: environment.worktreePath
+            )
+        }
+    }
+
+    static let workspaceReviewPrompt = """
+        Review the current workspace diff. Look for correctness, security, tests, and maintainability. \
+        Use GetWorkspaceDiff and GetDiffComments, then post each finding with PostDiffComment \
+        (filePath, startLine, endLine, body) so they land as numbered anchored comments — not as prose. \
+        After posting, list the findings as "1. … 2. …" so the user can say "fix 2 and 4".
+        """
+
+    /// Same path as the toolbar Review button.
+    func startWorkspaceReview(
+        in workspaceID: WorkspaceID,
+        reviewerModel: String? = nil,
+        instructions: String? = nil
+    ) {
+        var prompt = Self.workspaceReviewPrompt
+        if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += "\n\nAdditional instructions:\n\(instructions)"
+        }
+        createChat(
+            in: workspaceID,
+            initialMessage: prompt,
+            defaults: reviewDefaults(for: workspaceID),
+            model: reviewerModel,
+            isReview: true
+        )
     }
 
     func archive(_ id: WorkspaceID) {

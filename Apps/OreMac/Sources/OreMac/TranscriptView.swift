@@ -4795,7 +4795,7 @@ enum ToolChangeStats {
 /// the enclosing cell used to. Without this, making the text selectable would
 /// have swallowed those clicks into a text selection. Image and pasted-text
 /// chips and `@` tokens use the same hover preview as the composer.
-private final class TranscriptTextView: NSTextView, NSTextViewDelegate {
+private final class TranscriptTextView: FlowchartTextView, NSTextViewDelegate {
     var onSingleClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onOpenFile: ((String) -> Void)?

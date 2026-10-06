@@ -112,6 +112,7 @@ struct ReviewPane: View {
     /// a slow walk for a workspace the user already left must not land.
     @State private var fileTreeWorkspaceID: WorkspaceID?
     @State private var fileTreeRequestedFor: WorkspaceID?
+    private let chrome = ChromeLayoutStore.shared
 
     private enum DiffScope: Hashable {
         case all
@@ -131,6 +132,7 @@ struct ReviewPane: View {
     private var isTreeLayout: Bool { changesLayoutRaw != "list" }
 
     var body: some View {
+        let _ = chrome.paneRequestID
         VStack(spacing: 0) {
             tabRow
             Rectangle().fill(OreTheme.hairline).frame(height: 1)
@@ -146,6 +148,7 @@ struct ReviewPane: View {
                     .id(workspace.id)
             }
         }
+        .onAppear { applyPendingReviewTab() }
         // No fill of its own: the pane is cut from Liquid Glass where it is
         // laid out (`RootView.workspaceMain` clips it to the card radius and
         // applies `oreGlassSurface`). A material here as well would stack
@@ -210,6 +213,20 @@ struct ReviewPane: View {
                 await model.pullDraftComments(for: workspace.id)
                 try? await Task.sleep(for: interval)
             }
+        }
+        .onChange(of: chrome.paneRequestID) { _, id in
+            guard id > 0, model.selectedWorkspaceID == workspace.id else { return }
+            applyPendingReviewTab()
+        }
+    }
+
+    private func applyPendingReviewTab() {
+        guard let request = chrome.consumePaneRequest(where: { $0.isReviewTab }) else { return }
+        switch request {
+        case .reviewTabAllFiles: tab = .allFiles
+        case .reviewTabChanges: tab = .changes
+        case .reviewTabRequests: tab = .requests
+        default: break
         }
     }
 
@@ -1353,7 +1370,7 @@ private struct MarkdownPreview: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView()
+        let textView = FlowchartTextView(usingTextLayoutManager: false)
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false

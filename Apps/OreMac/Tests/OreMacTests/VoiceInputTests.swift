@@ -19,6 +19,7 @@ struct VoiceTranscriptAssemblerTests {
 
         assembler.applySegment("Then run it.", isFinal: false)
         #expect(assembler.text == "Add a test for the parser. Then run it.")
+        #expect(assembler.confirmedText == "Add a test for the parser. ")
     }
 
     @Test func utterancesReplaceTheWholeInFlightPhrase() {
@@ -28,6 +29,7 @@ struct VoiceTranscriptAssemblerTests {
         #expect(assembler.text == "fix the login bug")
         assembler.applyUtterance("fix the login bug", isFinal: true)
         #expect(assembler.text == "fix the login bug")
+        #expect(assembler.confirmedText == "fix the login bug")
     }
 
     @Test func discardingCommittedTextDropsAlreadyRecognizedWords() {
@@ -62,6 +64,25 @@ struct VoiceTranscriptAssemblerTests {
         assembler.discardCommitted()
         assembler.applyUtterance("add a test now", isFinal: false)
         #expect(assembler.text == "now")
+    }
+
+    @Test func analyzerWholeTranscriptResultsDoNotDuplicateConfirmedSpeech() {
+        var assembler = VoiceTranscriptAssembler()
+        assembler.applyAnalyzerResult("Add a test for the parser. ", isFinal: true)
+        assembler.applyAnalyzerResult("Add a test for the parser. Then run it.", isFinal: false)
+        #expect(assembler.text == "Add a test for the parser. Then run it.")
+        assembler.applyAnalyzerResult("Add a test for the parser. Then run it.", isFinal: true)
+        #expect(assembler.text == "Add a test for the parser. Then run it.")
+        #expect(assembler.confirmedText == "Add a test for the parser. Then run it.")
+    }
+
+    @Test func analyzerPhraseResultsStillAccumulate() {
+        var assembler = VoiceTranscriptAssembler()
+        assembler.applyAnalyzerResult("Add a test for the parser. ", isFinal: true)
+        assembler.applyAnalyzerResult("Then run it.", isFinal: false)
+        #expect(assembler.text == "Add a test for the parser. Then run it.")
+        assembler.applyAnalyzerResult("Then run it.", isFinal: true)
+        #expect(assembler.confirmedText == "Add a test for the parser. Then run it.")
     }
 }
 

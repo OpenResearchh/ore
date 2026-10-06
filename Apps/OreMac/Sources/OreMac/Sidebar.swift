@@ -841,7 +841,7 @@ private struct SidebarGlassCapsule: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), OreGlassSettings.shared.isEnabled {
             if let tint {
                 content.glassEffect(.regular.tint(tint), in: .capsule)
             } else {

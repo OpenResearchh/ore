@@ -19,6 +19,10 @@ changelog/
 # Python bytecode
 __pycache__/
 
+# Node script dependencies and generated reports
+node_modules/
+Apps/OreMac/Scripts/laya-flow-bench.json
+
 # Editors
 .vscode/
 .idea/

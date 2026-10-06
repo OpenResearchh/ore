@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  },
+  "scripts": {
+    "test:laya-flow": "node laya-flow-test.mjs",
+    "bench:laya-flow": "node laya-flow-bench.mjs"
+  }
+}

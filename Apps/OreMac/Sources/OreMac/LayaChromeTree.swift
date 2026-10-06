@@ -28,6 +28,7 @@ enum LayaChromeTree {
     static let skipIDs: Set<String> = ["none", "drop", "ui", "assistant"]
 
     static let root = fileGate
+    static let commands: Set<ChromeCommand> = collectCommands(in: root)
 
     private static func opt(
         _ id: String,
@@ -351,5 +352,18 @@ enum LayaChromeTree {
 
     static func command(for optionID: String) -> ChromeCommand? {
         ChromeCommand(rawValue: optionID)
+    }
+
+    private static func collectCommands(in hop: LayaHop) -> Set<ChromeCommand> {
+        var commands: Set<ChromeCommand> = []
+        for option in hop.options {
+            if option.leaf == .click, let command = command(for: option.id) {
+                commands.insert(command)
+            }
+            if let children = option.children {
+                commands.formUnion(collectCommands(in: children))
+            }
+        }
+        return commands
     }
 }

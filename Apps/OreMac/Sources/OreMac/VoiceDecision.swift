@@ -77,6 +77,42 @@ struct ChromeAvailability: Equatable, Sendable {
         return commands
     }
 
+    /// The tree can choose controls that are outside the old flat live catalog
+    /// (Settings, Finder, named files). Keep those available, but still remove
+    /// controls whose current UI state explicitly makes them inapplicable.
+    var treeCommands: Set<ChromeCommand> {
+        var commands = LayaChromeTree.commands
+        if chatTabCount <= 1 {
+            commands.remove(.chatTabNext)
+            commands.remove(.chatTabPrevious)
+        }
+        commands.remove(isMuted ? .assistantMute : .assistantUnmute)
+        switch permissionMode {
+        case .default:
+            commands.remove(.permissionAsk)
+        case .acceptEdits:
+            commands.remove(.permissionAcceptEdits)
+        case .plan:
+            commands.remove(.permissionPlan)
+        case .bypassPermissions:
+            commands.remove(.permissionBypass)
+        }
+        for command in [ChromeCommand.effortLow, .effortMedium, .effortHigh, .effortXhigh]
+        where command.reasoningEffort == effort {
+            commands.remove(command)
+        }
+        if !supportsFast {
+            commands.remove(.composerFast)
+            commands.remove(.composerStandard)
+        } else if fastMode {
+            commands.remove(.composerFast)
+        } else {
+            commands.remove(.composerStandard)
+        }
+        return commands
+    }
+
+
     @MainActor
     static func snapshot(
         tabCount: Int,
@@ -291,7 +327,6 @@ enum VoiceDecision {
         budget: Duration = commitBudget,
         usingAliases: Bool = VoiceActionGate.aliasesEnabled
     ) async -> VoiceChromeIntents {
-        _ = available
         let aliases = VoiceActionGate.consume(spoken, usingAliases: usingAliases)
         if usingAliases, !aliases.actions.isEmpty { return aliases }
         guard let engine else { return aliases }
@@ -308,8 +343,10 @@ enum VoiceDecision {
         var changes: [VoiceChange] = []
         var assistant: [String] = []
         var spokenFile: String?
+        var spokenFiles: [String] = []
         var toggleOn: Bool?
         var fromModel = false
+        let availableCommands = available.treeCommands
 
         for (index, clause) in parts.enumerated() {
             let remaining = deadline - ContinuousClock.now
@@ -324,6 +361,7 @@ enum VoiceDecision {
                 hop: LayaChromeTree.root,
                 leftover: clause,
                 engine: engine,
+                available: availableCommands,
                 budget: remaining
             )
             if !step.answered {
@@ -336,6 +374,7 @@ enum VoiceDecision {
                 actions.append(command)
                 if command == .openNamedFile {
                     spokenFile = Self.spokenFileName(in: clause)
+                    if let spokenFile { spokenFiles.append(spokenFile) }
                 }
                 if Self.isSettingsToggle(command) {
                     toggleOn = Self.toggleSense(in: clause)
@@ -357,6 +396,7 @@ enum VoiceDecision {
             changes: changes,
             fromModel: fromModel,
             spokenFile: spokenFile,
+            spokenFiles: spokenFiles,
             toggleOn: toggleOn
         )
         if intents.rewritten.isEmpty, actions.isEmpty, fromModel {
@@ -375,6 +415,7 @@ enum VoiceDecision {
         hop: LayaHop,
         leftover: String,
         engine: any DecisionEngine,
+        available: Set<ChromeCommand>? = nil,
         budget: Duration
     ) async -> WalkStep {
         let started = ContinuousClock.now
@@ -417,14 +458,17 @@ enum VoiceDecision {
                 hop: children,
                 leftover: leftover,
                 engine: engine,
+                available: available,
                 budget: remaining
             )
         }
         if let option, let command = LayaChromeTree.command(for: option.id), option.leaf == .click {
+            if let available, !available.contains(command) { return WalkStep() }
             return WalkStep(command: command)
         }
         if let command = ChromeCommand(rawValue: choice), option?.children == nil,
            !LayaChromeTree.skipIDs.contains(choice) {
+            if let available, !available.contains(command) { return WalkStep() }
             return WalkStep(command: command)
         }
         return WalkStep()

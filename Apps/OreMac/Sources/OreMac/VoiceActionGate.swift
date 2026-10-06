@@ -137,6 +137,17 @@ enum ChromeCommand: String, Sendable, Equatable, Hashable {
         case .settingsDefaultAgent: "Default Agent"
         }
     }
+
+    var allowsRepeatedVoiceExecution: Bool {
+        switch self {
+        case .openNamedFile, .openFilePalette, .terminalTabCreate,
+             .terminalTabNext, .terminalTabPrevious, .chatTabCreate,
+             .chatTabNext, .chatTabPrevious:
+            true
+        default:
+            false
+        }
+    }
 }
 
 /// Chrome the dictation consumed, plus the leftover words that should still
@@ -150,6 +161,8 @@ struct VoiceChromeIntents: Equatable, Sendable {
     var fromModel: Bool = false
     /// Spoken filename for ⌘P / openNamedFile.
     var spokenFile: String? = nil
+    /// Spoken filenames in action order when one utterance opens several files.
+    var spokenFiles: [String] = []
     /// On/off for a Settings toggle, when the clause said turn on/off.
     var toggleOn: Bool? = nil
 

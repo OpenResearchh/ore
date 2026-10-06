@@ -1398,15 +1398,20 @@ final class VoiceAssistantController {
 
     private func applyChrome(_ intents: VoiceChromeIntents) {
         guard let model, !intents.actions.isEmpty else { return }
-        if intents.actions.contains(.openNamedFile) {
-            ChromeLayoutStore.shared.pendingFileQuery = intents.spokenFile
-        }
         if let on = intents.toggleOn {
             ChromeLayoutStore.shared.pendingToggleOn = on
         }
+        var spokenFiles = intents.spokenFiles
+        if spokenFiles.isEmpty, let spokenFile = intents.spokenFile {
+            spokenFiles = [spokenFile]
+        }
         var ran = false
-        for command in intents.actions where chromeExecuted.insert(command).inserted {
+        for command in intents.actions where command.allowsRepeatedVoiceExecution || chromeExecuted.insert(command).inserted {
+            if command == .openNamedFile {
+                ChromeLayoutStore.shared.pendingFileQuery = spokenFiles.isEmpty ? intents.spokenFile : spokenFiles.removeFirst()
+            }
             model.perform(command)
+            chromeExecuted.insert(command)
             ran = true
         }
         if ran { flashHUDChromeTick() }

@@ -315,6 +315,35 @@ struct VoiceDecisionTests {
         #expect(intents.rewritten.isEmpty)
     }
 
+    @Test func multipleNamedFilesKeepTheirPayloadsInOrder() async {
+        let intents = await VoiceDecision.refine(
+            spoken: "open README.md then open CONTRIBUTING.md",
+            available: layout,
+            engine: ScriptedTreeEngine([
+                ("fileGate", "named_file"),
+                ("paletteControl", "openNamedFile"),
+                ("fileGate", "named_file"),
+                ("paletteControl", "openNamedFile"),
+            ])
+        )
+        #expect(intents.actions == [.openNamedFile, .openNamedFile])
+        #expect(intents.spokenFiles == ["README.md", "CONTRIBUTING.md"])
+    }
+
+    @Test func unavailableTreeCommandIsRejected() async {
+        let intents = await VoiceDecision.refine(
+            spoken: "set effort to high",
+            available: layout,
+            engine: ScriptedTreeEngine([
+                ("fileGate", "other"),
+                ("target", "composer"),
+                ("composerControl", "effortHigh"),
+            ])
+        )
+        #expect(intents.actions.isEmpty)
+        #expect(intents.rewritten.isEmpty)
+    }
+
     @Test func aFilenameDotDoesNotSplitAClause() {
         let parts = VoiceDecision.clauses(in: "open CONTRIBUTING.md and then hide the sidebar")
         #expect(parts.first == "open CONTRIBUTING.md")

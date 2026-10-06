@@ -445,9 +445,38 @@ struct HarnessCLIUpdaterTests {
         let plan = HarnessCLIUpdater.Plan.selfUpdate(executablePath: "/usr/local/bin/claude")
         let runnable = HarnessCLIUpdater.runnableScript(for: plan)
         #expect(runnable.contains("yes |"))
-        #expect(runnable.contains("pipefail"))
+        #expect(!runnable.contains("pipefail"))
         #expect(runnable.contains("NONINTERACTIVE=1"))
         // The card still shows the command the user would type.
         #expect(HarnessCLIUpdater.script(for: plan) == "'/usr/local/bin/claude' update")
+    }
+
+    /// Claude prints leftover-npm warnings, then "Successfully updated",
+    /// then the `yes |` wrapper can still exit 141. That is a finished
+    /// upgrade, not Try Again.
+    @Test func aSuccessfulUpdateIsNotAFailedWrapper() {
+        let output = """
+        Current version: 2.1.289
+        Warning: Multiple installations found
+        - npm-global at /usr/local/bin/claude
+        - native at /Users/me/.local/bin/claude (currently running)
+        Successfully updated from 2.1.289 to version 2.1.291
+        """
+        #expect(HarnessCLIUpdater.completedDespiteWrapper(
+            output: output, before: "2.1.289", after: "2.1.291"
+        ))
+        #expect(HarnessCLIUpdater.completedDespiteWrapper(
+            output: output, before: "2.1.289", after: "2.1.289"
+        ))
+        #expect(!HarnessCLIUpdater.completedDespiteWrapper(
+            output: "Error: EACCES: permission denied",
+            before: "2.1.289",
+            after: "2.1.289"
+        ))
+        #expect(HarnessCLIUpdater.completedDespiteWrapper(
+            output: "npm error",
+            before: "0.148.0",
+            after: "0.153.4"
+        ))
     }
 }

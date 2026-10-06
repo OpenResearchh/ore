@@ -366,7 +366,31 @@ public enum HarnessCLIUpdater {
             before = nil
         }
 
-        let ran = try await run(plan, kind: kind, fallback: fallback, executablePath: executablePath)
+        let ran: Plan
+        do {
+            ran = try await run(plan, kind: kind, fallback: fallback, executablePath: executablePath)
+        } catch let error as UpdateError {
+            // `yes | claude update` can exit 141 (SIGPIPE) after a real
+            // upgrade, and Claude itself sometimes exits non-zero after
+            // printing leftover-install warnings *and* "Successfully
+            // updated". Believe the binary (or that success line) over the
+            // wrapper status, or the card stays on Try Again forever.
+            let after: String?
+            if let executablePath {
+                after = await readInstalledVersion(at: executablePath)
+            } else {
+                after = nil
+            }
+            let output: String
+            if case .commandFailed(_, _, _, let text) = error {
+                output = text
+            } else {
+                throw error
+            }
+            guard completedDespiteWrapper(output: output, before: before, after: after)
+            else { throw error }
+            ran = plan
+        }
         guard shouldFollowNoOp(primary: plan, fallback: fallback),
               ran == plan,
               canSafelyRun(fallback, executablePath: executablePath),
@@ -378,6 +402,19 @@ public enum HarnessCLIUpdater {
         // job through the channel the install itself implies, rather than
         // returning success that the next check will contradict.
         try await runLoginShell(runnableScript(for: fallback), kind: kind)
+    }
+
+    /// True when the install moved (or the CLI said it did) even though the
+    /// shell wrapper came back non-zero.
+    static func completedDespiteWrapper(
+        output: String,
+        before: String?,
+        after: String?
+    ) -> Bool {
+        if let before, let after, after != before { return true }
+        let lower = output.lowercased()
+        return lower.contains("successfully updated from")
+            || lower.contains("updated successfully")
     }
 
     /// Runs `plan`, and on an unknown-subcommand failure of an unconfirmed
@@ -518,11 +555,17 @@ public enum HarnessCLIUpdater {
     /// What actually runs. `script(for:)` is the honest line on the card;
     /// this wraps it so a GUI app with a closed stdin still gets a
     /// non-interactive, confirmed upgrade.
+    ///
+    /// `yes` answers a confirm prompt. `pipefail` must not wrap that pipe:
+    /// when the updater closes stdin on success, `yes` dies with SIGPIPE
+    /// (141) and the card would show Try Again over a finished upgrade.
+    /// Without it the pipeline status is the updater's, which is the one
+    /// we mean.
     static func runnableScript(for plan: Plan) -> String {
         let displayed = script(for: plan)
         switch plan {
         case .selfUpdate:
-            return "set -o pipefail; CI=1 NONINTERACTIVE=1 yes | \(displayed)"
+            return "CI=1 NONINTERACTIVE=1 yes | \(displayed)"
         case .brew, .npm, .nativeInstaller:
             return "CI=1 NONINTERACTIVE=1 \(displayed)"
         }

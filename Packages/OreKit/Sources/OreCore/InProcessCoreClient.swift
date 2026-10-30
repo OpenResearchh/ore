@@ -834,6 +834,14 @@ public actor InProcessCoreClient: CoreClient {
             """
         }
 
+        // Stacking starts from the parent's HEAD, not from origin. Everything
+        // else — default branch, a named branch, an issue, a PR — has to
+        // fetch first, or a stale local `main` silently strands the agent
+        // behind GitHub.
+        if stackedOn == nil {
+            baseRevision = await git.syncedRevision(for: baseRevision)
+        }
+
         // Scientist identities are product-level workspace identities, so two
         // concurrent creation paths (UI, CLI, or restored sheet) must not pick
         // the same one. WorktreeManager still guarantees path uniqueness for

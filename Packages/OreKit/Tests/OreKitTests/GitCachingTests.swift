@@ -39,6 +39,20 @@ struct GitCachingTests {
         #expect(await fixture.git.remoteFetchCount == 2)
     }
 
+    @Test func fetchingABranchUpdatesTheRemoteTrackingRef() async throws {
+        // `git fetch origin main` looks as if it refreshed origin/main and
+        // only writes FETCH_HEAD. The explicit refspec is the whole point of
+        // this helper.
+        let fixture = try await GitFixture.initialized()
+        try await fixture.attachOrigin()
+        let stale = try await fixture.git.resolve("origin/main")
+        let moved = try await fixture.advanceOrigin()
+        #expect(try await fixture.git.resolve("origin/main") == stale)
+
+        try await fixture.git.fetchRemoteBranch("main", force: true)
+        #expect(try await fixture.git.resolve("origin/main") == moved)
+    }
+
     @Test func addingARemoteIsNoticedDespiteTheMemo() async throws {
         let fixture = try await GitFixture.initialized()
         #expect(await fixture.git.hasRemote() == false)

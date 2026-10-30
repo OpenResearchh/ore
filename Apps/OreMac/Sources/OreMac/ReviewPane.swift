@@ -3412,7 +3412,7 @@ private struct BaseSyncBanner: View {
                 icon = "arrow.down.circle"
                 tone = Color.accentColor
                 title = "Local \(sync.defaultBranch) is behind origin"
-                detail = "\(sync.localDefaultBehindOrigin) commit\(sync.localDefaultBehindOrigin == 1 ? "" : "s") to pull so Continue and new workspaces start from current \(sync.defaultBranch)."
+                detail = "\(sync.localDefaultBehindOrigin) commit\(sync.localDefaultBehindOrigin == 1 ? "" : "s") to pull so Continue starts from current \(sync.defaultBranch)."
             }
         }
 

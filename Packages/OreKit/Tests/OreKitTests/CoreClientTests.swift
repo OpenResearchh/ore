@@ -204,6 +204,44 @@ struct CoreClientTests {
         await client.shutdown()
     }
 
+    @Test func aNewWorkspaceStartsFromOriginWhenLocalDefaultIsStale() async throws {
+        // The main checkout is sitting on an old `main`. Origin has moved.
+        // Starting a workspace must fetch and branch from origin, not from
+        // that stale local ref — otherwise the agent begins behind GitHub.
+        let fixture = try await GitFixture.initialized()
+        try await fixture.attachOrigin()
+        let stale = try await fixture.git.resolve("main")
+        let moved = try await fixture.advanceOrigin(
+            file: "from-github.txt",
+            contents: "already on origin\n"
+        )
+        #expect(try await fixture.git.resolve("main") == stale)
+
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path,
+            name: "fresh from origin"
+        )))
+
+        guard case .workspaceAdded(let summary)? = await recorder.waitFor(matching: {
+            if case .workspaceAdded = $0 { return true }
+            return false
+        }) else {
+            Issue.record("no workspaceAdded event")
+            return
+        }
+
+        let worktree = URL(fileURLWithPath: summary.worktreePath)
+        #expect(summary.baseBranch == "main")
+        #expect(try await fixture.git.resolve("HEAD", in: worktree) == moved)
+        #expect(fixture.exists("from-github.txt", in: worktree))
+        #expect(await fixture.git.commitsAheadOfBase("main", in: worktree) == 0)
+
+        await client.shutdown()
+    }
+
     @Test func hidingTheHostReachesEveryEngineAndTheOnesMadeMeanwhile() async throws {
         let fixture = try await GitFixture.initialized()
         let client = try makeClient(fixture)
@@ -578,6 +616,59 @@ struct CoreClientTests {
         #expect(child.baseBranch == parent.branch)
         // The child starts from the parent's work, not from main.
         #expect(fixture.exists("lower.txt", in: URL(fileURLWithPath: child.worktreePath)))
+
+        await client.shutdown()
+    }
+
+    @Test func stackingDoesNotRebaseOntoOriginEvenWhenOriginIsAhead() async throws {
+        // Origin moving is not a reason to abandon the parent's unmerged
+        // commits. A stack is sequential agent work, not a fresh start.
+        let fixture = try await GitFixture.initialized()
+        try await fixture.attachOrigin()
+        let client = try makeClient(fixture)
+        let recorder = CoreEventRecorder(client)
+
+        await client.send(.addRepository(path: fixture.repository.path))
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path, name: "lower half"
+        )))
+        guard case .workspaceAdded(let parent)? = await recorder.waitFor(matching: {
+                if case .workspaceAdded = $0 { return true }
+                return false
+            }
+        ) else {
+            Issue.record("no parent workspace")
+            return
+        }
+
+        let parentWorktree = URL(fileURLWithPath: parent.worktreePath)
+        try fixture.write("lower.txt", "lower\n", in: parentWorktree)
+        try await fixture.run(["add", "-A"], in: parentWorktree)
+        try await fixture.commit("lower half", in: parentWorktree)
+
+        _ = try await fixture.advanceOrigin(
+            file: "from-github.txt",
+            contents: "already on origin\n"
+        )
+
+        await client.send(.createWorkspace(CreateWorkspaceRequest(
+            repositoryPath: fixture.repository.path,
+            name: "upper half",
+            seed: .workspace(parent.id)
+        )))
+        guard case .workspaceAdded(let child)? = await recorder.waitFor(matching: {
+                if case .workspaceAdded(let summary) = $0 { return summary.name == "upper half" }
+                return false
+            }
+        ) else {
+            Issue.record("no child workspace")
+            return
+        }
+
+        let childWorktree = URL(fileURLWithPath: child.worktreePath)
+        #expect(child.stackedOn == parent.id)
+        #expect(fixture.exists("lower.txt", in: childWorktree))
+        #expect(!fixture.exists("from-github.txt", in: childWorktree))
 
         await client.shutdown()
     }

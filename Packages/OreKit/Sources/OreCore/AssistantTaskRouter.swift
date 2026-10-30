@@ -157,11 +157,16 @@ enum AssistantTaskRouter {
             )
         }
 
+        if let workspace = focusedWorkspace(in: snapshot),
+           workspace.id != snapshot.assistantWorkspaceID {
+            return destination(in: workspace, utterance: lowered, snapshot: snapshot)
+        }
+
         return Decision(
-            action: .assistantChat,
-            workspaceID: snapshot.assistantWorkspaceID,
-            confidence: .medium,
-            reason: "No project named; keep this in the assistant's own chat."
+            action: .clarify,
+            confidence: .low,
+            question: "Which workspace should handle that?",
+            reason: "Implementation and repo work belong in a project tab, not the assistant chat."
         )
     }
 
@@ -310,7 +315,9 @@ enum AssistantTaskRouter {
         containsAny(text, [
             "fix", "test", "commit", "push", "pull request", "branch",
             "implement", "refactor", "diff", "bug", "deploy", "review",
-            "file", "build", "typecheck",
+            "file", "build", "typecheck", "improve", "patch", "add ",
+            "remove", "update", "change", "ore", "workspace", "voice",
+            "assistant", "pill", "mic", "narration", "composer",
         ])
     }
 

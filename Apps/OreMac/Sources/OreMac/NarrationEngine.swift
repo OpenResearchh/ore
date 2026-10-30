@@ -104,6 +104,10 @@ final class NarrationEngine {
     private var micActive = false
     private var summaryTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
+    /// When the sidebar mute is on, utterances still caption in the HUD without
+    /// touching the synthesizer. Each line gets a reading-time hold, then the
+    /// queue advances like audible narration.
+    private var silentDisplayTask: Task<Void, Never>?
 
     var isMasterEnabled: Bool {
         UserDefaults.standard.object(forKey: Self.masterSwitchKey) as? Bool ?? true
@@ -379,6 +383,8 @@ final class NarrationEngine {
         guard micActive != active else { return }
         micActive = active
         if active {
+            silentDisplayTask?.cancel()
+            silentDisplayTask = nil
             queue.dropAllProgress()
             if let current = currentUtterance, current.priority > .progress {
                 _ = queue.enqueue(current)
@@ -397,8 +403,11 @@ final class NarrationEngine {
     }
 
     func stopAll() {
+        silentDisplayTask?.cancel()
+        silentDisplayTask = nil
         queue.removeAll()
         stopSpeaking(immediate: true)
+        clearDisplayedUtterance()
         flushQuietWaitersIfIdle()
     }
 
@@ -480,8 +489,7 @@ final class NarrationEngine {
         chatID: ChatID,
         origin: NarrationOrigin
     ) {
-        // Muted skips the digest work too: nothing it produces would be heard.
-        guard isMasterEnabled, !isMuted else { return }
+        guard isMasterEnabled else { return }
         guard enabledChats.contains(chatID) else {
             observeFleet(event: event, chatID: chatID, origin: origin)
             return
@@ -873,13 +881,16 @@ final class NarrationEngine {
     private func enqueue(_ utterance: SpokenUtterance) {
         // Every spoken line funnels through here — narration, fleet
         // milestones, the greeting and the assistant's own answers.
-        guard !isMuted else { return }
-        loadNeuralVoiceIfNeeded()
+        if !isMuted { loadNeuralVoiceIfNeeded() }
         defer { ensureTicker() }
         switch queue.enqueue(utterance) {
         case .interruptCurrent:
-            if let current = currentUtterance, current.priority < .interrupt,
-               isVoiceSpeaking {
+            if isMuted {
+                silentDisplayTask?.cancel()
+                silentDisplayTask = nil
+                pumpSilent()
+            } else if let current = currentUtterance, current.priority < .interrupt,
+                      isVoiceSpeaking {
                 // The stop reports an ending, which pumps the queue — and the
                 // queue now leads with the interrupt.
                 stopSpeaking(immediate: false)
@@ -887,7 +898,7 @@ final class NarrationEngine {
                 pump()
             }
         case .queued:
-            pump()
+            if isMuted { pumpSilent() } else { pump() }
         case .dropped:
             break
         }
@@ -932,6 +943,10 @@ final class NarrationEngine {
     }
 
     private func pump() {
+        if isMuted {
+            pumpSilent()
+            return
+        }
         guard !micActive, !isVoiceSpeaking, let next = queue.peek else { return }
         let gap: TimeInterval = switch next.priority {
         case .interrupt: 0
@@ -974,14 +989,45 @@ final class NarrationEngine {
     }
 
     private func utteranceEnded() {
+        clearDisplayedUtterance()
+        lastUtteranceEndedAt = Date()
+        if isMuted { pumpSilent() } else { pump() }
+        flushQuietWaitersIfIdle()
+        ensureTicker()
+    }
+
+    private func clearDisplayedUtterance() {
         currentUtterance = nil
         speakingChatID = nil
         currentSpokenText = nil
         spokenCharacterCount = 0
-        lastUtteranceEndedAt = Date()
-        pump()
-        flushQuietWaitersIfIdle()
-        ensureTicker()
+    }
+
+    /// Muted sidebar: no audio, but the HUD pill still streams the line.
+    private func pumpSilent() {
+        guard isMuted, !micActive, currentUtterance == nil, silentDisplayTask == nil,
+              queue.peek != nil
+        else { return }
+        guard let utterance = queue.next() else { return }
+        currentUtterance = utterance
+        speakingChatID = utterance.chatID
+        currentSpokenText = utterance.text
+        spokenCharacterCount = utterance.text.utf16.count
+        digests[utterance.chatID]?.noteSpoken(utterance.text)
+        let hold = Self.silentCaptionHold(for: utterance.text)
+        silentDisplayTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: hold)
+            guard !Task.isCancelled, let self else { return }
+            self.silentDisplayTask = nil
+            self.utteranceEnded()
+        }
+    }
+
+    /// Enough time to read a caption without feeling like a stall.
+    private static func silentCaptionHold(for text: String) -> Duration {
+        let words = max(1, text.split(whereSeparator: \.isWhitespace).count)
+        let seconds = min(12, max(2.5, Double(words) * 0.35))
+        return .seconds(seconds)
     }
 
     private func dropState(for chatID: ChatID) {

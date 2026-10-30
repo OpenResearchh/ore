@@ -260,12 +260,12 @@ struct HandsFreeListeningGuardTests {
         ) == .timeout)
     }
 
-    @Test func maximumSessionTimeoutDoesNotSubmitPartialSpeech() {
+    @Test func maximumSessionTimeoutDoesNotCutOffMidSpeech() {
         var guardState = HandsFreeListeningGuard(startedAt: start)
         #expect(guardState.evaluate(
             transcript: "This request never said the finish phrase",
             at: start.advanced(by: HandsFreeListeningGuard.maximumDuration)
-        ) == .timeout)
+        ) == .none)
     }
 
     @Test func aFuzzyMatchNeedsTheLongerSettle() {
@@ -279,7 +279,7 @@ struct HandsFreeListeningGuardTests {
         #expect(guardState.evaluate(
             transcript: phrase,
             at: start.advanced(by: HandsFreeListeningGuard.fuzzySettle)
-        ) == .finish("Run the tests"))
+        ) == .none)
     }
 
     @Test func punctuationChurnInEarlierWordsDoesNotResetTheSettle() {
@@ -347,7 +347,7 @@ struct HandsFreeListeningGuardTests {
             transcript: "Run the tests yipyap yip yip",
             at: start.advanced(by: HandsFreeListeningGuard.fuzzySettle),
             isFinal: true
-        ) == .finish("Run the tests"))
+        ) == .none)
     }
 
     @Test func aStableNearMissRaisesTheHintAndNeverSubmits() {
@@ -383,10 +383,14 @@ struct HandsFreeListeningGuardTests {
         #expect(!guardState.nearMissHint)
     }
 
-    @Test func aTimeoutStillFiresDuringANearMiss() {
+    @Test func aTimeoutStillFiresDuringANearMissWithoutSpeech() {
         var guardState = HandsFreeListeningGuard(startedAt: start)
-        #expect(guardState.evaluate(
+        _ = guardState.evaluate(
             transcript: "Run the tests yep yep yep yep",
+            at: start.advanced(by: .seconds(10))
+        )
+        #expect(guardState.evaluate(
+            transcript: "",
             at: start.advanced(by: HandsFreeListeningGuard.maximumDuration)
         ) == .timeout)
     }

@@ -1883,6 +1883,20 @@ final class AppModel {
         Task { await client.send(.revertChatToCheckpoint(id, chatID, turnID)) }
     }
 
+    /// ⌘T: a new shell when the terminal is typing, otherwise a new chat.
+    func createTabInFocusedContext() {
+        if TerminalRegistry.shared.isTerminalFirstResponder(),
+           let workspace = selectedWorkspace {
+            ChromeLayout.showsTerminal = true
+            TerminalRegistry.shared.addTab(
+                for: workspace.id,
+                workingDirectory: workspace.worktreePath
+            )
+            return
+        }
+        if let id = selectedWorkspaceID { createChat(in: id) }
+    }
+
     func createChat(
         in workspaceID: WorkspaceID,
         initialMessage: String? = nil,

@@ -366,13 +366,15 @@ struct OreMacApp: App {
                 Divider()
 
                 Button("New Tab") {
-                    if let id = model.selectedWorkspaceID { model.createChat(in: id) }
+                    model.createTabInFocusedContext()
                 }
                 .keyboardShortcut("t", modifiers: .command)
 
                 Button("Close Tab") {
                     guard let workspaceID = model.selectedWorkspaceID else { return }
-                    if let path = model.activeFilePath[workspaceID] {
+                    if TerminalRegistry.shared.isTerminalFirstResponder() {
+                        TerminalRegistry.shared.closeActiveTab(for: workspaceID)
+                    } else if let path = model.activeFilePath[workspaceID] {
                         model.closeDiffFile(path, in: workspaceID)
                     } else if let chat = model.activeChat(for: workspaceID) {
                         model.requestCloseChat(chat.id, in: workspaceID, title: chat.title)
@@ -1356,7 +1358,7 @@ private struct KeyboardShortcutsView: View {
     private let shortcuts = [
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
         ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
-        ("New tab", "⌘T"), ("Close tab", "⌘W"),
+        ("New tab (terminal when focused)", "⌘T"), ("Close tab", "⌘W"),
         ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"),
         ("Allow / deny tool", "↩  Esc"),

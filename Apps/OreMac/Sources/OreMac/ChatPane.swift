@@ -2892,16 +2892,20 @@ struct ChatPane: View {
             addFiles(urls)
             return .consumed
         }
-        if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
-            as? [NSImage], !images.isEmpty {
-            return addPastedImages(images)
-        }
-        // Some sources (screenshots, certain apps) only put raw image data on the
-        // board rather than an NSImage object; pick it up directly.
+        // Raw bitmap data first. `readObjects(NSImage.self)` asks AppKit to
+        // materialize whatever is on the board, and on current macOS that
+        // walk includes PhotoKit — so a screenshot paste made ORE put up
+        // "would like to access your Photo Library" even though the bytes
+        // were already a PNG. Cursor then inherits the same TCC identity,
+        // which is why the prompt shows up on Cursor turns.
         for type: NSPasteboard.PasteboardType in [.png, .tiff] {
             if let data = pasteboard.data(forType: type), let image = NSImage(data: data) {
                 return addPastedImages([image])
             }
+        }
+        if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
+            as? [NSImage], !images.isEmpty {
+            return addPastedImages(images)
         }
         if let text = pasteboard.string(forType: .string), Attachment.shouldAttachPastedText(text) {
             return addPastedText(text)

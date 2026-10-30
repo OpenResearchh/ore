@@ -135,7 +135,7 @@ struct TranscriptView: NSViewRepresentable {
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = OreTheme.Surface.contentColor
         scrollView.automaticallyAdjustsContentInsets = false
         scrollView.usesPredominantAxisScrolling = true
         // Overlay scrollers keep the table width stable while scrolling, so

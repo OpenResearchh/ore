@@ -348,7 +348,7 @@ private struct DreamFindingDetail: View {
             .frame(maxWidth: 720, alignment: .leading)
         }
         .oreOverlayScrollers()
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(OreTheme.Surface.chrome)
     }
 
     private func chip(_ text: String) -> some View {

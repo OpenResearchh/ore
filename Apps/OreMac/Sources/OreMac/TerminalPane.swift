@@ -201,8 +201,7 @@ final class OreTerminalView: LocalProcessTerminalView {
 
         // ORE is dark-only — `OreMacApp` sets `.preferredColorScheme(.dark)`.
         // That is a SwiftUI environment value, though, and it does not reach an
-        // NSView's effective appearance. `.textBackgroundColor` and
-        // `.labelColor` are *dynamic*: SwiftTerm resolves them once, here, at
+        // NSView's effective appearance. Dynamic colours resolve once, here, at
         // assignment — before this view is in a window — so they resolved
         // against the system appearance instead of the app's. On a Mac set to
         // Light that painted a white terminal with black text inside ORE's
@@ -210,7 +209,7 @@ final class OreTerminalView: LocalProcessTerminalView {
         appearance = NSAppearance(named: .darkAqua)
         let dark = NSAppearance(named: .darkAqua) ?? effectiveAppearance
         dark.performAsCurrentDrawingAppearance {
-            nativeBackgroundColor = .textBackgroundColor
+            nativeBackgroundColor = OreTheme.Surface.contentColor
             nativeForegroundColor = .labelColor
         }
 

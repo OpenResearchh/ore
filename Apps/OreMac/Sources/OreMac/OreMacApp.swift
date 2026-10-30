@@ -707,6 +707,10 @@ struct RootView: View {
         NavigationSplitView(columnVisibility: sidebarVisibility) {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 340)
+                // Cool navy over the system sidebar material. Wallpaper still
+                // shows through windowed; full screen stops reading as the
+                // same gray as the transcript.
+                .background(OreTheme.Surface.sidebarMist.ignoresSafeArea())
         } detail: {
             detail
                 // The whole detail column sits on the wallpaper's light, the
@@ -717,15 +721,11 @@ struct RootView: View {
                     ZStack {
                         // Full screen deliberately falls back to this calm,
                         // opaque reading surface; the visual-effect view hides
-                        // while the window owns the display.
-                        OreTheme.Surface.content
+                        // while the window owns the display. Smoke lives on
+                        // the glass itself so it does not darken this canvas
+                        // a second time.
+                        OreTheme.Surface.Canvas()
                         OreWindowGlassBase()
-                        // Smoke in the glass: a bright wallpaper region (a
-                        // nebula core, a sunlit photo) otherwise backlights
-                        // the prose right through the HUD material. This keeps
-                        // the see-through quality while capping how loud
-                        // what's behind can get.
-                        Color.black.opacity(0.22)
                     }
                     .ignoresSafeArea()
                 }

@@ -81,10 +81,77 @@ enum OreTheme {
 
     /// Panel backgrounds. The transcript is the reading surface; everything
     /// around it recedes so the eye lands on the agent's reply, not on chrome.
+    ///
+    /// Dark is not system gray. Full screen especially has no wallpaper to
+    /// refract, so `textBackgroundColor` / `windowBackgroundColor` stacked into
+    /// three slightly different charcoal boxes. These are closer to Cursor's
+    /// Agents canvas: a warm near-black field, a cooler sidebar, and a
+    /// slightly lifted well for cards. Light mode keeps the semantic system
+    /// colours, since this window is otherwise dark-only.
     enum Surface {
-        static var content: Color { Color(nsColor: .textBackgroundColor) }
-        static var chrome: Color { Color(nsColor: .windowBackgroundColor) }
-        static var well: Color { Color(nsColor: .controlBackgroundColor) }
+        static var content: Color { Color(nsColor: contentColor) }
+        static var chrome: Color { Color(nsColor: chromeColor) }
+        static var well: Color { Color(nsColor: wellColor) }
+
+        /// AppKit scroll views and terminals cannot take a SwiftUI `Color`.
+        static var contentColor: NSColor {
+            NSColor(name: "OreSurfaceContent") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(srgbRed: 0.090, green: 0.086, blue: 0.082, alpha: 1)  // #171615
+                    : .textBackgroundColor
+            }
+        }
+
+        static var chromeColor: NSColor {
+            NSColor(name: "OreSurfaceChrome") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(srgbRed: 0.078, green: 0.080, blue: 0.102, alpha: 1)  // #14151A
+                    : .windowBackgroundColor
+            }
+        }
+
+        static var wellColor: NSColor {
+            NSColor(name: "OreSurfaceWell") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(srgbRed: 0.157, green: 0.157, blue: 0.165, alpha: 1)  // #28282A
+                    : .controlBackgroundColor
+            }
+        }
+
+        /// Cool wash over the system sidebar material. Wallpaper still shows
+        /// through in a windowed session; the navy shift is what stops the
+        /// column reading as the same gray as the transcript.
+        static var sidebarMist: Color {
+            Color(nsColor: NSColor(name: "OreSurfaceSidebarMist") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(srgbRed: 0.22, green: 0.20, blue: 0.42, alpha: 0.20)
+                    : .clear
+            })
+        }
+
+        /// Window floor. A shade darker at the top so the title-bar band
+        /// recedes into the canvas the way Cursor's empty chat does, instead
+        /// of a flat system gray lid.
+        struct Canvas: View {
+            var body: some View {
+                LinearGradient(
+                    colors: [
+                        Color(nsColor: canvasTopColor),
+                        Color(nsColor: contentColor),
+                    ],
+                    startPoint: .top,
+                    endPoint: UnitPoint(x: 0.5, y: 0.42)
+                )
+            }
+        }
+
+        static var canvasTopColor: NSColor {
+            NSColor(name: "OreSurfaceCanvasTop") { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    ? NSColor(srgbRed: 0.063, green: 0.061, blue: 0.059, alpha: 1)  // #100F0F
+                    : .textBackgroundColor
+            }
+        }
     }
 
     enum Status {
@@ -153,6 +220,36 @@ struct OreWindowGlassBase: NSViewRepresentable {
 /// Selector-based notification observers, deliberately: block observers on an
 /// `@MainActor` NSView are a strict-concurrency argument nobody needs to have.
 final class OreAdaptiveGlassView: NSVisualEffectView {
+    /// Dims wallpaper light that would otherwise backlight prose through the
+    /// HUD material. Lives on the glass itself so full screen — which hides
+    /// this view — is just the opaque canvas, not canvas plus another 22%
+    /// of black stacked on system gray.
+    private let smoke = NSView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        installSmoke()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        installSmoke()
+    }
+
+    private func installSmoke() {
+        smoke.wantsLayer = true
+        smoke.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.22).cgColor
+        smoke.autoresizingMask = [.width, .height]
+        smoke.frame = bounds
+        smoke.identifier = NSUserInterfaceItemIdentifier("ore.glass.smoke")
+        addSubview(smoke)
+    }
+
+    override func layout() {
+        super.layout()
+        smoke.frame = bounds
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         NotificationCenter.default.removeObserver(self)

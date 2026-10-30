@@ -235,9 +235,8 @@ private struct SettingsPanes: View {
         .frame(width: 950, height: 650)
         .background {
             ZStack {
-                OreTheme.Surface.content
+                OreTheme.Surface.Canvas()
                 OreWindowGlassBase()
-                Color.black.opacity(0.28)
             }
             .ignoresSafeArea()
         }

@@ -49,6 +49,22 @@ final class TerminalRegistry {
         activeTabIDs[workspaceID] = tabID
     }
 
+    /// Whether a workspace terminal is the key window's first responder —
+    /// the user is typing in the shell, not in a chat composer.
+    func isTerminalFirstResponder() -> Bool {
+        guard let responder = NSApp.keyWindow?.firstResponder as? NSView else {
+            return false
+        }
+        for workspaceViews in views.values {
+            for terminal in workspaceViews.values {
+                if responder === terminal || responder.isDescendant(of: terminal) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     /// Ensures a workspace has at least one terminal, returning its tabs. Called
     /// off the view-update path (from `.task`) so seeding never mutates state
     /// mid-render.
@@ -65,8 +81,12 @@ final class TerminalRegistry {
         let index = (tabs[workspaceID]?.count ?? 0) + 1
         let tab = TerminalTab(id: UUID(), title: "Terminal \(index)")
         tabs[workspaceID, default: []].append(tab)
-        _ = view(for: tab.id, workspaceID: workspaceID, workingDirectory: workingDirectory)
+        let created = view(for: tab.id, workspaceID: workspaceID, workingDirectory: workingDirectory)
         activeTabIDs[workspaceID] = tab.id
+        // So a second ⌘T while the shell is still "in focus" opens another
+        // terminal, not a chat — SwiftUI swaps the hosted view after this
+        // returns, which is why the focus hop waits a turn.
+        DispatchQueue.main.async { created.window?.makeFirstResponder(created) }
         return tab
     }
 
@@ -523,7 +543,7 @@ struct TerminalPane: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("New terminal")
+                    .help("New terminal (⌘T while the shell is focused)")
                 }
                 .padding(.horizontal, OreTheme.Space.xs)
             }

@@ -101,6 +101,57 @@ public struct UserMessage: Sendable, Codable, Hashable {
         let list = attachmentPaths.map { "- \($0)" }.joined(separator: "\n")
         return "\(text)\n\nAttached files:\n\(list)"
     }
+
+    /// Composer pills are `@pasted-image.png`. Cursor (and similar CLIs)
+    /// treat `@name` as a file mention, so that token shows up as a reference
+    /// to a file that does not exist — the bytes live at `relativePath`,
+    /// usually with a UUID prefix. Expand the pill to the real path before
+    /// the CLI sees the prompt. The Ore transcript keeps the short name.
+    public static func expandingComposerTokens(
+        _ text: String,
+        attachments: [Attachment]
+    ) -> String {
+        guard !attachments.isEmpty else { return text }
+        var result = text
+        let attachments = attachments.sorted { lhs, rhs in
+            lhs.displayName.count > rhs.displayName.count
+        }
+        for attachment in attachments {
+            let replacement = attachment.relativePath
+            for name in composerTokenNames(for: attachment) {
+                let token = "@\(name)"
+                guard token != "@\(replacement)", result.contains(token) else { continue }
+                result = result.replacingOccurrences(of: token, with: replacement)
+            }
+        }
+        return result
+    }
+
+    /// `@pasted-image.png` from the composer, plus the on-disk basename and
+    /// that basename with Ore's 8-hex copy prefix stripped, so a queued
+    /// replay whose display name is already `7B284CED-pasted-image.png`
+    /// still matches the original pill.
+    private static func composerTokenNames(for attachment: Attachment) -> [String] {
+        var names: [String] = []
+        func add(_ name: String) {
+            guard !name.isEmpty, !names.contains(name) else { return }
+            names.append(name)
+        }
+        add(attachment.displayName)
+        let base = FilePath.lastComponent(attachment.relativePath)
+        add(base)
+        if let stripped = stripCopyPrefix(base) { add(stripped) }
+        return names
+    }
+
+    /// `7B284CED-pasted-image.png` → `pasted-image.png`.
+    private static func stripCopyPrefix(_ filename: String) -> String? {
+        guard filename.count > 9,
+              filename.prefix(8).allSatisfy(\.isHexDigit),
+              filename.dropFirst(8).first == "-"
+        else { return nil }
+        return String(filename.dropFirst(9))
+    }
 }
 
 public enum HarnessError: Error, Sendable, CustomStringConvertible {

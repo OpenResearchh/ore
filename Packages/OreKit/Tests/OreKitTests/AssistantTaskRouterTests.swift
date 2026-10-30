@@ -55,6 +55,17 @@ struct AssistantTaskRouterTests {
         #expect(decision.workspaceID == kailash)
     }
 
+
+    @Test func vagueImplementationRoutesToFocusedWorkspaceNotAssistantChat() {
+        let decision = AssistantTaskRouter.route(
+            utterance: "Implement these fixes properly",
+            snapshot: fleet(focused: true)
+        )
+        #expect(decision.action == .sendExistingTab)
+        #expect(decision.workspaceID == kailash)
+        #expect(decision.chatID == authTab)
+    }
+
     @Test func assistantOnlyRequestsStayInTheAssistantChat() {
         let decision = AssistantTaskRouter.route(
             utterance: "Remember I prefer Opus for reviews",

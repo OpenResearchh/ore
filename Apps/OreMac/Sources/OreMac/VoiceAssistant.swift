@@ -398,19 +398,17 @@ struct HandsFreeListeningGuard {
             nearMissCandidateKey = nil
             nearMissHint = false
         }
-        if let match = evaluation.match {
+        if let match = evaluation.match, match.confidence == .exact {
             // A final recognizer result has already passed a stronger stability
             // boundary than the polling settle delay.
-            if isFinal, match.confidence == .exact { return .finish(match.request) }
+            if isFinal { return .finish(match.request) }
             // Settle is keyed on the words that would be sent, not the raw
             // transcript: cosmetic churn does not reset the clock, but either
             // a changed request word or changed phrase hypothesis still does.
             let key = Self.settleKey(for: match)
-            let required = match.confidence == .exact
-                ? Self.finishSettle : Self.fuzzySettle
             if finishCandidateKey == key {
                 if let since = finishCandidateSince,
-                   instant - since >= required {
+                   instant - since >= Self.finishSettle {
                     return .finish(match.request)
                 }
             } else {
@@ -425,7 +423,7 @@ struct HandsFreeListeningGuard {
         if current.isEmpty, instant - startedAt >= Self.noSpeechTimeout {
             return .timeout
         }
-        if instant - startedAt >= Self.maximumDuration {
+        if current.isEmpty, instant - startedAt >= Self.maximumDuration {
             return .timeout
         }
         if let silenceAutoFinish, !contentKey.isEmpty,

@@ -374,6 +374,32 @@ struct DiffEngineTests {
         #expect(await fixture.git.commitsAheadOfBase("main", in: worktree) == 1)
     }
 
+    @Test func syncedRevisionPrefersOriginAfterAFetch() async throws {
+        // Creating a workspace used to branch from local `main`. Once origin
+        // moved and the main checkout never pulled, every new worktree started
+        // behind GitHub — and the review pane then treated origin's commits as
+        // this workspace's work.
+        let fixture = try await GitFixture.initialized()
+        try await fixture.attachOrigin()
+        let stale = try await fixture.git.resolve("main")
+        let moved = try await fixture.advanceOrigin()
+
+        #expect(try await fixture.git.resolve("main") == stale)
+        let revision = await fixture.git.syncedRevision(for: "main")
+        #expect(revision == "origin/main")
+        #expect(try await fixture.git.resolve(revision) == moved)
+        #expect(try await fixture.git.resolve("origin/main") == moved)
+        // `main` is checked out in the fixture, so it is not fast-forwarded —
+        // moving a checked-out branch with update-ref would look like phantom
+        // uncommitted changes. The new worktree still starts from origin.
+        #expect(try await fixture.git.resolve("main") == stale)
+    }
+
+    @Test func syncedRevisionWithoutARemoteStaysOnTheLocalBranch() async throws {
+        let fixture = try await GitFixture.initialized()
+        #expect(await fixture.git.syncedRevision(for: "main") == "main")
+    }
+
     @Test func turnDiffsComeFromCheckpointRefs() async throws {
         let fixture = try await GitFixture.initialized()
         let manager = WorktreeManager(git: fixture.git, root: fixture.worktreeRoot)

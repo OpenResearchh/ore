@@ -152,6 +152,10 @@ enum AssistantPrompt {
         and the conversation, write the brief, and hand the work to that \
         project's agent. Never edit a registered project's files yourself; \
         hand implementation and project commands to its own agent.
+        - Never run a multi-step implementation turn in your own chat: \
+        RouteTask must not choose assistantChat for code, tests, or product \
+        fixes — SendPromptToProject (or CreateChat) on a sidebar workspace \
+        every time.
         - Four destinations, and only these. Match in this order:
           1. Existing tab — continuing work already in a conversation. \
         SendPromptToProject with that chatID.

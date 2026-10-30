@@ -1531,7 +1531,7 @@ struct ChatPane: View {
                     VoiceComposerTranscript(
                         prefix: draft,
                         transcript: voiceSettle?.quote ?? voiceQuote,
-                        isListening: voice.isListening,
+                        isListening: voice.isListening || (voice.isActive && voiceSettle == nil),
                         isSettled: voiceSettle != nil,
                         // Never let the settled prompt squeeze the toolbar out of a
                         // short window: cap it to a slice of the pane.
@@ -2203,23 +2203,23 @@ struct ChatPane: View {
     private var micButton: some View {
         Button(action: toggleVoice) {
             Group {
-                if voice.status == .downloadingModel || voice.status == .preparing {
+                if voice.status == .downloadingModel || voice.status == .preparing || voice.status == .requestingPermission {
                     ProgressView().controlSize(.small)
                 } else {
-                    Image(systemName: voice.isListening ? "mic.fill" : "mic")
+                    Image(systemName: voice.isActive ? "mic.fill" : "mic")
                         .font(.system(size: 13, weight: .semibold))
-                        .symbolEffect(.pulse, isActive: voice.isListening && !reduceMotion)
+                        .symbolEffect(.pulse, isActive: voice.isActive && !reduceMotion)
                 }
             }
-            .foregroundStyle(voice.isListening ? Color.red : .primary)
+            .foregroundStyle(voice.isActive ? Color.red : .primary)
             .frame(width: 30, height: 30)
             .background(
-                voice.isListening ? Color.red.opacity(0.14) : OreTheme.subduedFill,
+                voice.isActive ? Color.red.opacity(0.14) : OreTheme.subduedFill,
                 in: Circle()
             )
             .overlay(
                 Circle().stroke(
-                    voice.isListening ? Color.red.opacity(0.45) : OreTheme.hairline,
+                    voice.isActive ? Color.red.opacity(0.45) : OreTheme.hairline,
                     lineWidth: 1
                 )
             )
@@ -2892,16 +2892,20 @@ struct ChatPane: View {
             addFiles(urls)
             return .consumed
         }
-        if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
-            as? [NSImage], !images.isEmpty {
-            return addPastedImages(images)
-        }
-        // Some sources (screenshots, certain apps) only put raw image data on the
-        // board rather than an NSImage object; pick it up directly.
+        // Raw bitmap data first. `readObjects(NSImage.self)` asks AppKit to
+        // materialize whatever is on the board, and on current macOS that
+        // walk includes PhotoKit — so a screenshot paste made ORE put up
+        // "would like to access your Photo Library" even though the bytes
+        // were already a PNG. Cursor then inherits the same TCC identity,
+        // which is why the prompt shows up on Cursor turns.
         for type: NSPasteboard.PasteboardType in [.png, .tiff] {
             if let data = pasteboard.data(forType: type), let image = NSImage(data: data) {
                 return addPastedImages([image])
             }
+        }
+        if let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)
+            as? [NSImage], !images.isEmpty {
+            return addPastedImages(images)
         }
         if let text = pasteboard.string(forType: .string), Attachment.shouldAttachPastedText(text) {
             return addPastedText(text)

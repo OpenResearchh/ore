@@ -83,6 +83,50 @@ final class GitFixture {
         root.appendingPathComponent("worktrees", isDirectory: true)
     }
 
+    /// A bare `origin` remote with `HEAD` pushed, so fetch tests have a
+    /// network that is still entirely on disk.
+    @discardableResult
+    func attachOrigin() async throws -> URL {
+        let origin = root.appendingPathComponent("origin.git", isDirectory: true)
+        // `-b main` so the bare repo's HEAD matches the fixture. Without it
+        // HEAD points at a nonexistent `master`, a clone can't check out, and
+        // the next push lands on `master` instead of updating `main`.
+        try await run(["init", "-q", "--bare", "-b", "main", origin.path])
+        try await run(["remote", "add", "origin", origin.path])
+        try await run(["push", "-q", "-u", "origin", "HEAD"])
+        return origin
+    }
+
+    /// Commit on a throwaway clone of origin and push, leaving this checkout
+    /// stale — the shape of a machine that has not pulled since GitHub moved.
+    @discardableResult
+    func advanceOrigin(
+        file: String = "from-origin.txt",
+        contents: String = "landed remotely\n",
+        message: String = "landed on origin"
+    ) async throws -> String {
+        let origin = root.appendingPathComponent("origin.git")
+        let checkout = root.appendingPathComponent("origin-advance", isDirectory: true)
+        if FileManager.default.fileExists(atPath: checkout.path) {
+            try FileManager.default.removeItem(at: checkout)
+        }
+        try await git.run(["clone", "-q", origin.path, checkout.path], in: root)
+        let other = try GitClient(repositoryURL: checkout)
+        try await other.run(["config", "user.email", "tests@ore.local"])
+        try await other.run(["config", "user.name", "ORE Tests"])
+        try await other.run(["config", "commit.gpgsign", "false"])
+        let url = checkout.appendingPathComponent(file)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        try await other.run(["add", "-A"])
+        try await other.run(["commit", "-q", "-m", message])
+        try await other.run(["push", "-q", "origin", "HEAD"])
+        return try await other.run(["rev-parse", "HEAD"]).trimmedStandardOutput
+    }
+
     deinit {
         try? FileManager.default.removeItem(at: root)
     }

@@ -184,6 +184,39 @@ public actor GitClient {
         (try? await run(["show-ref", "--verify", "--quiet", "refs/heads/\(name)"])) != nil
     }
 
+    public func remoteTrackingBranchExists(_ name: String) async -> Bool {
+        (try? await run(["show-ref", "--verify", "--quiet", "refs/remotes/origin/\(name)"])) != nil
+    }
+
+    /// The commit-ish a new worktree should start from, after refreshing
+    /// `origin/<branch>` from the remote.
+    ///
+    /// A workspace cut from a stale local `main` is how agents start behind
+    /// GitHub: origin moved, the main checkout never pulled, and every new
+    /// worktree inherited that lag. The remote-tracking ref is the source of
+    /// truth whenever it exists. Fetch failure falls back to whatever is
+    /// already local so an offline machine still opens a workspace.
+    ///
+    /// Sequential awaits on purpose: a compact `if`/`try? await` chain in an
+    /// async frame has miscompiled on this toolchain. See
+    /// `WorkspaceEngine.autoFastForwardedLocalBehind`.
+    public func syncedRevision(for branch: String) async -> String {
+        let hasRemote = await hasRemote()
+        if hasRemote {
+            try? await fetchRemoteBranch(branch, force: true)
+        }
+        let hasOrigin = await remoteTrackingBranchExists(branch)
+        guard hasOrigin else { return branch }
+        let localExists = await branchExists(branch)
+        if localExists {
+            let checkedOut = await isBranchCheckedOut(branch)
+            if !checkedOut {
+                try? await fastForwardLocalBranch(branch, to: "origin/\(branch)")
+            }
+        }
+        return "origin/\(branch)"
+    }
+
     /// Where a worktree actually diverged from its base branch.
     ///
     /// `...` semantics — compare against the merge base — mean commits landing
@@ -458,7 +491,14 @@ public actor GitClient {
     private func performRemoteFetch(_ name: String, key: String) async throws {
         remoteFetchCount += 1
         do {
-            try await runSerialized(["fetch", "--quiet", "origin", name])
+            // `git fetch origin main` writes FETCH_HEAD only. Without a
+            // destination refspec, `origin/main` stays wherever the last
+            // full fetch (or the clone) left it, and every workspace that
+            // then branches from "the remote" starts behind GitHub.
+            try await runSerialized([
+                "fetch", "--quiet", "origin",
+                "+refs/heads/\(name):refs/remotes/origin/\(name)",
+            ])
         } catch {
             lastFailedRemoteFetch[key] = .now
             throw error

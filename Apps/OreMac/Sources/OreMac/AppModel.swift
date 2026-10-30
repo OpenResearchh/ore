@@ -335,6 +335,7 @@ final class AppModel {
         // The pill follows tabNeedsYou + the voice phase from here on, so a
         // blocked tab is answerable from any app, not only from ORE's window.
         AssistantVoiceHUD.shared.bind(model: self)
+        if #available(macOS 26.0, *) { DictationPrewarm.warm() }
         // Direct callback, not a SwiftUI onChange: hold-to-talk must survive
         // every window being closed — the menu bar presence is enough.
         VoiceHotkeyMonitor.shared.onCommand = { [weak self] command in
@@ -1880,6 +1881,20 @@ final class AppModel {
     func revert(to turnID: TurnID, in id: WorkspaceID) {
         guard let chatID = activeChat(for: id)?.id else { return }
         Task { await client.send(.revertChatToCheckpoint(id, chatID, turnID)) }
+    }
+
+    /// ⌘T: a new shell when the terminal is typing, otherwise a new chat.
+    func createTabInFocusedContext() {
+        if TerminalRegistry.shared.isTerminalFirstResponder(),
+           let workspace = selectedWorkspace {
+            ChromeLayout.showsTerminal = true
+            TerminalRegistry.shared.addTab(
+                for: workspace.id,
+                workingDirectory: workspace.worktreePath
+            )
+            return
+        }
+        if let id = selectedWorkspaceID { createChat(in: id) }
     }
 
     func createChat(

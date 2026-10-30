@@ -116,6 +116,38 @@ struct ClaudeControlPayloadTests {
         #expect(message.renderedText.hasPrefix("Follow this plan."))
     }
 
+    @Test func composerPillsExpandToTheRealAttachmentPath() {
+        // `@pasted-image.png` is an Ore composer chip. Cursor treats `@`
+        // as a file mention, so leaving the short name in the prompt made
+        // the CLI look for a file that does not exist.
+        let attachment = Attachment(
+            relativePath: ".context/attachments/7B284CED-pasted-image.png",
+            displayName: "pasted-image.png",
+            mimeType: "image/png"
+        )
+        let expanded = UserMessage.expandingComposerTokens(
+            "why does this show as @pasted-image.png",
+            attachments: [attachment]
+        )
+        #expect(expanded.contains(".context/attachments/7B284CED-pasted-image.png"))
+        #expect(!expanded.contains("@pasted-image.png"))
+        #expect(expanded.hasPrefix("why does this show as "))
+    }
+
+    @Test func aQueuedReplayStillExpandsTheOriginalPill() {
+        // Drain rebuilds attachments from path only, so displayName is the
+        // UUID-prefixed basename. The prompt still has `@pasted-image.png`.
+        let attachment = Attachment(
+            relativePath: ".context/attachments/7B284CED-pasted-image.png",
+            displayName: "7B284CED-pasted-image.png"
+        )
+        let expanded = UserMessage.expandingComposerTokens(
+            "see @pasted-image.png",
+            attachments: [attachment]
+        )
+        #expect(expanded == "see .context/attachments/7B284CED-pasted-image.png")
+    }
+
     @Test func aWellFormedCanUseToolIsAPermissionPrompt() {
         let line = #"{"type":"control_request","request_id":"req_1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#
         #expect(ClaudeWire.inboundControl(in: line) == .permissionPrompt)

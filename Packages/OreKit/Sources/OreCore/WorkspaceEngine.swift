@@ -928,7 +928,9 @@ public actor WorkspaceEngine {
                 ? text
                 : (preamble + [text]).joined(separator: "\n\n")
             try await session.send(UserMessage(
-                text: modelText,
+                text: UserMessage.expandingComposerTokens(
+                    modelText, attachments: request.attachments
+                ),
                 attachmentPaths: request.attachments.map(\.relativePath),
                 reasoningEffort: requestedEffort,
                 serviceTier: request.serviceTier

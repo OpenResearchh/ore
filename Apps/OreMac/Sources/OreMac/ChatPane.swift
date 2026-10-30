@@ -1364,6 +1364,10 @@ struct ChatPane: View {
                 Divider().overlay(OreTheme.hairline)
             }
 
+            if workspace.isStorageOffline {
+                storageOfflineBanner
+            }
+
             if chat.isBusy {
                 // Handed the state, not its values: the status row reads
                 // `lastEventAt` and friends itself, so a streaming event
@@ -2653,6 +2657,28 @@ struct ChatPane: View {
     }
 
     @ViewBuilder
+    private var storageOfflineBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "externaldrive.badge.xmark")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("This workspace is offline")
+                    .fontWeight(.medium)
+                Text(workspace.storage?.offlineMessage
+                     ?? "Plug the volume back in to continue. ORE will not move it onto This Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var composerBlockedByStorage: Bool { workspace.isStorageOffline }
+
+    @ViewBuilder
     private func sendButton(_ chat: ChatState) -> some View {
         if #available(macOS 26.0, *) {
             Button(action: send) {
@@ -2663,9 +2689,12 @@ struct ChatPane: View {
             .buttonStyle(.glassProminent)
             .buttonBorderShape(.circle)
             .tint(.accentColor)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
+            .disabled(composerBlockedByStorage
+                || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
             .keyboardShortcut(.return, modifiers: .command)
-            .help(chat.queueHint ?? "Send (⌘↩)")
+            .help(composerBlockedByStorage
+                ? (workspace.storage?.offlineMessage ?? "Workspace is offline")
+                : (chat.queueHint ?? "Send (⌘↩)"))
         } else {
             Button(action: send) {
                 Image(systemName: chat.willQueueNextMessage ? "text.append" : "arrow.up")
@@ -2676,9 +2705,12 @@ struct ChatPane: View {
                     .shadow(color: Color.accentColor.opacity(0.16), radius: 3, y: 1)
             }
             .buttonStyle(.plain)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty)
+            .disabled(composerBlockedByStorage
+                || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
             .keyboardShortcut(.return, modifiers: .command)
-            .help(chat.queueHint ?? "Send (⌘↩)")
+            .help(composerBlockedByStorage
+                ? (workspace.storage?.offlineMessage ?? "Workspace is offline")
+                : (chat.queueHint ?? "Send (⌘↩)"))
         }
     }
 
@@ -2717,6 +2749,7 @@ struct ChatPane: View {
     }
 
     private func send() {
+        guard !composerBlockedByStorage else { return }
         // ⌘↩ mid-dictation ends the session, which sends exactly once through
         // `finishVoice` rather than racing it — including a turn still waiting
         // out its hold, whose words are not in the draft yet.
@@ -2728,6 +2761,7 @@ struct ChatPane: View {
     }
 
     private func performSend() {
+        guard !composerBlockedByStorage else { return }
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let outgoing = attachments
         guard !text.isEmpty || !outgoing.isEmpty else { return }

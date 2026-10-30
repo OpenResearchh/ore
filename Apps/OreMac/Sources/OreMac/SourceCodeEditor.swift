@@ -58,7 +58,7 @@ struct SourceCodeEditor: NSViewRepresentable {
         )
         textView.textContainerInset = NSSize(width: 14, height: 12)
         // Let the enclosing scroll view own the semantic background. Resolving
-        // textBackgroundColor with an alpha before this view joins a window can
+        // a dynamic color with an alpha before this view joins a window can
         // freeze its Aqua (white) value, leaving white syntax text on white
         // after the app adopts Dark Aqua.
         textView.drawsBackground = false
@@ -77,7 +77,7 @@ struct SourceCodeEditor: NSViewRepresentable {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = OreTheme.Surface.contentColor
         scrollView.borderType = .noBorder
 
         let ruler = SourceLineNumberRuler(scrollView: scrollView, textView: textView)

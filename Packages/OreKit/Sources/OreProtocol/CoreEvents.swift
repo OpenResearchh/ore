@@ -94,17 +94,48 @@ public struct CoreSnapshot: Sendable, Codable {
     /// Empty until the first check completes — a window that opens mid-check
     /// simply has nothing to offer yet, and the event fills it in.
     public var harnessUpdates: [HarnessUpdateStatus]
+    /// Registered storage roots with live availability. Empty in snapshots
+    /// from cores predating pluggable storage — treat as This Mac only.
+    public var storageRoots: [StorageRoot]
 
     public init(
         workspaces: [WorkspaceSummary],
         chats: [ChatSummary] = [],
         harnesses: [HarnessProbeResult],
-        harnessUpdates: [HarnessUpdateStatus] = []
+        harnessUpdates: [HarnessUpdateStatus] = [],
+        storageRoots: [StorageRoot] = []
     ) {
         self.workspaces = workspaces
         self.chats = chats
         self.harnesses = harnesses
         self.harnessUpdates = harnessUpdates
+        self.storageRoots = storageRoots
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case workspaces, chats, harnesses, harnessUpdates, storageRoots
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workspaces = try container.decode([WorkspaceSummary].self, forKey: .workspaces)
+        chats = try container.decodeIfPresent([ChatSummary].self, forKey: .chats) ?? []
+        harnesses = try container.decode([HarnessProbeResult].self, forKey: .harnesses)
+        harnessUpdates = try container.decodeIfPresent(
+            [HarnessUpdateStatus].self, forKey: .harnessUpdates
+        ) ?? []
+        storageRoots = try container.decodeIfPresent(
+            [StorageRoot].self, forKey: .storageRoots
+        ) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(workspaces, forKey: .workspaces)
+        try container.encode(chats, forKey: .chats)
+        try container.encode(harnesses, forKey: .harnesses)
+        try container.encode(harnessUpdates, forKey: .harnessUpdates)
+        try container.encode(storageRoots, forKey: .storageRoots)
     }
 }
 
@@ -229,12 +260,16 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
     public var baseSync: BaseSyncStatus?
     /// Nil in snapshots from cores predating the assistant; treat as `.standard`.
     public var kind: WorkspaceKind?
+    /// Nil in snapshots from cores predating pluggable storage; treat as
+    /// This Mac, online.
+    public var storage: WorkspaceStorageState?
 
     public var isAssistant: Bool { kind == .assistant }
     public var isDream: Bool { kind == .dream }
     /// User-facing workspaces only. Assistant and dream rows ride the snapshot
     /// tagged by kind so dedicated windows can find them; the sidebar must not.
     public var isStandard: Bool { kind == nil || kind == .standard }
+    public var isStorageOffline: Bool { storage?.isOffline == true }
 
     public init(
         id: WorkspaceID,
@@ -257,7 +292,8 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         contextUsage: UsageReport? = nil,
         lastActivity: Date? = nil,
         baseSync: BaseSyncStatus? = nil,
-        kind: WorkspaceKind? = nil
+        kind: WorkspaceKind? = nil,
+        storage: WorkspaceStorageState? = nil
     ) {
         self.id = id
         self.name = name
@@ -280,6 +316,7 @@ public struct WorkspaceSummary: Sendable, Codable, Hashable, Identifiable {
         self.lastActivity = lastActivity
         self.baseSync = baseSync
         self.kind = kind
+        self.storage = storage
     }
 }
 

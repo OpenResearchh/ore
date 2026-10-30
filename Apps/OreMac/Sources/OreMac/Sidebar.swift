@@ -935,6 +935,18 @@ enum SidebarFleetActivity {
 /// "3h", "5d" — the reference design's timestamp column. A full relative
 /// sentence ("5 days ago") is the row's widest element for its least important
 /// fact; the compact form keeps the name in charge. Internal for tests.
+/// Capsule on an unplugged-volume row. Nil when the worktree is reachable.
+func sidebarStorageBadgeTitle(_ workspace: WorkspaceSummary) -> String? {
+    workspace.isStorageOffline ? "Offline" : nil
+}
+
+/// Second-line copy. Names the volume so "Offline" is not a mystery badge.
+func sidebarStorageStatusLine(_ workspace: WorkspaceSummary) -> String? {
+    guard workspace.isStorageOffline else { return nil }
+    let name = workspace.storage?.displayName ?? "external storage"
+    return "\(name) isn’t connected"
+}
+
 func sidebarCompactAge(_ date: Date, now: Date = Date()) -> String {
     let seconds = max(0, now.timeIntervalSince(date))
     let minutes = Int(seconds / 60)
@@ -1335,6 +1347,16 @@ private struct WorkspaceRow: View {
                         )
                     }
 
+                    if let badge = sidebarStorageBadgeTitle(workspace) {
+                        Text(badge)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.16), in: Capsule())
+                            .help(sidebarStorageStatusLine(workspace) ?? "Volume isn’t connected")
+                    }
+
                     Spacer(minLength: 4)
 
                     if let activity = workspace.lastActivity {
@@ -1489,6 +1511,7 @@ private struct WorkspaceRow: View {
 
     /// What the second line says, or nil when it would only say "Ready".
     private var statusLine: String? {
+        if let offline = sidebarStorageStatusLine(workspace) { return offline }
         switch effectiveStatus {
         case .awaitingInput: return "Needs you"
         case .runningTool:
@@ -1511,6 +1534,7 @@ private struct WorkspaceRow: View {
 
     private var hasSecondLine: Bool {
         secondLineText != nil
+            || workspace.isStorageOffline
             || workspace.stackedOn != nil
             || git.insertions > 0
             || git.deletions > 0

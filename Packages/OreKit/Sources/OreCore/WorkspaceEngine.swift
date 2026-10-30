@@ -2595,6 +2595,8 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
     case assistantWorkspaceProtected
     case questionNotPending(QuestionID, ChatID)
     case projectFilesNotTrashed([String])
+    case storageOffline(volumeName: String)
+    case storageRootNotFound(StorageRootID)
 
     public var description: String {
         switch self {
@@ -2622,6 +2624,11 @@ public enum OreCoreError: Error, Sendable, CustomStringConvertible {
                 + paths.joined(separator: ", ")
         case .questionNotPending(let id, let chatID):
             return "Question \(id.rawValue) is not pending on chat \(chatID.rawValue). Refresh app state and use the current IDs."
+        case .storageOffline(let volumeName):
+            return "This workspace is on “\(volumeName)”, which isn’t connected. "
+                + "Plug it back in to continue. ORE will not move it onto This Mac."
+        case .storageRootNotFound:
+            return "That storage location isn’t registered."
         }
     }
 }

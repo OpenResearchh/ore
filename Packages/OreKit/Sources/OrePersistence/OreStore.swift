@@ -3,27 +3,32 @@ import GRDB
 import OreProtocol
 import OreSupport
 
-/// Where ORE keeps its state.
-///
-/// `ORE_HOME` overrides it, which is what makes it possible to run a second
-/// instance against a scratch directory — for development, and so a test run
-/// can never touch the state a real session depends on.
-public enum OreHome {
-    public static var directory: URL {
-        if let override = ProcessInfo.processInfo.environment["ORE_HOME"], !override.isEmpty {
-            return FilePath.expandingTildeURL(override)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ore", isDirectory: true)
-    }
-
-    public static var worktreeRoot: URL {
-        directory.appendingPathComponent("workspaces", isDirectory: true)
-    }
-}
+/// Re-exported from OreSupport so existing `import OrePersistence` call sites
+/// keep compiling. The type lives next to `FilePath` so git worktree layout
+/// and the database share one home without a persistence dependency.
+public typealias OreHome = OreSupport.OreHome
 
 /// A failure that belongs to the store itself, phrased for the person who has
 /// to act on it rather than for a log.
+public enum StorageRootStoreError: Error, Sendable, CustomStringConvertible {
+    case notFound(StorageRootID)
+    case cannotRemoveInternal
+    case hasWorkspaces(StorageRootID, count: Int)
+
+    public var description: String {
+        switch self {
+        case .notFound:
+            return "That storage location isn’t registered."
+        case .cannotRemoveInternal:
+            return "This Mac is ORE’s default storage and can’t be removed."
+        case .hasWorkspaces(_, let count):
+            return "Remove or archive the \(count) workspace"
+                + (count == 1 ? "" : "s")
+                + " on this volume first."
+        }
+    }
+}
+
 public enum OreStoreError: LocalizedError, Sendable {
     /// The file on disk was written by a build of ORE newer than this one.
     case storeWrittenByANewerORE(found: Int, expected: Int)
@@ -201,6 +206,153 @@ public actor OreStore {
 
     public nonisolated func repository(path: String) async throws -> RepositoryRecord? {
         try await writer.read { db in try RepositoryRecord.fetchOne(db, key: path) }
+    }
+
+    // MARK: - Storage roots
+
+    public nonisolated func storageRoots() async throws -> [StorageRootRecord] {
+        try await writer.read { db in
+            try StorageRootRecord
+                .order(Column("kind").desc, Column("createdAt").asc)
+                .fetchAll(db)
+        }
+    }
+
+    public func saveStorageRoot(_ record: StorageRootRecord) throws {
+        try writer.write { db in try record.save(db) }
+    }
+
+    /// Inserts This Mac if a migrated (or empty) store somehow lacks it.
+    /// Updates `mountPath` when `$ORE_HOME` moved between launches.
+    public func ensureInternalStorageRoot(mountPath: String) throws {
+        try writer.write { db in
+            if var existing = try StorageRootRecord.fetchOne(
+                db, key: StorageRootID.internalDefault.rawValue
+            ) {
+                if existing.mountPath != mountPath {
+                    existing.mountPath = mountPath
+                    existing.lastSeenAt = Date()
+                    try existing.update(db)
+                }
+            } else {
+                try StorageRootRecord(
+                    id: .internalDefault,
+                    kind: .internal,
+                    displayName: "This Mac",
+                    mountPath: mountPath,
+                    isPreferred: true
+                ).insert(db)
+            }
+        }
+    }
+
+    public func setPreferredStorageRoot(_ id: StorageRootID) throws {
+        try writer.write { db in
+            guard try StorageRootRecord.fetchOne(db, key: id.rawValue) != nil else {
+                throw StorageRootStoreError.notFound(id)
+            }
+            try db.execute(sql: "UPDATE storageRoot SET isPreferred = 0")
+            try db.execute(
+                sql: "UPDATE storageRoot SET isPreferred = 1 WHERE id = ?",
+                arguments: [id.rawValue]
+            )
+        }
+    }
+
+    public nonisolated func workspaceCount(onStorageRoot id: StorageRootID) async throws -> Int {
+        try await writer.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM workspace WHERE storageRootID = ?",
+                arguments: [id.rawValue]
+            ) ?? 0
+        }
+    }
+
+    public func deleteStorageRoot(_ id: StorageRootID) throws {
+        guard id != .internalDefault else {
+            throw StorageRootStoreError.cannotRemoveInternal
+        }
+        try writer.write { db in
+            let count = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM workspace WHERE storageRootID = ?",
+                arguments: [id.rawValue]
+            ) ?? 0
+            guard count == 0 else {
+                throw StorageRootStoreError.hasWorkspaces(id, count: count)
+            }
+            let wasPreferred = (try Int.fetchOne(
+                db,
+                sql: "SELECT isPreferred FROM storageRoot WHERE id = ?",
+                arguments: [id.rawValue]
+            ) ?? 0) != 0
+            try StorageRootRecord.deleteOne(db, key: id.rawValue)
+            if wasPreferred {
+                try db.execute(
+                    sql: "UPDATE storageRoot SET isPreferred = 1 WHERE id = ?",
+                    arguments: [StorageRootID.internalDefault.rawValue]
+                )
+            }
+        }
+    }
+
+    /// Prefix rewrite after a volume remounts under a new path. The files did
+    /// not move; only the mount point did. Foreign keys on `repository.path`
+    /// are deferred so both tables can change in one transaction.
+    public func relocateStorageRoot(
+        _ id: StorageRootID,
+        from oldMount: String,
+        to newMount: String
+    ) throws {
+        guard oldMount != newMount else { return }
+        try writer.write { db in
+            try db.execute(sql: "PRAGMA defer_foreign_keys = ON")
+            let repositories = try Row.fetchAll(
+                db,
+                sql: "SELECT path FROM repository WHERE storageRootID = ?",
+                arguments: [id.rawValue]
+            )
+            for row in repositories {
+                let oldPath: String = row["path"]
+                let relocated = StorageRootResolver.relocating(
+                    oldPath, from: oldMount, to: newMount
+                )
+                guard relocated != oldPath else { continue }
+                try db.execute(
+                    sql: "UPDATE workspace SET repositoryPath = ? WHERE repositoryPath = ?",
+                    arguments: [relocated, oldPath]
+                )
+                try db.execute(
+                    sql: """
+                        UPDATE repositoryScriptApproval SET repositoryPath = ?
+                        WHERE repositoryPath = ?
+                        """,
+                    arguments: [relocated, oldPath]
+                )
+                try db.execute(
+                    sql: "UPDATE repository SET path = ? WHERE path = ?",
+                    arguments: [relocated, oldPath]
+                )
+            }
+            let worktrees = try Row.fetchAll(
+                db,
+                sql: "SELECT id, worktreePath FROM workspace WHERE storageRootID = ?",
+                arguments: [id.rawValue]
+            )
+            for row in worktrees {
+                let workspaceID: String = row["id"]
+                let oldPath: String = row["worktreePath"]
+                let relocated = StorageRootResolver.relocating(
+                    oldPath, from: oldMount, to: newMount
+                )
+                guard relocated != oldPath else { continue }
+                try db.execute(
+                    sql: "UPDATE workspace SET worktreePath = ? WHERE id = ?",
+                    arguments: [relocated, workspaceID]
+                )
+            }
+        }
     }
 
     // MARK: - Workspaces

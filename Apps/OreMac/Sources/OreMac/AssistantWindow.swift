@@ -52,8 +52,8 @@ struct AssistantActivityView: View {
         .toolbarBackground(.hidden, for: .windowToolbar)
         .background {
             ZStack {
+                OreTheme.Surface.Canvas()
                 OreWindowGlassBase()
-                Color.black.opacity(0.22)
             }
             .ignoresSafeArea()
         }

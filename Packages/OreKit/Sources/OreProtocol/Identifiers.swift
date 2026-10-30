@@ -75,3 +75,15 @@ public struct DreamFindingID: OreIdentifier {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+/// One registered place worktrees and project libraries can live.
+///
+/// `internalDefault` is This Mac (`~/ore` / `$ORE_HOME`). External ids are
+/// minted at registration and never reused, so an unplugged volume still
+/// names the workspaces that belong on it.
+public struct StorageRootID: OreIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let internalDefault = StorageRootID(rawValue: "internal")
+}

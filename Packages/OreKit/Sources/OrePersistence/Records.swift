@@ -13,12 +13,90 @@ public struct RepositoryRecord: Codable, FetchableRecord, PersistableRecord, Sen
     public var name: String
     public var defaultBranch: String
     public var addedAt: Date
+    /// Nil on rows written before pluggable storage; treated as This Mac.
+    public var storageRootID: String?
 
-    public init(path: String, name: String, defaultBranch: String, addedAt: Date = Date()) {
+    public init(
+        path: String,
+        name: String,
+        defaultBranch: String,
+        addedAt: Date = Date(),
+        storageRootID: StorageRootID? = nil
+    ) {
         self.path = path
         self.name = name
         self.defaultBranch = defaultBranch
         self.addedAt = addedAt
+        self.storageRootID = storageRootID?.rawValue
+    }
+}
+
+public struct StorageRootRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Hashable {
+    public static let databaseTableName = "storageRoot"
+
+    public var id: String
+    public var kind: String
+    public var displayName: String
+    public var mountPath: String
+    public var volumeUUID: String?
+    public var pathRelativeToVolume: String
+    public var isPreferred: Bool
+    public var createdAt: Date
+    public var lastSeenAt: Date?
+
+    public init(
+        id: StorageRootID,
+        kind: StorageRootKind,
+        displayName: String,
+        mountPath: String,
+        volumeUUID: String? = nil,
+        pathRelativeToVolume: String = "",
+        isPreferred: Bool = false,
+        createdAt: Date = Date(),
+        lastSeenAt: Date? = nil
+    ) {
+        self.id = id.rawValue
+        self.kind = kind.rawValue
+        self.displayName = displayName
+        self.mountPath = mountPath
+        self.volumeUUID = volumeUUID
+        self.pathRelativeToVolume = pathRelativeToVolume
+        self.isPreferred = isPreferred
+        self.createdAt = createdAt
+        self.lastSeenAt = lastSeenAt
+    }
+
+    public init(_ root: StorageRoot) {
+        self.init(
+            id: root.id,
+            kind: root.kind,
+            displayName: root.displayName,
+            mountPath: root.mountPath,
+            volumeUUID: root.volumeUUID,
+            pathRelativeToVolume: root.pathRelativeToVolume,
+            isPreferred: root.isPreferred,
+            createdAt: root.createdAt,
+            lastSeenAt: root.lastSeenAt
+        )
+    }
+
+    public var storageRootID: StorageRootID { StorageRootID(rawValue: id) }
+
+    public var storageKind: StorageRootKind { StorageRootKind(rawValue: kind) ?? .external }
+
+    public func asStorageRoot(isAvailable: Bool = true) -> StorageRoot {
+        StorageRoot(
+            id: storageRootID,
+            kind: storageKind,
+            displayName: displayName,
+            mountPath: mountPath,
+            volumeUUID: volumeUUID,
+            pathRelativeToVolume: pathRelativeToVolume,
+            isAvailable: isAvailable,
+            isPreferred: isPreferred,
+            createdAt: createdAt,
+            lastSeenAt: lastSeenAt
+        )
     }
 }
 
@@ -54,6 +132,9 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
     /// rather than a flag so a new kind never means a second migration of the
     /// same shape.
     public var kind: String
+    /// Registered storage root this worktree lives on. Nil means This Mac
+    /// (rows from before pluggable storage, and tests that don't care).
+    public var storageRootID: String?
 
     public init(
         id: WorkspaceID,
@@ -76,7 +157,8 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         createdAt: Date = Date(),
         lastActivityAt: Date? = nil,
         isNameUserSet: Bool = false,
-        kind: WorkspaceKind = .standard
+        kind: WorkspaceKind = .standard,
+        storageRootID: StorageRootID? = nil
     ) {
         self.id = id.rawValue
         self.name = name
@@ -99,6 +181,7 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
         self.lastActivityAt = lastActivityAt
         self.isNameUserSet = isNameUserSet
         self.kind = kind.rawValue
+        self.storageRootID = storageRootID?.rawValue
     }
 
     public var workspaceID: WorkspaceID { WorkspaceID(rawValue: id) }
@@ -135,7 +218,16 @@ public struct WorkspaceRecord: Codable, FetchableRecord, PersistableRecord, Send
             contextUsage: contextUsage,
             lastActivity: lastActivityAt,
             baseSync: baseSync,
-            kind: workspaceKind
+            kind: workspaceKind,
+            storage: storageRootID.map { id in
+                let rootID = StorageRootID(rawValue: id)
+                return WorkspaceStorageState(
+                    rootID: rootID,
+                    kind: rootID == .internalDefault ? .internal : .external,
+                    displayName: rootID == .internalDefault ? "This Mac" : "External storage",
+                    isOffline: false
+                )
+            }
         )
     }
 }

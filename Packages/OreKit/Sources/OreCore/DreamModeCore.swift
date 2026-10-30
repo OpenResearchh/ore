@@ -604,7 +604,8 @@ extension InProcessCoreClient {
         let repoSlug = Slug.make(repositoryURL.lastPathComponent)
         let name = "dream-\(kind.rawValue)-\(repoSlug)-\(day)"
 
-        let manager = WorktreeManager(git: git, root: worktreeRoot)
+        let root = await resolveCreationRoot(requested: nil)
+        let manager = WorktreeManager(git: git, root: workspacesURL(for: root))
         let worktree = try await manager.create(WorktreeManager.CreateRequest(
             name: name,
             branchPrefix: "ore/dream",
@@ -624,13 +625,16 @@ extension InProcessCoreClient {
             model: dreamSettings.defaultModel ?? configuration.defaultModel,
             permissionMode: .plan,
             isNameUserSet: true,
-            kind: .dream
+            kind: .dream,
+            storageRootID: root.id
         )
         try await store.saveWorkspace(record)
         _ = try await store.ensureDefaultChat(for: record)
         let engine = try await makeEngine(for: record)
         markListMutation()
-        continuation.yield(.workspaceAdded(await engine.summary()))
+        continuation.yield(.workspaceAdded(
+            decorate(await engine.summary(), storageRootID: record.storageRootID)
+        ))
         _ = why
         return record
     }

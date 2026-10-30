@@ -1531,7 +1531,7 @@ struct ChatPane: View {
                     VoiceComposerTranscript(
                         prefix: draft,
                         transcript: voiceSettle?.quote ?? voiceQuote,
-                        isListening: voice.isListening,
+                        isListening: voice.isListening || (voice.isActive && voiceSettle == nil),
                         isSettled: voiceSettle != nil,
                         // Never let the settled prompt squeeze the toolbar out of a
                         // short window: cap it to a slice of the pane.
@@ -2203,23 +2203,23 @@ struct ChatPane: View {
     private var micButton: some View {
         Button(action: toggleVoice) {
             Group {
-                if voice.status == .downloadingModel || voice.status == .preparing {
+                if voice.status == .downloadingModel || voice.status == .preparing || voice.status == .requestingPermission {
                     ProgressView().controlSize(.small)
                 } else {
-                    Image(systemName: voice.isListening ? "mic.fill" : "mic")
+                    Image(systemName: voice.isActive ? "mic.fill" : "mic")
                         .font(.system(size: 13, weight: .semibold))
-                        .symbolEffect(.pulse, isActive: voice.isListening && !reduceMotion)
+                        .symbolEffect(.pulse, isActive: voice.isActive && !reduceMotion)
                 }
             }
-            .foregroundStyle(voice.isListening ? Color.red : .primary)
+            .foregroundStyle(voice.isActive ? Color.red : .primary)
             .frame(width: 30, height: 30)
             .background(
-                voice.isListening ? Color.red.opacity(0.14) : OreTheme.subduedFill,
+                voice.isActive ? Color.red.opacity(0.14) : OreTheme.subduedFill,
                 in: Circle()
             )
             .overlay(
                 Circle().stroke(
-                    voice.isListening ? Color.red.opacity(0.45) : OreTheme.hairline,
+                    voice.isActive ? Color.red.opacity(0.45) : OreTheme.hairline,
                     lineWidth: 1
                 )
             )

@@ -335,6 +335,7 @@ final class AppModel {
         // The pill follows tabNeedsYou + the voice phase from here on, so a
         // blocked tab is answerable from any app, not only from ORE's window.
         AssistantVoiceHUD.shared.bind(model: self)
+        if #available(macOS 26.0, *) { DictationPrewarm.warm() }
         // Direct callback, not a SwiftUI onChange: hold-to-talk must survive
         // every window being closed — the menu bar presence is enough.
         VoiceHotkeyMonitor.shared.onCommand = { [weak self] command in

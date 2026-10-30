@@ -458,6 +458,7 @@ final class VoiceInputController {
         speechAnalyzerUnavailable = false
         audioLevel = 0
         errorSettingsLink = nil
+        if #available(macOS 26.0, *) { DictationPrewarm.warm() }
         status = .requestingPermission
         runTask = Task { await run() }
     }

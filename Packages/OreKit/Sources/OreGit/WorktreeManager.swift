@@ -4,7 +4,8 @@ import OreSupport
 
 /// Creates and removes the isolated worktrees each workspace runs in.
 ///
-/// Worktrees live **outside** the repository, under `~/ore/workspaces/<repo>/<slug>`.
+/// Worktrees live **outside** the repository, under
+/// `<storage-root>/workspaces/<repo>/<slug>` (This Mac: `~/ore/workspaces`).
 /// Putting them inside the repo is the obvious thing to do and is wrong in three
 /// ways at once: they show up in the parent's file watchers and search, `.gitignore`
 /// has to be taught about them, and every tool that walks the tree sees N copies
@@ -20,15 +21,7 @@ public actor WorktreeManager {
     }
 
     /// `~/ore/workspaces`, or `$ORE_HOME/workspaces`.
-    public static var defaultRoot: URL {
-        let home = ProcessInfo.processInfo.environment["ORE_HOME"].flatMap { override -> URL? in
-            override.isEmpty
-                ? nil
-                : FilePath.expandingTildeURL(override)
-        } ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("ore", isDirectory: true)
-        return home.appendingPathComponent("workspaces", isDirectory: true)
-    }
+    public static var defaultRoot: URL { OreHome.worktreeRoot }
 
     // MARK: - Creating
 

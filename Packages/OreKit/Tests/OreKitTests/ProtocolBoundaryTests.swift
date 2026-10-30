@@ -125,6 +125,12 @@ struct ProtocolBoundaryTests {
                     localDefaultBehindOrigin: 2,
                     workspaceBehindOrigin: 4,
                     wouldConflict: true
+                ),
+                storage: WorkspaceStorageState(
+                    rootID: .internalDefault,
+                    kind: .internal,
+                    displayName: "This Mac",
+                    isOffline: false
                 )
             )],
             chats: [ChatSummary(
@@ -138,7 +144,8 @@ struct ProtocolBoundaryTests {
             harnesses: [HarnessProbeResult(
                 kind: .claudeCode, executablePath: "/usr/local/bin/claude",
                 version: "2.1.154", authState: .authenticated
-            )]
+            )],
+            storageRoots: [StorageRoot.makeInternal(mountPath: "/Users/x/ore")]
         )
 
         let decoded = try JSONDecoder().decode(
@@ -147,6 +154,8 @@ struct ProtocolBoundaryTests {
         #expect(decoded.workspaces == snapshot.workspaces)
         #expect(decoded.chats == snapshot.chats)
         #expect(decoded.harnesses == snapshot.harnesses)
+        #expect(decoded.storageRoots == snapshot.storageRoots)
+        #expect(decoded.workspaces.first?.storage?.rootID == .internalDefault)
     }
 
     @Test func chatCommandsRoundTripWithTheirRoutingIdentity() throws {
@@ -175,6 +184,12 @@ struct ProtocolBoundaryTests {
             .rerunFailedChecks(workspaceID),
             .pullDefaultBranch(workspaceID),
             .continueAfterMerge(workspaceID),
+            .registerStorageRoot(RegisterStorageRootRequest(
+                path: "/Volumes/T7/ore", displayName: "T7", preferForNewWork: true
+            )),
+            .removeStorageRoot(StorageRootID(rawValue: "ssd")),
+            .setPreferredStorageRoot(.internalDefault),
+            .rescanStorageRoots,
         ]
         for command in commands {
             let data = try JSONEncoder().encode(command)

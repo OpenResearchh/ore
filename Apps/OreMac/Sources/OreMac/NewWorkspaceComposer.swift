@@ -30,6 +30,7 @@ struct NewWorkspaceComposer: View {
     /// Opens the GitHub picker, which lives in Advanced because it needs auth,
     /// search and a clone — none of which belong on the fast path.
     var onBrowseGitHub: () -> Void
+    @Binding var storageRootID: StorageRootID
 
     @State private var voice = VoiceInputController()
     @FocusState private var writing: Bool
@@ -302,6 +303,24 @@ struct NewWorkspaceComposer: View {
             .fixedSize()
             .foregroundStyle(.secondary)
 
+            if model.storageRoots.count > 1 {
+                Menu {
+                    ForEach(model.storageRoots) { root in
+                        Button(root.isAvailable ? root.displayName : "\(root.displayName) (offline)") {
+                            storageRootID = root.id
+                        }
+                        .disabled(!root.isAvailable)
+                    }
+                } label: {
+                    Text(storageLabel)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .foregroundStyle(.secondary)
+                .help("Where the new worktree will live")
+            }
+
             Button("Advanced", action: onAdvanced)
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -323,6 +342,14 @@ struct NewWorkspaceComposer: View {
             }
             .transition(.opacity)
         }
+    }
+
+    private var storageLabel: String {
+        let id = storageRootID
+        if let root = model.storageRoots.first(where: { $0.id == id }) {
+            return root.isAvailable ? root.displayName : "This Mac"
+        }
+        return model.storageRootForNewWork.displayName
     }
 
     private func chip(_ text: String) -> some View {

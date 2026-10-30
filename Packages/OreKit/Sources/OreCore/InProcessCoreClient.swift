@@ -27,6 +27,10 @@ public actor InProcessCoreClient: CoreClient {
     /// harness alongside its live probe/model inventory.
     let harnessRegistry: HarnessRegistry
     let worktreeRoot: URL?
+    let volumeProbe: VolumeProbe
+    /// Last probed roots. Refreshed on create, snapshot, and `rescanStorageRoots`.
+    /// Internal so `StorageRootCore` (same module, other file) can keep it.
+    var cachedRoots: [StorageRoot] = []
     private let allowAPIKeyFallback: Bool
 
     private var engines: [WorkspaceID: WorkspaceEngine] = [:]
@@ -88,12 +92,14 @@ public actor InProcessCoreClient: CoreClient {
         store: OreStore,
         harnessRegistry: HarnessRegistry = .standard(),
         worktreeRoot: URL? = nil,
+        volumeProbe: VolumeProbe = .live,
         allowAPIKeyFallback: Bool = false,
         discardItem: (@Sendable (URL) throws -> Void)? = nil
     ) {
         self.store = store
         self.harnessRegistry = harnessRegistry
         self.worktreeRoot = worktreeRoot
+        self.volumeProbe = volumeProbe
         self.allowAPIKeyFallback = allowAPIKeyFallback
         self.discardItem = discardItem ?? { url in
             #if os(macOS)
@@ -348,6 +354,18 @@ public actor InProcessCoreClient: CoreClient {
 
         case .resync(let id):
             try await resync(id)
+
+        case .registerStorageRoot(let request):
+            try await registerStorageRoot(request)
+
+        case .removeStorageRoot(let id):
+            try await removeStorageRoot(id)
+
+        case .setPreferredStorageRoot(let id):
+            try await setPreferredStorageRoot(id)
+
+        case .rescanStorageRoots:
+            try await rescanStorageRoots()
         }
     }
 
@@ -391,7 +409,7 @@ public actor InProcessCoreClient: CoreClient {
     /// once, while a dozen workspaces still come up in a few rounds.
     static let engineStartupConcurrency = 4
 
-    private func startEngines(_ records: [WorkspaceRecord]) async {
+    func startEngines(_ records: [WorkspaceRecord]) async {
         await withTaskGroup(of: Void.self) { group in
             var running = 0
             for record in records {
@@ -409,6 +427,11 @@ public actor InProcessCoreClient: CoreClient {
     /// land before its chats and status have loaded; one summary once `start`
     /// has finished is what replaces the stored row the snapshot carried.
     private func startEngineAtLaunch(_ record: WorkspaceRecord) async {
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        if storageState(for: record).isOffline {
+            continuation.yield(.workspaceUpdated(decorate(record)))
+            return
+        }
         let engine: WorkspaceEngine
         do {
             engine = try await makeEngine(for: record)
@@ -572,26 +595,35 @@ public actor InProcessCoreClient: CoreClient {
     func resync(_ id: WorkspaceID?) async throws {
         let revision = listRevision
         if let id {
+            if let record = try await store.workspace(id) {
+                if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+                if storageState(for: record).isOffline {
+                    continuation.yield(.workspaceUpdated(decorate(record)))
+                    return
+                }
+            }
             let engine = try await engine(for: id)
             let summary = await engine.summary()
             guard revision == listRevision else {
                 try await resync(id)
                 return
             }
-            continuation.yield(.workspaceUpdated(summary))
+            let rootID = try? await store.workspace(id)?.storageRootID
+            continuation.yield(.workspaceUpdated(decorate(summary, storageRootID: rootID)))
             return
         }
 
         var summaries: [WorkspaceSummary] = []
         var chats: [ChatSummary] = []
+        let roots = await refreshCachedRoots()
         // The assistant rides the snapshot too — tagged by kind, so the app
         // can route it to the Assistant window instead of the sidebar.
         for record in try await store.workspaces(includeArchived: true, includeAssistant: true) {
             if let engine = engines[record.workspaceID] {
-                summaries.append(await engine.summary())
+                summaries.append(decorate(await engine.summary(), storageRootID: record.storageRootID))
                 chats.append(contentsOf: (try? await engine.chatSummaries()) ?? [])
             } else {
-                summaries.append(record.summary())
+                summaries.append(decorate(record))
                 chats.append(contentsOf: (try? await store.chats(
                     workspaceID: record.workspaceID
                 ).map { $0.summary() }) ?? [])
@@ -601,7 +633,8 @@ public actor InProcessCoreClient: CoreClient {
             workspaces: summaries,
             chats: chats,
             harnesses: harnessProbes,
-            harnessUpdates: harnessUpdates
+            harnessUpdates: harnessUpdates,
+            storageRoots: roots
         )
         #if DEBUG
         if let hook = beforeSnapshotEmission {
@@ -631,7 +664,7 @@ public actor InProcessCoreClient: CoreClient {
 
     // MARK: - Repositories
 
-    func addRepository(path: String) async throws {
+    func addRepository(path: String, storageRootID: StorageRootID? = nil) async throws {
         let root = try await canonicalRepositoryURL(path)
         let git = try gitClient(for: root.path)
 
@@ -655,10 +688,12 @@ public actor InProcessCoreClient: CoreClient {
             throw GitError.repositoryHasNoCommits(path: root.path)
         }
 
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
         try await store.addRepository(RepositoryRecord(
             path: root.path,
             name: root.lastPathComponent,
-            defaultBranch: await git.defaultBranch()
+            defaultBranch: await git.defaultBranch(),
+            storageRootID: storageRootID ?? inferStorageRootID(containing: root.path)
         ))
         try await resync(nil)
     }
@@ -681,12 +716,13 @@ public actor InProcessCoreClient: CoreClient {
     /// fails its foreign key.
     @discardableResult
     func createProject(_ request: CreateProjectRequest) async throws -> CreatedProject {
+        let root = await resolveCreationRoot(requested: request.storageRootID)
         let parent = request.parentDirectory
             .map { FilePath.expandingTildeURL($0).standardizedFileURL }
-            ?? OreHome.directory.appendingPathComponent("repositories", isDirectory: true)
+            ?? repositoriesURL(for: root)
 
         let created = try await RepositoryInitializer.create(name: request.name, in: parent)
-        try await addRepository(path: created.path.path)
+        try await addRepository(path: created.path.path, storageRootID: root.id)
 
         var project = CreatedProject(
             repositoryPath: created.path.path,
@@ -706,7 +742,8 @@ public actor InProcessCoreClient: CoreClient {
             model: request.model,
             initialPrompt: request.initialPrompt,
             promptOrigin: request.promptOrigin,
-            branchPrefix: request.branchPrefix
+            branchPrefix: request.branchPrefix,
+            storageRootID: root.id
         ))
         return project
     }
@@ -814,7 +851,11 @@ public actor InProcessCoreClient: CoreClient {
             }
         }
 
-        let manager = WorktreeManager(git: git, root: worktreeRoot)
+        let root = await resolveCreationRoot(requested: request.storageRootID)
+        let requestedUnavailable = request.storageRootID.map { requested in
+            requested != root.id
+        } ?? false
+        let manager = WorktreeManager(git: git, root: workspacesURL(for: root))
         let worktree = try await manager.create(WorktreeManager.CreateRequest(
             name: name.isEmpty ? "workspace" : name,
             branchPrefix: request.branchPrefix ?? configuration.branchPrefix,
@@ -832,7 +873,8 @@ public actor InProcessCoreClient: CoreClient {
             baseBranch: worktree.baseBranch,
             stackedOnWorkspaceID: stackedOn,
             harness: request.harness,
-            model: request.model ?? configuration.defaultModel
+            model: request.model ?? configuration.defaultModel,
+            storageRootID: root.id
         )
         try await store.saveWorkspace(record)
         _ = try await store.ensureDefaultChat(for: record)
@@ -849,7 +891,16 @@ public actor InProcessCoreClient: CoreClient {
 
         let engine = try await makeEngine(for: record)
         markListMutation()
-        continuation.yield(.workspaceAdded(await engine.summary()))
+        continuation.yield(.workspaceAdded(
+            decorate(await engine.summary(), storageRootID: record.storageRootID)
+        ))
+        if requestedUnavailable {
+            continuation.yield(.commandFailed(CommandFailure(
+                workspaceID: record.workspaceID,
+                message: "The selected volume isn’t connected, so this workspace was created on This Mac.",
+                detail: "Existing workspaces on that volume stay where they are. Plug it back in to use it for new work."
+            )))
+        }
 
         // `ore.toml` is repository content — after a clone, someone else's —
         // so its scripts wait for the user to read and allow them once.
@@ -1015,6 +1066,8 @@ public actor InProcessCoreClient: CoreClient {
         guard record.workspaceKind != .assistant else {
             throw OreCoreError.assistantWorkspaceProtected
         }
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        try requireStorage(for: record)
         let configuration = OreConfiguration.load(
             repositoryPath: URL(fileURLWithPath: record.repositoryPath)
         )
@@ -1065,7 +1118,7 @@ public actor InProcessCoreClient: CoreClient {
         // Publish the committed row directly. A whole snapshot is slower and,
         // because building it suspends on every engine, used to be able to
         // arrive out of order with another mutation.
-        continuation.yield(.workspaceUpdated(updated.summary()))
+        continuation.yield(.workspaceUpdated(decorate(updated)))
     }
 
     /// Total allocated size of a directory tree. Best-effort: unreadable
@@ -1093,6 +1146,8 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        try requireStorage(for: record)
         let git = try gitClient(for: record.repositoryPath)
         let worktree = URL(fileURLWithPath: record.worktreePath)
 
@@ -1116,7 +1171,9 @@ public actor InProcessCoreClient: CoreClient {
         if let updated {
             let engine = try await makeEngine(for: updated)
             markListMutation()
-            continuation.yield(.workspaceUpdated(await engine.summary()))
+            continuation.yield(.workspaceUpdated(
+                decorate(await engine.summary(), storageRootID: updated.storageRootID)
+            ))
         }
     }
 
@@ -1190,7 +1247,13 @@ public actor InProcessCoreClient: CoreClient {
         // and a folder the Trash refused is reported rather than leaving a
         // project half-deleted in the sidebar.
         let fileManager = FileManager.default
-        let root = (worktreeRoot ?? WorktreeManager.defaultRoot).standardizedFileURL
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        var worktreeRoots = cachedRoots.map {
+            workspacesURL(for: $0).standardizedFileURL.path
+        }
+        if let worktreeRoot {
+            worktreeRoots.append(worktreeRoot.standardizedFileURL.path)
+        }
         var failures: [String] = []
         var parents = Set<URL>()
         for member in members where !member.isArchived {
@@ -1203,9 +1266,9 @@ public actor InProcessCoreClient: CoreClient {
                 failures.append(worktree.path)
             }
         }
-        // `~/ore/workspaces/<project>/`, emptied: remove it so a project of
-        // the same name starts clean. Only ever inside the worktree root.
-        for parent in parents where parent.path.hasPrefix(root.path + "/") {
+        // `<root>/workspaces/<project>/`, emptied: remove it so a project of
+        // the same name starts clean. Only ever inside a registered worktree root.
+        for parent in parents where worktreeRoots.contains(where: { parent.path.hasPrefix($0 + "/") }) {
             let contents = (try? fileManager.contentsOfDirectory(atPath: parent.path)) ?? []
             if contents.allSatisfy({ $0 == ".DS_Store" }) {
                 try? fileManager.removeItem(at: parent)
@@ -1225,6 +1288,8 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        try requireStorage(for: record)
         return (
             record,
             try gitClient(for: record.repositoryPath),
@@ -1384,6 +1449,8 @@ public actor InProcessCoreClient: CoreClient {
         guard let record = try await store.workspace(id) else {
             throw OreCoreError.workspaceNotFound(id)
         }
+        if cachedRoots.isEmpty { _ = await refreshCachedRoots() }
+        try requireStorage(for: record)
         return try await makeEngine(for: record)
     }
 
@@ -1585,10 +1652,22 @@ public actor InProcessCoreClient: CoreClient {
         engine: WorkspaceEngine
     ) {
         guard engines[id] === engine else { return }
+        if case .workspaceUpdated(let summary) = event {
+            continuation.yield(.workspaceUpdated(decorate(summary)))
+            return
+        }
         continuation.yield(event)
     }
 
-    private func stopEngine(_ id: WorkspaceID) async {
+    func isEngineRunning(_ id: WorkspaceID) -> Bool {
+        engines[id] != nil
+    }
+
+    func resetGitClients() {
+        gitClients.removeAll()
+    }
+
+    func stopEngine(_ id: WorkspaceID) async {
         if let engine = engines.removeValue(forKey: id) {
             await engine.stop()
         }
@@ -2239,7 +2318,9 @@ private extension CoreCommand {
              .checkHarnessUpdates,
              .resolveAssistantConfirmation, .updateDreamSettings,
              .updateDreamEnvironment, .startDreamRun, .abortDreamRun,
-             .resolveDreamFinding, .listDreamFindings:
+             .resolveDreamFinding, .listDreamFindings,
+             .registerStorageRoot, .removeStorageRoot, .setPreferredStorageRoot,
+             .rescanStorageRoots:
             return nil
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import GRDB
 import OreProtocol
+import OreSupport
 
 /// The database schema, as an ordered list of migrations.
 ///
@@ -20,7 +21,7 @@ public enum OreSchema {
     /// `ORE_VERSION`, so downgrading is a single command away.
     ///
     /// Matches the highest `vN.` prefix on the migrations below.
-    public static let userVersion = 14
+    public static let userVersion = 15
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -511,6 +512,59 @@ public enum OreSchema {
             try db.alter(table: "repositoryScriptApproval") { table in
                 table.add(column: "run", .text)
             }
+        }
+
+        migrator.registerMigration("v15.pluggableStorage") { db in
+            // External volumes are named here, not inferred from worktree
+            // paths. The sqlite file stays on This Mac; only checkouts and
+            // project libraries can live elsewhere. See docs/pluggable-storage.md.
+            try db.create(table: "storageRoot") { table in
+                table.primaryKey("id", .text)
+                table.column("kind", .text).notNull()
+                table.column("displayName", .text).notNull()
+                table.column("mountPath", .text).notNull()
+                table.column("volumeUUID", .text)
+                table.column("pathRelativeToVolume", .text).notNull().defaults(to: "")
+                table.column("isPreferred", .boolean).notNull().defaults(to: false)
+                table.column("createdAt", .datetime).notNull()
+                table.column("lastSeenAt", .datetime)
+            }
+
+            try db.execute(
+                sql: """
+                    INSERT INTO storageRoot (
+                        id, kind, displayName, mountPath, pathRelativeToVolume,
+                        isPreferred, createdAt
+                    ) VALUES (?, 'internal', 'This Mac', ?, '', 1, ?)
+                    """,
+                arguments: [
+                    StorageRootID.internalDefault.rawValue,
+                    OreHome.directory.path,
+                    Date(),
+                ]
+            )
+
+            try db.alter(table: "workspace") { table in
+                table.add(column: "storageRootID", .text)
+                    .references("storageRoot", onDelete: .setNull)
+            }
+            try db.alter(table: "repository") { table in
+                table.add(column: "storageRootID", .text)
+                    .references("storageRoot", onDelete: .setNull)
+            }
+            try db.execute(
+                sql: "UPDATE workspace SET storageRootID = ?",
+                arguments: [StorageRootID.internalDefault.rawValue]
+            )
+            try db.execute(
+                sql: "UPDATE repository SET storageRootID = ?",
+                arguments: [StorageRootID.internalDefault.rawValue]
+            )
+            try db.create(
+                index: "workspace_on_storageRoot",
+                on: "workspace",
+                columns: ["storageRootID"]
+            )
         }
 
         return migrator

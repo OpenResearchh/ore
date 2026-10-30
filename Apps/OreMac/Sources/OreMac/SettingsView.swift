@@ -926,7 +926,6 @@ private struct SettingsPanes: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 16) {
                 SettingsCard(title: "Workspace runtime", icon: "externaldrive") {
-                    SettingsValueRow(label: "Storage", value: "~/ore", monospaced: true)
                     SettingsValueRow(label: "Worktrees", value: "One per workspace")
                     SettingsValueRow(label: "Active", value: "\(appModel.workspaces.count)")
                 }
@@ -937,6 +936,8 @@ private struct SettingsPanes: View {
                     SettingsValueRow(label: "Terminal", value: "Same environment")
                 }
             }
+
+            StorageRootsSettings()
 
             SettingsCard(title: "Isolation", icon: "lock.shield") {
                 HStack(alignment: .top, spacing: 12) {
@@ -950,10 +951,13 @@ private struct SettingsPanes: View {
             }
 
             SettingsCard(title: "Effective paths", icon: "folder") {
-                SettingsValueRow(label: "Workspaces", value: "~/ore/workspaces", monospaced: true)
-                SettingsValueRow(label: "Database", value: "~/ore/ore.sqlite", monospaced: true)
+                SettingsValueRow(
+                    label: "Database",
+                    value: "\(OreHome.displayPath)/ore.sqlite",
+                    monospaced: true
+                )
                 SettingsValueRow(label: "Attachments", value: ".context/attachments", monospaced: true)
-                Text("Paths are shown without expanding your home directory, so settings and screenshots do not expose personal account details.")
+                Text("The database stays on This Mac. Worktrees and new projects can live on a volume you add above. Internal paths are shown without expanding your home directory, so settings and screenshots do not expose personal account details.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -1598,6 +1602,95 @@ private struct LegalTextView: NSViewRepresentable {
             ]
         ))
         textView.scroll(.zero)
+    }
+}
+
+private struct StorageRootsSettings: View {
+    @Environment(AppModel.self) private var appModel
+
+    var body: some View {
+        SettingsCard(title: "Storage", icon: "externaldrive") {
+            ForEach(appModel.storageRoots) { root in
+                storageRow(root)
+            }
+            if appModel.storageRoots.isEmpty {
+                SettingsValueRow(
+                    label: "This Mac",
+                    value: "\(OreHome.displayPath)/workspaces",
+                    monospaced: true
+                )
+            }
+            HStack {
+                Text("New workspaces and projects go to the preferred volume when it is connected, otherwise This Mac. Unplugging a volume leaves its workspaces offline — they are not moved.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 12)
+                Button("Add Volume…") { chooseVolume() }
+            }
+        }
+    }
+
+    private func storageRow(_ root: StorageRoot) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: root.isAvailable
+                      ? "externaldrive"
+                      : "externaldrive.badge.xmark")
+                    .foregroundStyle(root.isAvailable ? Color.secondary : Color.orange)
+                Text(root.displayName)
+                    .fontWeight(.medium)
+                if root.isPreferred {
+                    Text("Preferred")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(OreTheme.subduedFill, in: Capsule())
+                }
+                Spacer()
+                Text(root.isAvailable ? "Online" : "Offline")
+                    .font(.caption)
+                    .foregroundStyle(root.isAvailable ? Color.secondary : Color.orange)
+            }
+            Text(displayPath(for: root))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+            HStack {
+                if !root.isPreferred, root.isAvailable {
+                    Button("Use for new work") {
+                        appModel.setPreferredStorageRoot(root.id)
+                    }
+                    .buttonStyle(.link)
+                }
+                if root.kind == .external {
+                    Button("Remove", role: .destructive) {
+                        appModel.removeStorageRoot(root.id)
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func displayPath(for root: StorageRoot) -> String {
+        if root.kind == .internal {
+            return "\(OreHome.displayPath)/workspaces"
+        }
+        return root.mountPath
+    }
+
+    private func chooseVolume() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add Volume"
+        panel.message = "ORE will keep repositories and workspaces in this folder, the same layout as ~/ore. The database stays on This Mac."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        appModel.registerStorageRoot(at: url)
     }
 }
 

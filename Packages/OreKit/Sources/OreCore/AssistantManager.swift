@@ -80,7 +80,8 @@ public enum AssistantManager {
             model: defaultModel,
             permissionMode: .acceptEdits,
             isNameUserSet: true,
-            kind: .assistant
+            kind: .assistant,
+            storageRootID: .internalDefault
         )
         try await store.saveWorkspace(record)
         // Created explicitly rather than via `ensureDefaultChat` so the title

@@ -138,7 +138,17 @@ final class AppModel {
     private(set) var harnessUpdates: [HarnessUpdateStatus] = []
     private(set) var modelCatalog: [HarnessKind: [AgentModel]] = [:]
     private(set) var repositories: [String] = []
+    /// Registered storage roots with live availability, from the last snapshot.
+    private(set) var storageRoots: [StorageRoot] = []
     private(set) var isLoaded = false
+
+    /// Where new workspaces and projects go: preferred if that volume is
+    /// plugged in, otherwise This Mac. Existing external workspaces are not
+    /// moved.
+    var storageRootForNewWork: StorageRoot {
+        StorageRootResolver.rootForNewCreation(requested: nil, roots: storageRoots)
+            ?? StorageRoot.makeInternal(mountPath: OreHome.directory.path)
+    }
 
     /// Repository paths in most-recently-worked order, for inferring which
     /// project a new instruction is about. The sidebar already sorts projects
@@ -333,6 +343,10 @@ final class AppModel {
         VoiceHotkeyMonitor.shared.isAssistantEngaged = { [weak self] in
             self?.voiceAssistant.phase != .idle
         }
+        StorageVolumeMonitor.shared.onChange = { [weak self] in
+            self?.rescanStorageRoots()
+        }
+        StorageVolumeMonitor.shared.start()
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.client.events {
@@ -1302,6 +1316,26 @@ final class AppModel {
         }
     }
 
+    func rescanStorageRoots() {
+        Task { await client.send(.rescanStorageRoots) }
+    }
+
+    func registerStorageRoot(at url: URL, preferForNewWork: Bool = false) {
+        Task {
+            await client.send(.registerStorageRoot(RegisterStorageRootRequest(
+                path: url.path, preferForNewWork: preferForNewWork
+            )))
+        }
+    }
+
+    func removeStorageRoot(_ id: StorageRootID) {
+        Task { await client.send(.removeStorageRoot(id)) }
+    }
+
+    func setPreferredStorageRoot(_ id: StorageRootID) {
+        Task { await client.send(.setPreferredStorageRoot(id)) }
+    }
+
     func createWorkspace(_ request: CreateWorkspaceRequest) {
         var request = request
         if request.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1352,7 +1386,8 @@ final class AppModel {
             harness: source.harness,
             model: source.model,
             initialPrompt: nil,
-            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix"),
+            storageRootID: source.storage?.rootID
         ))
         return true
     }
@@ -1519,6 +1554,14 @@ final class AppModel {
         chatID: ChatID,
         fromComposer: Bool = true
     ) {
+        if let workspace = workspaces.first(where: { $0.id == id }),
+           workspace.isStorageOffline {
+            banners.append(Banner(
+                message: "This workspace is offline.",
+                detail: workspace.storage?.offlineMessage
+            ))
+            return
+        }
         let state = chat(for: chatID)
         cancelScheduledContinuation(for: chatID)
         // A button's prompt isn't the composer's text: whatever the user has
@@ -3756,13 +3799,13 @@ final class AppModel {
     /// avoids collisions between identically named projects from two owners.
     /// The canonical clone is registered with core before this returns, so the
     /// caller can immediately create its first worktree.
-    func cloneGitHubRepository(_ reference: String) async throws -> String {
+    func cloneGitHubRepository(_ reference: String, storageRoot: StorageRoot? = nil) async throws -> String {
         let value = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let identity = Self.githubIdentity(from: value) else {
             throw GitHubRepositoryInputError.invalidReference
         }
-        let destination = OreHome.directory
-            .appendingPathComponent("repositories", isDirectory: true)
+        let library = storageRoot ?? storageRootForNewWork
+        let destination = URL(fileURLWithPath: library.repositoriesPath, isDirectory: true)
             .appendingPathComponent(identity.owner, isDirectory: true)
             .appendingPathComponent(identity.name, isDirectory: true)
 
@@ -4257,6 +4300,7 @@ final class AppModel {
             )
             harnesses = snapshot.harnesses
             if !snapshot.harnessUpdates.isEmpty { harnessUpdates = snapshot.harnessUpdates }
+            storageRoots = snapshot.storageRoots
             // Priming, not observing: the fleet's state at launch is the
             // briefing's story, and the watcher must not narrate a night's
             // worth of drift as though it just happened.

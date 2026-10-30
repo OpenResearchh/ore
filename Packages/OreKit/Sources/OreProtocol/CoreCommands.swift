@@ -117,6 +117,15 @@ public enum CoreCommand: Sendable, Codable {
     case resolveDreamFinding(DreamFindingID, DreamFindingResolution)
     case listDreamFindings
 
+    // Storage
+    /// Register a folder (usually on an external volume) as a place new
+    /// workspaces and projects can live. The sqlite database stays on This Mac.
+    case registerStorageRoot(RegisterStorageRootRequest)
+    case removeStorageRoot(StorageRootID)
+    case setPreferredStorageRoot(StorageRootID)
+    /// Re-probe registered volumes after a mount, unmount, or rename.
+    case rescanStorageRoots
+
     // Diagnostics
     case probeHarnesses
     /// Ask each installed agent CLI's install channel whether a newer version
@@ -149,6 +158,9 @@ public struct CreateProjectRequest: Sendable, Codable {
     public var initialPrompt: String?
     public var promptOrigin: MessageOrigin
     public var branchPrefix: String?
+    /// Where the project folder (and its first worktree) should live. Nil
+    /// uses the preferred available root, falling back to This Mac.
+    public var storageRootID: StorageRootID?
 
     public init(
         name: String,
@@ -159,7 +171,8 @@ public struct CreateProjectRequest: Sendable, Codable {
         model: String? = nil,
         initialPrompt: String? = nil,
         promptOrigin: MessageOrigin = .user,
-        branchPrefix: String? = nil
+        branchPrefix: String? = nil,
+        storageRootID: StorageRootID? = nil
     ) {
         self.name = name
         self.parentDirectory = parentDirectory
@@ -170,6 +183,7 @@ public struct CreateProjectRequest: Sendable, Codable {
         self.initialPrompt = initialPrompt
         self.promptOrigin = promptOrigin
         self.branchPrefix = branchPrefix
+        self.storageRootID = storageRootID
     }
 }
 
@@ -196,6 +210,9 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
     /// opening prompt as something the user typed.
     public var promptOrigin: MessageOrigin
     public var branchPrefix: String?
+    /// Where the worktree should be created. Nil uses the preferred available
+    /// root, falling back to This Mac when that volume is unplugged.
+    public var storageRootID: StorageRootID?
 
     public init(
         repositoryPath: String,
@@ -205,7 +222,8 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
         model: String? = nil,
         initialPrompt: String? = nil,
         promptOrigin: MessageOrigin = .user,
-        branchPrefix: String? = nil
+        branchPrefix: String? = nil,
+        storageRootID: StorageRootID? = nil
     ) {
         self.repositoryPath = repositoryPath
         self.name = name
@@ -215,6 +233,7 @@ public struct CreateWorkspaceRequest: Sendable, Codable {
         self.initialPrompt = initialPrompt
         self.promptOrigin = promptOrigin
         self.branchPrefix = branchPrefix
+        self.storageRootID = storageRootID
     }
 }
 

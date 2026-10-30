@@ -45,6 +45,7 @@ struct NewWorkspaceSheet: View {
     @State private var localBranches: [String] = []
     @State private var isLoadingSeeds = false
     @State private var projectName = ""
+    @State private var storageRootID = StorageRootID.internalDefault
 
     private enum RepositorySource: String, CaseIterable, Identifiable {
         case local = "On this Mac"
@@ -93,7 +94,8 @@ struct NewWorkspaceSheet: View {
                 onBrowseGitHub: {
                     repositorySource = .github
                     carryInstructionIntoForm()
-                }
+                },
+                storageRootID: $storageRootID
             )
             .task { await prepareDefaults() }
             .overlay(alignment: .bottom) {
@@ -125,6 +127,8 @@ struct NewWorkspaceSheet: View {
                     }
                 }
                 .pickerStyle(.segmented)
+
+                storageRootPicker
 
                 if repositorySource == .newProject {
                     newProjectFields
@@ -275,9 +279,39 @@ struct NewWorkspaceSheet: View {
             return "An empty git repository with one commit, created in ORE's project library."
         }
         let folder = RepositoryInitializer.directoryName(for: trimmed)
-        let library = OreHome.directory.appendingPathComponent("repositories", isDirectory: true)
-        return "Creates \(library.appendingPathComponent(folder).path) as a git repository "
+        let root = selectedStorageRoot
+        let library = URL(fileURLWithPath: root.repositoriesPath, isDirectory: true)
+        let shown = root.kind == .internal
+            ? "\(OreHome.displayPath)/repositories/\(folder)"
+            : library.appendingPathComponent(folder).path
+        return "Creates \(shown) as a git repository "
             + "with an initial commit, then opens a workspace on it."
+    }
+
+    private var selectedStorageRoot: StorageRoot {
+        model.storageRoots.first(where: { $0.id == storageRootID && $0.isAvailable })
+            ?? model.storageRootForNewWork
+    }
+
+    @ViewBuilder
+    private var storageRootPicker: some View {
+        Picker("Store on", selection: $storageRootID) {
+            if model.storageRoots.isEmpty {
+                Text("This Mac").tag(StorageRootID.internalDefault)
+            }
+            ForEach(model.storageRoots) { root in
+                Text(root.isAvailable ? root.displayName : "\(root.displayName) (offline)")
+                    .tag(root.id)
+                    .selectionDisabled(!root.isAvailable)
+            }
+        }
+        .disabled(model.storageRoots.filter(\.isAvailable).count < 2 && model.storageRoots.count < 2)
+        if let preferred = model.storageRoots.first(where: \.isPreferred),
+           !preferred.isAvailable {
+            Text("\(preferred.displayName) isn’t connected — new workspaces will go to This Mac until it returns.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
     }
 
     @ViewBuilder
@@ -449,6 +483,7 @@ struct NewWorkspaceSheet: View {
         if name.isEmpty { name = model.suggestedResearchIdentity().name }
         if repositoryPath.isEmpty { repositoryPath = model.repositories.first ?? "" }
         if let ready = model.readyHarnesses.first { harness = ready }
+        storageRootID = model.storageRootForNewWork.id
         if let raw = UserDefaults.standard.string(forKey: AppModel.DefaultKey.newChatHarness),
            let preferred = HarnessKind(rawValue: raw), model.readyHarnesses.contains(preferred) {
             harness = preferred
@@ -513,7 +548,8 @@ struct NewWorkspaceSheet: View {
                 harness: plan.harness,
                 model: plan.model,
                 initialPrompt: plan.intent.goal,
-                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix"),
+                storageRootID: selectedStorageRoot.id
             ))
             dismiss()
             return
@@ -529,7 +565,8 @@ struct NewWorkspaceSheet: View {
             harness: plan.harness,
             model: plan.model,
             initialPrompt: plan.intent.goal,
-            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix"),
+            storageRootID: selectedStorageRoot.id
         ))
         dismiss()
     }
@@ -584,7 +621,8 @@ struct NewWorkspaceSheet: View {
                 harness: harness,
                 model: modelName.isEmpty ? nil : modelName,
                 initialPrompt: prompt.isEmpty ? nil : prompt,
-                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+                branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix"),
+                storageRootID: selectedStorageRoot.id
             ))
             if createAnother {
                 chooseAnotherIdentity()
@@ -599,7 +637,9 @@ struct NewWorkspaceSheet: View {
         let selectedRepository: String
         do {
             if repositorySource == .github {
-                selectedRepository = try await model.cloneGitHubRepository(githubReference)
+                selectedRepository = try await model.cloneGitHubRepository(
+                    githubReference, storageRoot: selectedStorageRoot
+                )
             } else {
                 selectedRepository = repositoryPath
             }
@@ -615,7 +655,8 @@ struct NewWorkspaceSheet: View {
             harness: harness,
             model: modelName.isEmpty ? nil : modelName,
             initialPrompt: prompt.isEmpty ? nil : prompt,
-            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix")
+            branchPrefix: UserDefaults.standard.string(forKey: "ore.branchPrefix"),
+            storageRootID: selectedStorageRoot.id
         ))
         if createAnother {
             chooseAnotherIdentity()

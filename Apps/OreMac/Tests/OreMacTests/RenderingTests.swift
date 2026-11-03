@@ -353,6 +353,79 @@ struct MarkdownRendererTests {
         #expect(escaped == nil)
     }
 
+    @Test func leadingDotPathsSurviveUnwrap() {
+        #expect(AgentFileReferenceResolver.unwrapPunctuation(
+            ".context/attachments/03BE1FE5-pasted-image.png"
+        ) == ".context/attachments/03BE1FE5-pasted-image.png")
+        #expect(AgentFileReferenceResolver.unwrapPunctuation("`.env`") == ".env")
+        #expect(AgentFileReferenceResolver.unwrapPunctuation("Sources/App.swift.") == "Sources/App.swift")
+    }
+
+    @Test func hiddenAttachmentPathsResolveFromDisk() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-attach-\(UUID().uuidString)", isDirectory: true)
+        let relative = ".context/attachments/03BE1FE5-pasted-image.png"
+        let file = root.appendingPathComponent(relative)
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("png".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let resolved = AgentFileReferenceResolver.resolve(
+            relative,
+            worktreePath: root.path,
+            files: []
+        )
+        #expect(resolved == .init(path: relative, line: nil))
+
+        let noteRelative = ".context/realtime-live-improved.md"
+        let note = root.appendingPathComponent(noteRelative)
+        try Data("# notes".utf8).write(to: note)
+        let noteResolved = AgentFileReferenceResolver.resolve(
+            noteRelative,
+            worktreePath: root.path,
+            files: []
+        )
+        #expect(noteResolved == .init(path: noteRelative, line: nil))
+    }
+
+    @Test func pastedImagePathsBecomeInternalLinks() {
+        let result = render("Read .context/attachments/03BE1FE5-pasted-image.png next.")
+        guard let range = result.string.range(of: ".context/attachments/03BE1FE5-pasted-image.png") else {
+            Issue.record("attachment path was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        let path = url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "path" })?.value
+        }
+        #expect(url?.scheme == "ore-file")
+        #expect(path == ".context/attachments/03BE1FE5-pasted-image.png")
+    }
+
+    @Test func markdownLinksToContextNotesStayWorkspaceFiles() {
+        let result = render(
+            "[Read all ten live exchanges.](.context/realtime-live-improved.md)"
+        )
+        guard let range = result.string.range(of: "Read all ten live exchanges.") else {
+            Issue.record("link text was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        #expect(url?.scheme == "ore-file")
+        if let url {
+            #expect(
+                MarkdownRenderer.TranscriptLink.parse(url)
+                    == .openFile(".context/realtime-live-improved.md")
+            )
+        }
+    }
+
     @Test func emphasisAndStrongChangeTheFontRatherThanTheText() {
         let result = render("*italic* and **bold**")
         #expect(result.string.contains("italic"))

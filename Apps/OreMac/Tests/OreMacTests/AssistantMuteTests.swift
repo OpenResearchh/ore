@@ -47,5 +47,29 @@ struct AssistantMuteTests {
         #expect(!engine.hasAudibleOrQueuedSpeech)
         #expect(engine.currentSpokenText == "Your build finished.")
         #expect(engine.speakingChatID == chatID)
+        // The pill streams this; dumping the whole line at once is unreadable.
+        #expect(engine.spokenPrefix.isEmpty)
+        #expect(engine.spokenCharacterCount == 0)
+    }
+
+    @Test func muteCaptionsRevealWholeWordsThenFinish() {
+        #expect(
+            NarrationEngine.wordEndOffsets(in: "Over in the Sugar Nuclei")
+                == [4, 7, 11, 17, 24]
+        )
+        #expect(
+            !NarrationEngine.endingWasLost(
+                isAudibleOrQueued: false,
+                isMidUtterance: true,
+                isSilentCaption: true
+            )
+        )
+        #expect(
+            NarrationEngine.endingWasLost(
+                isAudibleOrQueued: false,
+                isMidUtterance: true,
+                isSilentCaption: false
+            )
+        )
     }
 }

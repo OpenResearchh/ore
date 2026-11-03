@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum RemoteControlPage {
@@ -8,9 +9,15 @@ enum RemoteControlPage {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ORE">
+<meta name="theme-color" content="#14151A">
+<meta name="format-detection" content="telephone=no">
 <title>ORE</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
 :root {
   color-scheme: dark;
@@ -37,6 +44,7 @@ enum RemoteControlPage {
   --radius-pill: 11px;
   --radius-card: 16px;
   --sidebar: 248px;
+  --inspector: 300px;
   --safe-t: env(safe-area-inset-top);
   --safe-b: env(safe-area-inset-bottom);
   --safe-l: env(safe-area-inset-left);
@@ -87,7 +95,7 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--running); }
 .dot.needs { background: var(--needs); }
 .dot.idle { background: transparent; }
-.main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
 .chrome {
   display: flex; align-items: center; gap: 8px;
   padding: calc(8px + var(--safe-t)) calc(12px + var(--safe-r)) 8px 12px;
@@ -101,16 +109,30 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 .tabs { flex: 1; min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { display: none; }
 .tab {
-  flex: none; max-width: 180px; padding: 7px 12px; border-radius: var(--radius-tab);
-  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  font-size: 13px; display: inline-flex; align-items: center; gap: 6px;
+  flex: none; max-width: 200px; padding: 7px 8px 7px 12px; border-radius: var(--radius-tab);
+  color: var(--muted); white-space: nowrap; font-size: 13px;
+  display: inline-flex; align-items: center; gap: 6px;
 }
+.tab .title { overflow: hidden; text-overflow: ellipsis; }
 .tab .i { width: 12px; height: 12px; }
 .tab.sel { background: var(--selected); color: var(--text); font-weight: 600; }
-.tab.busy::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px;
-  border-radius: 50%; background: var(--running); vertical-align: middle; }
-.status { font-size: 11px; color: var(--muted); flex: none; max-width: 40%; text-align: right; }
-.stage { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.tab.busy::before { content: ""; display: inline-block; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--running); }
+.tab.unread .title { color: var(--text); }
+.tab-close {
+  width: 18px; height: 18px; border-radius: 6px; color: var(--dim);
+  display: grid; place-items: center; flex: none;
+}
+.tab-close:hover { background: rgba(255,255,255,.08); color: var(--text); }
+.status {
+  font-size: 11px; color: var(--muted); flex: none; display: inline-flex; align-items: center; gap: 6px;
+}
+.status .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+.status.ok .live-dot { background: #34d399; }
+.status.wait .live-dot { background: var(--needs); animation: pulse 1.2s ease-in-out infinite; }
+.status.bad .live-dot { background: var(--failed); }
+.stage { flex: 1; min-height: 0; position: relative; display: flex; min-width: 0; }
+.chat-col { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
 .flow { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .log {
   flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch;
@@ -118,7 +140,7 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 }
 .col { max-width: 720px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; gap: 16px; }
 .empty { color: var(--muted); text-align: center; padding: 64px 24px; font-size: 14px; line-height: 1.5; }
-.turn { max-width: 100%; }
+.turn { max-width: 100%; position: relative; }
 .turn.you { display: flex; justify-content: flex-end; }
 .header { font-size: 11px; color: var(--dim); margin: 0 0 6px; letter-spacing: .01em;
   display: flex; align-items: center; gap: 6px; }
@@ -127,13 +149,28 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
   padding: 10px 14px; font-size: var(--prose); line-height: 1.45; white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.quote {
+  display: flex; gap: 8px; margin: 0 0 8px; padding: 0 0 0 8px;
+  border-left: 2px solid var(--brand); color: var(--muted); font-size: 12px;
+}
 .prose { font-size: var(--prose); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
 .prose.live::after { content: "▍"; margin-left: 1px; color: var(--brand); animation: caret 1s steps(1) infinite; }
+.prose code, .bubble code {
+  font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(255,255,255,.06); padding: 1px 5px; border-radius: 6px;
+}
+.prose a, .bubble a { color: var(--brand); text-decoration: none; }
 @keyframes caret { 50% { opacity: 0; } }
 .fold {
   display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; padding: 0; border: 0; background: none;
   font-size: 12px; color: var(--muted); cursor: pointer;
 }
+.reply-btn {
+  position: absolute; top: 0; opacity: .7; width: 28px; height: 28px; border-radius: 8px;
+  background: var(--well); color: var(--muted); display: grid; place-items: center;
+}
+.turn.you .reply-btn { left: 0; }
+.turn:not(.you) .reply-btn { right: 0; }
 .process { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .process-toggle {
   display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
@@ -170,8 +207,9 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 .dock {
   padding: 8px 14px calc(10px + var(--safe-b));
   background: linear-gradient(180deg, transparent, var(--content) 28%);
+  max-width: 100%; min-width: 0;
 }
-.dock-inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+.dock-inner { max-width: min(720px, 100%); width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .card {
   background: var(--well); border: 1px solid var(--hairline); border-radius: var(--radius-card);
   padding: 14px;
@@ -185,9 +223,10 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 .composer {
   display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap;
   background: var(--well); border: 1px solid var(--hairline); border-radius: var(--radius-card);
-  padding: 8px 8px 8px 14px;
+  padding: 8px 8px 8px 14px; width: 100%; max-width: 100%; min-width: 0;
 }
 .composer-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.composer-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 0 4px 2px; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .chip, .chip-btn {
   display: inline-flex; align-items: center; gap: 5px;
@@ -204,6 +243,12 @@ button { appearance: none; border: 0; background: none; cursor: pointer; }
 .chip-btn.on .i { color: var(--brand); }
 .meter { font-size: 11px; color: var(--muted); margin-left: auto; padding: 0 4px;
   display: inline-flex; align-items: center; gap: 4px; }
+.reply-bar {
+  display: none; align-items: center; gap: 8px; padding: 6px 8px;
+  background: var(--subdued); border-radius: 10px; color: var(--muted); font-size: 12px;
+}
+.reply-bar.show { display: flex; }
+.reply-bar .quote { margin: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 textarea {
   width: 100%; min-height: 44px; max-height: 160px; resize: none; border: 0; background: transparent;
   padding: 8px 0; outline: none; font-size: var(--prose); line-height: 1.4;
@@ -222,6 +267,92 @@ button:disabled { opacity: .4; }
 .error-bar { display: none; margin: 0; padding: 8px 16px; color: var(--failed); font-size: 13px; }
 .error-bar.show { display: block; }
 #stop:disabled { display: none; }
+.inspector {
+  width: var(--inspector); flex: none; background: var(--chrome);
+  border-left: 1px solid var(--hairline); display: none; flex-direction: column; min-height: 0;
+}
+.app.inspect .inspector { display: flex; }
+.insp-tabs { display: flex; gap: 4px; padding: 10px; border-bottom: 1px solid var(--hairline); }
+.insp-tab {
+  flex: 1; min-height: 32px; border-radius: 8px; color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.insp-tab.on { background: var(--selected); color: var(--text); font-weight: 600; }
+.insp-body { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; padding: 8px; }
+.file {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 6px 8px; border-radius: 8px; color: var(--text);
+}
+.file:hover, .file.sel { background: var(--subdued); }
+.file .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview {
+  margin: 8px; padding: 10px; background: var(--content); border-radius: 10px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); max-height: 40%; overflow: auto;
+}
+.review-stat { padding: 12px; color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 8px; }
+.review-stat b { color: var(--text); font-weight: 600; }
+.install, .reconnect {
+  display: none; margin: 0; padding: 8px 16px; font-size: 12px; color: var(--muted);
+  background: rgba(245,158,11,.08); border-bottom: 1px solid var(--hairline);
+}
+.install.show, .reconnect.show { display: block; }
+.phone-nav {
+  display: none; flex: none; gap: 8px; padding: 6px 12px calc(8px + var(--safe-b));
+  background: var(--chrome); border-top: 1px solid var(--hairline);
+}
+.phone-nav button {
+  flex: 1; min-height: 40px; border-radius: 12px; color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.phone-nav button.on { background: var(--selected); color: var(--text); font-weight: 600; }
+.search {
+  display: none; position: absolute; left: 12px; right: 12px; top: calc(56px + var(--safe-t)); z-index: 8;
+  background: var(--chrome); border: 1px solid var(--hairline); border-radius: 12px;
+  padding: 10px; box-shadow: 0 16px 40px rgba(0,0,0,.45); max-height: 50%; overflow: auto;
+}
+.app.searching .search { display: block; }
+.search input {
+  width: 100%; min-height: 36px; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--well); padding: 0 12px; margin-bottom: 8px;
+}
+.hit { display: block; width: 100%; text-align: left; padding: 8px; border-radius: 8px; color: var(--text); }
+.hit:hover { background: var(--subdued); }
+.hit .path { color: var(--brand); font-size: 11px; display: block; }
+.term-dock {
+  display: none; flex: none; height: 200px; background: #0c0c0d;
+  border-top: 1px solid var(--hairline); flex-direction: column; min-width: 0;
+}
+.app.term-open .term-dock { display: flex; }
+.term-chrome {
+  display: flex; gap: 8px; align-items: center; padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline); color: var(--muted); font-size: 12px;
+}
+.term-chrome input {
+  flex: 1; min-width: 0; min-height: 32px; background: var(--well);
+  border: 1px solid var(--hairline); border-radius: 8px; padding: 0 10px;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.term-log {
+  flex: 1; margin: 0; overflow: auto; padding: 8px 10px;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #d1d5db; white-space: pre-wrap;
+}
+.diff-add { color: #86efac; }
+.diff-del { color: #fca5a5; }
+.diff-ctx { color: var(--dim); }
+.hunk { margin: 0 0 12px; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.editor {
+  display: none; width: 100%; min-height: 140px; max-height: 36%; border: 0; resize: vertical;
+  background: var(--content); color: var(--text); padding: 10px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.editor.show { display: block; }
+.insp-tools { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--hairline); }
+@media (min-width: 1100px) {
+  .inspector { display: flex; }
+  .app.inspect .inspector { display: flex; }
+}
 @media (max-width: 839px) {
   .nav-btn { display: grid; }
   .sidebar {
@@ -231,6 +362,17 @@ button:disabled { opacity: .4; }
   .app.nav-open .sidebar { transform: none; }
   .app.nav-open .backdrop { display: block; }
   .status { display: none; }
+  .phone-nav { display: flex; }
+  .inspector {
+    position: fixed; inset: 0 0 0 0; width: auto; z-index: 18;
+    display: none; padding-top: var(--safe-t); padding-bottom: 52px;
+  }
+  .app.files-open .inspector { display: flex; }
+  .app.files-open .backdrop { display: block; }
+  .dock { padding-bottom: 8px; }
+}
+@media (display-mode: standalone) {
+  .chrome { padding-top: calc(10px + var(--safe-t)); }
 }
 </style>
 </head>
@@ -250,10 +392,26 @@ button:disabled { opacity: .4; }
       <button class="icon-btn" id="newchat" type="button" aria-label="New chat" title="New chat">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 2v10M2 7h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       </button>
-      <div class="status" id="status">Connecting…</div>
+      <button class="icon-btn" id="files-btn" type="button" aria-label="Files" title="Files">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2.5 5.2h4.1l1.3 1.5H13.5v6.8H2.5z" stroke="currentColor" stroke-width="1.5"/><path d="M2.5 5.2V3.8h3.6l.8 1.4" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+      <button class="icon-btn" id="search-btn" type="button" aria-label="Search files" title="Search">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.2" stroke="currentColor" stroke-width="1.5"/><path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <button class="icon-btn" id="term-btn" type="button" aria-label="Terminal" title="Terminal">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 4.5l4 3.5-4 3.5M8 12.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="status" id="status"><span class="live-dot"></span><span id="status-label">Connecting…</span></div>
     </header>
+    <p class="install" id="install">Add to Home Screen to keep this remote as an app. Share → Add to Home Screen. Pairing stays on this iPad.</p>
+    <p class="reconnect" id="reconnect">Connection paused. Reconnecting to this Mac…</p>
     <p class="error-bar" id="error"></p>
+    <div class="search" id="search">
+      <input id="search-q" placeholder="Search file contents" enterkeyhint="search">
+      <div id="search-hits"></div>
+    </div>
     <div class="stage">
+      <div class="chat-col">
       <div class="flow">
       <div class="log" id="log"></div>
       <button type="button" class="jump" id="jump">
@@ -289,25 +447,86 @@ button:disabled { opacity: .4; }
               </button>
               <span class="meter" id="meter"></span>
             </div>
+            <div class="reply-bar" id="replybar">
+              <div class="quote" id="replypreview"></div>
+              <button type="button" class="tab-close" id="replyclear" aria-label="Clear reply">×</button>
+            </div>
             <textarea id="draft" rows="1" placeholder="Message this agent" enterkeyhint="send"></textarea>
+            <div class="composer-actions">
+              <button class="danger" id="stop" type="button" disabled>
+                <svg class="i fill" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.2"/></svg>
+                Stop
+              </button>
+              <button class="primary" id="send" type="button">
+                <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 12.5V3.5M4.5 7L8 3.5 11.5 7"/></svg>
+                <span id="send-label">Send</span>
+              </button>
+            </div>
           </div>
-          <button class="danger" id="stop" type="button" disabled>
-            <svg class="i fill" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.2"/></svg>
-            Stop
-          </button>
-          <button class="primary" id="send" type="button">
-            <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 12.5V3.5M4.5 7L8 3.5 11.5 7"/></svg>
-            <span id="send-label">Send</span>
-          </button>
         </div>
       </div></div>
+      </div>
+      <aside class="inspector" id="inspector">
+        <div class="insp-tabs">
+          <button type="button" class="insp-tab on" id="tab-files" data-pane="files">Files</button>
+          <button type="button" class="insp-tab" id="tab-changes" data-pane="changes">Changes</button>
+          <button type="button" class="insp-tab" id="tab-requests" data-pane="requests">Requests</button>
+        </div>
+        <div class="insp-tools">
+          <button type="button" class="ghost" id="newfile">New file</button>
+          <button type="button" class="primary" id="savefile" hidden>Save</button>
+        </div>
+        <div class="insp-body" id="inspector-body"></div>
+        <textarea class="editor" id="editor" hidden></textarea>
+        <pre class="preview" id="preview" hidden></pre>
+      </aside>
     </div>
+    <div class="term-dock" id="term-dock">
+      <div class="term-chrome">
+        <span>Terminal</span>
+        <input id="term-cmd" placeholder="Run in this worktree" enterkeyhint="go" autocomplete="off" spellcheck="false">
+        <button type="button" class="primary" id="term-run">Run</button>
+      </div>
+      <pre class="term-log" id="term-log"></pre>
+    </div>
+    <nav class="phone-nav" id="phone-nav">
+      <button type="button" class="on" data-view="chat" id="view-chat">Chat</button>
+      <button type="button" data-view="files" id="view-files">Files</button>
+      <button type="button" data-view="changes" id="view-changes">Changes</button>
+      <button type="button" data-view="term" id="view-term">Term</button>
+    </nav>
   </section>
 </div>
 <script>
+const TOKEN_KEY = "ore-remote-token";
+function readStoredToken() {
+  try { const v = localStorage.getItem(TOKEN_KEY); if (v) return v; } catch (e) {}
+  try { const v = sessionStorage.getItem(TOKEN_KEY); if (v) return v; } catch (e) {}
+  const match = document.cookie.match(/(?:^|; )ore-token=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+function persistToken(value) {
+  if (!value) return;
+  try { localStorage.setItem(TOKEN_KEY, value); } catch (e) {}
+  try { sessionStorage.setItem(TOKEN_KEY, value); } catch (e) {}
+  const secure = location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = "ore-token=" + encodeURIComponent(value) + "; Path=/; Max-Age=31536000; SameSite=Lax" + secure;
+}
+function forgetToken() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  document.cookie = "ore-token=; Path=/; Max-Age=0";
+}
+const params = new URLSearchParams(location.search);
 const hashToken = decodeURIComponent((location.hash || "").replace(/^#/, ""));
-if (hashToken) try { sessionStorage.setItem("ore-remote-token", hashToken); } catch (e) {}
-const token = hashToken || (function(){ try { return sessionStorage.getItem("ore-remote-token") || ""; } catch (e) { return ""; } })();
+const queryToken = params.get("token") || "";
+const token = hashToken || queryToken || readStoredToken();
+if (token) persistToken(token);
+if (hashToken || queryToken) {
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+}
+const standalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches;
+const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const headers = () => ({ "Content-Type": "application/json", "X-Ore-Token": token });
 const $ = (id) => document.getElementById(id);
 let state = { workspaces: [], chats: [], messages: [], permissions: [], questions: [], busy: false };
@@ -320,10 +539,29 @@ let collapsedResponses = new Set();
 let didSeedCollapse = false;
 let boundChat = "";
 let scrollEndTimer = 0;
+let source = null;
+let pollTimer = 0;
+let reconnectTimer = 0;
+let backoff = 500;
+let live = false;
+let filesCache = [];
+let filesWorkspace = "";
+let openFolders = new Set();
+let inspectorPane = "files";
+let draftReply = null;
+let selectedFile = "";
+let changesCache = { files: [], insertions: 0, deletions: 0, branch: "" };
+let selectedChange = "";
+let diffCache = null;
+let searchHits = [];
+let shellLog = [];
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
-  if (response.status === 401) throw new Error("This device is not paired. Scan the QR code in ORE Settings again.");
+  const response = await fetch(path, { credentials: "same-origin", ...options, headers: { ...headers(), ...(options.headers || {}) } });
+  if (response.status === 401) {
+    forgetToken();
+    throw new Error("This device is not paired. Scan the QR code in ORE Settings again.");
+  }
   if (!response.ok) throw new Error(await response.text() || response.statusText);
   if (response.status === 204) return null;
   return response.json();
@@ -368,12 +606,23 @@ function icon(name) {
     plan: '<path d="M4.5 2.8h7v10.4h-7z"/><path d="M6.2 5.5h3.6M6.2 8h3.6M6.2 10.5h2.2"/>',
     shield: '<path d="M8 2.5l5 2v3.7c0 3.1-2.1 5.3-5 6.3-2.9-1-5-3.2-5-6.3V4.5z"/>',
     meter: '<path d="M8 13.2A5.2 5.2 0 1 1 13.2 8"/><path d="M8 8l3-3"/>',
-    bolt: '<path class="fill" d="M9 1.5L4 9h4l-1 5.5L13 7H9z"/>'
+    bolt: '<path class="fill" d="M9 1.5L4 9h4l-1 5.5L13 7H9z"/>',
+    reply: '<path d="M4.5 7.5H12a2 2 0 0 1 2 2V13"/><path d="M4.5 7.5 7.2 4.8M4.5 7.5 7.2 10.2"/>',
+    doc: '<path d="M4.5 2.8h5.2L11.5 5v8.2h-7z"/><path d="M9.5 2.8V5h2"/>',
+    search: '<circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2L13.5 13.5"/>',
+    term: '<path d="M3 4.5l4 3.5-4 3.5M8 12.5h5"/>'
   };
   const d = paths[name];
   if (!d) return "";
   const fill = name === "sparkle" || name === "bolt" || d.includes('class="fill"') ? " fill" : "";
   return `<svg class="i${fill}" viewBox="0 0 16 16" aria-hidden="true">${d}</svg>`;
+}
+
+function setLive(kind, label) {
+  const node = $("status");
+  node.className = "status " + kind;
+  $("status-label").textContent = label;
+  $("reconnect").classList.toggle("show", kind === "wait" || kind === "bad");
 }
 
 function renderWorkspaces() {
@@ -403,7 +652,8 @@ function renderTabs() {
   host.innerHTML = chats.map(c => {
     const sel = c.id === selectedChat ? " sel" : "";
     const busy = c.busy ? " busy" : "";
-    return `<button type="button" class="tab${sel}${busy}" data-chat="${escapeAttr(c.id)}">${icon("bubble")}${escapeHtml(c.title || "Chat")}</button>`;
+    const unread = c.unread ? " unread" : "";
+    return `<button type="button" class="tab${sel}${busy}${unread}" data-chat="${escapeAttr(c.id)}">${icon("bubble")}<span class="title">${escapeHtml(c.title || "Chat")}</span><span class="tab-close" data-close="${escapeAttr(c.id)}" aria-label="Close">×</span></button>`;
   }).join("");
 }
 
@@ -459,11 +709,11 @@ function heading(m) {
 
 function processRow(m) {
   const open = expanded.has(m.id);
-  const live = !m.complete;
+  const liveRow = !m.complete;
   const label = m.title || (m.kind === "thinking" ? "Thinking" : m.kind === "activity" ? "Activity" : "Tool");
   const kindIcon = m.kind === "thinking" ? "brain" : m.kind === "activity" ? "list" : m.kind === "error" ? "warn" : "wrench";
   const chev = m.expandable ? `<span class="chev">›</span>` : "";
-  const pulse = live ? `<span class="dot"></span>` : "";
+  const pulse = liveRow ? `<span class="dot"></span>` : "";
   let body = "";
   if (open) {
     if (m.kind === "activity") {
@@ -474,7 +724,7 @@ function processRow(m) {
     } else if (m.detail || m.text) {
       body = `<div class="tool-body">${escapeHtml(m.detail || m.text)}</div>`;
     }
-  } else if (m.kind === "thinking" && live && m.text) {
+  } else if (m.kind === "thinking" && liveRow && m.text) {
     body = `<div class="thinking">${escapeHtml(clip(m.text, 280))}</div>`;
   }
   const toggle = m.expandable
@@ -483,12 +733,37 @@ function processRow(m) {
   return `<div class="process${open ? " open" : ""}" data-id="${escapeAttr(m.id)}">${toggle}${body}</div>`;
 }
 
+function safeHref(url) {
+  const u = String(url || "");
+  if (/^(https?:|mailto:|#)/i.test(u) || u.startsWith(".") || u.startsWith("/")) return u;
+  return "#";
+}
+
+function renderRich(text) {
+  let s = escapeHtml(text);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) =>
+    `<a href="${escapeAttr(safeHref(href))}" data-file="${escapeAttr(href)}">${label}</a>`);
+  return s;
+}
+
+function replyButton(m) {
+  if (m.kind !== "you" && m.kind !== "agent" && m.kind !== "plan") return "";
+  return `<button type="button" class="reply-btn" data-reply="${escapeAttr(m.id)}" aria-label="Reply">${icon("reply")}</button>`;
+}
+
+function quoted(m) {
+  if (!m.reply) return "";
+  return `<div class="quote">↩ ${escapeHtml(m.reply.author || (m.reply.role === "assistant" ? "Agent" : "You"))} · ${escapeHtml(m.reply.text || "")}</div>`;
+}
+
 function renderMessage(m) {
   const kind = m.kind || "agent";
   const queued = m.queued ? " queued" : "";
   const id = escapeAttr(m.id || "");
   if (kind === "you") {
-    return `<div class="turn you${queued}" data-id="${id}"><div class="bubble">${escapeHtml(m.text || "")}</div></div>`;
+    return `<div class="turn you${queued}" data-id="${id}">${replyButton(m)}<div class="bubble">${quoted(m)}${renderRich(m.text || "")}</div></div>`;
   }
   if (kind === "tool" || kind === "activity" || kind === "thinking") {
     return `<div class="turn${queued}" data-id="${id}">${heading(m)}${processRow(m)}</div>`;
@@ -503,15 +778,15 @@ function renderMessage(m) {
     </div>`;
   }
   if (kind === "plan") {
-    return `<div class="turn plan${queued}" data-id="${id}">${heading(m)}${icon("plan")}${escapeHtml(m.text || "")}</div>`;
+    return `<div class="turn plan${queued}" data-id="${id}">${heading(m)}${replyButton(m)}${icon("plan")}${escapeHtml(m.text || "")}</div>`;
   }
   const folded = collapsedResponses.has(m.id) && isLong(m.text);
-  const live = !m.complete;
+  const liveRow = !m.complete;
   const body = folded ? preview(m.text) : (m.text || "");
   const toggle = isLong(m.text) && m.complete
     ? `<button type="button" class="fold" data-fold="${id}">${icon("down")}${folded ? "Show full response" : "Hide full response"}</button>`
     : "";
-  return `<div class="turn${queued}" data-id="${id}">${heading(m)}<div class="prose${live ? " live" : ""}">${escapeHtml(body)}</div>${toggle}</div>`;
+  return `<div class="turn${queued}" data-id="${id}">${heading(m)}${replyButton(m)}<div class="prose${liveRow ? " live" : ""}">${renderRich(body)}</div>${toggle}</div>`;
 }
 
 function atBottom(log) {
@@ -543,8 +818,8 @@ function renderLog() {
     return;
   }
   const expandKey = [...expanded].sort().join(",") + "/" + [...collapsedResponses].sort().join(",");
-  const ids = messages.map(m => m.id).join("\n");
-  const structure = ids + "|" + expandKey;
+  const idsKey = messages.map(m => m.id).join("\n");
+  const structure = idsKey + "|" + expandKey;
   const last = messages[messages.length - 1];
   const lastNode = last && log.querySelector(`[data-id="${CSS.escape(last.id)}"]`);
   if (log.dataset.structure === structure && lastNode) {
@@ -552,7 +827,7 @@ function renderLog() {
     const thinking = lastNode.querySelector(".thinking");
     const label = lastNode.querySelector(".process-toggle .label");
     if (prose) {
-      prose.textContent = last.text || "";
+      prose.innerHTML = renderRich(last.text || "");
       prose.classList.toggle("live", !last.complete);
     } else if (thinking) {
       thinking.textContent = last.text || "";
@@ -640,6 +915,81 @@ function renderComposer() {
   meter.innerHTML = c.context ? icon("meter") + escapeHtml(c.context) : "";
   const ws = (state.workspaces || []).find(w => w.id === selectedWorkspace);
   $("draft").placeholder = ws && ws.kind === "assistant" ? "Message Assistant" : "Message this agent";
+  const bar = $("replybar");
+  bar.classList.toggle("show", !!draftReply);
+  if (draftReply) {
+    $("replypreview").textContent = "↩ " + (draftReply.author || "Message") + " · " + (draftReply.text || "");
+  }
+}
+
+function fileRow(node, depth) {
+  const pad = 8 + depth * 14;
+  if (node.dir) {
+    const open = openFolders.has(node.path);
+    const kids = open ? (node.children || []).map(child => fileRow(child, depth + 1)).join("") : "";
+    return `<button type="button" class="file" style="padding-left:${pad}px" data-folder="${escapeAttr(node.path)}">${icon("folder")}<span class="name">${escapeHtml(node.name)}</span></button>${kids}`;
+  }
+  const sel = node.path === selectedFile ? " sel" : "";
+  return `<button type="button" class="file${sel}" style="padding-left:${pad}px" data-file="${escapeAttr(node.path)}">${icon("doc")}<span class="name">${escapeHtml(node.name)}</span></button>`;
+}
+
+function renderInspector() {
+  const host = $("inspector-body");
+  const ws = (state.workspaces || []).find(w => w.id === selectedWorkspace);
+  document.querySelectorAll(".insp-tab").forEach(tab => {
+    tab.classList.toggle("on", tab.dataset.pane === inspectorPane);
+  });
+  const editor = $("editor");
+  const preview = $("preview");
+  const save = $("savefile");
+  const tools = inspectorPane === "files" && !(ws && ws.kind === "assistant");
+  $("newfile").hidden = !tools;
+  if (inspectorPane !== "files") {
+    editor.hidden = true;
+    editor.classList.remove("show");
+    save.hidden = true;
+    preview.hidden = true;
+  }
+  if (ws && ws.kind === "assistant" && inspectorPane !== "requests") {
+    host.innerHTML = `<div class="empty">${icon("sparkle")}Assistant has no worktree.</div>`;
+    return;
+  }
+  if (inspectorPane === "requests") {
+    host.innerHTML = $("needsyou").innerHTML || `<div class="empty">${icon("shield")}No pending requests.</div>`;
+    return;
+  }
+  if (inspectorPane === "changes") {
+    const files = changesCache.files || [];
+    const head = `<div class="review-stat"><div>${icon("branch")} ${escapeHtml(changesCache.branch || "")}</div>
+      <div>+${changesCache.insertions || 0} / −${changesCache.deletions || 0}</div></div>`;
+    if (!files.length) {
+      host.innerHTML = head + `<div class="empty">${icon("check")}No uncommitted changes.</div>`;
+      return;
+    }
+    const list = files.map(f => {
+      const sel = f.path === selectedChange ? " sel" : "";
+      return `<button type="button" class="file${sel}" data-change="${escapeAttr(f.path)}">${icon("doc")}<span class="name">${escapeHtml(f.path)}</span><span class="ws-branch">+${f.insertions || 0} −${f.deletions || 0}</span></button>`;
+    }).join("");
+    let diffHTML = "";
+    if (diffCache && diffCache.path === selectedChange) {
+      if (diffCache.binary) diffHTML = `<div class="hint">Binary file</div>`;
+      else diffHTML = (diffCache.hunks || []).map(h => {
+        const lines = (h.lines || []).map(line => {
+          const cls = line.kind === "added" ? "diff-add" : line.kind === "removed" ? "diff-del" : "diff-ctx";
+          const mark = line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " ";
+          return `<div class="${cls}">${mark}${escapeHtml(line.text || "")}</div>`;
+        }).join("");
+        return `<div class="hunk">${h.header ? `<div class="diff-ctx">${escapeHtml(h.header)}</div>` : ""}${lines}</div>`;
+      }).join("");
+    }
+    host.innerHTML = head + list + (diffHTML ? `<div class="hunk">${diffHTML}</div>` : "");
+    return;
+  }
+  if (!filesCache.length) {
+    host.innerHTML = `<div class="empty">${icon("folder")}No files yet.</div>`;
+    return;
+  }
+  host.innerHTML = filesCache.map(node => fileRow(node, 0)).join("");
 }
 
 function render() {
@@ -657,6 +1007,7 @@ function render() {
   renderLog();
   renderNeedsYou();
   renderComposer();
+  renderInspector();
   const hint = state.queueHint || (state.busy ? "Agent is working…" : "");
   const busy = $("busy");
   busy.className = "banner" + (state.error ? " fail" : "");
@@ -667,7 +1018,7 @@ function render() {
   if (sendLabel) sendLabel.textContent = state.willQueue ? "Queue" : "Send";
   $("stop").disabled = !state.busy && !state.willQueue;
   const ws = (state.workspaces || []).find(w => w.id === selectedWorkspace);
-  $("status").textContent = state.busy ? "Working" : (ws ? ws.name : "Live");
+  if (live) setLive("ok", state.busy ? "Working" : (ws ? ws.name : "Live"));
 }
 
 function escapeHtml(value) {
@@ -675,31 +1026,192 @@ function escapeHtml(value) {
 }
 function escapeAttr(value) { return escapeHtml(value); }
 
+function applyState(next) {
+  state = next;
+  live = true;
+  backoff = 500;
+  showError("");
+  render();
+}
+
+function eventQuery() {
+  return "workspace=" + encodeURIComponent(selectedWorkspace) +
+    "&chat=" + encodeURIComponent(selectedChat) +
+    "&token=" + encodeURIComponent(token);
+}
+
+function stopSource() {
+  if (source) { source.close(); source = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  live = false;
+  setLive("wait", "Reconnecting");
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = 0;
+    backoff = Math.min(backoff * 2, 8000);
+    connect();
+  }, backoff);
+}
+
+function startPoll() {
+  if (pollTimer) return;
+  refresh();
+  pollTimer = setInterval(refresh, 1500);
+}
+
+function connect() {
+  if (!token) {
+    showError("This device is not paired. Scan the QR code in ORE Settings.");
+    setLive("bad", "Not paired");
+    return;
+  }
+  stopSource();
+  if (window.EventSource) {
+    source = new EventSource("/api/events?" + eventQuery());
+    source.onmessage = (event) => {
+      try { applyState(JSON.parse(event.data)); } catch (e) {}
+    };
+    source.onopen = () => { live = true; backoff = 500; $("reconnect").classList.remove("show"); };
+    source.onerror = () => {
+      if (source) { source.close(); source = null; }
+      fetch("/api/state?" + eventQuery(), { credentials: "same-origin", headers: headers() }).then(response => {
+        if (response.status === 401) {
+          forgetToken();
+          showError("This device is not paired. Scan the QR code in ORE Settings again.");
+          setLive("bad", "Not paired");
+          return;
+        }
+        scheduleReconnect();
+      }).catch(() => scheduleReconnect());
+    };
+  } else {
+    startPoll();
+  }
+}
+
 async function refresh() {
   try {
-    const next = await api("/api/state?workspace=" + encodeURIComponent(selectedWorkspace) +
-      "&chat=" + encodeURIComponent(selectedChat));
-    state = next;
-    showError("");
-    render();
+    const next = await api("/api/state?" + eventQuery());
+    applyState(next);
   } catch (error) {
+    live = false;
     showError(error.message);
-    $("status").textContent = "Disconnected";
+    setLive("bad", "Disconnected");
   }
+}
+
+async function loadFiles() {
+  if (!selectedWorkspace) return;
+  try {
+    const next = await api("/api/files?workspace=" + encodeURIComponent(selectedWorkspace));
+    filesCache = next.files || [];
+    filesWorkspace = selectedWorkspace;
+    renderInspector();
+  } catch (e) {}
+}
+
+async function openFile(path) {
+  selectedFile = path;
+  inspectorPane = "files";
+  renderInspector();
+  try {
+    const next = await api("/api/file?workspace=" + encodeURIComponent(selectedWorkspace) + "&path=" + encodeURIComponent(path));
+    const preview = $("preview");
+    const editor = $("editor");
+    const save = $("savefile");
+    if (next.binary) {
+      editor.hidden = true;
+      editor.classList.remove("show");
+      save.hidden = true;
+      preview.hidden = false;
+      preview.textContent = (next.name || path) + " is a binary file.";
+    } else {
+      preview.hidden = true;
+      editor.hidden = false;
+      editor.classList.add("show");
+      editor.value = next.text || "";
+      save.hidden = false;
+    }
+  } catch (e) {}
+}
+
+async function loadChanges() {
+  if (!selectedWorkspace) return;
+  try {
+    changesCache = await api("/api/changes?workspace=" + encodeURIComponent(selectedWorkspace));
+    renderInspector();
+  } catch (e) {}
+}
+
+async function openChange(path) {
+  selectedChange = path;
+  inspectorPane = "changes";
+  renderInspector();
+  try {
+    diffCache = await api("/api/diff?workspace=" + encodeURIComponent(selectedWorkspace) + "&path=" + encodeURIComponent(path));
+    renderInspector();
+  } catch (e) {}
+}
+
+async function runSearch() {
+  const q = $("search-q").value.trim();
+  if (!q) return;
+  const next = await api("/api/search?workspace=" + encodeURIComponent(selectedWorkspace) + "&q=" + encodeURIComponent(q));
+  searchHits = next.hits || [];
+  $("search-hits").innerHTML = searchHits.map(hit =>
+    `<button type="button" class="hit" data-file="${escapeAttr(hit.path)}"><span class="path">${escapeHtml(hit.path)}:${hit.line}</span>${escapeHtml(hit.text)}</button>`
+  ).join("") || `<div class="empty">No matches.</div>`;
+}
+
+async function runShell() {
+  const command = $("term-cmd").value.trim();
+  if (!command) return;
+  $("term-cmd").value = "";
+  const next = await api("/api/shell", { method: "POST", body: JSON.stringify({ workspaceID: selectedWorkspace, command }) });
+  shellLog = next.log || [];
+  renderTerminal();
+}
+
+function renderTerminal() {
+  $("term-log").textContent = (shellLog || []).map(e =>
+    "$ " + (e.command || "") + "\n" + (e.output || "") + (e.status === "fail" ? "\nexit " + (e.code || "") : "")
+  ).join("\n\n");
+  $("term-log").scrollTop = $("term-log").scrollHeight;
+}
+
+function showPane(view) {
+  const files = view === "files" || view === "changes";
+  $("view-chat").classList.toggle("on", view === "chat");
+  $("view-files").classList.toggle("on", view === "files");
+  $("view-changes").classList.toggle("on", view === "changes");
+  $("view-term").classList.toggle("on", view === "term");
+  $("app").classList.toggle("files-open", files);
+  $("app").classList.toggle("inspect", files || view === "files");
+  $("app").classList.toggle("term-open", view === "term");
+  if (view === "files") { inspectorPane = "files"; loadFiles(); }
+  if (view === "changes") { inspectorPane = "changes"; loadChanges(); }
+  renderInspector();
 }
 
 async function selectWorkspace(id) {
   selectedWorkspace = id;
   selectedChat = "";
+  filesCache = [];
+  selectedFile = "";
   closeNav();
+  $("app").classList.remove("files-open");
   await api("/api/select", { method: "POST", body: JSON.stringify({ workspaceID: id }) });
-  await refresh();
+  connect();
+  loadFiles();
 }
 
 async function selectChat(id) {
   selectedChat = id;
   await api("/api/select", { method: "POST", body: JSON.stringify(ids()) });
-  await refresh();
+  connect();
 }
 
 function markScrolling() {
@@ -718,6 +1230,33 @@ $("log").addEventListener("touchstart", () => { userScrolling = true; }, { passi
 $("log").addEventListener("click", (event) => {
   const fold = event.target.closest("[data-fold]");
   const proc = event.target.closest("[data-expand]");
+  const reply = event.target.closest("[data-reply]");
+  const file = event.target.closest("a[data-file]");
+  if (file) {
+    const href = file.getAttribute("data-file") || "";
+    if (href.startsWith(".") || (!/^https?:/i.test(href) && href.indexOf("://") < 0)) {
+      event.preventDefault();
+      $("app").classList.add("inspect");
+      inspectorPane = "files";
+      openFile(href.replace(/^\.\//, ""));
+      return;
+    }
+  }
+  if (reply) {
+    const row = (state.messages || []).find(m => m.id === reply.dataset.reply);
+    if (row) {
+      draftReply = {
+        rowID: row.id,
+        turnID: row.turn,
+        role: row.kind === "you" ? "user" : "assistant",
+        author: row.kind === "you" ? "You" : (row.header || "Agent"),
+        text: clip(row.text || row.title || "", 120)
+      };
+      renderComposer();
+      $("draft").focus();
+    }
+    return;
+  }
   if (fold) {
     const id = fold.dataset.fold;
     if (collapsedResponses.has(id)) collapsedResponses.delete(id);
@@ -739,18 +1278,91 @@ $("jump").addEventListener("click", () => {
   syncJump();
 });
 $("nav").addEventListener("click", () => $("app").classList.toggle("nav-open"));
-$("backdrop").addEventListener("click", closeNav);
+$("backdrop").addEventListener("click", () => {
+  closeNav();
+  $("app").classList.remove("files-open");
+});
 $("workspaces").addEventListener("click", (event) => {
   const row = event.target.closest("[data-ws]");
   if (row) selectWorkspace(row.dataset.ws);
 });
 $("tabs").addEventListener("click", (event) => {
+  const close = event.target.closest("[data-close]");
+  if (close) {
+    event.preventDefault();
+    event.stopPropagation();
+    api("/api/close-chat", { method: "POST", body: JSON.stringify({ workspaceID: selectedWorkspace, chatID: close.dataset.close }) })
+      .then(() => connect());
+    return;
+  }
   const tab = event.target.closest("[data-chat]");
   if (tab) selectChat(tab.dataset.chat);
 });
 $("newchat").addEventListener("click", async () => {
   await api("/api/new-chat", { method: "POST", body: JSON.stringify({ workspaceID: selectedWorkspace }) });
-  await refresh();
+  connect();
+});
+$("files-btn").addEventListener("click", () => {
+  $("app").classList.toggle("inspect");
+  $("app").classList.toggle("files-open");
+  inspectorPane = "files";
+  loadFiles();
+  renderInspector();
+});
+$("search-btn").addEventListener("click", () => {
+  $("app").classList.toggle("searching");
+  if ($("app").classList.contains("searching")) $("search-q").focus();
+});
+$("term-btn").addEventListener("click", () => $("app").classList.toggle("term-open"));
+$("tab-files").addEventListener("click", () => { inspectorPane = "files"; renderInspector(); loadFiles(); });
+$("tab-changes").addEventListener("click", () => { inspectorPane = "changes"; renderInspector(); loadChanges(); });
+$("tab-requests").addEventListener("click", () => { inspectorPane = "requests"; renderInspector(); });
+$("inspector-body").addEventListener("click", (event) => {
+  const folder = event.target.closest("[data-folder]");
+  const file = event.target.closest("[data-file]");
+  const change = event.target.closest("[data-change]");
+  if (folder) {
+    const path = folder.dataset.folder;
+    if (openFolders.has(path)) openFolders.delete(path);
+    else openFolders.add(path);
+    renderInspector();
+    return;
+  }
+  if (change) { openChange(change.dataset.change); return; }
+  if (file) openFile(file.dataset.file);
+});
+$("phone-nav").addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-view]");
+  if (btn) showPane(btn.dataset.view);
+});
+$("search-q").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); runSearch(); }
+});
+$("search-hits").addEventListener("click", (event) => {
+  const hit = event.target.closest("[data-file]");
+  if (!hit) return;
+  $("app").classList.remove("searching");
+  $("app").classList.add("inspect", "files-open");
+  openFile(hit.dataset.file);
+});
+$("newfile").addEventListener("click", async () => {
+  const path = window.prompt("New file path", "untitled.txt");
+  if (!path) return;
+  const next = await api("/api/new-file", { method: "POST", body: JSON.stringify({ workspaceID: selectedWorkspace, path }) });
+  if (next && next.error) { showError(next.error); return; }
+  await loadFiles();
+  if (next && next.path) openFile(next.path);
+});
+$("savefile").addEventListener("click", async () => {
+  if (!selectedFile) return;
+  const next = await api("/api/save", { method: "POST", body: JSON.stringify({
+    workspaceID: selectedWorkspace, path: selectedFile, text: $("editor").value
+  }) });
+  if (next && next.error) showError(next.error);
+});
+$("term-run").addEventListener("click", runShell);
+$("term-cmd").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); runShell(); }
 });
 $("send").addEventListener("click", send);
 $("draft").addEventListener("input", resizeDraft);
@@ -759,8 +1371,9 @@ $("draft").addEventListener("keydown", (event) => {
 });
 $("stop").addEventListener("click", async () => {
   await api("/api/stop", { method: "POST", body: JSON.stringify(ids()) });
-  await refresh();
+  refresh();
 });
+$("replyclear").addEventListener("click", () => { draftReply = null; renderComposer(); });
 async function pushComposer() {
   await api("/api/composer", { method: "POST", body: JSON.stringify({
     ...ids(),
@@ -770,7 +1383,7 @@ async function pushComposer() {
     permissionMode: $("permission").value,
     fast: $("fast").classList.contains("on") ? "1" : ""
   }) });
-  await refresh();
+  refresh();
 }
 $("harness").addEventListener("change", () => {
   const harnesses = (state.composer && state.composer.harnesses) || [];
@@ -809,7 +1422,7 @@ $("needsyou").addEventListener("click", async (event) => {
   } else {
     return;
   }
-  await refresh();
+  refresh();
 });
 
 async function send() {
@@ -818,19 +1431,115 @@ async function send() {
   $("draft").value = "";
   resizeDraft();
   followBottom = true;
-  await api("/api/send", { method: "POST", body: JSON.stringify({
+  const payload = {
     ...ids(),
     text,
     effort: $("effort").hidden ? "" : $("effort").value,
     fast: $("fast").classList.contains("on") ? "1" : ""
-  }) });
-  await refresh();
+  };
+  if (draftReply) {
+    payload.replyRowID = draftReply.rowID;
+    payload.replyTurnID = draftReply.turnID;
+    payload.replyRole = draftReply.role;
+    payload.replyAuthor = draftReply.author;
+    payload.replyText = draftReply.text;
+    draftReply = null;
+    renderComposer();
+  }
+  await api("/api/send", { method: "POST", body: JSON.stringify(payload) });
+  refresh();
 }
 
-refresh();
-setInterval(refresh, 1500);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") connect();
+});
+window.addEventListener("pageshow", () => connect());
+window.addEventListener("online", () => connect());
+window.addEventListener("focus", () => { if (!live) connect(); });
+if (ios && !standalone) $("install").classList.add("show");
+if (standalone) $("install").classList.remove("show");
+connect();
+loadFiles();
 </script>
 </body>
 </html>
 """#
+
+    static let manifest = """
+{
+  "name": "ORE",
+  "short_name": "ORE",
+  "description": "Remote control for ORE on this Mac",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#171615",
+  "theme_color": "#14151A",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
+"""
+
+    static func asset(path: String) -> (type: String, data: Data)? {
+        switch path {
+        case "/manifest.webmanifest":
+            return ("application/manifest+json", Data(manifest.utf8))
+        case "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png", "/favicon.png", "/favicon.ico":
+            return ("image/png", iconPNG())
+        default:
+            return nil
+        }
+    }
+
+    static func iconPNG() -> Data { iconPNGStorage }
+
+    private static let iconPNGStorage: Data = renderIconPNG()
+
+    private static func renderIconPNG() -> Data {
+        let size = 180
+        let pixels = size
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixels,
+            pixelsHigh: pixels,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return Data() }
+        rep.size = NSSize(width: size, height: size)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor(srgbRed: 23 / 255, green: 22 / 255, blue: 21 / 255, alpha: 1).setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+        NSColor(srgbRed: 245 / 255, green: 158 / 255, blue: 11 / 255, alpha: 1).setFill()
+        let inset = CGFloat(size) * 0.18
+        NSBezierPath(
+            roundedRect: NSRect(x: inset, y: inset, width: CGFloat(size) - inset * 2, height: CGFloat(size) - inset * 2),
+            xRadius: 28,
+            yRadius: 28
+        ).fill()
+        let text = "ORE" as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 42, weight: .bold),
+            .foregroundColor: NSColor(srgbRed: 26 / 255, green: 18 / 255, blue: 8 / 255, alpha: 1),
+        ]
+        let textSize = text.size(withAttributes: attrs)
+        text.draw(
+            at: NSPoint(x: (CGFloat(size) - textSize.width) / 2, y: (CGFloat(size) - textSize.height) / 2 - 2),
+            withAttributes: attrs
+        )
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:]) ?? Data()
+    }
 }

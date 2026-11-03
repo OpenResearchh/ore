@@ -3,6 +3,7 @@ import CoreImage
 import Darwin
 import Foundation
 import Network
+import OreGit
 import OreProtocol
 
 /// A local HTTPS surface so an iPhone or iPad can drive this Mac's workspaces
@@ -30,6 +31,7 @@ final class RemoteControlServer {
     private var listener: NWListener?
     private var sessions: [ObjectIdentifier: RemoteHTTPSession] = [:]
     private var model: AppModel?
+    private var shellLogs: [String: [[String: String]]] = [:]
     private var presenceExpire: Task<Void, Never>?
     private var endpointRefresh: Task<Void, Never>?
 
@@ -227,6 +229,7 @@ final class RemoteControlServer {
                 let serviceTier = summary.flatMap {
                     resolvedServiceTier(model: model, chat: $0, fast: fast)
                 }
+                let reply = Self.reply(from: payload)
                 if let chat {
                     model.send(
                         text,
@@ -235,7 +238,8 @@ final class RemoteControlServer {
                         origin: .user,
                         to: workspace,
                         chatID: chat,
-                        fromComposer: false
+                        fromComposer: false,
+                        replyTo: reply
                     )
                 } else {
                     _ = model.send(
@@ -305,6 +309,28 @@ final class RemoteControlServer {
                     chatID: chat
                 )
             }
+        case "/api/close-chat":
+            return mutate(body) { payload in
+                guard let workspace = workspaceID(payload["workspaceID"]),
+                      let raw = payload["chatID"], !raw.isEmpty
+                else { return }
+                model.closeChat(ChatID(rawValue: raw), in: workspace)
+            }
+        case "/api/files":
+            return json(files(model: model, query: query))
+        case "/api/file":
+            return fileContents(model: model, query: query)
+        case "/api/new-file":
+            return mutate(body) { payload in
+                guard let workspace = listedWorkspaces(model: model).first(where: {
+                    $0.id == workspaceID(payload["workspaceID"])
+                }), !workspace.isAssistant,
+                      let path = payload["path"]
+                else { return }
+                try? model.createEmptyFile(path: path, in: workspace)
+            }
+        case "/api/events":
+            return json(state(model: model, query: query))
         case "/api/answer":
             return mutate(body) { payload in
                 guard let workspace = workspaceID(payload["workspaceID"])
@@ -322,6 +348,32 @@ final class RemoteControlServer {
             }
         default:
             return (404, "text/plain", Data("not found\n".utf8))
+        }
+    }
+
+    fileprivate func handleAuthorizedAsync(
+        path: String,
+        query: [String: String],
+        body: Data
+    ) async -> (Int, String, Data) {
+        guard let model else {
+            return (503, "text/plain", Data("ORE is starting\n".utf8))
+        }
+        switch path {
+        case "/api/changes":
+            return json(await changes(model: model, query: query))
+        case "/api/diff":
+            return json(await diff(model: model, query: query))
+        case "/api/search":
+            return json(await search(model: model, query: query))
+        case "/api/save":
+            return await saveFile(model: model, body: body)
+        case "/api/new-file":
+            return createFile(model: model, body: body)
+        case "/api/shell":
+            return await runShell(model: model, query: query, body: body)
+        default:
+            return route(path: path, query: query, body: body)
         }
     }
 
@@ -474,7 +526,286 @@ final class RemoteControlServer {
             "selectedWorkspace": workspaceID?.rawValue ?? "",
             "selectedChat": chatID?.rawValue ?? "",
             "composer": composerSnapshot(model: model, chat: summary, usage: usage),
+            "review": reviewSnapshot(model: model, workspaceID: workspaceID),
+            "standalone": true,
         ]
+    }
+
+    fileprivate func eventJSON(query: [String: String]) -> String {
+        guard let model else { return "{}" }
+        let encoded = json(state(model: model, query: query)).2
+        return String(decoding: encoded, as: UTF8.self)
+    }
+
+    private func reviewSnapshot(model: AppModel, workspaceID: WorkspaceID?) -> [String: Any] {
+        guard let workspaceID, !isAssistant(workspaceID, model: model) else {
+            return ["changed": 0, "insertions": 0, "deletions": 0]
+        }
+        let git = model.gitChrome(for: workspaceID)
+        return [
+            "changed": git.changedFileCount,
+            "insertions": git.insertions,
+            "deletions": git.deletions,
+        ]
+    }
+
+    private func files(model: AppModel, query: [String: String]) -> [String: Any] {
+        let id = workspaceID(query["workspace"])
+            ?? model.selectedWorkspaceID
+            ?? model.assistantWorkspace?.id
+        guard let id,
+              let workspace = listedWorkspaces(model: model).first(where: { $0.id == id }),
+              !workspace.isAssistant
+        else {
+            return ["files": [] as [Any], "workspace": id?.rawValue ?? ""]
+        }
+        let scanner = WorkspaceFileScanner(
+            fileLimit: 250,
+            hideNames: WorkspaceFileScanner.default.hideNames,
+            skipRecursionNames: WorkspaceFileScanner.default.skipRecursionNames
+        )
+        let nodes = scanner.scan(at: workspace.worktreePath)
+        var remaining = 250
+        return [
+            "workspace": id.rawValue,
+            "files": encodeFiles(nodes, remaining: &remaining),
+        ]
+    }
+
+    private func encodeFiles(_ nodes: [WorkspaceFileNode], remaining: inout Int) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for node in nodes {
+            guard remaining > 0 else { break }
+            remaining -= 1
+            var item: [String: Any] = [
+                "path": node.path,
+                "name": node.name,
+                "dir": node.isDirectory,
+            ]
+            if let children = node.children, !children.isEmpty {
+                item["children"] = encodeFiles(children, remaining: &remaining)
+            }
+            out.append(item)
+        }
+        return out
+    }
+
+    private func fileContents(model: AppModel, query: [String: String]) -> (Int, String, Data) {
+        let id = workspaceID(query["workspace"])
+            ?? model.selectedWorkspaceID
+        guard let id,
+              let workspace = listedWorkspaces(model: model).first(where: { $0.id == id }),
+              !workspace.isAssistant,
+              let relative = query["path"], !relative.isEmpty
+        else {
+            return json(["error": "missing file"])
+        }
+        do {
+            let url = try AppModel.safeFileURL(root: workspace.worktreePath, relativePath: relative)
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            if values.isDirectory == true {
+                return json(["error": "directory", "path": relative])
+            }
+            let size = values.fileSize ?? 0
+            if size > 400_000 {
+                return json(["path": relative, "binary": true, "text": "", "name": url.lastPathComponent])
+            }
+            let data = try Data(contentsOf: url)
+            if data.prefix(8_192).contains(0) {
+                return json(["path": relative, "binary": true, "text": "", "name": url.lastPathComponent])
+            }
+            guard let text = String(data: data, encoding: .utf8) else {
+                return json(["path": relative, "binary": true, "text": "", "name": url.lastPathComponent])
+            }
+            return json(["path": relative, "binary": false, "text": String(text.prefix(120_000)), "name": url.lastPathComponent])
+        } catch {
+            return json(["error": "unreadable", "path": relative])
+        }
+    }
+
+    private func worktree(
+        model: AppModel,
+        id raw: String?
+    ) -> WorkspaceSummary? {
+        let id = workspaceID(raw)
+            ?? model.selectedWorkspaceID
+            ?? model.assistantWorkspace?.id
+        guard let id else { return nil }
+        return listedWorkspaces(model: model).first(where: { $0.id == id && !$0.isAssistant })
+    }
+
+    private func changes(model: AppModel, query: [String: String]) async -> [String: Any] {
+        guard let workspace = worktree(model: model, id: query["workspace"]) else {
+            return ["files": [] as [Any], "branch": "", "insertions": 0, "deletions": 0]
+        }
+        let snap = await model.loadWorkingTreeStatus(for: workspace.id)
+        let files = (snap?.files ?? []).prefix(200).map { file -> [String: Any] in
+            [
+                "path": file.path,
+                "status": file.status.rawValue,
+                "insertions": file.insertions ?? 0,
+                "deletions": file.deletions ?? 0,
+                "staged": file.isStaged,
+            ]
+        }
+        return [
+            "workspace": workspace.id.rawValue,
+            "branch": snap?.branch ?? workspace.branch,
+            "files": Array(files),
+            "insertions": (snap?.stagedInsertions ?? 0) + (snap?.unstagedInsertions ?? 0),
+            "deletions": (snap?.stagedDeletions ?? 0) + (snap?.unstagedDeletions ?? 0),
+        ]
+    }
+
+    private func diff(model: AppModel, query: [String: String]) async -> [String: Any] {
+        guard let workspace = worktree(model: model, id: query["workspace"]) else {
+            return ["path": "", "hunks": [] as [Any], "error": "no workspace"]
+        }
+        let wanted = query["path"] ?? ""
+        do {
+            let diffs = try await model.loadDiff(for: workspace.id)
+            if wanted.isEmpty {
+                return [
+                    "files": diffs.prefix(80).map { file -> [String: Any] in
+                        [
+                            "path": file.path,
+                            "status": file.status.rawValue,
+                            "insertions": file.insertions,
+                            "deletions": file.deletions,
+                            "binary": file.isBinary,
+                        ]
+                    }
+                ]
+            }
+            guard let file = diffs.first(where: { $0.path == wanted }) else {
+                return ["path": wanted, "hunks": [] as [Any], "missing": true]
+            }
+            var lines = 0
+            let hunks: [[String: Any]] = file.hunks.prefix(40).map { hunk in
+                let body = hunk.lines.prefix(200).map { line -> [String: Any] in
+                    lines += 1
+                    return [
+                        "kind": line.kind.rawValue,
+                        "text": String(line.text.prefix(400)),
+                    ]
+                }
+                return [
+                    "header": hunk.header,
+                    "oldStart": hunk.oldStart,
+                    "newStart": hunk.newStart,
+                    "lines": Array(body),
+                ]
+            }
+            _ = lines
+            return [
+                "path": file.path,
+                "status": file.status.rawValue,
+                "binary": file.isBinary,
+                "truncated": file.isTruncated,
+                "insertions": file.insertions,
+                "deletions": file.deletions,
+                "hunks": hunks,
+            ]
+        } catch {
+            return ["path": wanted, "error": error.localizedDescription, "hunks": [] as [Any]]
+        }
+    }
+
+    private func search(model: AppModel, query: [String: String]) async -> [String: Any] {
+        guard let workspace = worktree(model: model, id: query["workspace"]) else {
+            return ["hits": [] as [Any]]
+        }
+        let needle = query["q"] ?? ""
+        let root = workspace.worktreePath
+        let hits = await Task.detached(priority: .userInitiated) {
+            WorkspaceContentSearch.search(query: needle, in: root, limit: 60)
+        }.value
+        return [
+            "q": needle,
+            "hits": hits.map { hit in
+                [
+                    "path": hit.path,
+                    "line": hit.line,
+                    "text": String(hit.text.prefix(240)),
+                ] as [String: Any]
+            },
+        ]
+    }
+
+    private func saveFile(model: AppModel, body: Data) async -> (Int, String, Data) {
+        let payload = jsonObject(body)
+        guard let workspace = worktree(model: model, id: payload["workspaceID"]),
+              let path = payload["path"], !path.isEmpty
+        else {
+            return json(["error": "missing file"])
+        }
+        do {
+            try await model.saveFileContents(payload["text"] ?? "", path: path, in: workspace)
+            return json(["ok": true, "path": path])
+        } catch {
+            return json(["error": error.localizedDescription, "path": path])
+        }
+    }
+
+    private func createFile(model: AppModel, body: Data) -> (Int, String, Data) {
+        let payload = jsonObject(body)
+        guard let workspace = worktree(model: model, id: payload["workspaceID"]),
+              let path = payload["path"]
+        else {
+            return json(["error": "missing path"])
+        }
+        do {
+            try model.createEmptyFile(path: path, in: workspace)
+            return json(["ok": true, "path": path])
+        } catch {
+            return json(["error": error.localizedDescription])
+        }
+    }
+
+    private func runShell(
+        model: AppModel,
+        query: [String: String],
+        body: Data
+    ) async -> (Int, String, Data) {
+        let payload = jsonObject(body)
+        guard let workspace = worktree(
+            model: model,
+            id: payload["workspaceID"] ?? query["workspace"]
+        ) else {
+            return json(["error": "no workspace", "log": shellLogs[query["workspace"] ?? ""] ?? []])
+        }
+        let command = (payload["command"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if command.isEmpty {
+            return json(["log": shellLogs[workspace.id.rawValue] ?? []])
+        }
+        let worktree = workspace.worktreePath
+        let result = await Task.detached(priority: .userInitiated) {
+            ShellSnippet.execute(command, worktree: worktree)
+        }.value
+        let entry = [
+            "command": command,
+            "output": result.output,
+            "status": result.status == .succeeded ? "ok" : "fail",
+            "code": String(result.exitCode),
+        ]
+        var log = shellLogs[workspace.id.rawValue] ?? []
+        log.append(entry)
+        if log.count > 12 { log.removeFirst(log.count - 12) }
+        shellLogs[workspace.id.rawValue] = log
+        return json(["ok": result.status == .succeeded, "entry": entry, "log": log])
+    }
+
+    private static func reply(from payload: [String: String]) -> MessageReply? {
+        guard let row = payload["replyRowID"], !row.isEmpty,
+              let turn = payload["replyTurnID"], !turn.isEmpty
+        else { return nil }
+        return MessageReply(
+            rowID: row,
+            turnID: TurnID(rawValue: turn),
+            role: payload["replyRole"] == "assistant" ? .assistant : .user,
+            author: payload["replyAuthor"] ?? "",
+            text: payload["replyText"] ?? ""
+        )
     }
 
     private func composerSnapshot(
@@ -747,6 +1078,15 @@ final class RemoteControlServer {
         if row.kind == .activityGroup, !row.groupedRows.isEmpty {
             payload["steps"] = row.groupedRows.map { message(from: $0, nested: true) }
         }
+        if let reply = row.replyTo {
+            payload["reply"] = [
+                "rowID": reply.rowID,
+                "turnID": reply.turnID.rawValue,
+                "role": reply.role.rawValue,
+                "author": reply.author,
+                "text": reply.preview,
+            ]
+        }
         return payload
     }
 
@@ -873,7 +1213,10 @@ struct RemoteEndpoint: Identifiable, Equatable {
     }
 
     func pairingURL(token: String) -> URL {
-        URL(string: pageURL.absoluteString + "#" + token)!
+        var components = URLComponents(url: pageURL, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "token", value: token)]
+        components.fragment = token
+        return components.url ?? pageURL
     }
 }
 
@@ -889,10 +1232,13 @@ private final class RemoteHTTPSession {
     private var path = "/"
     private var query: [String: String] = [:]
     private var headerToken: String?
+    private var cookieToken: String?
     private var closed = false
     private var didRespond = false
+    private var streaming = false
     private var idleTask: Task<Void, Never>?
     private var lifetimeTask: Task<Void, Never>?
+    private var streamTask: Task<Void, Never>?
 
     init(connection: NWConnection, server: RemoteControlServer) {
         self.connection = connection
@@ -1007,25 +1353,119 @@ private final class RemoteHTTPSession {
                 }
             }
         }
+        cookieToken = RemoteHTTPLimits.cookieToken(from: text)
         return true
     }
 
     private func respond(body: Data) {
-        if let headerToken { query["token"] = headerToken }
+        if query["token"] == nil, let headerToken { query["token"] = headerToken }
+        if query["token"] == nil, let cookieToken { query["token"] = cookieToken }
         let authorized = server?.isAuthorized(query["token"]) == true
+        if path == "/api/events" {
+            if authorized {
+                beginEventStream()
+            } else {
+                respond(status: 401, type: "text/plain", body: Data("unauthorized\n".utf8))
+            }
+            return
+        }
+        if let asset = RemoteControlPage.asset(path: path) {
+            respond(status: 200, type: asset.type, body: asset.data, setCookie: authorized)
+            return
+        }
         let result: (Int, String, Data)
         if path == "/" {
             result = (200, "text/html; charset=utf-8", Data(RemoteControlPage.html.utf8))
         } else if !authorized {
             result = (401, "text/plain", Data("unauthorized\n".utf8))
+        } else if RemoteHTTPLimits.isSlowAPI(path) {
+            idleTask?.cancel()
+            idleTask = nil
+            Task { @MainActor in
+                let next = await self.server?.handleAuthorizedAsync(
+                    path: self.path,
+                    query: self.query,
+                    body: body
+                ) ?? (503, "text/plain", Data())
+                self.respond(status: next.0, type: next.1, body: next.2, setCookie: true)
+            }
+            return
         } else {
             result = server?.handleAuthorized(path: path, query: query, body: body)
                 ?? (503, "text/plain", Data())
         }
-        respond(status: result.0, type: result.1, body: result.2)
+        respond(status: result.0, type: result.1, body: result.2, setCookie: authorized)
     }
 
-    private func respond(status: Int, type: String, body: Data) {
+    private func cookieHeader() -> String? {
+        guard let token = query["token"], server?.isAuthorized(token) == true else { return nil }
+        var cookie = "Set-Cookie: ore-token=\(token); Path=/; Max-Age=31536000; SameSite=Lax"
+        if server?.usesTLS == true { cookie += "; Secure" }
+        return cookie + "\r\n"
+    }
+
+    private func beginEventStream() {
+        guard !closed, !didRespond else { return }
+        didRespond = true
+        streaming = true
+        idleTask?.cancel()
+        idleTask = nil
+        lifetimeTask?.cancel()
+        lifetimeTask = Task { @MainActor in
+            try? await Task.sleep(for: RemoteHTTPLimits.streamLifetime)
+            guard !Task.isCancelled else { return }
+            self.finish()
+        }
+        var head = "HTTP/1.1 200 OK\r\n"
+        head += "Content-Type: text/event-stream; charset=utf-8\r\n"
+        head += "Cache-Control: no-cache, no-transform\r\n"
+        head += "Connection: keep-alive\r\n"
+        head += "X-Accel-Buffering: no\r\n"
+        head += "Access-Control-Allow-Origin: *\r\n"
+        if let cookie = cookieHeader() { head += cookie }
+        head += "\r\n"
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            Task { @MainActor in
+                if error != nil {
+                    self?.finish()
+                    return
+                }
+                self?.pumpEvents()
+            }
+        })
+    }
+
+    private func pumpEvents() {
+        streamTask?.cancel()
+        streamTask = Task { @MainActor in
+            var last = ""
+            var lastBeat = Date.distantPast
+            while !Task.isCancelled, !self.closed, self.streaming {
+                let payload = self.server?.eventJSON(query: self.query) ?? "{}"
+                let now = Date()
+                if payload != last {
+                    last = payload
+                    lastBeat = now
+                    self.sendStream("data: \(payload)\n\n")
+                } else if now.timeIntervalSince(lastBeat) >= 15 {
+                    lastBeat = now
+                    self.sendStream(": keepalive\n\n")
+                }
+                try? await Task.sleep(for: .milliseconds(600))
+            }
+        }
+    }
+
+    private func sendStream(_ text: String) {
+        guard !closed else { return }
+        connection.send(content: Data(text.utf8), completion: .contentProcessed { [weak self] error in
+            Task { @MainActor in
+                if error != nil { self?.finish() }
+            }
+        })
+    }
+
+    private func respond(status: Int, type: String, body: Data, setCookie: Bool = false) {
         guard !closed, !didRespond else { return }
         didRespond = true
         let statusText = status == 200 ? "OK" : status == 204 ? "No Content"
@@ -1036,7 +1476,9 @@ private final class RemoteHTTPSession {
         head += "Content-Type: \(type)\r\n"
         head += "Content-Length: \(body.count)\r\n"
         head += "Connection: close\r\n"
-        head += "Access-Control-Allow-Origin: *\r\n\r\n"
+        head += "Access-Control-Allow-Origin: *\r\n"
+        if setCookie, let cookie = cookieHeader() { head += cookie }
+        head += "\r\n"
         var payload = Data(head.utf8)
         payload.append(body)
         connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
@@ -1047,8 +1489,11 @@ private final class RemoteHTTPSession {
     fileprivate func finish() {
         guard !closed else { return }
         closed = true
+        streaming = false
+        streamTask?.cancel()
         idleTask?.cancel()
         lifetimeTask?.cancel()
+        streamTask = nil
         idleTask = nil
         lifetimeTask = nil
         connection.cancel()

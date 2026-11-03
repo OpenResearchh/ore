@@ -436,7 +436,7 @@ private struct SettingsPanes: View {
                         set: { remote.setEnabled($0) }
                     )
                 )
-                Text("Scan the QR with Safari on iPhone or iPad over Tailscale (or another VPN). Wi-Fi pairing is not offered: a self-signed certificate is trivial to substitute on a café AP, and Safari cannot pin ours. This is a working remote — chats, send, stop, allow/deny — not a second Mac window. Files, terminal, and review stay on this Mac.")
+                Text("Scan the QR with Safari on iPhone or iPad over Tailscale (or another VPN), then Share → Add to Home Screen so ORE stays as an app. The remote is the same workspace: chats, files, diffs, search, and a worktree terminal. The pairing cookie survives that install, and the remote reconnects when you reopen it. Wi-Fi pairing is not offered: a self-signed certificate is trivial to substitute on a café AP, and Safari cannot pin ours.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TailscaleRemoteSetup(status: remote.tailscale)

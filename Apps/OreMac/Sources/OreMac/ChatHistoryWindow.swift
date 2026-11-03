@@ -1,3 +1,6 @@
+import Foundation
+import OreProtocol
+
 /// Long chats open on the newest turns first. Older turns are prepended once
 /// their blocks arrive, so switching to a year-old conversation does not wait
 /// on every tool result before the latest reply is on screen.
@@ -10,6 +13,28 @@ enum ChatHistoryWindow {
             Array(turns.suffix(recentTurnLimit)),
             Array(turns.dropLast(recentTurnLimit))
         )
+    }
+
+    /// Markers belong with the window whose turns they fall in. Putting every
+    /// transition on the older batch (then prepending it) parked recent
+    /// switches above the older turns.
+    static func splitTransitions(
+        _ transitions: [ChatTransition],
+        recentStart: Date?
+    ) -> (recent: [ChatTransition], older: [ChatTransition]) {
+        guard let recentStart else { return (transitions, []) }
+        var recent: [ChatTransition] = []
+        var older: [ChatTransition] = []
+        recent.reserveCapacity(transitions.count)
+        older.reserveCapacity(transitions.count)
+        for transition in transitions {
+            if transition.createdAt >= recentStart {
+                recent.append(transition)
+            } else {
+                older.append(transition)
+            }
+        }
+        return (recent, older)
     }
 }
 

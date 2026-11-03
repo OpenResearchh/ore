@@ -224,7 +224,7 @@ final class AppModel {
     @ObservationIgnored
     private var didWarmWorkspaces = false
     @ObservationIgnored
-    private var historyLoadsInFlight: Set<ChatID> = []
+    private var historyLoadsInFlight: Set<ObjectIdentifier> = []
 
     /// Speaks agent activity aloud for tabs whose speaker toggle is on.
     let narration = NarrationEngine()
@@ -1072,13 +1072,20 @@ final class AppModel {
     /// rows. Doing the conversion here — rather than storing rows — keeps the
     /// database shaped like the domain rather than like this particular view.
     private func loadHistory(for id: ChatID) async {
-        guard historyLoadsInFlight.insert(id).inserted else { return }
-        defer { historyLoadsInFlight.remove(id) }
-        let state = chatStates[id] ?? makeChatState(for: id)
-        guard !state.hasLoadedHistory else { return }
+        let expected = chatStates[id] ?? makeChatState(for: id)
+        guard !expected.hasLoadedHistory else { return }
+        let loadID = ObjectIdentifier(expected)
+        guard historyLoadsInFlight.insert(loadID).inserted else { return }
+        defer { historyLoadsInFlight.remove(loadID) }
         guard let turns = try? await client.transcript(chatID: id) else { return }
         let (recentTurns, olderTurns) = ChatHistoryWindow.split(turns)
         let transitions = (try? await client.chatTransitions(chatID: id)) ?? []
+        let splitMarkers = olderTurns.isEmpty
+            ? (recent: transitions, older: [ChatTransition]())
+            : ChatHistoryWindow.splitTransitions(
+                transitions,
+                recentStart: recentTurns.first?.startedAt
+            )
         // Newest turns first so opening a long chat isn't gated on every
         // historical tool result. Remaining turns are prepended below.
         var recentGrouped: [(turnID: TurnID, blocks: [BlockRecord])] = []
@@ -1091,10 +1098,13 @@ final class AppModel {
                 recentGrouped.map { ($0.turnID, $0.blocks) },
                 uniquingKeysWith: { first, _ in first }
             )
-            return Self.historyRows(turns: recentTurns, blocks: blocks, transitions: olderTurns.isEmpty ? transitions : [])
+            return Self.historyRows(turns: recentTurns, blocks: blocks, transitions: splitMarkers.recent)
         }.value
-        guard let current = chatStates[id] else { return }
-        current.loadHistory(recentRows)
+        // Close+reopen mid-load replaces ChatState. Never paint this fetch
+        // onto the replacement — that dropped the newest turns and left only
+        // whatever the old task prepended next.
+        guard chatStates[id] === expected else { return }
+        expected.loadHistory(recentRows)
 
         guard !olderTurns.isEmpty else { return }
         let grouped = (try? await client.blocks(chatID: id)) ?? []
@@ -1104,10 +1114,10 @@ final class AppModel {
                 grouped.filter { olderIDs.contains($0.turnID) }.map { ($0.turnID, $0.blocks) },
                 uniquingKeysWith: { first, _ in first }
             )
-            return Self.historyRows(turns: olderTurns, blocks: blocks, transitions: transitions)
+            return Self.historyRows(turns: olderTurns, blocks: blocks, transitions: splitMarkers.older)
         }.value
-        guard let latest = chatStates[id] else { return }
-        latest.prependOlderHistory(olderRows)
+        guard chatStates[id] === expected else { return }
+        expected.prependOlderHistory(olderRows)
     }
 
     /// A chat's state only if something already loaded it. For polls and

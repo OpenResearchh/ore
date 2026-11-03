@@ -5,9 +5,10 @@ import Foundation
 import Network
 import OreProtocol
 
-/// A local HTTP surface so an iPhone or iPad can drive this Mac's workspaces
-/// while the lid is closed. Pairing is a QR code of the LAN URL plus a token;
-/// nothing is published off the machine.
+/// A local HTTPS surface so an iPhone or iPad can drive this Mac's workspaces
+/// while the lid is closed. Pairing is a QR code of the URL plus a token;
+/// nothing is published off the machine. Wi-Fi pairing is omitted if TLS
+/// cannot be issued, so the token is never sent in the clear on a café AP.
 @MainActor
 @Observable
 final class RemoteControlServer {
@@ -16,6 +17,8 @@ final class RemoteControlServer {
     static let tokenKey = "ore.remote.token"
 
     private(set) var isRunning = false
+    private(set) var usesTLS = false
+    private(set) var certificateFingerprint: String?
     private(set) var port: UInt16 = 0
     private(set) var lanURL: URL?
     private(set) var endpoints: [RemoteEndpoint] = []
@@ -25,6 +28,7 @@ final class RemoteControlServer {
     private(set) var tokenVersion = 0
 
     private var listener: NWListener?
+    private var sessions: [ObjectIdentifier: RemoteHTTPSession] = [:]
     private var model: AppModel?
     private var presenceExpire: Task<Void, Never>?
     private var endpointRefresh: Task<Void, Never>?
@@ -69,10 +73,12 @@ final class RemoteControlServer {
         guard listener == nil else { return }
         lastError = nil
         do {
-            let parameters = NWParameters.tcp
-            parameters.allowLocalEndpointReuse = true
-            parameters.includePeerToPeer = true
-            let listener = try NWListener(using: parameters, on: .any)
+            let configured = RemoteControlTLS.listenerParameters()
+            usesTLS = configured.usesTLS
+            certificateFingerprint = configured.usesTLS
+                ? RemoteControlTLS.certificateFingerprint()
+                : nil
+            let listener = try NWListener(using: configured.0, on: .any)
             listener.service = NWListener.Service(name: "ORE", type: "_ore-remote._tcp")
             listener.newConnectionHandler = { [weak self] connection in
                 Task { @MainActor in self?.accept(connection) }
@@ -107,7 +113,12 @@ final class RemoteControlServer {
     func stop() {
         listener?.cancel()
         listener = nil
+        let open = Array(sessions.values)
+        sessions.removeAll()
+        for session in open { session.finish() }
         isRunning = false
+        usesTLS = false
+        certificateFingerprint = nil
         port = 0
         lanURL = nil
         endpoints = []
@@ -139,7 +150,10 @@ final class RemoteControlServer {
         endpointRefresh?.cancel()
         endpointRefresh = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, self.isRunning else { return }
+                // `isRunning` is only set once the listener is `.ready`. Poll
+                // while the listener still exists so Tailscale is not missed
+                // during that window.
+                guard let self, self.listener != nil else { return }
                 if self.port == 0 {
                     try? await Task.sleep(for: .milliseconds(250))
                     continue
@@ -155,24 +169,26 @@ final class RemoteControlServer {
 
     private func refreshEndpoints() {
         guard port != 0 else { return }
-        let found = Self.endpoints(port: port, tailscale: tailscale)
+        let found = Self.endpoints(port: port, tailscale: tailscale, encrypted: usesTLS)
         endpoints = found
         lanURL = found.first?.pageURL
     }
 
     private func accept(_ connection: NWConnection) {
+        if sessions.count >= RemoteHTTPLimits.maxSessions {
+            connection.cancel()
+            return
+        }
         connection.start(queue: .main)
-        RemoteHTTPSession(connection: connection, server: self).receive()
+        let session = RemoteHTTPSession(connection: connection, server: self)
+        sessions[ObjectIdentifier(session)] = session
+        clientCount = sessions.count
+        session.receive()
     }
 
-    fileprivate func notePresence() {
-        clientCount = 1
-        presenceExpire?.cancel()
-        presenceExpire = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(20))
-            guard !Task.isCancelled else { return }
-            clientCount = 0
-        }
+    fileprivate func endSession(_ session: RemoteHTTPSession) {
+        sessions.removeValue(forKey: ObjectIdentifier(session))
+        clientCount = sessions.count
     }
 
     fileprivate func isAuthorized(_ token: String?) -> Bool {
@@ -405,17 +421,22 @@ final class RemoteControlServer {
         ]
     }
 
-    private static func endpoints(port: UInt16, tailscale: TailscaleStatus) -> [RemoteEndpoint] {
+    private static func endpoints(
+        port: UInt16,
+        tailscale: TailscaleStatus,
+        encrypted: Bool
+    ) -> [RemoteEndpoint] {
         var found: [RemoteEndpoint] = []
         if case .connected(let ipv4, let magicDNS, _) = tailscale.kind {
             if let magicDNS {
-                found.append(RemoteEndpoint(
-                    kind: .tailscale,
-                    label: "Tailscale",
-                    host: magicDNS,
-                    port: port,
-                    detail: "Away from home — iPad also needs Tailscale, same account"
-                ))
+            found.append(RemoteEndpoint(
+                kind: .tailscale,
+                label: "Tailscale",
+                host: magicDNS,
+                port: port,
+                encrypted: encrypted,
+                detail: "Away from home — iPad also needs Tailscale, same account"
+            ))
             }
             if !found.contains(where: { $0.host == ipv4 }) {
                 found.append(RemoteEndpoint(
@@ -423,6 +444,7 @@ final class RemoteControlServer {
                     label: magicDNS == nil ? "Tailscale" : "Tailscale IP",
                     host: ipv4,
                     port: port,
+                    encrypted: encrypted,
                     detail: magicDNS == nil
                         ? "Away from home — iPad also needs Tailscale, same account"
                         : nil
@@ -466,11 +488,16 @@ final class RemoteControlServer {
                 kind = .other
                 label = name
             }
+            // Wi-Fi pairing with a self-signed cert is first-use MITM: Safari
+            // will offer to continue on an attacker's certificate. Tailscale
+            // and VPN already encrypt the path, so those stay.
+            if kind == .wifi || kind == .other { continue }
             found.append(RemoteEndpoint(
                 kind: kind,
                 label: label,
                 host: ip,
                 port: port,
+                encrypted: encrypted,
                 detail: kind == .wifi ? "Same network as this Mac" : nil
             ))
         }
@@ -506,10 +533,15 @@ struct RemoteEndpoint: Identifiable, Equatable {
     var label: String
     var host: String
     var port: UInt16
+    var encrypted: Bool
     var detail: String?
     var id: String { host }
 
-    var pageURL: URL { URL(string: "http://\(host):\(port)/")! }
+    var pageURL: URL {
+        let host = self.host.contains(":") ? "[\(self.host)]" : self.host
+        let scheme = encrypted ? "https" : "http"
+        return URL(string: "\(scheme)://\(host):\(port)/")!
+    }
 
     func pairingURL(token: String) -> URL {
         URL(string: pageURL.absoluteString + "#" + token)!
@@ -528,6 +560,10 @@ private final class RemoteHTTPSession {
     private var path = "/"
     private var query: [String: String] = [:]
     private var headerToken: String?
+    private var closed = false
+    private var didRespond = false
+    private var idleTask: Task<Void, Never>?
+    private var lifetimeTask: Task<Void, Never>?
 
     init(connection: NWConnection, server: RemoteControlServer) {
         self.connection = connection
@@ -535,37 +571,86 @@ private final class RemoteHTTPSession {
     }
 
     func receive() {
+        armLifetime()
+        armIdle()
+        read()
+    }
+
+    private func read() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             Task { @MainActor in
                 guard let self else { return }
-                if let data, !data.isEmpty { self.buffer.append(data) }
+                if let data, !data.isEmpty {
+                    self.buffer.append(data)
+                    self.armIdle()
+                }
                 self.consume()
                 if isComplete || error != nil {
                     self.finish()
                 } else if self.connection.state == .ready {
-                    self.receive()
+                    self.read()
                 }
             }
         }
     }
 
+    private func armIdle() {
+        idleTask?.cancel()
+        idleTask = Task { @MainActor in
+            try? await Task.sleep(for: RemoteHTTPLimits.idleTimeout)
+            guard !Task.isCancelled else { return }
+            self.finish()
+        }
+    }
+
+    private func armLifetime() {
+        guard lifetimeTask == nil else { return }
+        lifetimeTask = Task { @MainActor in
+            try? await Task.sleep(for: RemoteHTTPLimits.maxLifetime)
+            guard !Task.isCancelled else { return }
+            self.finish()
+        }
+    }
+
     private func consume() {
+        guard !closed, !didRespond else { return }
         if !sawHeaders {
+            if RemoteHTTPLimits.headersTooLarge(buffer) {
+                respond(status: 413, type: "text/plain", body: Data("payload too large\n".utf8))
+                return
+            }
             guard let range = buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
             let headerData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
             buffer.removeSubrange(buffer.startIndex..<range.upperBound)
-            parseHeaders(String(decoding: headerData, as: UTF8.self))
+            if parseHeaders(String(decoding: headerData, as: UTF8.self)) == false {
+                respond(status: 400, type: "text/plain", body: Data("bad request\n".utf8))
+                return
+            }
             sawHeaders = true
         }
+        if buffer.count > RemoteHTTPLimits.maxBodyBytes {
+            respond(status: 413, type: "text/plain", body: Data("payload too large\n".utf8))
+            return
+        }
         guard sawHeaders, buffer.count >= expectedBody else { return }
-        let body = buffer.prefix(expectedBody)
+        let body = Data(buffer.prefix(expectedBody))
         buffer.removeSubrange(buffer.startIndex..<buffer.index(buffer.startIndex, offsetBy: expectedBody))
-        respond(body: Data(body))
+        respond(body: body)
     }
 
-    private func parseHeaders(_ text: String) {
+    /// Returns false when the request must be rejected before reading a body.
+    @discardableResult
+    private func parseHeaders(_ text: String) -> Bool {
+        switch RemoteHTTPLimits.contentLength(from: text) {
+        case .missing:
+            expectedBody = 0
+        case .valid(let length):
+            expectedBody = length
+        case .invalid:
+            return false
+        }
         let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let request = lines.first else { return }
+        guard let request = lines.first else { return true }
         let parts = request.split(separator: " ")
         if parts.count >= 2 {
             method = String(parts[0])
@@ -581,9 +666,6 @@ private final class RemoteHTTPSession {
         }
         for line in lines.dropFirst() {
             let lower = line.lowercased()
-            if lower.hasPrefix("content-length:") {
-                expectedBody = Int(line.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) ?? 0
-            }
             if lower.hasPrefix("x-ore-token:") {
                 headerToken = line.split(separator: ":", maxSplits: 1)[1]
                     .trimmingCharacters(in: .whitespaces)
@@ -596,6 +678,7 @@ private final class RemoteHTTPSession {
                 }
             }
         }
+        return true
     }
 
     private func respond(body: Data) {
@@ -607,26 +690,39 @@ private final class RemoteHTTPSession {
         } else if !authorized {
             result = (401, "text/plain", Data("unauthorized\n".utf8))
         } else {
-            server?.notePresence()
             result = server?.handleAuthorized(path: path, query: query, body: body)
                 ?? (503, "text/plain", Data())
         }
-        let statusText = result.0 == 200 ? "OK" : result.0 == 204 ? "No Content"
-            : result.0 == 401 ? "Unauthorized" : "Error"
-        var head = "HTTP/1.1 \(result.0) \(statusText)\r\n"
-        head += "Content-Type: \(result.1)\r\n"
-        head += "Content-Length: \(result.2.count)\r\n"
+        respond(status: result.0, type: result.1, body: result.2)
+    }
+
+    private func respond(status: Int, type: String, body: Data) {
+        guard !closed, !didRespond else { return }
+        didRespond = true
+        let statusText = status == 200 ? "OK" : status == 204 ? "No Content"
+            : status == 400 ? "Bad Request"
+            : status == 401 ? "Unauthorized"
+            : status == 413 ? "Payload Too Large" : "Error"
+        var head = "HTTP/1.1 \(status) \(statusText)\r\n"
+        head += "Content-Type: \(type)\r\n"
+        head += "Content-Length: \(body.count)\r\n"
         head += "Connection: close\r\n"
         head += "Access-Control-Allow-Origin: *\r\n\r\n"
         var payload = Data(head.utf8)
-        payload.append(result.2)
+        payload.append(body)
         connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
-            self?.connection.cancel()
             Task { @MainActor in self?.finish() }
         })
     }
 
-    private func finish() {
+    fileprivate func finish() {
+        guard !closed else { return }
+        closed = true
+        idleTask?.cancel()
+        lifetimeTask?.cancel()
+        idleTask = nil
+        lifetimeTask = nil
         connection.cancel()
+        server?.endSession(self)
     }
 }

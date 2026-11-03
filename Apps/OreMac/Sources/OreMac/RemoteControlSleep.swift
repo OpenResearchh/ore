@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import IOKit.ps
 import IOKit.pwr_mgt
@@ -15,6 +16,9 @@ enum RemoteControlSleep {
 
     private static var assertionIDs: [IOPMAssertionID] = []
     private static var activity: NSObjectProtocol?
+    private static var isEnabled = false
+    private static var powerSource: CFRunLoopSource?
+    private static var wakeObserver: NSObjectProtocol?
 
     static var isOnACPower: Bool {
         DreamEnvironmentMonitor.isOnACPower()
@@ -23,7 +27,53 @@ enum RemoteControlSleep {
     /// While remote control is on, hold system-sleep so a closed lid still
     /// answers the LAN. Client count is only for the Settings badge.
     static func update(enabled: Bool) {
-        if enabled && allowsAssertion { take() } else { release() }
+        isEnabled = enabled
+        if enabled {
+            watchPower()
+        } else {
+            unwatchPower()
+        }
+        apply()
+    }
+
+    /// Plug/unplug must re-evaluate the assertion; start() used to snapshot
+    /// AC once and never look again.
+    fileprivate static func apply() {
+        if isEnabled && allowsAssertion { take() } else { release() }
+    }
+
+    private static let powerCallback: IOPowerSourceCallbackType = { _ in
+        DispatchQueue.main.async {
+            Task { @MainActor in RemoteControlSleep.apply() }
+        }
+    }
+
+    private static func watchPower() {
+        if powerSource == nil,
+           let source = IOPSNotificationCreateRunLoopSource(powerCallback, nil)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            powerSource = source
+        }
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { RemoteControlSleep.apply() }
+            }
+        }
+    }
+
+    private static func unwatchPower() {
+        if let source = powerSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            powerSource = nil
+        }
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
     }
 
     private static var allowsAssertion: Bool {

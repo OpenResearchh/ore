@@ -436,7 +436,7 @@ private struct SettingsPanes: View {
                         set: { remote.setEnabled($0) }
                     )
                 )
-                Text("Scan the QR with Safari on iPhone or iPad. This is a working remote — chats, send, stop, allow/deny — not a second Mac window. Files, terminal, and review stay on this Mac.")
+                Text("Scan the QR with Safari on iPhone or iPad over Tailscale (or another VPN). Wi-Fi pairing is not offered: a self-signed certificate is trivial to substitute on a café AP, and Safari cannot pin ours. This is a working remote — chats, send, stop, allow/deny — not a second Mac window. Files, terminal, and review stay on this Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TailscaleRemoteSetup(status: remote.tailscale)
@@ -463,6 +463,17 @@ private struct SettingsPanes: View {
                                 .textSelection(.enabled)
                                 .foregroundStyle(.secondary)
                         }
+                    }
+                    if let fingerprint = remote.certificateFingerprint {
+                        Text("Certificate SHA-256  \(fingerprint)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !remote.usesTLS {
+                        Text("Could not issue a local certificate. Pair only over Tailscale or another VPN so the token and transcripts are not sent in the clear.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     Text(remote.clientCount == 0
                          ? "Waiting for a device."

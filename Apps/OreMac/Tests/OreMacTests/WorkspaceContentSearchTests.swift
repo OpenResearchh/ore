@@ -12,6 +12,15 @@ struct WorkspaceContentSearchTests {
         #expect(hit?.text == "let x = 1")
     }
 
+    @Test func parseLineStripsDotSlashPrefixes() {
+        let hit = WorkspaceContentSearch.parseLine("./note.md:1:Hello UniqueTokenXYZ")
+        #expect(hit?.path == "note.md")
+        #expect(hit?.line == 1)
+        #expect(hit?.text == "Hello UniqueTokenXYZ")
+        let nested = WorkspaceContentSearch.parseLine("././src/App.swift:3:x")
+        #expect(nested?.path == "src/App.swift")
+    }
+
     @Test func parseLineRejectsAbsolutePathsAndJunk() {
         #expect(WorkspaceContentSearch.parseLine("/tmp/secret.swift:1:nope") == nil)
         #expect(WorkspaceContentSearch.parseLine("") == nil)
@@ -41,6 +50,34 @@ struct ChatHistoryWindowTests {
         let short = ChatHistoryWindow.split([1, 2, 3])
         #expect(short.recent == [1, 2, 3])
         #expect(short.older.isEmpty)
+    }
+
+    @Test func transitionsStayWithTheWindowTheyOccurredIn() {
+        let chat = ChatID(rawValue: "c1")
+        let olderMark = ChatTransition(
+            id: "old",
+            chatID: chat,
+            kind: .modelChanged,
+            createdAt: Date(timeIntervalSince1970: 100)
+        )
+        let recentMark = ChatTransition(
+            id: "new",
+            chatID: chat,
+            kind: .harnessChanged,
+            createdAt: Date(timeIntervalSince1970: 300)
+        )
+        let parts = ChatHistoryWindow.splitTransitions(
+            [olderMark, recentMark],
+            recentStart: Date(timeIntervalSince1970: 200)
+        )
+        #expect(parts.older.map(\.id) == ["old"])
+        #expect(parts.recent.map(\.id) == ["new"])
+        let allRecent = ChatHistoryWindow.splitTransitions(
+            [olderMark, recentMark],
+            recentStart: nil
+        )
+        #expect(allRecent.older.isEmpty)
+        #expect(allRecent.recent.map(\.id) == ["old", "new"])
     }
 
     @Test func outlineTitlesComeFromUserPrompts() {
@@ -82,8 +119,48 @@ struct ShellSnippetTests {
     }
 
     @Test func runURLRoundTripsThroughTranscriptLink() {
-        let url = ShellSnippet.runURL(command: "ls")
+        let url = ShellSnippet.runURL(command: "ls", worktree: "/tmp/tree")
         #expect(url.scheme == "ore-run")
-        #expect(MarkdownRenderer.TranscriptLink.parse(url) == .runSnippet(ShellSnippet.id(for: "ls")))
+        #expect(
+            MarkdownRenderer.TranscriptLink.parse(url)
+                == .runSnippet(ShellSnippet.id(for: "ls", worktree: "/tmp/tree"))
+        )
+    }
+
+    @Test func snippetIDsAreScopedToTheWorktree() {
+        #expect(
+            ShellSnippet.id(for: "ls", worktree: "/tmp/a")
+                != ShellSnippet.id(for: "ls", worktree: "/tmp/b")
+        )
+    }
+
+    @Test func executeDrainsLargeStdoutWithoutStalling() {
+        let result = ShellSnippet.execute(
+            "for i in {1..8000}; do echo 0123456789abcdefghij; done",
+            worktree: "/tmp"
+        )
+        #expect(result.status == .succeeded)
+        #expect(result.output.contains("truncated") || result.output.count > 1_000)
+    }
+}
+
+struct RemoteHTTPLimitsTests {
+    @Test func contentLengthRejectsNegativeAndOversizedValues() {
+        #expect(RemoteHTTPLimits.contentLength(from: "GET / HTTP/1.1") == .missing)
+        #expect(RemoteHTTPLimits.contentLength(from: "Content-Length: 12") == .valid(12))
+        #expect(RemoteHTTPLimits.contentLength(from: "Content-Length: -1") == .invalid)
+        #expect(RemoteHTTPLimits.contentLength(from: "content-length: 999999999") == .invalid)
+        #expect(RemoteHTTPLimits.contentLength(from: "Content-Length: abc") == .invalid)
+    }
+
+    @Test func aLargeBodyInTheFirstPacketIsNotAnOversizedHeader() {
+        var packet = Data("POST /api/send HTTP/1.1\r\nContent-Length: 40000\r\n\r\n".utf8)
+        packet.append(Data(repeating: 0x61, count: 40_000))
+        #expect(!RemoteHTTPLimits.headersTooLarge(packet))
+        #expect(RemoteHTTPLimits.contentLength(from: "Content-Length: 40000") == .valid(40_000))
+        var headers = Data(repeating: 0x41, count: RemoteHTTPLimits.maxHeaderBytes + 1)
+        headers.append(Data("\r\n\r\n".utf8))
+        #expect(RemoteHTTPLimits.headersTooLarge(headers))
+        #expect(RemoteHTTPLimits.headersTooLarge(Data(repeating: 0x41, count: RemoteHTTPLimits.maxHeaderBytes + 1)))
     }
 }

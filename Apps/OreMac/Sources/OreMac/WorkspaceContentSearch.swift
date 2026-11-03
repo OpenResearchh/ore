@@ -26,7 +26,8 @@ enum WorkspaceContentSearch: Sendable {
         guard !line.isEmpty else { return nil }
         let parts = line.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
         guard parts.count >= 3, let number = Int(parts[1]), number > 0 else { return nil }
-        let path = String(parts[0])
+        var path = String(parts[0])
+        while path.hasPrefix("./") { path.removeFirst(2) }
         guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
         return WorkspaceContentHit(
             path: path,

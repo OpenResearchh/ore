@@ -60,15 +60,18 @@ struct MarkdownRenderer {
     var baseFont: NSFont
     var textColor: NSColor
     var highlighter: SyntaxHighlighter?
+    var worktreePath: String
 
     init(
         baseFont: NSFont = .systemFont(ofSize: 13),
         textColor: NSColor = .labelColor,
-        highlighter: SyntaxHighlighter? = nil
+        highlighter: SyntaxHighlighter? = nil,
+        worktreePath: String = ""
     ) {
         self.baseFont = baseFont
         self.textColor = textColor
         self.highlighter = highlighter
+        self.worktreePath = worktreePath
     }
 
     func render(
@@ -94,7 +97,8 @@ struct MarkdownRenderer {
             textColor: textColor,
             highlighter: highlighter,
             fenceCount: fenceCount,
-            skipCachingLastFence: highlighting == .stablePrefix
+            skipCachingLastFence: highlighting == .stablePrefix,
+            worktreePath: worktreePath
         )
         let result = NSMutableAttributedString(attributedString: visitor.visit(document))
         // Claim bare URLs first so the file-reference pass can't chew into a
@@ -709,6 +713,7 @@ struct MarkdownRenderer {
         let highlighter: SyntaxHighlighter?
         let fenceCount: Int
         let skipCachingLastFence: Bool
+        let worktreePath: String
         /// Nesting depth for list items, so a nested bullet indents.
         var listDepth = 0
         var visitedFences = 0
@@ -962,7 +967,7 @@ struct MarkdownRenderer {
         }
 
         private func runControl(for command: String, font: NSFont) -> NSAttributedString {
-            let id = ShellSnippet.id(for: command)
+            let id = ShellSnippet.id(for: command, worktree: worktreePath)
             let label: String
             switch SnippetRunCache.result(id: id)?.status {
             case .running: label = "Running…"
@@ -976,7 +981,7 @@ struct MarkdownRenderer {
                     .font: NSFont.systemFont(ofSize: font.pointSize, weight: .semibold),
                     .foregroundColor: NSColor.oreInlineChipText,
                     .backgroundColor: NSColor.oreInlineChipFill,
-                    .link: ShellSnippet.runURL(command: command),
+                    .link: ShellSnippet.runURL(command: command, worktree: worktreePath),
                     .underlineStyle: 0,
                 ]
             )
@@ -985,7 +990,7 @@ struct MarkdownRenderer {
         }
 
         private func snippetOutput(for command: String, font: NSFont) -> NSAttributedString {
-            let id = ShellSnippet.id(for: command)
+            let id = ShellSnippet.id(for: command, worktree: worktreePath)
             guard let result = SnippetRunCache.result(id: id), result.status != .running else {
                 return NSAttributedString()
             }

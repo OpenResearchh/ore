@@ -2606,10 +2606,14 @@ final class TranscriptCell: NSTableCellView {
     /// renders streaming text the same way), so cutting mid-document is safe.
     /// Cached per (row id, text length, appearance) — collapsed rows are
     /// complete, so the text cannot change under the cache.
-    static func collapsedAttributedText(for row: TranscriptRow) -> NSAttributedString {
+    static func collapsedAttributedText(
+        for row: TranscriptRow,
+        worktreePath: String = ""
+    ) -> NSAttributedString {
         var hasher = Hasher()
         hasher.combine(currentAppearance.name.rawValue)
         hasher.combine(row.text.utf8.count)
+        hasher.combine(worktreePath)
         let signature = hasher.finalize()
         if let cached = collapsedRenderCache.value(forID: row.id, signature: signature) {
             return cached
@@ -2617,7 +2621,8 @@ final class TranscriptCell: NSTableCellView {
         let rendered = MarkdownRenderer(
             baseFont: .systemFont(ofSize: OreTheme.Font.prose),
             textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
+            highlighter: SyntaxHighlighter.shared,
+            worktreePath: worktreePath
         ).render(truncatedMarkdown(row.text), highlighting: .all)
         collapsedRenderCache.store(rendered, id: row.id, turnID: row.turnID, signature: signature)
         return rendered
@@ -2826,7 +2831,7 @@ final class TranscriptCell: NSTableCellView {
         turnHarness: HarnessKind? = nil
     ) -> NSAttributedString {
         let base = responseCollapse == .collapsed
-            ? collapsedAttributedText(for: row)
+            ? collapsedAttributedText(for: row, worktreePath: worktreePath)
             : attributedText(for: row, worktreePath: worktreePath)
         guard row.kind == .activityGroup, badgeText(for: row).isEmpty,
               let turnHeader, !turnHeader.isEmpty
@@ -2974,7 +2979,7 @@ final class TranscriptCell: NSTableCellView {
 
     static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let appearance = currentAppearance.name.rawValue
-        let signature = renderSignature(for: row, appearance: appearance)
+        let signature = renderSignature(for: row, appearance: appearance, worktreePath: worktreePath)
         if let cached = renderCache.value(forID: row.id, signature: signature) { return cached }
 
         let rendered: NSAttributedString
@@ -2988,7 +2993,8 @@ final class TranscriptCell: NSTableCellView {
             let renderer = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             )
             if row.isComplete {
                 rendered = renderer.render(row.text, highlighting: .all)
@@ -3024,7 +3030,8 @@ final class TranscriptCell: NSTableCellView {
             rendered = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             ).render(source, highlighting: row.isComplete ? .all : .stablePrefix)
 
         case .toolCall, .thinking, .error:
@@ -3080,9 +3087,14 @@ final class TranscriptCell: NSTableCellView {
     /// rows built elsewhere (history, tests) that reuse an id at revision zero.
     /// Rendered rows bake in resolved colours and rasterised chips, so the
     /// appearance is part of the identity too.
-    static func renderSignature(for row: TranscriptRow, appearance: String) -> Int {
+    static func renderSignature(
+        for row: TranscriptRow,
+        appearance: String,
+        worktreePath: String = ""
+    ) -> Int {
         var hasher = Hasher()
         hasher.combine(appearance)
+        hasher.combine(worktreePath)
         hasher.combine(row.kind)
         hasher.combine(row.contentRevision)
         hasher.combine(row.activitySignature)

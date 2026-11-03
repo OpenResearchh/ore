@@ -15,14 +15,15 @@ enum ShellSnippet {
         return languages.contains(language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
-    static func id(for command: String) -> String {
+    static func id(for command: String, worktree: String = "") -> String {
         var hasher = Hasher()
         hasher.combine(command)
+        hasher.combine(worktree)
         return String(UInt64(bitPattern: Int64(hasher.finalize())), radix: 16)
     }
 
-    static func runURL(command: String) -> URL {
-        let identifier = id(for: command)
+    static func runURL(command: String, worktree: String = "") -> URL {
+        let identifier = id(for: command, worktree: worktree)
         SnippetRunCache.register(command, id: identifier)
         var components = URLComponents()
         components.scheme = "ore-run"
@@ -46,16 +47,24 @@ enum ShellSnippet {
             return SnippetRunResult(status: .failed, output: error.localizedDescription, exitCode: -1)
         }
 
+        // Drain stdout while the process runs. Waiting first lets a chatty
+        // command fill the pipe and deadlock.
+        let collected = PipeDrain()
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global(qos: .utility).async {
+            collected.data = pipe.fileHandleForReading.readDataToEndOfFile()
+            drained.leave()
+        }
+
         let deadline = DispatchTime.now() + .seconds(60)
-        let timedOut = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) {
             if process.isRunning { process.terminate() }
-            timedOut.signal()
         }
         process.waitUntilExit()
-        timedOut.signal()
+        _ = drained.wait(timeout: .now() + .seconds(2))
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = collected.data
         var text = String(decoding: data, as: UTF8.self)
         if text.utf8.count > 32_768 {
             text = String(decoding: text.utf8.prefix(32_768), as: UTF8.self) + "\n… truncated"
@@ -70,6 +79,10 @@ enum ShellSnippet {
             exitCode: process.terminationStatus
         )
     }
+}
+
+private final class PipeDrain: @unchecked Sendable {
+    var data = Data()
 }
 
 struct SnippetRunResult: Sendable, Equatable {

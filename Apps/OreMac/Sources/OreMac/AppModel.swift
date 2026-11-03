@@ -2225,6 +2225,17 @@ final class AppModel {
         }
     }
 
+    /// Closes whichever coding tab owns the centre column: a source/diff tab
+    /// first, otherwise the active agent conversation. All keyboard and menu
+    /// surfaces use this so ⌘W never develops subtly different meanings.
+    func requestCloseActiveCodingTab(in workspaceID: WorkspaceID) {
+        if let path = activeFilePath[workspaceID] {
+            closeDiffFile(path, in: workspaceID)
+        } else if let chat = activeChat(for: workspaceID) {
+            requestCloseChat(chat.id, in: workspaceID, title: chat.title)
+        }
+    }
+
     func renameChat(
         _ chatID: ChatID,
         in workspaceID: WorkspaceID,
@@ -3744,17 +3755,62 @@ final class AppModel {
         try await GitHubClient(repositoryURL: OreHome.directory).authenticate()
     }
 
-    /// Opens Terminal with the vendor installer. ORE does not pipe `curl | bash`
-    /// itself — that is the user's decision, in a shell they can read first.
+    /// Runs setup in ORE's workspace terminal when a workspace exists. The
+    /// no-workspace onboarding screen is the only fallback to Terminal.app:
+    /// there is no worktree (and therefore no in-app PTY) to attach it to yet.
+    func runCommandInTerminal(
+        _ command: String,
+        title: String,
+        runsImmediately: Bool = true,
+        onCompletion: ((Int32) -> Void)? = nil
+    ) {
+        guard let workspace = selectedWorkspace else {
+            ExternalTools.copyAndRunInTerminal(command)
+            return
+        }
+
+        NotificationCenter.default.post(name: .oreShowWorkspaceTerminal, object: nil)
+        let operationID = onCompletion == nil ? nil : UUID()
+        TerminalRegistry.shared.prepare(
+            command,
+            in: workspace.id,
+            workingDirectory: workspace.worktreePath,
+            title: title,
+            runsImmediately: runsImmediately,
+            operationID: operationID,
+            onCompletion: onCompletion
+        )
+    }
+
+    /// Opens the vendor installer in a terminal the user can see. A successful
+    /// tracked run re-probes immediately, so install cards resolve without a
+    /// manual refresh or an app-focus round trip.
     func installHarness(_ kind: HarnessKind) {
-        ExternalTools.copyAndRunInTerminal(HarnessSetup.installCommand(for: kind))
+        runCommandInTerminal(
+            HarnessSetup.installCommand(for: kind),
+            title: "Install \(kind.displayName)"
+        ) { [weak self] exitCode in
+            guard exitCode == 0, let self else { return }
+            ShellEnvironment.invalidateCache()
+            Task { await self.client.send(.probeHarnesses) }
+        }
     }
 
     /// Install `gh` when Homebrew is on PATH; otherwise open the download page
     /// and still copy the brew command for later.
     func installGitHubCLI() {
         if ShellEnvironment.locate("brew") != nil {
-            ExternalTools.copyAndRunInTerminal(GitHubCLISetup.installCommand)
+            runCommandInTerminal(
+                GitHubCLISetup.installCommand,
+                title: "Install GitHub CLI"
+            ) { exitCode in
+                guard exitCode == 0 else { return }
+                ShellEnvironment.invalidateCache()
+                NotificationCenter.default.post(
+                    name: .oreSetupTerminalCommandCompleted,
+                    object: nil
+                )
+            }
             return
         }
         ExternalTools.copyPath(GitHubCLISetup.installCommand)
@@ -3807,7 +3863,10 @@ final class AppModel {
         } else {
             command = HarnessSetup.signInCommand(for: kind)
         }
-        ExternalTools.copyAndRunInTerminal(command)
+        runCommandInTerminal(command, title: "Sign in to \(kind.displayName)") { [weak self] exitCode in
+            guard exitCode == 0, let self else { return }
+            Task { await self.client.send(.probeHarnesses) }
+        }
     }
 
     /// Clones into ORE's repository library using owner/name folders, which
@@ -3926,12 +3985,29 @@ final class AppModel {
     }
 
     struct HarnessCLIUpdate: Equatable {
+        enum TerminalRepairState: Equatable {
+            case waiting(UUID)
+            case verifying(UUID)
+            case succeeded
+
+            var operationID: UUID? {
+                switch self {
+                case .waiting(let id), .verifying(let id): id
+                case .succeeded: nil
+                }
+            }
+        }
+
         var kind: HarnessKind
         var isRunning: Bool
         var error: String?
         /// Filled in for a failure the user can actually fix — a root-owned
         /// install — with commands matching how that CLI was installed.
         var repair: HarnessRepair?
+        /// Set the instant the repair is handed to ORE's terminal. The repair
+        /// controls disappear while this is non-nil, preventing duplicate
+        /// tabs and repeated privileged commands from one impatient click.
+        var terminalRepairState: TerminalRepairState? = nil
     }
     private(set) var harnessCLIUpdate: HarnessCLIUpdate?
 
@@ -3950,6 +4026,72 @@ final class AppModel {
     /// launched with; the next one they start picks up the new version.
     func updateHarnessCLI(_ kind: HarnessKind) {
         Task { _ = await runHarnessCLIUpdate(kind) }
+    }
+
+    func beginHarnessTerminalRepair(_ kind: HarnessKind, operationID: UUID) {
+        guard harnessCLIUpdate?.kind == kind, harnessCLIUpdate?.repair != nil else { return }
+        harnessCLIUpdate?.terminalRepairState = .waiting(operationID)
+    }
+
+    /// Resolves a repair launched in the persistent in-app shell. A zero shell
+    /// status is necessary but not sufficient: self-updaters can exit zero
+    /// while leaving the old binary in place, so ORE re-probes PATH and checks
+    /// the installed version against the version the card promised.
+    func completeHarnessTerminalRepair(
+        _ kind: HarnessKind,
+        operationID: UUID,
+        exitCode: Int32
+    ) {
+        Task { await resolveHarnessTerminalRepair(kind, operationID: operationID, exitCode: exitCode) }
+    }
+
+    private func resolveHarnessTerminalRepair(
+        _ kind: HarnessKind,
+        operationID: UUID,
+        exitCode: Int32
+    ) async {
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState?.operationID == operationID
+        else { return }
+
+        guard exitCode == 0 else {
+            harnessCLIUpdate?.terminalRepairState = nil
+            harnessCLIUpdate?.error = exitCode == -1
+                ? "The terminal was closed before the repair finished."
+                : "The terminal repair exited with status \(exitCode)."
+            return
+        }
+
+        harnessCLIUpdate?.terminalRepairState = .verifying(operationID)
+        let target = harnessUpdate(for: kind)?.latestVersion
+        await client.send(.probeHarnesses)
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState?.operationID == operationID
+        else { return }
+
+        let installed = await client.harnessProbeResult(kind)?.version
+        let reachedTarget: Bool
+        if let installed, let target {
+            reachedTarget = installed == target || HarnessVersion.isNewer(installed, than: target)
+        } else {
+            reachedTarget = false
+        }
+
+        guard reachedTarget else {
+            harnessCLIUpdate?.terminalRepairState = nil
+            let version = installed.map { " It is still reporting \($0)." } ?? ""
+            harnessCLIUpdate?.error = "The terminal command finished, but the update was not detected."
+                + version
+            return
+        }
+
+        harnessCLIUpdate?.terminalRepairState = .succeeded
+        try? await Task.sleep(for: .milliseconds(900))
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState == .succeeded
+        else { return }
+        await client.send(.checkHarnessUpdates(force: true))
+        harnessCLIUpdate = nil
     }
 
     /// Why an upgrade that exited zero did not actually change anything.

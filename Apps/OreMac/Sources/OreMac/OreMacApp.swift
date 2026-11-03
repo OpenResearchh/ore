@@ -342,13 +342,25 @@ struct OreMacApp: App {
 
                 MuteAssistantCommand().environment(model)
 
-                Button("Command Palette") { isShowingPalette = true }
+                Button("Command Palette") {
+                    isShowingFilePalette = false
+                    isShowingShortcuts = false
+                    isShowingPalette = true
+                }
                     .keyboardShortcut("k", modifiers: .command)
 
-                Button("Open File…") { isShowingFilePalette = true }
+                Button("Open File…") {
+                    isShowingPalette = false
+                    isShowingShortcuts = false
+                    isShowingFilePalette = true
+                }
                     .keyboardShortcut("p", modifiers: .command)
 
-                Button("Keyboard Shortcuts") { isShowingShortcuts = true }
+                Button("Keyboard Shortcuts") {
+                    isShowingPalette = false
+                    isShowingFilePalette = false
+                    isShowingShortcuts = true
+                }
                     .keyboardShortcut("/", modifiers: .command)
 
                 Divider()
@@ -374,10 +386,8 @@ struct OreMacApp: App {
                     guard let workspaceID = model.selectedWorkspaceID else { return }
                     if TerminalRegistry.shared.isTerminalFirstResponder() {
                         TerminalRegistry.shared.closeActiveTab(for: workspaceID)
-                    } else if let path = model.activeFilePath[workspaceID] {
-                        model.closeDiffFile(path, in: workspaceID)
-                    } else if let chat = model.activeChat(for: workspaceID) {
-                        model.requestCloseChat(chat.id, in: workspaceID, title: chat.title)
+                    } else {
+                        model.requestCloseActiveCodingTab(in: workspaceID)
                     }
                 }
                 .keyboardShortcut("w", modifiers: .command)
@@ -404,6 +414,36 @@ struct OreMacApp: App {
                     if let id = model.selectedWorkspaceID { model.cycleChat(in: id, offset: 1) }
                 }
                 .keyboardShortcut("]", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button(chrome.showsTerminal ? "Hide Terminal" : "Show Terminal") {
+                    chrome.showsTerminal.toggle()
+                }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+                .disabled(model.selectedWorkspaceID == nil)
+
+                Button("New Terminal Tab") {
+                    guard let workspace = model.selectedWorkspace else { return }
+                    TerminalRegistry.shared.addTab(
+                        for: workspace.id,
+                        workingDirectory: workspace.worktreePath
+                    )
+                    chrome.showsTerminal = true
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option])
+                .disabled(model.selectedWorkspaceID == nil)
+
+                Button("Close Terminal Tab") {
+                    guard let workspace = model.selectedWorkspace,
+                          let tabID = TerminalRegistry.shared.activeTab(for: workspace.id)
+                    else { return }
+                    let wasLast = (TerminalRegistry.shared.tabs[workspace.id]?.count ?? 0) <= 1
+                    TerminalRegistry.shared.closeTab(tabID, for: workspace.id)
+                    if wasLast { chrome.showsTerminal = false }
+                }
+                .keyboardShortcut("w", modifiers: [.command, .control])
+                .disabled(model.selectedWorkspaceID == nil)
 
                 Divider()
 
@@ -755,23 +795,27 @@ struct RootView: View {
                 }
             }
         }
+        .overlay { keyboardOverlay }
         .animation(.easeOut(duration: 0.25), value: model.launchBriefing == nil)
+        .onReceive(NotificationCenter.default.publisher(for: .oreShowWorkspaceTerminal)) { _ in
+            bottomPane = .terminal
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .oreShowKeyboardShortcuts)) { _ in
+            dismissKeyboardOverlay()
+            // A command can originate inside ⌘K, whose selection handler
+            // dismisses itself immediately after running. Present on the next
+            // main-actor turn so that dismissal cannot swallow the new panel.
+            Task { @MainActor in
+                await Task.yield()
+                isShowingShortcuts = true
+            }
+        }
         .onChange(of: model.pendingDreamsOpen) { _, wanted in
             guard wanted else { return }
             openWindow(id: "dreams")
             model.consumePendingDreamsOpen()
         }
         .sheet(isPresented: $isShowingNewWorkspace) { NewWorkspaceSheet() }
-        .sheet(isPresented: $isShowingPalette) { CommandPalette() }
-        .sheet(isPresented: $isShowingFilePalette) {
-            if let workspace = model.selectedWorkspace {
-                FilePalette(
-                    workspace: workspace,
-                    initialQuery: ChromeLayoutStore.shared.pendingFileQuery ?? ""
-                )
-            }
-        }
-        .sheet(isPresented: $isShowingShortcuts) { KeyboardShortcutsView() }
         .modifier(ScriptApprovalDialog())
         .modifier(ProjectDeleteDialog())
         .confirmationDialog(
@@ -852,10 +896,53 @@ struct RootView: View {
                     )
                     .symbolVariant(chrome.showsReview ? .fill : .none)
                 }
-                .help(chrome.showsReview ? "Hide the review pane" : "Show the review pane")
+                .help(chrome.showsReview
+                    ? "Hide the review pane (⌥⌘B)"
+                    : "Show the review pane (⌥⌘B)")
                 .keyboardShortcut("r", modifiers: [.command, .option])
             }
         }
+    }
+
+    /// Command surfaces belong to the workspace window, not an attached sheet.
+    /// Keeping them in this hierarchy gives Liquid Glass real pixels to sample
+    /// and avoids the heavy, document-modal sheet silhouette.
+    @ViewBuilder
+    private var keyboardOverlay: some View {
+        if isShowingPalette || isShowingFilePalette || isShowingShortcuts {
+            ZStack {
+                Color.black.opacity(0.12)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { dismissKeyboardOverlay() }
+
+                if isShowingPalette {
+                    CommandPalette(onDismiss: dismissKeyboardOverlay)
+                        .transition(.scale(scale: 0.97).combined(with: .opacity))
+                } else if isShowingFilePalette, let workspace = model.selectedWorkspace {
+                    FilePalette(
+                        workspace: workspace,
+                        initialQuery: ChromeLayoutStore.shared.pendingFileQuery ?? "",
+                        onDismiss: dismissKeyboardOverlay
+                    )
+                        .transition(.scale(scale: 0.97).combined(with: .opacity))
+                } else if isShowingShortcuts {
+                    KeyboardShortcutsView(onDismiss: dismissKeyboardOverlay)
+                        .transition(.scale(scale: 0.97).combined(with: .opacity))
+                }
+            }
+            .onExitCommand(perform: dismissKeyboardOverlay)
+            .animation(.smooth(duration: 0.2), value: isShowingPalette)
+            .animation(.smooth(duration: 0.2), value: isShowingFilePalette)
+            .animation(.smooth(duration: 0.2), value: isShowingShortcuts)
+            .zIndex(20)
+        }
+    }
+
+    private func dismissKeyboardOverlay() {
+        isShowingPalette = false
+        isShowingFilePalette = false
+        isShowingShortcuts = false
     }
 
     // Bridges NavigationSplitView's column visibility to the persisted
@@ -1011,7 +1098,6 @@ struct RootView: View {
                 }
             }
             .buttonStyle(.plain)
-            .keyboardShortcut("t", modifiers: [.command, .option])
             .help("Open the workspace terminal (⌥⌘T)")
 
             if !tabs.isEmpty {
@@ -1082,17 +1168,6 @@ struct RootView: View {
         .buttonStyle(.plain)
         .keyboardShortcut("f", modifiers: [.command, .option])
         .help("Open this worktree in Finder (⌥⌘F)")
-
-        // A real Terminal window, not ORE's pane: the pane dies with the tab,
-        // and a long build or an interactive rebase wants to outlive it.
-        Button {
-            ExternalTools.openInTerminal(workspace.worktreePath)
-        } label: {
-            AppMark(target: .terminal, size: 16)
-        }
-        .buttonStyle(.plain)
-        .keyboardShortcut("t", modifiers: [.command, .option, .shift])
-        .help("Open this worktree in Terminal (⇧⌥⌘T)")
 
         CopyPathButton(path: workspace.worktreePath)
 
@@ -1183,6 +1258,9 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { githubStatus = await model.refreshGitHubStatus() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .oreSetupTerminalCommandCompleted)) { _ in
+            Task { githubStatus = await model.refreshGitHubStatus() }
+        }
         // No fill: the welcome floats directly on the window's glass base.
     }
 
@@ -1213,11 +1291,42 @@ struct RootView: View {
                 .frame(maxWidth: 560)
                 .oreCard(padding: 12, radius: 14)
             }
-            HarnessUpdateBanner()
+            HarnessUpdateBanner(
+                onOpenInTerminal: { kind, repair in
+                    openRepairInTerminal(kind: kind, repair: repair)
+                },
+                onShowTerminal: { _ in bottomPane = .terminal }
+            )
         }
         .padding(.top, OreTheme.Space.sm)
         .animation(.smooth(duration: 0.3), value: model.banners.count)
         .animation(.smooth(duration: 0.3), value: model.pendingHarnessUpdates.count)
+    }
+
+    /// Keep repair work in the workspace the card belongs to. Privileged
+    /// scripts are only staged; the user sees them in a clean tab and presses
+    /// Return themselves. Non-root scripts run only after the explicitly
+    /// labelled Run in Terminal button is clicked.
+    private func openRepairInTerminal(kind: HarnessKind, repair: HarnessRepair) {
+        guard let workspace = model.selectedWorkspace else { return }
+        let operationID = UUID()
+        model.beginHarnessTerminalRepair(kind, operationID: operationID)
+        bottomPane = .terminal
+        TerminalRegistry.shared.prepare(
+            repair.script,
+            in: workspace.id,
+            workingDirectory: workspace.worktreePath,
+            title: "\(kind.displayName) repair",
+            runsImmediately: !repair.needsRoot,
+            operationID: operationID,
+            onCompletion: { exitCode in
+                model.completeHarnessTerminalRepair(
+                    kind,
+                    operationID: operationID,
+                    exitCode: exitCode
+                )
+            }
+        )
     }
 }
 
@@ -1354,12 +1463,16 @@ private struct GitDiffPrefetch: View {
 }
 
 private struct KeyboardShortcutsView: View {
-    @Environment(\.dismiss) private var dismiss
+    let onDismiss: () -> Void
     private let shortcuts = [
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
         ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
-        ("New tab (terminal when focused)", "⌘T"), ("Close tab", "⌘W"),
-        ("Previous / next tab", "⌥⌘←  ⌥⌘→"), ("Cancel turn", "⌘."),
+        ("New tab (terminal when focused)", "⌘T"),
+        ("Close tab (terminal when focused)", "⌘W"),
+        ("Previous / next coding tab", "⌥⌘←  ⌥⌘→"),
+        ("Toggle left sidebar", "⌘B"), ("Toggle review sidebar", "⌥⌘B"),
+        ("Toggle terminal", "⌥⌘T"), ("New terminal tab", "⌥⌘N"),
+        ("Close terminal tab", "⌃⌘W"), ("Cancel turn", "⌘."),
         ("Send / queue", "⌘↩"),
         ("Allow / deny tool", "↩  Esc"),
         ("Allow / deny from composer", "⇧⌘A  ⇧⌘D"),
@@ -1369,30 +1482,71 @@ private struct KeyboardShortcutsView: View {
         ("Narrate this tab", "⌥⌘S"),
         ("Assistant", "⌥⌘A"),
         ("Next git step", "⌥⌘G"),
-        ("Toggle terminal", "⌥⌘T"),
         ("Jump to workspace", "⌘1–9"), ("This cheatsheet", "⌘/"),
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Keyboard Shortcuts").font(.title2.bold())
+        VStack(spacing: 0) {
+            HStack(spacing: OreTheme.Space.sm) {
+                Image(systemName: "keyboard")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .oreGlassSurface(
+                        .rect(cornerRadius: 10),
+                        tint: OreTheme.brand.opacity(0.12),
+                        elevation: .inset
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keyboard Shortcuts").font(.title2.bold())
+                    Text("Move through ORE without leaving the keyboard")
+                        .font(.system(size: OreTheme.Font.caption))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .oreGlassSurface(.capsule, elevation: .inset, interactive: true)
+                .keyboardShortcut(.cancelAction)
+                .help("Close (Esc)")
             }
-            Grid(alignment: .leading, horizontalSpacing: 32, verticalSpacing: 9) {
-                ForEach(shortcuts, id: \.0) { label, keys in
-                    GridRow {
-                        Text(label)
-                        Text(keys).font(.system(.body, design: .monospaced))
-                            .foregroundStyle(.secondary)
+            .padding(OreTheme.Space.lg)
+
+            QuickPaletteDivider()
+
+            ScrollView {
+                Grid(alignment: .leading, horizontalSpacing: 36, verticalSpacing: 11) {
+                    ForEach(shortcuts, id: \.0) { label, keys in
+                        GridRow {
+                            Text(label)
+                                .font(.system(size: OreTheme.Font.body))
+                            QuickPaletteKeycap(text: keys)
+                                .gridColumnAlignment(.trailing)
+                        }
                     }
                 }
+                .padding(OreTheme.Space.lg)
             }
+            .oreOverlayScrollers()
+
+            QuickPaletteDivider()
+
+            HStack(spacing: 6) {
+                Text("These shortcuts work anywhere in the main ORE window")
+                Spacer()
+                QuickPaletteKeycap(text: "esc")
+                Text("Close")
+            }
+            .font(.system(size: OreTheme.Font.caption))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, OreTheme.Space.lg)
+            .frame(height: 42)
         }
-        .oreCard(padding: OreTheme.Space.lg)
-        .padding(OreTheme.Space.lg)
-        .frame(width: 440)
+        .frame(width: 500, height: 590)
+        .quickPaletteChrome()
     }
 }
 
@@ -1417,13 +1571,14 @@ private struct FilePaletteChromeListener: View {
 
 private struct FilePalette: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
     let workspace: WorkspaceSummary
     var initialQuery: String = ""
+    let onDismiss: () -> Void
 
     @State private var files: [WorkspaceFileNode] = []
     @State private var query = ""
     @State private var selection: String?
+    @State private var isLoading = true
     @FocusState private var focused: Bool
 
     private var matches: [WorkspaceFileNode] {
@@ -1437,58 +1592,124 @@ private struct FilePalette: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "doc.text.magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Open file in \(workspace.name)", text: $query)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 17))
-                    .focused($focused)
-                    .onSubmit { openSelection() }
-                Text("⌘P").font(.caption.monospaced()).foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 16)
-            .frame(height: 52)
+            searchHeader
 
-            Divider()
+            QuickPaletteDivider()
 
-            if files.isEmpty {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(matches, selection: $selection) { node in
-                    Button { open(node.path) } label: {
-                        HStack(spacing: 10) {
-                            SourceFileIcon(path: node.path, size: 17)
-                                .frame(width: 16)
-                            Text((node.path as NSString).lastPathComponent)
-                                .foregroundStyle(.primary)
-                            Text((node.path as NSString).deletingLastPathComponent)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                                .truncationMode(.head)
-                            Spacer()
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .tag(node.path)
+            if isLoading {
+                VStack(spacing: OreTheme.Space.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Indexing workspace files…")
+                        .font(.system(size: OreTheme.Font.body))
+                        .foregroundStyle(.secondary)
                 }
-                .listStyle(.inset)
-                .scrollContentBackground(.hidden)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if matches.isEmpty {
+                QuickPaletteEmptyState(
+                    icon: "doc.text.magnifyingglass",
+                    title: query.isEmpty ? "No files in this workspace" : "No files match “\(query)”",
+                    detail: query.isEmpty ? nil : "Try a file name, extension, or folder path."
+                )
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(matches) { node in
+                                QuickPaletteRow(
+                                    title: (node.path as NSString).lastPathComponent,
+                                    detail: parentPath(of: node.path),
+                                    trailing: nil,
+                                    isSelected: selection == node.path,
+                                    action: { open(node.path) }
+                                ) {
+                                    SourceFileIcon(path: node.path, size: 17)
+                                        .frame(width: 18)
+                                }
+                                .id(node.path)
+                            }
+                        }
+                        .padding(OreTheme.Space.sm)
+                    }
+                    .oreOverlayScrollers()
+                    .onChange(of: selection) { _, path in
+                        guard let path else { return }
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            proxy.scrollTo(path, anchor: .center)
+                        }
+                    }
+                }
             }
+
+            QuickPaletteDivider()
+            QuickPaletteFooter(summary: fileSummary)
         }
-        .frame(width: 620, height: 470)
-        .background(.regularMaterial)
+        .frame(width: 620, height: 480)
+        .quickPaletteChrome()
         .task {
             if query.isEmpty, !initialQuery.isEmpty {
                 query = initialQuery
                 ChromeLayoutStore.shared.pendingFileQuery = nil
             }
             files = await model.workspaceFiles(for: workspace)
+            isLoading = false
             selection = matches.first?.path
             focused = true
         }
         .onChange(of: query) { _, _ in selection = matches.first?.path }
+    }
+
+    private var searchHeader: some View {
+        HStack(spacing: 11) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField("Search files by name or path", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 17, weight: .medium))
+                .focused($focused)
+                .onSubmit { openSelection() }
+                .onKeyPress(.downArrow) {
+                    moveSelection(1)
+                    return .handled
+                }
+                .onKeyPress(.upArrow) {
+                    moveSelection(-1)
+                    return .handled
+                }
+
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+
+            Label(fileSearchScope, systemImage: "folder")
+                .font(.system(size: OreTheme.Font.caption, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .frame(maxWidth: 180, minHeight: 24)
+                .oreGlassSurface(.capsule, elevation: .inset)
+                .help("Searching \(workspace.name)")
+
+            QuickPaletteKeycap(text: "⌘P")
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .frame(height: 58)
+    }
+
+    private var fileSummary: String {
+        if isLoading { return "Indexing files" }
+        let count = matches.count
+        return "\(count) file\(count == 1 ? "" : "s")"
+    }
+
+    private var fileSearchScope: String {
+        let repository = (workspace.repositoryPath as NSString).lastPathComponent
+        return "\(repository) · \(workspace.branch)"
     }
 
     private func flatten(_ nodes: [WorkspaceFileNode]) -> [WorkspaceFileNode] {
@@ -1505,6 +1726,11 @@ private struct FilePalette: View {
         return 3
     }
 
+    private func parentPath(of path: String) -> String {
+        let parent = (path as NSString).deletingLastPathComponent
+        return parent.isEmpty || parent == "." ? "Workspace root" : parent
+    }
+
     private func openSelection() {
         if let selection { open(selection) }
         else if let first = matches.first { open(first.path) }
@@ -1512,7 +1738,14 @@ private struct FilePalette: View {
 
     private func open(_ path: String) {
         model.openSourceFile(path, in: workspace.id)
-        dismiss()
+        onDismiss()
+    }
+
+    private func moveSelection(_ offset: Int) {
+        let paths = matches.map(\.path)
+        guard !paths.isEmpty else { return }
+        let index = selection.flatMap { paths.firstIndex(of: $0) } ?? (offset > 0 ? -1 : 0)
+        selection = paths[(index + offset + paths.count) % paths.count]
     }
 }
 

@@ -1108,7 +1108,7 @@ struct ChatPane: View {
         }
         .padding(.horizontal, compact ? 8 : 10)
         .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
-        .help(compact ? path : "")
+        .help(isSelected ? "\(path) — close with ⌘W" : path)
         .foregroundStyle(isSelected ? .primary : .secondary)
         .oreNavigationSelection(
             isSelected: isSelected,
@@ -1167,7 +1167,7 @@ struct ChatPane: View {
         }
         .padding(.horizontal, compact ? 8 : 10)
         .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
-        .help(compact ? tab.title : "")
+        .help(isSelected ? "\(tab.title) — close with ⌘W" : tab.title)
         .foregroundStyle(isSelected ? .primary : .secondary)
         // The active tab is at full strength; every other tab recedes — even a
         // working one — so which tab you're actually in is never in doubt. A

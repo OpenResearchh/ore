@@ -600,6 +600,7 @@ struct ChatPane: View {
                     onClear: { chat.setDraftReply(nil) }
                 )
                 .frame(maxWidth: OreTheme.contentMaxWidth)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, OreTheme.Space.md)
                 .padding(.top, OreTheme.Space.sm)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -6150,9 +6151,6 @@ struct ReplyTargetBar: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                .fill(Color.accentColor)
-                .frame(width: 3)
             Button(action: onReveal) {
                 VStack(alignment: .leading, spacing: 2) {
                     Label("Replying to \(reply.author)", systemImage: "arrowshape.turn.up.left")
@@ -6177,9 +6175,21 @@ struct ReplyTargetBar: View {
             .buttonStyle(.plain)
             .help("Remove reply")
         }
-        .padding(.horizontal, 10)
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
         .padding(.vertical, 7)
+        // Overlay, not a sibling: a `RoundedRectangle` in the HStack only had
+        // a width and ate the pane height the dock was offered, stretching the
+        // quote over the transcript.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(Color.accentColor)
+                .frame(width: 3)
+                .padding(.vertical, 8)
+                .padding(.leading, 8)
+        }
         .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

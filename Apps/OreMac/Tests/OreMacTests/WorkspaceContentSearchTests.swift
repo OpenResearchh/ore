@@ -195,3 +195,29 @@ struct WorkspaceFileCreationTests {
         }
     }
 }
+
+struct RemoteControlPageTests {
+    @Test func layoutMatchesTheMacChrome() {
+        let html = RemoteControlPage.html
+        #expect(html.contains("class=\"sidebar\""))
+        #expect(html.contains("class=\"tabs\""))
+        #expect(html.contains("class=\"composer\""))
+        #expect(html.contains("--brand: #F59E0B"))
+        #expect(html.contains("id=\"toolbar\""))
+        #expect(html.contains("id=\"harness\""))
+        #expect(html.contains("id=\"model\""))
+        #expect(html.contains("id=\"effort\""))
+        #expect(html.contains("id=\"permission\""))
+        #expect(html.contains("id=\"fast\""))
+        #expect(html.contains("/api/composer"))
+        #expect(html.contains("kind === \"assistant\""))
+        #expect(html.contains("Message Assistant"))
+        #expect(html.contains("Show full response"))
+        #expect(html.contains("data-expand"))
+        #expect(html.contains("followBottom"))
+        #expect(html.contains("id=\"jump\""))
+        #expect(html.contains("Latest"))
+        #expect(html.contains("id=\"send-label\""))
+        #expect(html.contains("function icon("))
+    }
+}

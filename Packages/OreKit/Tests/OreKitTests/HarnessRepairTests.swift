@@ -225,6 +225,16 @@ struct HarnessRepairTests {
         #expect(repair.script.contains("'/Users/o'\\''brien/bin'"))
     }
 
+    /// The friendly updater error wraps the npm command in Markdown. The
+    /// delimiter is presentation, never part of what zsh should receive.
+    @Test func aMarkdownWrappedLeftoverCommandDoesNotCopyItsBacktick() {
+        let message = "The CLI says to run `npm -g uninstall @anthropic-ai/claude-code`."
+        #expect(
+            HarnessUpdateFailure.leftoverUninstallCommand(in: message)
+                == "npm -g uninstall @anthropic-ai/claude-code"
+        )
+    }
+
     // MARK: - A CLI that is present but cannot be launched
 
     /// Quarantined by Gatekeeper, missing its `+x` bit, a symlink into a

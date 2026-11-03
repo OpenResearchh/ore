@@ -939,4 +939,25 @@ struct RateLimitExpiryTests {
         state.apply(.question(question("q1")))
         #expect(state.pendingQuestions.isEmpty)
     }
+
+    @Test func olderHistoryLandsBeforeTheRecentWindow() {
+        let state = ChatState()
+        let recent = TranscriptRow(
+            id: "recent",
+            turnID: TurnID(rawValue: "t-new"),
+            kind: .userMessage,
+            text: "latest"
+        )
+        let older = TranscriptRow(
+            id: "older",
+            turnID: TurnID(rawValue: "t-old"),
+            kind: .userMessage,
+            text: "earlier"
+        )
+        state.loadHistory([recent])
+        state.prependOlderHistory([older])
+        #expect(state.rows.map(\.id) == ["older", "recent"])
+        state.prependOlderHistory([older])
+        #expect(state.rows.map(\.id) == ["older", "recent"])
+    }
 }

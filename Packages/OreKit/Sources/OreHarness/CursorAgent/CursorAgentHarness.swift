@@ -313,9 +313,16 @@ public actor CursorAgentSession: AgentSession {
 
         let process: ChildProcess
         do {
-            process = try ChildProcess(
+            let cursorArguments = arguments(for: message.renderedText)
+            let launch = CursorAgentPrivacyBoundary.launchCommand(
                 executablePath: executablePath,
-                arguments: arguments(for: message.renderedText),
+                arguments: cursorArguments,
+                workingDirectory: configuration.workingDirectory,
+                additionalAllowedRoots: configuration.additionalWritableRoots
+            )
+            process = try ChildProcess(
+                executablePath: launch.executablePath,
+                arguments: launch.arguments,
                 workingDirectory: configuration.workingDirectory,
                 environment: ShellEnvironment.childEnvironment(
                     overrides: configuration.environmentOverrides,
@@ -355,7 +362,7 @@ public actor CursorAgentSession: AgentSession {
         return recent.joined(separator: "\n")
     }
 
-    private func arguments(for prompt: String) -> [String] {
+    func arguments(for prompt: String) -> [String] {
         var arguments = [
             "--print",
             "--output-format", "stream-json",
@@ -363,6 +370,13 @@ public actor CursorAgentSession: AgentSession {
             "--workspace", configuration.workingDirectory.path,
             // Headless, so there is no dialog to trust the workspace in.
             "--trust",
+            // Cursor otherwise inherits a user's persisted `sandbox.mode`.
+            // A disabled global setting lets terminal subprocesses roam the
+            // home directory and makes macOS ask ORE for Desktop, Documents,
+            // Downloads, Photos, Music, and volume access. Always request the
+            // CLI's own command sandbox; the process-level boundary below also
+            // covers Cursor's startup discovery, which this flag does not.
+            "--sandbox", "enabled",
         ]
         if let model = configuration.model {
             arguments += ["--model", model]
@@ -454,5 +468,89 @@ public actor CursorAgentSession: AgentSession {
         if let currentProcess { await currentProcess.terminate() }
         currentProcess = nil
         continuation.finish()
+    }
+}
+
+/// Prevents Cursor itself (not only the commands it chooses to run) from
+/// probing macOS privacy-protected folders outside the active workspace.
+///
+/// Cursor's `--sandbox enabled` flag applies to terminal subprocesses. The CLI
+/// still performs startup discovery as ORE's child process, so macOS attributes
+/// any broad home-directory access to ORE and presents a misleading permission
+/// cascade. A small outer Seatbelt profile denies only TCC-protected user
+/// locations while leaving auth, configuration, developer tools, caches, and
+/// the network alone. Workspaces and linked-worktree Git metadata are explicit
+/// exceptions, including when a user deliberately keeps a repository in one of
+/// those locations.
+enum CursorAgentPrivacyBoundary {
+    struct LaunchCommand: Equatable {
+        var executablePath: String
+        var arguments: [String]
+    }
+
+    static func launchCommand(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: URL,
+        additionalAllowedRoots: [URL],
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> LaunchCommand {
+        #if os(macOS)
+        let sandboxExecutable = "/usr/bin/sandbox-exec"
+        guard FileManager.default.isExecutableFile(atPath: sandboxExecutable) else {
+            return LaunchCommand(executablePath: executablePath, arguments: arguments)
+        }
+        let profile = profile(
+            homeDirectory: homeDirectory,
+            allowedRoots: [workingDirectory] + additionalAllowedRoots
+        )
+        return LaunchCommand(
+            executablePath: sandboxExecutable,
+            arguments: ["-p", profile, executablePath] + arguments
+        )
+        #else
+        return LaunchCommand(executablePath: executablePath, arguments: arguments)
+        #endif
+    }
+
+    static func profile(homeDirectory: URL, allowedRoots: [URL]) -> String {
+        let home = homeDirectory.standardizedFileURL
+        let protectedRoots = [
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Movies",
+            "Music",
+            "Pictures",
+            "Library/CloudStorage",
+            "Library/Mobile Documents",
+        ].map { home.appendingPathComponent($0).path } + ["/Volumes"]
+
+        var lines = ["(version 1)", "(allow default)"]
+        lines += protectedRoots.map {
+            "(deny file-read* file-write* (subpath \(stringLiteral($0))))"
+        }
+
+        // Seatbelt uses the more specific/later matching rule. Resolve both
+        // spellings so a symlinked worktree is not accidentally denied by its
+        // physical location while its visible path was allowlisted (or vice
+        // versa).
+        var seen: Set<String> = []
+        let roots = allowedRoots.flatMap { url in
+            [url.standardizedFileURL.path, url.standardizedFileURL.resolvingSymlinksInPath().path]
+        }.filter { !$0.isEmpty && seen.insert($0).inserted }
+        lines += roots.map {
+            "(allow file-read* file-write* (subpath \(stringLiteral($0))))"
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func stringLiteral(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        return "\"\(escaped)\""
     }
 }

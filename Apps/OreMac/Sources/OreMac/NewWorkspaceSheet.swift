@@ -815,57 +815,232 @@ private struct GitHubRepositoryList: View {
 /// memory after about the third one.
 struct CommandPalette: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
+    let onDismiss: () -> Void
 
     @State private var query = ""
     @State private var results: [AppModel.SearchResult] = []
+    @State private var isSearchingTranscripts = false
     @FocusState private var focused: Bool
     @State private var selectedID: String?
+    @AppStorage("ore.showsSidebar") private var showsSidebar = true
+    @AppStorage("ore.showsReview") private var showsReview = true
+    @AppStorage("ore.bottomPane") private var bottomPaneRaw = "none"
 
     private struct PaletteCommand: Identifiable {
         var id: String
         var title: String
+        var detail: String
+        var systemImage: String
         var shortcut: String
         var action: () -> Void
     }
 
     private var commands: [PaletteCommand] {
         var values: [PaletteCommand] = [
-            PaletteCommand(id: "new-chat", title: "New Chat Tab", shortcut: "⌘T") {
-                if let id = model.selectedWorkspaceID { model.createChat(in: id) }
-            },
-            PaletteCommand(id: "settings", title: "Open Settings", shortcut: "⌘,") {
+            PaletteCommand(
+                id: "settings", title: "Open Settings",
+                detail: "Models, harnesses, voice, and app preferences",
+                systemImage: "gearshape", shortcut: "⌘,"
+            ) {
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            },
+            PaletteCommand(
+                id: "shortcuts", title: "Keyboard Shortcuts",
+                detail: "See every navigation and control shortcut",
+                systemImage: "keyboard", shortcut: "⌘/"
+            ) {
+                NotificationCenter.default.post(name: .oreShowKeyboardShortcuts, object: nil)
+            },
+            PaletteCommand(
+                id: "sidebar", title: showsSidebar ? "Hide Left Sidebar" : "Show Left Sidebar",
+                detail: "Collapse or expand workspace navigation",
+                systemImage: "sidebar.left", shortcut: "⌘B"
+            ) {
+                showsSidebar.toggle()
+            },
+            PaletteCommand(
+                id: "review", title: showsReview ? "Hide Review Sidebar" : "Show Review Sidebar",
+                detail: "Collapse or expand files, changes, and review",
+                systemImage: "sidebar.right", shortcut: "⌥⌘B"
+            ) {
+                showsReview.toggle()
             },
         ]
         if let workspace = model.selectedWorkspace {
             values.append(PaletteCommand(
+                id: "search-files", title: "Search in Files",
+                detail: "Find a line inside this worktree",
+                systemImage: "text.magnifyingglass", shortcut: "⇧⌘F"
+            ) {
+                onDismiss()
+                ChromeLayout.request(.openContentSearch)
+            })
+            values.append(PaletteCommand(
+                id: "open-file", title: "Open File",
+                detail: "Jump to a file by name",
+                systemImage: "doc.text.magnifyingglass", shortcut: "⌘P"
+            ) {
+                onDismiss()
+                ChromeLayout.request(.openFilePalette)
+            })
+            values.append(PaletteCommand(
+                id: "new-chat", title: "New Coding Tab",
+                detail: "Start another agent conversation in this workspace",
+                systemImage: "plus.bubble", shortcut: "⌘T",
+                action: { model.createChat(in: workspace.id) }
+            ))
+            values.append(PaletteCommand(
+                id: "close-coding-tab", title: "Close Current Coding Tab",
+                detail: "Close the active conversation or source file",
+                systemImage: "xmark.square", shortcut: "⌘W",
+                action: { model.requestCloseActiveCodingTab(in: workspace.id) }
+            ))
+            values.append(PaletteCommand(
+                id: "previous-coding-tab", title: "Previous Coding Tab",
+                detail: "Move left through agent conversations",
+                systemImage: "arrow.left.square", shortcut: "⌥⌘←",
+                action: { model.cycleChat(in: workspace.id, offset: -1) }
+            ))
+            values.append(PaletteCommand(
+                id: "next-coding-tab", title: "Next Coding Tab",
+                detail: "Move right through agent conversations",
+                systemImage: "arrow.right.square", shortcut: "⌥⌘→",
+                action: { model.cycleChat(in: workspace.id, offset: 1) }
+            ))
+            values.append(PaletteCommand(
+                id: "terminal", title: bottomPaneRaw == "terminal"
+                    ? "Hide Terminal" : "Show Terminal",
+                detail: "Collapse or expand the workspace terminal",
+                systemImage: "terminal", shortcut: "⌥⌘T",
+                action: { bottomPaneRaw = bottomPaneRaw == "terminal" ? "none" : "terminal" }
+            ))
+            values.append(PaletteCommand(
+                id: "new-terminal", title: "New Terminal Tab",
+                detail: "Open another shell in this worktree",
+                systemImage: "terminal.fill", shortcut: "⌥⌘N"
+            ) {
+                TerminalRegistry.shared.addTab(
+                    for: workspace.id,
+                    workingDirectory: workspace.worktreePath
+                )
+                bottomPaneRaw = "terminal"
+            })
+            if TerminalRegistry.shared.activeTab(for: workspace.id) != nil {
+                values.append(PaletteCommand(
+                    id: "close-terminal", title: "Close Current Terminal Tab",
+                    detail: "Stop and close the active workspace shell",
+                    systemImage: "xmark.rectangle", shortcut: "⌃⌘W"
+                ) {
+                    guard let tabID = TerminalRegistry.shared.activeTab(for: workspace.id) else {
+                        return
+                    }
+                    let wasLast = (TerminalRegistry.shared.tabs[workspace.id]?.count ?? 0) <= 1
+                    TerminalRegistry.shared.closeTab(tabID, for: workspace.id)
+                    if wasLast { bottomPaneRaw = "none" }
+                })
+            }
+            values.append(PaletteCommand(
                 id: "pin", title: workspace.isPinned ? "Unpin Workspace" : "Pin Workspace",
+                detail: workspace.isPinned
+                    ? "Return this workspace to activity order"
+                    : "Keep this workspace at the top of the sidebar",
+                systemImage: workspace.isPinned ? "pin.slash" : "pin",
                 shortcut: "", action: { model.setPinned(!workspace.isPinned, for: workspace.id) }
             ))
             values.append(PaletteCommand(
-                id: "archive", title: "Archive Workspace", shortcut: "",
+                id: "archive", title: "Archive Workspace",
+                detail: "Stop its agent and reclaim the worktree",
+                systemImage: "archivebox",
+                shortcut: "",
                 action: { model.archive(workspace.id) }
             ))
         }
         guard !query.isEmpty else { return values }
-        return values.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        return values.filter {
+            $0.title.localizedCaseInsensitiveContains(query)
+                || $0.detail.localizedCaseInsensitiveContains(query)
+        }
     }
 
     private var matchingWorkspaces: [WorkspaceSummary] {
-        guard !query.isEmpty else { return model.sortedWorkspaces }
-        return model.sortedWorkspaces.filter {
+        guard !query.isEmpty else { return Array(model.sortedWorkspaces.prefix(7)) }
+        return Array(model.sortedWorkspaces.filter {
             $0.name.localizedCaseInsensitiveContains(query)
                 || $0.branch.localizedCaseInsensitiveContains(query)
-        }
+        }.prefix(20))
+    }
+
+    private var visibleIDs: [String] {
+        commands.map(\.id)
+            + matchingWorkspaces.map(workspaceID)
+            + results.map(resultID)
+    }
+
+    private var resultCount: Int {
+        commands.count + matchingWorkspaces.count + results.count
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField("Jump to a workspace, or search every transcript…", text: $query)
+            searchHeader
+
+            QuickPaletteDivider()
+
+            if resultCount == 0, !isSearchingTranscripts {
+                QuickPaletteEmptyState(
+                    icon: "magnifyingglass",
+                    title: "No results for “\(query)”",
+                    detail: "Try a workspace, branch, transcript phrase, or command."
+                )
+            } else {
+                resultList
+            }
+
+            QuickPaletteDivider()
+            QuickPaletteFooter(summary: footerSummary)
+        }
+        .frame(width: 620, height: 480)
+        .quickPaletteChrome()
+        .task {
+            focused = true
+            selectedID = visibleIDs.first
+        }
+        .onChange(of: query) { _, _ in
+            results = []
+            selectedID = visibleIDs.first
+        }
+        .onChange(of: results.count) { _, _ in
+            if selectedID == nil { selectedID = visibleIDs.first }
+        }
+        .task(id: query) {
+            // Debounced: search runs against SQLite's FTS index while the user
+            // is still typing.
+            let searchQuery = query
+            guard searchQuery.count >= 2 else {
+                isSearchingTranscripts = false
+                return
+            }
+            isSearchingTranscripts = true
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+            } catch {
+                return
+            }
+            let found = await model.search(searchQuery)
+            guard !Task.isCancelled, query == searchQuery else { return }
+            results = found
+            isSearchingTranscripts = false
+        }
+    }
+
+    private var searchHeader: some View {
+        HStack(spacing: 11) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField("Search workspaces, transcripts, and commands", text: $query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 17, weight: .medium))
-                .padding(OreTheme.Space.md)
                 .focused($focused)
                 .onSubmit { activateSelection() }
                 .onKeyPress(.downArrow) {
@@ -876,82 +1051,96 @@ struct CommandPalette: View {
                     moveSelection(-1)
                     return .handled
                 }
+            if isSearchingTranscripts {
+                ProgressView().controlSize(.small)
+            } else if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+            QuickPaletteKeycap(text: "⌘K")
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, OreTheme.Space.md)
+        .frame(height: 58)
+    }
 
-            Rectangle().fill(OreTheme.hairline).frame(height: 1)
-
-            List(selection: $selectedID) {
-                if !commands.isEmpty {
-                    Section("Commands") {
+    private var resultList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    if !commands.isEmpty {
+                        QuickPaletteSectionHeader(title: "Commands", count: commands.count)
                         ForEach(commands) { command in
-                            Button { run(command) } label: {
-                                HStack {
-                                    Label(command.title, systemImage: "command")
-                                    Spacer()
-                                    Text(command.shortcut).foregroundStyle(.secondary)
-                                }
+                            QuickPaletteRow(
+                                title: command.title,
+                                detail: command.detail,
+                                trailing: command.shortcut,
+                                isSelected: selectedID == command.id,
+                                action: { run(command) }
+                            ) {
+                                Image(systemName: command.systemImage)
+                                    .foregroundStyle(command.id == "archive" ? .orange : OreTheme.brand)
                             }
-                            .buttonStyle(.plain)
-                            .tag(command.id)
+                            .id(command.id)
                         }
                     }
-                }
-                if !matchingWorkspaces.isEmpty {
-                    Section("Workspaces") {
-                        ForEach(matchingWorkspaces) { workspace in
-                            Button {
-                                model.selectedWorkspaceID = workspace.id
-                                dismiss()
-                            } label: {
-                                HStack {
-                                    Text(workspace.name)
-                                    Spacer()
-                                    Text(workspace.branch)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .tag("workspace-\(workspace.id.rawValue)")
-                        }
-                    }
-                }
 
-                if !results.isEmpty {
-                    Section("In transcripts") {
-                        ForEach(results) { result in
-                            Button {
-                                model.selectedWorkspaceID = result.workspaceID
-                                dismiss()
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(result.workspaceName).font(.caption).foregroundStyle(.secondary)
-                                    Text(result.snippet).lineLimit(2)
-                                }
+                    if !matchingWorkspaces.isEmpty {
+                        QuickPaletteSectionHeader(
+                            title: query.isEmpty ? "Recent Workspaces" : "Workspaces",
+                            count: matchingWorkspaces.count
+                        )
+                        ForEach(matchingWorkspaces) { workspace in
+                            let id = workspaceID(workspace)
+                            QuickPaletteRow(
+                                title: workspace.name,
+                                detail: workspace.branch,
+                                trailing: workspace.id == model.selectedWorkspaceID ? "Current" : nil,
+                                isSelected: selectedID == id,
+                                action: { open(workspace) }
+                            ) {
+                                Image(systemName: workspace.isPinned ? "pin.fill" : "square.stack.3d.up")
+                                    .foregroundStyle(workspace.isPinned ? OreTheme.brand : .secondary)
                             }
-                            .buttonStyle(.plain)
+                            .id(id)
+                        }
+                    }
+
+                    if !results.isEmpty {
+                        QuickPaletteSectionHeader(title: "In Transcripts", count: results.count)
+                        ForEach(results) { result in
+                            let id = resultID(result)
+                            QuickPaletteRow(
+                                title: result.snippet,
+                                detail: result.workspaceName,
+                                trailing: nil,
+                                isSelected: selectedID == id,
+                                action: { open(result) }
+                            ) {
+                                Image(systemName: "text.bubble")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .id(id)
                         }
                     }
                 }
+                .padding(.horizontal, OreTheme.Space.sm)
+                .padding(.bottom, OreTheme.Space.sm)
             }
-            .listStyle(.inset)
             .oreOverlayScrollers()
-        }
-        .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: OreTheme.cardRadius))
-        .overlay { RoundedRectangle(cornerRadius: OreTheme.cardRadius).stroke(OreTheme.hairline) }
-        .frame(width: 600, height: 440)
-        .task { focused = true }
-        .onChange(of: query) { _, _ in selectedID = commands.first?.id }
-        .task(id: query) {
-            // Debounced: search runs against SQLite's FTS index while the user
-            // is still typing.
-            try? await Task.sleep(for: .milliseconds(150))
-            guard !Task.isCancelled, query.count >= 2 else {
-                results = []
-                return
+            .onChange(of: selectedID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id, anchor: .center) }
             }
-            results = await model.search(query)
         }
+    }
+
+    private var footerSummary: String {
+        if query.isEmpty { return "Commands and recent workspaces" }
+        return "\(resultCount) result\(resultCount == 1 ? "" : "s")"
     }
 
     private func openFirstResult() {
@@ -960,7 +1149,7 @@ struct CommandPalette: View {
         } else if let result = results.first {
             model.selectedWorkspaceID = result.workspaceID
         }
-        dismiss()
+        onDismiss()
     }
 
     private func activateSelection() {
@@ -974,7 +1163,12 @@ struct CommandPalette: View {
                "workspace-\($0.id.rawValue)" == selectedID
            }) {
             model.selectedWorkspaceID = workspace.id
-            dismiss()
+            onDismiss()
+            return
+        }
+        if let selectedID,
+           let result = results.first(where: { resultID($0) == selectedID }) {
+            open(result)
             return
         }
         if let command = commands.first { run(command) } else { openFirstResult() }
@@ -982,14 +1176,32 @@ struct CommandPalette: View {
 
     private func run(_ command: PaletteCommand) {
         command.action()
-        dismiss()
+        onDismiss()
     }
 
     private func moveSelection(_ offset: Int) {
-        let ids = commands.map(\.id) + matchingWorkspaces.map { "workspace-\($0.id.rawValue)" }
+        let ids = visibleIDs
         guard !ids.isEmpty else { return }
         let index = selectedID.flatMap { ids.firstIndex(of: $0) } ?? (offset > 0 ? -1 : 0)
         selectedID = ids[(index + offset + ids.count) % ids.count]
+    }
+
+    private func workspaceID(_ workspace: WorkspaceSummary) -> String {
+        "workspace-\(workspace.id.rawValue)"
+    }
+
+    private func resultID(_ result: AppModel.SearchResult) -> String {
+        "transcript-\(result.id)"
+    }
+
+    private func open(_ workspace: WorkspaceSummary) {
+        model.selectedWorkspaceID = workspace.id
+        onDismiss()
+    }
+
+    private func open(_ result: AppModel.SearchResult) {
+        model.selectedWorkspaceID = result.workspaceID
+        onDismiss()
     }
 }
 

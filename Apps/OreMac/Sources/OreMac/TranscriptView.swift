@@ -350,6 +350,29 @@ struct TranscriptView: NSViewRepresentable {
             self.onRevert = onRevert
             self.onToggleActivity = onToggleActivity
             self.onOpenFile = onOpenFile
+            super.init()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(snippetRunDidChange),
+                name: SnippetRunCache.didChange,
+                object: nil
+            )
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func snippetRunDidChange() {
+            guard let tableView else { return }
+            var reload = IndexSet()
+            for (index, row) in rows.enumerated() where row.kind == .assistantText {
+                invalidateHeight(at: index)
+                reload.insert(index)
+            }
+            guard !reload.isEmpty else { return }
+            tableView.noteHeightOfRows(withIndexesChanged: reload)
+            tableView.reloadData(forRowIndexes: reload, columnIndexes: IndexSet(integer: 0))
         }
 
         func update(rows newRows: [TranscriptRow], structureToken: Int? = nil) {
@@ -451,11 +474,12 @@ struct TranscriptView: NSViewRepresentable {
             // row count — neither changes while text streams into the last row.
             // Skipping the redraw + tracking-area rebuild on every delta is what
             // keeps streaming cheap.
-            let turnRows = newRows.indices.filter { newRows[$0].kind == .userMessage }
+            let outline = ChatOutlineItem.items(from: newRows)
+            let turnRows = outline.map(\.row)
             if turnRows != railTurnRows || newRows.count != railTotalRows {
                 railTurnRows = turnRows
                 railTotalRows = newRows.count
-                container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
+                container?.turnRail.update(turns: outline, totalRows: newRows.count)
             }
 
             // A chat you switch to opens at the newest exchange, deliberately:
@@ -1820,7 +1844,7 @@ final class TranscriptContainerView: NSView {
             ),
             turnRail.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             turnRail.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -50),
-            turnRail.widthAnchor.constraint(equalToConstant: 18),
+            turnRail.widthConstraint,
         ])
     }
 
@@ -1829,30 +1853,36 @@ final class TranscriptContainerView: NSView {
 }
 
 final class TurnRailView: NSView {
-    var turnRows: [Int] = []
+    var turns: [ChatOutlineItem] = []
+    var turnRows: [Int] { turns.map(\.row) }
     var totalRows = 0
     // Only a genuine change is worth a redraw; the scroll observer sets this on
     // every tick, and most ticks leave the active turn exactly where it was.
     var activeRow: Int? { didSet { if oldValue != activeRow { needsDisplay = true } } }
     var onSelectRow: ((Int) -> Void)?
     private var isHovering = false
+    private(set) var widthConstraint: NSLayoutConstraint!
     /// How far from a marker's centre a click still counts as that marker.
-    private static let markerHitSlop: CGFloat = 5
+    private static let markerHitSlop: CGFloat = 8
     /// Below this, a minimap is noise: two dots that say what the scrollbar
     /// already says, in the strip beside it.
     private static let minimumTurns = 3
+    private static let compactWidth: CGFloat = 18
+    private static let expandedWidth: CGFloat = 168
 
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        // Installed once, with `.inVisibleRect` so AppKit keeps it in step with
-        // the bounds. Rebuilding it on every `update` — which a streaming turn
-        // reaches whenever the row count moves — was tracking-area churn on the
-        // path that has to stay cheap.
+        let constraint = widthAnchor.constraint(equalToConstant: Self.compactWidth)
+        constraint.identifier = "turn-rail-width"
+        widthConstraint = constraint
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            options: [
+                .mouseEnteredAndExited, .mouseMoved,
+                .activeInKeyWindow, .inVisibleRect,
+            ],
             owner: self
         ))
     }
@@ -1860,11 +1890,11 @@ final class TurnRailView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not supported") }
 
-    func update(turnRows: [Int], totalRows: Int) {
-        self.turnRows = turnRows
+    func update(turns: [ChatOutlineItem], totalRows: Int) {
+        self.turns = turns
         self.totalRows = totalRows
-        if activeRow == nil { activeRow = turnRows.last }
-        isHidden = turnRows.count < Self.minimumTurns
+        if activeRow == nil { activeRow = turns.last?.row }
+        isHidden = turns.count < Self.minimumTurns
         needsDisplay = true
     }
 
@@ -1874,36 +1904,64 @@ final class TurnRailView: NSView {
     /// hover. Returning the rail for that empty space is what turned a scrollbar
     /// drag into a jump to the nearest turn.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, !turnRows.isEmpty else { return nil }
+        guard !isHidden, !turns.isEmpty else { return nil }
         let local = convert(point, from: superview)
         guard bounds.contains(local) else { return nil }
-        let near = turnRows.contains { abs(y(for: $0) - local.y) <= Self.markerHitSlop }
+        if isHovering { return self }
+        let near = turns.contains { abs(y(for: $0.row) - local.y) <= Self.markerHitSlop }
         return near ? self : nil
     }
 
-    override func mouseEntered(with event: NSEvent) { isHovering = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { isHovering = false; needsDisplay = true }
+    override func mouseEntered(with event: NSEvent) {
+        setExpanded(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setExpanded(false)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        needsDisplay = true
+    }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard let nearest = turnRows.min(by: {
-            abs(y(for: $0) - point.y) < abs(y(for: $1) - point.y)
+        guard let nearest = turns.min(by: {
+            abs(y(for: $0.row) - point.y) < abs(y(for: $1.row) - point.y)
         }) else { return }
-        activeRow = nearest
-        onSelectRow?(nearest)
+        activeRow = nearest.row
+        onSelectRow?(nearest.row)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard !turnRows.isEmpty else { return }
+        guard !turns.isEmpty else { return }
         NSColor.separatorColor.withAlphaComponent(0.25).setFill()
         NSBezierPath(roundedRect: NSRect(x: bounds.maxX - 2, y: 4, width: 1, height: max(0, bounds.height - 8)), xRadius: 0.5, yRadius: 0.5).fill()
-        for row in turnRows {
-            let active = row == activeRow
+        for item in turns {
+            let active = item.row == activeRow
             let width: CGFloat = active ? 13 : (isHovering ? 8 : 5)
-            let rect = NSRect(x: bounds.maxX - width, y: y(for: row) - 2, width: width, height: 4)
+            let rect = NSRect(x: bounds.maxX - width, y: y(for: item.row) - 2, width: width, height: 4)
             (active ? NSColor.controlAccentColor : NSColor.secondaryLabelColor.withAlphaComponent(0.5)).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+            if isHovering {
+                let title = item.title as NSString
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: active ? .semibold : .regular),
+                    .foregroundColor: active ? NSColor.labelColor : NSColor.secondaryLabelColor,
+                ]
+                let size = title.size(withAttributes: attributes)
+                title.draw(
+                    at: NSPoint(x: max(4, bounds.maxX - width - 8 - size.width), y: y(for: item.row) - size.height / 2),
+                    withAttributes: attributes
+                )
+            }
         }
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        isHovering = expanded
+        widthConstraint.constant = expanded ? Self.expandedWidth : Self.compactWidth
+        needsDisplay = true
     }
 
     private func y(for row: Int) -> CGFloat {
@@ -2402,6 +2460,7 @@ final class TranscriptCell: NSTableCellView {
             menuButtonCenterConstraint.constant = Self.firstLineHeight(of: attributedText) / 2
         }
         label.onOpenFile = onOpenFile
+        label.worktreePath = worktreePath
         label.skipHoverTracking = skipHoverTracking
         // Activity groups toggle on a click, so their text isn't selectable;
         // every other row is, now that selecting no longer restyles it. The
@@ -2547,10 +2606,14 @@ final class TranscriptCell: NSTableCellView {
     /// renders streaming text the same way), so cutting mid-document is safe.
     /// Cached per (row id, text length, appearance) — collapsed rows are
     /// complete, so the text cannot change under the cache.
-    static func collapsedAttributedText(for row: TranscriptRow) -> NSAttributedString {
+    static func collapsedAttributedText(
+        for row: TranscriptRow,
+        worktreePath: String = ""
+    ) -> NSAttributedString {
         var hasher = Hasher()
         hasher.combine(currentAppearance.name.rawValue)
         hasher.combine(row.text.utf8.count)
+        hasher.combine(worktreePath)
         let signature = hasher.finalize()
         if let cached = collapsedRenderCache.value(forID: row.id, signature: signature) {
             return cached
@@ -2558,7 +2621,8 @@ final class TranscriptCell: NSTableCellView {
         let rendered = MarkdownRenderer(
             baseFont: .systemFont(ofSize: OreTheme.Font.prose),
             textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
+            highlighter: SyntaxHighlighter.shared,
+            worktreePath: worktreePath
         ).render(truncatedMarkdown(row.text), highlighting: .all)
         collapsedRenderCache.store(rendered, id: row.id, turnID: row.turnID, signature: signature)
         return rendered
@@ -2767,7 +2831,7 @@ final class TranscriptCell: NSTableCellView {
         turnHarness: HarnessKind? = nil
     ) -> NSAttributedString {
         let base = responseCollapse == .collapsed
-            ? collapsedAttributedText(for: row)
+            ? collapsedAttributedText(for: row, worktreePath: worktreePath)
             : attributedText(for: row, worktreePath: worktreePath)
         guard row.kind == .activityGroup, badgeText(for: row).isEmpty,
               let turnHeader, !turnHeader.isEmpty
@@ -2915,7 +2979,7 @@ final class TranscriptCell: NSTableCellView {
 
     static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let appearance = currentAppearance.name.rawValue
-        let signature = renderSignature(for: row, appearance: appearance)
+        let signature = renderSignature(for: row, appearance: appearance, worktreePath: worktreePath)
         if let cached = renderCache.value(forID: row.id, signature: signature) { return cached }
 
         let rendered: NSAttributedString
@@ -2929,7 +2993,8 @@ final class TranscriptCell: NSTableCellView {
             let renderer = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             )
             if row.isComplete {
                 rendered = renderer.render(row.text, highlighting: .all)
@@ -2965,7 +3030,8 @@ final class TranscriptCell: NSTableCellView {
             rendered = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             ).render(source, highlighting: row.isComplete ? .all : .stablePrefix)
 
         case .toolCall, .thinking, .error:
@@ -3021,9 +3087,14 @@ final class TranscriptCell: NSTableCellView {
     /// rows built elsewhere (history, tests) that reuse an id at revision zero.
     /// Rendered rows bake in resolved colours and rasterised chips, so the
     /// appearance is part of the identity too.
-    static func renderSignature(for row: TranscriptRow, appearance: String) -> Int {
+    static func renderSignature(
+        for row: TranscriptRow,
+        appearance: String,
+        worktreePath: String = ""
+    ) -> Int {
         var hasher = Hasher()
         hasher.combine(appearance)
+        hasher.combine(worktreePath)
         hasher.combine(row.kind)
         hasher.combine(row.contentRevision)
         hasher.combine(row.activitySignature)
@@ -3036,6 +3107,9 @@ final class TranscriptCell: NSTableCellView {
         hasher.combine(row.resolvedSubject)
         hasher.combine(row.attachments)
         hasher.combine(row.subagentChildCount)
+        if row.kind == .assistantText {
+            hasher.combine(SnippetRunCache.revision)
+        }
         combineFingerprint(of: row.toolInput, into: &hasher)
         combineFingerprint(of: row.resultMetadata, into: &hasher)
         return hasher.finalize()
@@ -4799,6 +4873,7 @@ private final class TranscriptTextView: FlowchartTextView, NSTextViewDelegate {
     var onSingleClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onOpenFile: ((String) -> Void)?
+    var worktreePath = ""
     /// Agent-busy: don't TextKit-hit-test on every mouseMoved. Those events
     /// queued ahead of clicks and are a large part of "the close button does
     /// nothing until I click twice."
@@ -4861,6 +4936,9 @@ private final class TranscriptTextView: FlowchartTextView, NSTextViewDelegate {
             return true
         case .openURL(let url):
             return NSWorkspace.shared.open(url)
+        case .runSnippet(let id):
+            SnippetRunCache.run(id: id, in: worktreePath)
+            return true
         case nil:
             return false
         }

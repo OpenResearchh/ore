@@ -116,6 +116,25 @@ struct MarkdownRendererTests {
         #expect(color != NSColor.labelColor)
     }
 
+    @Test func bashFencesCarryARunControl() {
+        let result = render("""
+        Try:
+
+        ```bash
+        echo hello
+        ```
+        """)
+        #expect(result.string.contains("Run"))
+        var runLink: URL?
+        result.enumerateAttribute(.link, in: NSRange(location: 0, length: result.length)) { value, _, _ in
+            if let url = value as? URL, url.scheme == "ore-run" { runLink = url }
+        }
+        #expect(runLink != nil)
+        if let runLink {
+            #expect(MarkdownRenderer.TranscriptLink.parse(runLink) == .runSnippet(ShellSnippet.id(for: "echo hello")))
+        }
+    }
+
     @Test func multilineCodeUsesOneTextBlockInsteadOfLineBackgrounds() {
         let result = render("""
         ```swift

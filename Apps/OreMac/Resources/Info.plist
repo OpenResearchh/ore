@@ -36,6 +36,12 @@
 	<string>ORE uses the microphone to dictate prompts into the composer. macOS transcribes it on this Mac when an on-device model is available, otherwise with Apple’s speech service. Audio is never sent to your agent provider.</string>
 	<key>NSRemovableVolumesUsageDescription</key>
 	<string>ORE reads and writes the git repositories you add as projects. Grant access if you keep your code on an external drive.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>ORE’s remote control advertises this Mac on your local network so an iPhone or iPad you pair can send messages and stop agents. Traffic never leaves the LAN.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ore-remote._tcp</string>
+	</array>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>ORE turns dictation into a prompt. Recognition prefers an on-device model and never goes to Claude, Codex, or Cursor.</string>
 	<key>NSSupportsAutomaticTermination</key>

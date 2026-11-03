@@ -63,7 +63,13 @@ public enum HarnessUpdateFailure {
 
     /// `Fix: Run: npm -g uninstall @scope/pkg` as the CLI printed it.
     public static func leftoverUninstallCommand(in text: String) -> String? {
-        let pattern = #"npm\s+-g\s+uninstall\s+\S+"#
+        // This often arrives after `UpdateError` has turned the vendor's raw
+        // output into Markdown: `run `npm …``. `\S+` used to swallow that
+        // closing backtick (and the sentence's period), so pasting the repair
+        // left zsh waiting at its `bquote>` continuation prompt. npm package
+        // names are deliberately narrower than arbitrary shell tokens here;
+        // the vendor is naming a package, not handing us an expression.
+        let pattern = #"npm\s+-g\s+uninstall\s+[@A-Za-z0-9._/-]+"#
         guard let expression = try? NSRegularExpression(pattern: pattern),
               let match = expression.firstMatch(
                 in: text, range: NSRange(text.startIndex..., in: text)

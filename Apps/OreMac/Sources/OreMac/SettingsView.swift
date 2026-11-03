@@ -69,6 +69,7 @@ private struct SettingsPanes: View {
     @AppStorage(VoiceHotkeyMonitor.legacyHoldDictationKey) private var legacyHoldDictation = false
     @Bindable private var layaEngine = LayaEngine.shared
     @Bindable private var glass = OreGlassSettings.shared
+    @Bindable private var remote = RemoteControlServer.shared
     @AppStorage("ore.assistant.proactive") private var assistantProactive = true
     @AppStorage(QuitConfirmation.suppressedKey) private var quitWithoutAsking = false
     @AppStorage(AppModel.automaticRoutinePermissionsKey)
@@ -427,6 +428,68 @@ private struct SettingsPanes: View {
                 }
             }
             .task { notificationsBlocked = await Self.notificationsAreBlocked() }
+            SettingsCard(title: "Remote control", icon: "ipad.and.iphone") {
+                Toggle(
+                    "Allow iPhone and iPad remote control",
+                    isOn: Binding(
+                        get: { remote.isRunning || UserDefaults.standard.bool(forKey: RemoteControlServer.enabledKey) },
+                        set: { remote.setEnabled($0) }
+                    )
+                )
+                Text("Scan the QR with Safari on iPhone or iPad. This is a working remote — chats, send, stop, allow/deny — not a second Mac window. Files, terminal, and review stay on this Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TailscaleRemoteSetup(status: remote.tailscale)
+                if remote.isRunning {
+                    let _ = remote.tokenVersion
+                    if let image = remote.qrImage(dimension: 220) {
+                        Image(nsImage: image)
+                            .interpolation(.none)
+                            .resizable()
+                            .frame(width: 180, height: 180)
+                            .padding(.vertical, 8)
+                    }
+                    ForEach(remote.endpoints) { endpoint in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(endpoint.label)
+                                .font(.caption.weight(.semibold))
+                            if let detail = endpoint.detail {
+                                Text(detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(endpoint.pairingURL(token: remote.pairingToken).absoluteString)
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(remote.clientCount == 0
+                         ? "Waiting for a device."
+                         : "\(remote.clientCount) device(s) connected.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Toggle(
+                        "Only keep awake on AC power",
+                        isOn: Binding(
+                            get: {
+                                UserDefaults.standard.object(forKey: RemoteControlSleep.requireACKey) as? Bool ?? true
+                            },
+                            set: {
+                                UserDefaults.standard.set($0, forKey: RemoteControlSleep.requireACKey)
+                                RemoteControlSleep.update(enabled: remote.isRunning)
+                            }
+                        )
+                    )
+                    Button("New pairing code") {
+                        _ = remote.rotateToken()
+                    }
+                }
+                if let error = remote.lastError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            }
+            .task { await remote.refreshTailscale() }
             SettingsCard(title: "Launch briefing", icon: "sunrise") {
                 Toggle("Greet me at launch", isOn: $greetingEnabled)
                 Toggle("Speak the briefing aloud", isOn: $greetingVoice)
@@ -1690,6 +1753,54 @@ private struct StorageRootsSettings: View {
         panel.message = "ORE will keep repositories and workspaces in this folder, the same layout as ~/ore. The database stays on This Mac."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         appModel.registerStorageRoot(at: url)
+    }
+}
+
+private struct TailscaleRemoteSetup: View {
+    let status: TailscaleStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(headline)
+                .font(.caption.weight(.semibold))
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Button(status.appURL == nil ? "Install Tailscale on this Mac" : "Open Tailscale") {
+                    TailscaleStatus.openOrInstall()
+                }
+                Button("iPad app") {
+                    TailscaleStatus.openIPadInstructions()
+                }
+            }
+        }
+    }
+
+    private var headline: String {
+        switch status.kind {
+        case .missing:
+            return "Tailscale is not on this Mac"
+        case .installed:
+            return "Tailscale is installed — open it and turn it on"
+        case .needsLogin:
+            return "Tailscale needs you to sign in"
+        case .stopped:
+            return "Tailscale is installed but not connected"
+        case .connected(_, let dns, let tailnet):
+            if let dns { return "Tailscale connected · \(dns)" }
+            if let tailnet { return "Tailscale connected · \(tailnet)" }
+            return "Tailscale connected"
+        }
+    }
+
+    private var detail: String {
+        switch status.kind {
+        case .connected:
+            return "Same Wi-Fi works without Tailscale. From a café, the iPad needs the Tailscale app too, signed into the same account. Scan the Tailscale QR — not the Wi-Fi one."
+        default:
+            return "Free for your own devices. Install it here and on the iPad (App Store), same account. ORE does not send traffic through Tailscale’s servers; the apps build a private tunnel between the two."
+        }
     }
 }
 

@@ -14,6 +14,7 @@ enum ChromePaneRequest: Equatable, Sendable {
     case setFast(Bool)
     case setEffort(ReasoningEffort)
     case openFilePalette
+    case openContentSearch
     case terminalTabCreate
     case terminalTabClose
     case terminalTabNext
@@ -35,6 +36,10 @@ enum ChromePaneRequest: Equatable, Sendable {
 
     var isFilePalette: Bool {
         self == .openFilePalette
+    }
+
+    var isContentSearch: Bool {
+        self == .openContentSearch
     }
 
     var isReviewTab: Bool {

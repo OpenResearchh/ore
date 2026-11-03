@@ -125,6 +125,7 @@ struct OreMacApp: App {
     @State private var isShowingNewWorkspace = false
     @State private var isShowingPalette = false
     @State private var isShowingFilePalette = false
+    @State private var isShowingContentSearch = false
     @State private var isShowingShortcuts = false
     // Mirror RootView's pane flags so the menu shortcuts can toggle them.
     private var chrome: ChromeLayoutStore { ChromeLayoutStore.shared }
@@ -244,6 +245,7 @@ struct OreMacApp: App {
                 isShowingNewWorkspace: $isShowingNewWorkspace,
                 isShowingPalette: $isShowingPalette,
                 isShowingFilePalette: $isShowingFilePalette,
+                isShowingContentSearch: $isShowingContentSearch,
                 launchFailure: launchFailure,
                 isShowingShortcuts: $isShowingShortcuts
             )
@@ -344,6 +346,7 @@ struct OreMacApp: App {
 
                 Button("Command Palette") {
                     isShowingFilePalette = false
+                    isShowingContentSearch = false
                     isShowingShortcuts = false
                     isShowingPalette = true
                 }
@@ -351,14 +354,24 @@ struct OreMacApp: App {
 
                 Button("Open File…") {
                     isShowingPalette = false
+                    isShowingContentSearch = false
                     isShowingShortcuts = false
                     isShowingFilePalette = true
                 }
                     .keyboardShortcut("p", modifiers: .command)
 
+                Button("Search in Files…") {
+                    isShowingPalette = false
+                    isShowingFilePalette = false
+                    isShowingShortcuts = false
+                    isShowingContentSearch = true
+                }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+
                 Button("Keyboard Shortcuts") {
                     isShowingPalette = false
                     isShowingFilePalette = false
+                    isShowingContentSearch = false
                     isShowingShortcuts = true
                 }
                     .keyboardShortcut("/", modifiers: .command)
@@ -684,6 +697,7 @@ struct RootView: View {
     @Binding var isShowingNewWorkspace: Bool
     @Binding var isShowingPalette: Bool
     @Binding var isShowingFilePalette: Bool
+    @Binding var isShowingContentSearch: Bool
     var launchFailure: String?
     @Binding var isShowingShortcuts: Bool
 
@@ -909,7 +923,7 @@ struct RootView: View {
     /// and avoids the heavy, document-modal sheet silhouette.
     @ViewBuilder
     private var keyboardOverlay: some View {
-        if isShowingPalette || isShowingFilePalette || isShowingShortcuts {
+        if isShowingPalette || isShowingFilePalette || isShowingContentSearch || isShowingShortcuts {
             ZStack {
                 Color.black.opacity(0.12)
                     .ignoresSafeArea()
@@ -926,6 +940,9 @@ struct RootView: View {
                         onDismiss: dismissKeyboardOverlay
                     )
                         .transition(.scale(scale: 0.97).combined(with: .opacity))
+                } else if isShowingContentSearch, let workspace = model.selectedWorkspace {
+                    ContentSearchPalette(workspace: workspace, onDismiss: dismissKeyboardOverlay)
+                        .transition(.scale(scale: 0.97).combined(with: .opacity))
                 } else if isShowingShortcuts {
                     KeyboardShortcutsView(onDismiss: dismissKeyboardOverlay)
                         .transition(.scale(scale: 0.97).combined(with: .opacity))
@@ -934,6 +951,7 @@ struct RootView: View {
             .onExitCommand(perform: dismissKeyboardOverlay)
             .animation(.smooth(duration: 0.2), value: isShowingPalette)
             .animation(.smooth(duration: 0.2), value: isShowingFilePalette)
+            .animation(.smooth(duration: 0.2), value: isShowingContentSearch)
             .animation(.smooth(duration: 0.2), value: isShowingShortcuts)
             .zIndex(20)
         }
@@ -942,6 +960,7 @@ struct RootView: View {
     private func dismissKeyboardOverlay() {
         isShowingPalette = false
         isShowingFilePalette = false
+        isShowingContentSearch = false
         isShowingShortcuts = false
     }
 
@@ -977,6 +996,7 @@ struct RootView: View {
             }
             .background {
                 FilePaletteChromeListener(isShowing: $isShowingFilePalette)
+                ContentSearchChromeListener(isShowing: $isShowingContentSearch)
             }
         } else {
             welcome
@@ -1466,7 +1486,8 @@ private struct KeyboardShortcutsView: View {
     let onDismiss: () -> Void
     private let shortcuts = [
         ("New workspace", "⌘N"), ("Command palette", "⌘K"),
-        ("Open file", "⌘P"), ("Archive workspace", "⌃⌘A"),
+        ("Open file", "⌘P"), ("Search in files", "⇧⌘F"),
+        ("Archive workspace", "⌃⌘A"),
         ("New tab (terminal when focused)", "⌘T"),
         ("Close tab (terminal when focused)", "⌘W"),
         ("Previous / next coding tab", "⌥⌘←  ⌥⌘→"),
@@ -1563,6 +1584,23 @@ private struct FilePaletteChromeListener: View {
             .onChange(of: chrome.paneRequestID) { _, id in
                 guard id > 0,
                       chrome.consumePaneRequest(where: { $0.isFilePalette }) != nil
+                else { return }
+                isShowing = true
+            }
+    }
+}
+
+private struct ContentSearchChromeListener: View {
+    @Binding var isShowing: Bool
+    private let chrome = ChromeLayoutStore.shared
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: chrome.paneRequestID) { _, id in
+                guard id > 0,
+                      chrome.consumePaneRequest(where: { $0.isContentSearch }) != nil
                 else { return }
                 isShowing = true
             }

@@ -348,6 +348,7 @@ final class AppModel {
             self?.rescanStorageRoots()
         }
         StorageVolumeMonitor.shared.start()
+        RemoteControlServer.shared.bind(model: self)
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.client.events {
@@ -1076,25 +1077,37 @@ final class AppModel {
         let state = chatStates[id] ?? makeChatState(for: id)
         guard !state.hasLoadedHistory else { return }
         guard let turns = try? await client.transcript(chatID: id) else { return }
-        // One query for the whole chat; a long chat used to cost one round
-        // trip per turn, each resuming on the main actor.
-        let grouped = (try? await client.blocks(chatID: id)) ?? []
+        let (recentTurns, olderTurns) = ChatHistoryWindow.split(turns)
         let transitions = (try? await client.chatTransitions(chatID: id)) ?? []
-        // Folding results into calls and sorting is linear in the transcript's
-        // length; a long chat is not a reason to hold the main thread.
-        let rows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
+        // Newest turns first so opening a long chat isn't gated on every
+        // historical tool result. Remaining turns are prepended below.
+        var recentGrouped: [(turnID: TurnID, blocks: [BlockRecord])] = []
+        for turn in recentTurns {
+            let blocks = (try? await client.blocks(turnID: turn.turnID)) ?? []
+            if !blocks.isEmpty { recentGrouped.append((turn.turnID, blocks)) }
+        }
+        let recentRows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
             let blocks = Dictionary(
-                grouped.map { ($0.turnID, $0.blocks) },
+                recentGrouped.map { ($0.turnID, $0.blocks) },
                 uniquingKeysWith: { first, _ in first }
             )
-            return Self.historyRows(turns: turns, blocks: blocks, transitions: transitions)
+            return Self.historyRows(turns: recentTurns, blocks: blocks, transitions: olderTurns.isEmpty ? transitions : [])
         }.value
-        // The chat may have closed (state released) or closed and reopened
-        // (a new state) while this read ran. Load into whatever is current, and
-        // never resurrect state for a chat nobody holds any more.
-        // `ChatState.loadHistory` ignores a second load.
         guard let current = chatStates[id] else { return }
-        current.loadHistory(rows)
+        current.loadHistory(recentRows)
+
+        guard !olderTurns.isEmpty else { return }
+        let grouped = (try? await client.blocks(chatID: id)) ?? []
+        let olderIDs = Set(olderTurns.map(\.turnID))
+        let olderRows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
+            let blocks = Dictionary(
+                grouped.filter { olderIDs.contains($0.turnID) }.map { ($0.turnID, $0.blocks) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            return Self.historyRows(turns: olderTurns, blocks: blocks, transitions: transitions)
+        }.value
+        guard let latest = chatStates[id] else { return }
+        latest.prependOlderHistory(olderRows)
     }
 
     /// A chat's state only if something already loaded it. For polls and

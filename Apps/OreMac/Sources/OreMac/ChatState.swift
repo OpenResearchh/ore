@@ -600,6 +600,19 @@ final class ChatState {
         refreshRevertableTurns()
     }
 
+    /// Older turns, painted after the newest window so opening a long chat
+    /// shows the latest reply first.
+    func prependOlderHistory(_ older: [TranscriptRow]) {
+        let existing = Set(rows.map(\.id))
+        let new = older.filter { !existing.contains($0.id) }
+        guard !new.isEmpty else { return }
+        rows = new + rows
+        for (blockID, index) in streamingRowIndex {
+            streamingRowIndex[blockID] = index + new.count
+        }
+        refreshRevertableTurns()
+    }
+
     private(set) var hasLoadedHistory = false
 
     // MARK: - Rate limits

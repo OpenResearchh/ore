@@ -868,6 +868,22 @@ struct CommandPalette: View {
         ]
         if let workspace = model.selectedWorkspace {
             values.append(PaletteCommand(
+                id: "search-files", title: "Search in Files",
+                detail: "Find a line inside this worktree",
+                systemImage: "text.magnifyingglass", shortcut: "⇧⌘F"
+            ) {
+                onDismiss()
+                ChromeLayout.request(.openContentSearch)
+            })
+            values.append(PaletteCommand(
+                id: "open-file", title: "Open File",
+                detail: "Jump to a file by name",
+                systemImage: "doc.text.magnifyingglass", shortcut: "⌘P"
+            ) {
+                onDismiss()
+                ChromeLayout.request(.openFilePalette)
+            })
+            values.append(PaletteCommand(
                 id: "new-chat", title: "New Coding Tab",
                 detail: "Start another agent conversation in this workspace",
                 systemImage: "plus.bubble", shortcut: "⌘T",

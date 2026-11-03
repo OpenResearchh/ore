@@ -215,20 +215,45 @@ final class RemoteControlServer {
                 guard let text = payload["text"], !text.isEmpty else { return }
                 let workspace = workspaceID(payload["workspaceID"])
                     ?? model.selectedWorkspaceID
-                let chat = payload["chatID"].map { ChatID(rawValue: $0) }
+                    ?? model.assistantWorkspace?.id
+                let chat = payload["chatID"].flatMap { raw -> ChatID? in
+                    raw.isEmpty ? nil : ChatID(rawValue: raw)
+                }
                 guard let workspace else { return }
+                let effort = payload["effort"].flatMap(ReasoningEffort.init(rawValue:))
+                let fast = payload["fast"] == "1" || payload["fast"] == "true"
+                let summary = chat.flatMap { model.chatIndex.summary(for: $0) }
+                    ?? model.activeChat(for: workspace)
+                let serviceTier = summary.flatMap {
+                    resolvedServiceTier(model: model, chat: $0, fast: fast)
+                }
                 if let chat {
-                    model.send(text, origin: .user, to: workspace, chatID: chat, fromComposer: false)
+                    model.send(
+                        text,
+                        effort: effort,
+                        serviceTier: serviceTier,
+                        origin: .user,
+                        to: workspace,
+                        chatID: chat,
+                        fromComposer: false
+                    )
                 } else {
-                    _ = model.send(text, origin: .user, to: workspace)
+                    _ = model.send(
+                        text,
+                        effort: effort,
+                        serviceTier: serviceTier,
+                        origin: .user,
+                        to: workspace
+                    )
                 }
             }
         case "/api/stop":
             return mutate(body) { payload in
                 let workspace = workspaceID(payload["workspaceID"])
                     ?? model.selectedWorkspaceID
+                    ?? model.assistantWorkspace?.id
                 guard let workspace else { return }
-                if let raw = payload["chatID"] {
+                if let raw = payload["chatID"], !raw.isEmpty {
                     model.interrupt(workspace, chatID: ChatID(rawValue: raw))
                 } else {
                     model.interrupt(workspace)
@@ -237,8 +262,12 @@ final class RemoteControlServer {
         case "/api/select":
             return mutate(body) { payload in
                 if let workspace = workspaceID(payload["workspaceID"]) {
-                    model.selectedWorkspaceID = workspace
-                    if let raw = payload["chatID"] {
+                    // Assistant is not a sidebar selection on the Mac; pinning
+                    // it here would blank the main window.
+                    if !isAssistant(workspace, model: model) {
+                        model.selectedWorkspaceID = workspace
+                    }
+                    if let raw = payload["chatID"], !raw.isEmpty {
                         model.selectChat(ChatID(rawValue: raw), in: workspace)
                     }
                 }
@@ -246,13 +275,23 @@ final class RemoteControlServer {
         case "/api/new-chat":
             return mutate(body) { payload in
                 guard let workspace = workspaceID(payload["workspaceID"])
-                    ?? model.selectedWorkspaceID else { return }
-                model.createChat(in: workspace)
+                    ?? model.selectedWorkspaceID
+                    ?? model.assistantWorkspace?.id else { return }
+                if isAssistant(workspace, model: model) {
+                    model.createAssistantConversation()
+                } else {
+                    model.createChat(in: workspace)
+                }
+            }
+        case "/api/composer":
+            return mutate(body) { payload in
+                applyComposer(model: model, payload: payload)
             }
         case "/api/permission":
             return mutate(body) { payload in
                 guard let workspace = workspaceID(payload["workspaceID"])
-                    ?? model.selectedWorkspaceID,
+                    ?? model.selectedWorkspaceID
+                    ?? model.assistantWorkspace?.id,
                       let requestID = payload["requestID"], !requestID.isEmpty
                 else { return }
                 let chat = payload["chatID"].map { ChatID(rawValue: $0) }
@@ -269,7 +308,8 @@ final class RemoteControlServer {
         case "/api/answer":
             return mutate(body) { payload in
                 guard let workspace = workspaceID(payload["workspaceID"])
-                    ?? model.selectedWorkspaceID,
+                    ?? model.selectedWorkspaceID
+                    ?? model.assistantWorkspace?.id,
                       let questionID = payload["questionID"], !questionID.isEmpty,
                       let answer = payload["answer"]
                 else { return }
@@ -302,7 +342,11 @@ final class RemoteControlServer {
         }
         var result: [String: String] = [:]
         for (key, value) in object {
-            if let text = value as? String { result[key] = text }
+            if let text = value as? String {
+                result[key] = text
+            } else if let flag = value as? Bool {
+                result[key] = flag ? "1" : ""
+            }
         }
         return result
     }
@@ -312,22 +356,35 @@ final class RemoteControlServer {
         return WorkspaceID(rawValue: raw)
     }
 
+    private func isAssistant(_ id: WorkspaceID, model: AppModel) -> Bool {
+        model.assistantWorkspace?.id == id
+    }
+
+    private func listedWorkspaces(model: AppModel) -> [WorkspaceSummary] {
+        var listed: [WorkspaceSummary] = []
+        if let assistant = model.assistantWorkspace {
+            listed.append(assistant)
+        }
+        listed.append(contentsOf: model.sortedWorkspaces.filter { !$0.isDream })
+        return Array(listed.prefix(40))
+    }
+
     private func state(model: AppModel, query: [String: String]) -> [String: Any] {
-        let workspaceID = query["workspace"].map(WorkspaceID.init(rawValue:))
+        let workspaceID = self.workspaceID(query["workspace"])
             ?? model.selectedWorkspaceID
-        let chatID = query["chat"].map(ChatID.init(rawValue:))
-            ?? workspaceID.flatMap { model.activeChat(for: $0)?.id }
-        let workspaces = model.sortedWorkspaces
-            .filter { !$0.isAssistant && !$0.isDream }
-            .prefix(40)
-            .map { workspace -> [String: String] in
-                [
-                    "id": workspace.id.rawValue,
-                    "name": workspace.name,
-                    "branch": workspace.branch,
-                    "needsYou": workspace.hasUnread ? "1" : "",
-                ]
-            }
+            ?? model.assistantWorkspace?.id
+        let chatID = query["chat"].flatMap { raw -> ChatID? in
+            raw.isEmpty ? nil : ChatID(rawValue: raw)
+        } ?? workspaceID.flatMap { model.activeChat(for: $0)?.id }
+        let workspaces = listedWorkspaces(model: model).map { workspace -> [String: String] in
+            [
+                "id": workspace.id.rawValue,
+                "name": workspace.isAssistant ? (workspace.name.isEmpty ? "Assistant" : workspace.name) : workspace.name,
+                "branch": workspace.isAssistant ? "Conversations" : workspace.branch,
+                "kind": workspace.kind?.rawValue ?? "standard",
+                "needsYou": workspace.hasUnread ? "1" : "",
+            ]
+        }
         var chats: [[String: String]] = []
         if let workspaceID {
             chats = model.chats(for: workspaceID).prefix(30).map { chat in
@@ -347,23 +404,42 @@ final class RemoteControlServer {
         var willQueue = false
         var queueHint = ""
         var error = ""
+        var usage: UsageReport?
         if let chatID {
             let chat = model.chat(for: chatID)
             busy = chat.isBusy
             willQueue = chat.willQueueNextMessage
+            usage = chat.usage
             if willQueue {
                 queueHint = chat.status == .awaitingInput
                     ? "This will queue — the agent is waiting on you."
                     : "This will queue behind the current turn."
             }
             error = chat.prominentError?.message ?? ""
-            let rows = chat.rows.filter { row in
-                switch row.kind {
-                case .divider, .turnFooter: return false
-                default: return true
+            let hiding: TurnID? = {
+                if case .proposal = chat.plan { return chat.planTurnID }
+                return nil
+            }()
+            let displayed = TranscriptDisplay.rows(
+                from: chat.rows,
+                keepLiveTurnExpanded: chat.isTurnActive,
+                expanded: [],
+                memo: TranscriptDisplay.Memo(),
+                hidingPlanTurnID: hiding
+            )
+            let agentName = model.chatIndex.summary(for: chatID)?.harness.displayName ?? "Agent"
+            let stamp = ISO8601DateFormatter()
+            var headerTurns = Set<TurnID>()
+            messages = displayed.suffix(80).compactMap { row in
+                guard row.kind != .divider, row.kind != .turnFooter else { return nil }
+                var payload = Self.message(from: row)
+                if (row.kind == .activityGroup || row.kind == .assistantText || row.kind == .plan),
+                   headerTurns.insert(row.turnID).inserted {
+                    payload["header"] = agentName
+                    payload["at"] = stamp.string(from: row.createdAt)
                 }
+                return payload
             }
-            messages = rows.suffix(50).map { Self.message(from: $0) }
             permissions = chat.pendingPermissions.compactMap { request in
                 if request.toolName == "AskUserQuestion" { return nil }
                 if request.toolName == "ExitPlanMode", case .proposal = chat.plan { return nil }
@@ -384,6 +460,7 @@ final class RemoteControlServer {
                 ] as [String: Any]
             }
         }
+        let summary = chatID.flatMap { model.chatIndex.summary(for: $0) }
         return [
             "workspaces": workspaces,
             "chats": chats,
@@ -396,10 +473,227 @@ final class RemoteControlServer {
             "error": error,
             "selectedWorkspace": workspaceID?.rawValue ?? "",
             "selectedChat": chatID?.rawValue ?? "",
+            "composer": composerSnapshot(model: model, chat: summary, usage: usage),
         ]
     }
 
-    private static func message(from row: TranscriptRow) -> [String: Any] {
+    private func composerSnapshot(
+        model: AppModel,
+        chat: ChatSummary?,
+        usage: UsageReport?
+    ) -> [String: Any] {
+        var kinds = model.readyHarnesses
+        if let chat, !kinds.contains(chat.harness) {
+            kinds.insert(chat.harness, at: 0)
+        }
+        let harnesses: [[String: Any]] = kinds.map { kind in
+            [
+                "id": kind.rawValue,
+                "name": kind.displayName,
+                "models": composerModels(model: model, harness: kind),
+            ]
+        }
+        let permissionModes: [[String: String]] = PermissionMode.allCases.map {
+            ["id": $0.rawValue, "name": $0.displayName]
+        }
+        guard let chat else {
+            return [
+                "harnesses": harnesses,
+                "permissionModes": permissionModes,
+                "harness": kinds.first?.rawValue ?? "",
+                "model": "",
+                "effort": "",
+                "permissionMode": PermissionMode.default.rawValue,
+                "fast": false,
+                "supportsFast": false,
+                "supportsEffort": false,
+                "efforts": [] as [Any],
+                "context": "",
+            ]
+        }
+        let choices = model.knownModels(for: chat.harness)
+        let family = ModelVariantCatalog.family(containing: chat.model, in: choices)
+        let efforts = availableEfforts(model: model, chat: chat)
+        let fast = isFastEnabled(chat: chat, family: family)
+        let supportsFast = supportsFastMode(chat, family: family, choices: choices)
+        let selectedModel = family?.id ?? chat.model ?? model.defaultModelID(for: chat.harness) ?? ""
+        let selectedName = family?.displayName
+            ?? choices.first { $0.id == chat.model }?.displayName
+            ?? chat.model
+            ?? chat.harness.displayName
+        let effort = chat.reasoningEffort
+            ?? family?.encodedEffort(of: chat.model)
+            ?? storedEffort(for: chat)
+        let report = usage ?? chat.contextUsage
+        var context = ""
+        if let report, let window = report.contextWindow, window > 0 {
+            let percent = min(100, (report.totalContextTokens * 100) / window)
+            context = "\(percent)%"
+        }
+        return [
+            "harnesses": harnesses,
+            "permissionModes": permissionModes,
+            "harness": chat.harness.rawValue,
+            "model": selectedModel,
+            "modelName": selectedName,
+            "effort": effort?.rawValue ?? "",
+            "permissionMode": chat.permissionMode.rawValue,
+            "fast": fast,
+            "supportsFast": supportsFast,
+            "supportsEffort": !efforts.isEmpty,
+            "efforts": efforts.map { ["id": $0.rawValue, "name": $0.displayName] },
+            "context": context,
+        ]
+    }
+
+    private func composerModels(model: AppModel, harness: HarnessKind) -> [[String: Any]] {
+        let choices = model.knownModels(for: harness)
+        let families = ModelVariantCatalog.families(from: choices)
+        if families.isEmpty {
+            return choices.map { agent in
+                [
+                    "id": agent.id,
+                    "name": agent.displayName,
+                    "description": agent.description,
+                    "default": agent.isDefault,
+                ] as [String: Any]
+            }
+        }
+        return families.map { family in
+            [
+                "id": family.id,
+                "name": family.displayName,
+                "description": family.description,
+                "default": family.isDefault,
+            ] as [String: Any]
+        }
+    }
+
+    private func applyComposer(model: AppModel, payload: [String: String]) {
+        let workspace = workspaceID(payload["workspaceID"])
+            ?? model.selectedWorkspaceID
+            ?? model.assistantWorkspace?.id
+        guard let workspace else { return }
+        let chatID = payload["chatID"].flatMap { raw -> ChatID? in
+            raw.isEmpty ? nil : ChatID(rawValue: raw)
+        } ?? model.activeChat(for: workspace)?.id
+        guard let chatID, let chat = model.chatIndex.summary(for: chatID) else { return }
+        model.selectChat(chatID, in: workspace)
+        let effort = payload["effort"].flatMap(ReasoningEffort.init(rawValue:))
+        let fast = payload["fast"] == "1" || payload["fast"] == "true"
+        let harness = payload["harness"].flatMap(HarnessKind.init(rawValue:)) ?? chat.harness
+        let desiredModel = resolvedModelID(
+            payload["model"],
+            harness: harness,
+            effort: effort,
+            fast: fast,
+            model: model
+        )
+        if harness != chat.harness {
+            model.switchHarness(harness, model: desiredModel, for: chat)
+        } else if desiredModel != nil, desiredModel != chat.model {
+            model.setModel(desiredModel, for: chat)
+        }
+        if let effort {
+            model.setEffort(effort, for: chat)
+            UserDefaults.standard.set(effort.rawValue, forKey: "ore.reasoningEffort.\(chat.id.rawValue)")
+        }
+        if let mode = payload["permissionMode"].flatMap(PermissionMode.init(rawValue:)),
+           mode != chat.permissionMode {
+            model.setPermissionMode(mode, for: workspace)
+        }
+        UserDefaults.standard.set(fast, forKey: "ore.fastMode.\(chat.id.rawValue)")
+    }
+
+    private func resolvedModelID(
+        _ raw: String?,
+        harness: HarnessKind,
+        effort: ReasoningEffort?,
+        fast: Bool,
+        model: AppModel
+    ) -> String? {
+        let choices = model.knownModels(for: harness)
+        guard let raw, !raw.isEmpty else { return model.defaultModelID(for: harness) }
+        let families = ModelVariantCatalog.families(from: choices)
+        if let family = families.first(where: {
+            $0.id == raw || $0.variants.contains { $0.id == raw }
+        }) {
+            return family.resolve(effort: effort, fast: family.supportsFast && fast).id
+        }
+        return raw
+    }
+
+    private func availableEfforts(model: AppModel, chat: ChatSummary) -> [ReasoningEffort] {
+        let choices = model.knownModels(for: chat.harness)
+        if let family = ModelVariantCatalog.family(containing: chat.model, in: choices),
+           family.encodedEfforts.count > 1 {
+            return family.encodedEfforts
+        }
+        guard chat.harness.supportsReasoningEffort else { return [] }
+        let selected: AgentModel?
+        if let requestedID = chat.model {
+            selected = choices.first { $0.id == requestedID }
+            if selected == nil { return [] }
+        } else {
+            selected = choices.first(where: \.isDefault) ?? choices.first
+        }
+        let advertised = Set(selected?.supportedReasoningEfforts ?? [])
+        guard !advertised.isEmpty else { return [] }
+        return ReasoningEffort.allCases.filter { advertised.contains($0.rawValue) }
+    }
+
+    private func supportsFastMode(
+        _ chat: ChatSummary,
+        family: ModelFamily?,
+        choices: [AgentModel]
+    ) -> Bool {
+        if family?.supportsFast == true { return true }
+        guard chat.harness == .codex else { return false }
+        let selected: AgentModel?
+        if let id = chat.model {
+            selected = choices.first { $0.id == id }
+            if selected == nil { return false }
+        } else {
+            selected = choices.first(where: \.isDefault) ?? choices.first
+        }
+        return selected?.supportedServiceTiers.contains("fast") == true
+    }
+
+    private func isFastEnabled(
+        chat: ChatSummary,
+        family: ModelFamily?
+    ) -> Bool {
+        if let family, family.supportsFast {
+            return family.isFast(chat.model)
+        }
+        return UserDefaults.standard.bool(forKey: "ore.fastMode.\(chat.id.rawValue)")
+    }
+
+    private func storedEffort(for chat: ChatSummary) -> ReasoningEffort? {
+        let key = "ore.reasoningEffort.\(chat.id.rawValue)"
+        return UserDefaults.standard.string(forKey: key).flatMap(ReasoningEffort.init(rawValue:))
+    }
+
+    private func resolvedServiceTier(
+        model: AppModel,
+        chat: ChatSummary,
+        fast: Bool
+    ) -> String? {
+        guard fast else { return nil }
+        let choices = model.knownModels(for: chat.harness)
+        if let family = ModelVariantCatalog.family(containing: chat.model, in: choices),
+           family.supportsFast {
+            return nil
+        }
+        guard supportsFastMode(
+            chat,
+            family: ModelVariantCatalog.family(containing: chat.model, in: choices),
+            choices: choices
+        ) else { return nil }
+        return "fast"
+    }
+
+    private static func message(from row: TranscriptRow, nested: Bool = false) -> [String: Any] {
         let kind: String
         switch row.kind {
         case .userMessage: kind = "you"
@@ -411,14 +705,49 @@ final class RemoteControlServer {
         case .plan: kind = "plan"
         case .divider, .turnFooter: kind = "agent"
         }
-        let title = row.toolName ?? row.resolvedSubject ?? ""
-        let body = row.resultText.flatMap { $0.isEmpty ? nil : $0 } ?? row.text
-        return [
+        let title: String
+        switch row.kind {
+        case .activityGroup:
+            title = row.text
+        case .thinking:
+            title = "Thinking"
+        case .toolCall:
+            title = row.toolName ?? row.resolvedSubject ?? row.text
+        default:
+            title = row.toolName ?? row.resolvedSubject ?? ""
+        }
+        let detail = row.resultText.flatMap { $0.isEmpty ? nil : $0 }
+        let body: String
+        switch row.kind {
+        case .toolCall:
+            body = detail ?? row.text
+        case .activityGroup:
+            body = row.text
+        default:
+            body = row.text
+        }
+        let expandable = row.kind == .activityGroup
+            || row.kind == .toolCall
+            || row.kind == .thinking
+            || row.kind == .error
+        var payload: [String: Any] = [
+            "id": row.id,
             "kind": kind,
-            "title": String(title.prefix(80)),
-            "text": String(body.prefix(2_000)),
+            "turn": row.turnID.rawValue,
+            "title": String(title.prefix(120)),
+            "text": String(body.prefix(12_000)),
             "queued": row.isQueued,
+            "complete": row.isComplete,
+            "expandable": expandable,
+            "nested": nested,
         ]
+        if let detail, row.kind == .toolCall || row.kind == .error {
+            payload["detail"] = String(detail.prefix(8_000))
+        }
+        if row.kind == .activityGroup, !row.groupedRows.isEmpty {
+            payload["steps"] = row.groupedRows.map { message(from: $0, nested: true) }
+        }
+        return payload
     }
 
     private static func endpoints(

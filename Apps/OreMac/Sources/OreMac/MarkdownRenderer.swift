@@ -434,6 +434,7 @@ struct MarkdownRenderer {
             "js", "jsx", "ts", "tsx", "py", "rb", "php", "sh", "zsh", "fish", "sql",
             "html", "css", "scss", "vue", "svelte", "json", "jsonl", "yaml", "yml", "toml",
             "xml", "md", "mdx", "txt", "plist", "gradle", "properties", "env",
+            "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp", "pdf",
         ].joined(separator: "|")
         // A trailing `:line`, `:line:col`, or `:line,col` locator is captured so a
         // click can jump straight to it. The trailing `(?![A-Za-z0-9])` boundary

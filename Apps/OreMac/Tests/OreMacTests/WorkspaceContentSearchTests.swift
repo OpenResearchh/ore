@@ -164,3 +164,60 @@ struct RemoteHTTPLimitsTests {
         #expect(RemoteHTTPLimits.headersTooLarge(Data(repeating: 0x41, count: RemoteHTTPLimits.maxHeaderBytes + 1)))
     }
 }
+
+struct WorkspaceFileCreationTests {
+    @Test func validatedRelativePathRejectsTraversal() {
+        #expect(AppModel.validatedRelativePath("foo.swift") == "foo.swift")
+        #expect(AppModel.validatedRelativePath("src/foo.swift") == "src/foo.swift")
+        #expect(AppModel.validatedRelativePath("  notes.md  ") == "notes.md")
+        #expect(AppModel.validatedRelativePath("../secret") == nil)
+        #expect(AppModel.validatedRelativePath("/etc/passwd") == nil)
+        #expect(AppModel.validatedRelativePath("foo/../bar") == nil)
+        #expect(AppModel.validatedRelativePath("") == nil)
+        #expect(AppModel.validatedRelativePath(".") == nil)
+        #expect(AppModel.validatedRelativePath("foo\\bar") == nil)
+    }
+
+    @Test func writeEmptyFileCreatesNestedPathAndRefusesOverwrite() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-new-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try AppModel.writeEmptyFile("src/hello.swift", root: root.path)
+        let created = root.appendingPathComponent("src/hello.swift")
+        #expect(FileManager.default.fileExists(atPath: created.path))
+        #expect(throws: AppModel.FileCreationError.alreadyExists) {
+            try AppModel.writeEmptyFile("src/hello.swift", root: root.path)
+        }
+        #expect(throws: AppModel.FileCreationError.invalidName) {
+            try AppModel.writeEmptyFile("../outside.swift", root: root.path)
+        }
+    }
+}
+
+struct RemoteControlPageTests {
+    @Test func layoutMatchesTheMacChrome() {
+        let html = RemoteControlPage.html
+        #expect(html.contains("class=\"sidebar\""))
+        #expect(html.contains("class=\"tabs\""))
+        #expect(html.contains("class=\"composer\""))
+        #expect(html.contains("--brand: #F59E0B"))
+        #expect(html.contains("id=\"toolbar\""))
+        #expect(html.contains("id=\"harness\""))
+        #expect(html.contains("id=\"model\""))
+        #expect(html.contains("id=\"effort\""))
+        #expect(html.contains("id=\"permission\""))
+        #expect(html.contains("id=\"fast\""))
+        #expect(html.contains("/api/composer"))
+        #expect(html.contains("kind === \"assistant\""))
+        #expect(html.contains("Message Assistant"))
+        #expect(html.contains("Show full response"))
+        #expect(html.contains("data-expand"))
+        #expect(html.contains("followBottom"))
+        #expect(html.contains("id=\"jump\""))
+        #expect(html.contains("Latest"))
+        #expect(html.contains("id=\"send-label\""))
+        #expect(html.contains("function icon("))
+    }
+}

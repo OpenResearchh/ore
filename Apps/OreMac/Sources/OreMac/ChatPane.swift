@@ -3065,9 +3065,8 @@ struct ChatPane: View {
     }
 
     /// Agent output may use a repository-relative path, an absolute worktree
-    /// path, or a short basename. Resolve all three into the workspace index so
-    /// clicking a reference opens ORE's source tab rather than asking Finder to
-    /// interpret a relative URL.
+    /// path, or a short basename. Resolve into the workspace, including hidden
+    /// `.context` notes the All Files list does not show.
     private func openAgentFile(_ reference: String) {
         guard let resolved = AgentFileReferenceResolver.resolve(
             reference,

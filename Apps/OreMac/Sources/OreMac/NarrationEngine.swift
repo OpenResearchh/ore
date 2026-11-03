@@ -888,6 +888,7 @@ final class NarrationEngine {
             if isMuted {
                 silentDisplayTask?.cancel()
                 silentDisplayTask = nil
+                clearDisplayedUtterance()
                 pumpSilent()
             } else if let current = currentUtterance, current.priority < .interrupt,
                       isVoiceSpeaking {
@@ -914,15 +915,29 @@ final class NarrationEngine {
                 coalescers[activeChatID] = coalescer
             }
         }
-        pump()
+        if isMuted {
+            // A cancelled mute timer with the line still marked in flight is
+            // how the pill froze on the last caption: the queue could not
+            // advance, and a lost-ending check would not fire while more
+            // lines were waiting.
+            if currentUtterance != nil, silentDisplayTask == nil {
+                utteranceEnded()
+            } else {
+                pumpSilent()
+            }
+        } else {
+            pump()
+        }
         // The ticker is the engine's second chance at anything a missed event
         // stranded, and a lost ending strands more than a pump. `onEnd` is the
         // only thing that ever finishes a line: without it the book-keeping
         // stays mid-utterance, `notifyWhenQuiet` is never released, and the
         // voice pill sits on "Speaking…" with the agent long since silent.
+        // Mute captions are not lost endings — they have no synthesizer.
         if Self.endingWasLost(
             isAudibleOrQueued: hasAudibleOrQueuedSpeech,
-            isMidUtterance: currentUtterance != nil
+            isMidUtterance: currentUtterance != nil,
+            isSilentCaption: silentDisplayTask != nil
         ) {
             utteranceEnded()
         } else {
@@ -938,8 +953,29 @@ final class NarrationEngine {
     /// ending when a preempted stream loses the generation check. Nothing is
     /// audible and nothing is queued, yet a line is still marked in flight:
     /// that combination only happens when an ending was lost.
-    static func endingWasLost(isAudibleOrQueued: Bool, isMidUtterance: Bool) -> Bool {
-        isMidUtterance && !isAudibleOrQueued
+    static func endingWasLost(
+        isAudibleOrQueued: Bool,
+        isMidUtterance: Bool,
+        isSilentCaption: Bool = false
+    ) -> Bool {
+        isMidUtterance && !isAudibleOrQueued && !isSilentCaption
+    }
+
+    /// UTF-16 offsets at the end of each whole word, so a muted caption can
+    /// reveal the line the way speech does instead of dumping it at once.
+    nonisolated static func wordEndOffsets(in text: String) -> [Int] {
+        var offsets: [Int] = []
+        var seen = 0
+        for word in text.split(omittingEmptySubsequences: true, whereSeparator: \.isWhitespace) {
+            if seen > 0 { seen += 1 }
+            seen += String(word).utf16.count
+            offsets.append(seen)
+        }
+        let full = text.utf16.count
+        if let last = offsets.last, last < full {
+            offsets.append(full)
+        }
+        return offsets
     }
 
     private func pump() {
@@ -1003,7 +1039,8 @@ final class NarrationEngine {
         spokenCharacterCount = 0
     }
 
-    /// Muted sidebar: no audio, but the HUD pill still streams the line.
+    /// Muted sidebar: no audio, but the HUD pill still streams the line
+    /// word by word so it can be read, then dismisses itself.
     private func pumpSilent() {
         guard isMuted, !micActive, currentUtterance == nil, silentDisplayTask == nil,
               queue.peek != nil
@@ -1012,23 +1049,28 @@ final class NarrationEngine {
         currentUtterance = utterance
         speakingChatID = utterance.chatID
         currentSpokenText = utterance.text
-        spokenCharacterCount = utterance.text.utf16.count
+        spokenCharacterCount = 0
         digests[utterance.chatID]?.noteSpoken(utterance.text)
-        let hold = Self.silentCaptionHold(for: utterance.text)
+        let text = utterance.text
+        let ends = Self.wordEndOffsets(in: text)
         silentDisplayTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: hold)
+            for end in ends {
+                try? await Task.sleep(for: Self.silentWordInterval)
+                guard !Task.isCancelled, let self else { return }
+                self.spokenCharacterCount = end
+            }
+            try? await Task.sleep(for: Self.silentTailHold)
             guard !Task.isCancelled, let self else { return }
             self.silentDisplayTask = nil
             self.utteranceEnded()
         }
     }
 
-    /// Enough time to read a caption without feeling like a stall.
-    private static func silentCaptionHold(for text: String) -> Duration {
-        let words = max(1, text.split(whereSeparator: \.isWhitespace).count)
-        let seconds = min(12, max(2.5, Double(words) * 0.35))
-        return .seconds(seconds)
-    }
+    /// Pace a muted caption like spoken narration: one word at a time.
+    static let silentWordInterval: Duration = .milliseconds(260)
+    /// A beat after the last word so the pill does not vanish on the final
+    /// syllable.
+    static let silentTailHold: Duration = .milliseconds(700)
 
     private func dropState(for chatID: ChatID) {
         queue.dropAll(for: chatID)

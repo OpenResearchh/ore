@@ -134,10 +134,55 @@ enum RemoteControlTLS {
 /// which traps, and there was no cap on header or body size.
 enum RemoteHTTPLimits {
     static let maxHeaderBytes = 32 * 1024
-    static let maxBodyBytes = 64 * 1024
-    static let maxSessions = 8
+    static let maxBodyBytes = 512 * 1024
+    static let maxSessions = 16
     static let idleTimeout: Duration = .seconds(30)
     static let maxLifetime: Duration = .seconds(120)
+    /// Event streams stay open so an iPad Home Screen app can resume instead
+    /// of pairing again. Bounded so a backgrounded tablet cannot pin a slot.
+    static let streamLifetime: Duration = .seconds(30 * 60)
+
+    static func isSlowAPI(_ path: String) -> Bool {
+        switch path {
+        case "/api/changes", "/api/diff", "/api/search", "/api/save", "/api/new-file", "/api/shell":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isPublicPath(_ path: String) -> Bool {
+        switch path {
+        case "/",
+             "/manifest.webmanifest",
+             "/apple-touch-icon.png",
+             "/apple-touch-icon-precomposed.png",
+             "/favicon.ico",
+             "/favicon.png":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Pairing token from `Cookie: ore-token=…`. Add to Home Screen on iOS
+    /// gets a separate JavaScript storage world from Safari, but cookies on
+    /// the origin survive that jump.
+    static func cookieToken(from headers: String) -> String? {
+        for raw in headers.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.lowercased().hasPrefix("cookie:") else { continue }
+            let value = line.dropFirst("cookie:".count)
+            for part in value.split(separator: ";") {
+                let pair = part.trimmingCharacters(in: .whitespaces)
+                let lower = pair.lowercased()
+                guard lower.hasPrefix("ore-token=") else { continue }
+                let token = String(pair.dropFirst("ore-token=".count))
+                return token.removingPercentEncoding ?? token
+            }
+        }
+        return nil
+    }
 
     /// Headers stop at `\r\n\r\n`. Bytes after that are body, so a legal
     /// request whose first packet includes a large body must not be treated

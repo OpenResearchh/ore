@@ -21,6 +21,10 @@ final class AssistantVoiceHUD {
     final class DisplayState {
         var showsVoiceRow = false
         var showsActions = false
+        /// Word-by-word prefix of the line currently being voiced or captioned.
+        /// Held here so the pill re-renders as `spokenCharacterCount` advances
+        /// — the SwiftUI view does not otherwise observe the engine.
+        var caption = ""
         /// The ask the panel was sized for — and the only one the card may
         /// draw. The view used to re-derive this from the model, which is how
         /// ✕ came to do nothing: dismissing hides an ask from `evaluate()`'s
@@ -98,6 +102,7 @@ final class AssistantVoiceHUD {
             _ = controller.failure
             _ = controller.hudChromeTick
             _ = model.narration.currentSpokenText
+            _ = model.narration.spokenCharacterCount
         } onChange: {
             Task { @MainActor in
                 AssistantVoiceHUD.shared.evaluate()
@@ -141,6 +146,7 @@ final class AssistantVoiceHUD {
         display.showsVoiceRow = voiceActive
         display.showsActions = actions
         display.item = actionable
+        display.caption = model?.narration.spokenPrefix ?? ""
         guard voiceActive || actions else {
             hide()
             return
@@ -522,7 +528,7 @@ private struct AssistantHUDView: View {
             // The same word-by-word prefix the assistant's own speech streams:
             // the engine reports it for whichever utterance is playing.
             isNarrating
-                ? (model?.narration.spokenPrefix ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                ? display.caption.trimmingCharacters(in: .whitespacesAndNewlines)
                 : ""
         }
     }

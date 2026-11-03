@@ -163,6 +163,22 @@ struct RemoteHTTPLimitsTests {
         #expect(RemoteHTTPLimits.headersTooLarge(headers))
         #expect(RemoteHTTPLimits.headersTooLarge(Data(repeating: 0x41, count: RemoteHTTPLimits.maxHeaderBytes + 1)))
     }
+
+    @Test func cookieTokenReadsOreTokenAndIgnoresOthers() {
+        #expect(RemoteHTTPLimits.cookieToken(from: "Cookie: ore-token=abc-123") == "abc-123")
+        #expect(
+            RemoteHTTPLimits.cookieToken(from: "Cookie: theme=dark; ore-token=pair-me; sid=9")
+                == "pair-me"
+        )
+        #expect(RemoteHTTPLimits.cookieToken(from: "X-Ore-Token: nope") == nil)
+        #expect(RemoteHTTPLimits.isPublicPath("/manifest.webmanifest"))
+        #expect(RemoteHTTPLimits.isPublicPath("/apple-touch-icon.png"))
+        #expect(!RemoteHTTPLimits.isPublicPath("/api/state"))
+        #expect(RemoteHTTPLimits.isSlowAPI("/api/diff"))
+        #expect(RemoteHTTPLimits.isSlowAPI("/api/shell"))
+        #expect(!RemoteHTTPLimits.isSlowAPI("/api/state"))
+        #expect(RemoteHTTPLimits.contentLength(from: "Content-Length: 200000") == .valid(200000))
+    }
 }
 
 struct WorkspaceFileCreationTests {
@@ -219,5 +235,31 @@ struct RemoteControlPageTests {
         #expect(html.contains("Latest"))
         #expect(html.contains("id=\"send-label\""))
         #expect(html.contains("function icon("))
+        #expect(html.contains("manifest.webmanifest"))
+        #expect(html.contains("apple-touch-icon"))
+        #expect(html.contains("localStorage"))
+        #expect(html.contains("EventSource"))
+        #expect(html.contains("/api/events"))
+        #expect(html.contains("pageshow"))
+        #expect(html.contains("visibilitychange"))
+        #expect(html.contains("Add to Home Screen"))
+        #expect(html.contains("class=\"inspector\""))
+        #expect(html.contains("data-reply"))
+        #expect(html.contains("/api/close-chat"))
+        #expect(html.contains("display-mode: standalone"))
+        #expect(html.contains("/api/diff"))
+        #expect(html.contains("/api/search"))
+        #expect(html.contains("/api/shell"))
+        #expect(html.contains("/api/save"))
+        #expect(html.contains("class=\"term-dock\""))
+        #expect(html.contains("data-pane=\"changes\""))
+        #expect(html.contains("data-pane=\"requests\""))
+        #expect(html.contains("id=\"search-q\""))
+        #expect(html.contains("id=\"term-cmd\""))
+        #expect(html.contains("New file"))
+        #expect(RemoteControlPage.manifest.contains("\"display\": \"standalone\""))
+        let icon = RemoteControlPage.iconPNG()
+        #expect(icon.count > 100)
+        #expect(icon.starts(with: Data([0x89, 0x50, 0x4E, 0x47])))
     }
 }

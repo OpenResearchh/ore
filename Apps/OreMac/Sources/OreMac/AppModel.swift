@@ -1576,7 +1576,8 @@ final class AppModel {
         origin: MessageOrigin = .user,
         to id: WorkspaceID,
         chatID: ChatID,
-        fromComposer: Bool = true
+        fromComposer: Bool = true,
+        replyTo: MessageReply? = nil
     ) {
         if let workspace = workspaces.first(where: { $0.id == id }),
            workspace.isStorageOffline {
@@ -1591,7 +1592,7 @@ final class AppModel {
         // A button's prompt isn't the composer's text: whatever the user has
         // half-typed, attached or commented stays put for their own send.
         let comments = fromComposer ? state.takeDraftComments() : []
-        let reply = fromComposer ? state.takeDraftReply() : nil
+        let reply = replyTo ?? (fromComposer ? state.takeDraftReply() : nil)
         if fromComposer {
             persistDraftComments([], for: chatID)
             persistDraftAttachments([], for: chatID)

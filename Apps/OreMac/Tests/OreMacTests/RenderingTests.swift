@@ -1,5 +1,6 @@
 import AppKit
 import OreProtocol
+import SwiftUI
 import Testing
 
 @testable import OreMac
@@ -697,6 +698,42 @@ struct UserMessageAttachmentTests {
         #expect(rendered.string.contains("what did you mean by that?"))
     }
 
+    @Test func replyTargetBarStaysAChipWhenThePaneIsTall() {
+        let reply = MessageReply(
+            rowID: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            role: .assistant,
+            author: "Cursor Agent",
+            text: "Direct hangup no longer waits on a stalled synthesizer. finish_goodbye now uses TaskScope.wait_for so cancel does not hang."
+        )
+        let box = HeightBox()
+        let root = ZStack(alignment: .bottom) {
+            Color.clear.frame(width: 520, height: 720)
+            ReplyTargetBar(reply: reply, onReveal: {}, onClear: {})
+                .background {
+                    GeometryReader { geo in
+                        Color.clear.preference(key: ReplyBarHeightKey.self, value: geo.size.height)
+                    }
+                }
+                .onPreferenceChange(ReplyBarHeightKey.self) { box.height = $0 }
+        }
+        .frame(width: 520, height: 720)
+        let host = NSHostingView(rootView: root)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 720),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        window.setContentSize(NSSize(width: 520, height: 720))
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+        #expect(box.height > 28)
+        #expect(box.height < 96)
+        window.contentView = nil
+    }
+
     @Test func imageAttachmentsUseHoverPreviewInsteadOfInlineThumbnails() {
         let row = TranscriptRow(
             id: "u-preview",
@@ -1384,6 +1421,17 @@ struct UserMessageAttachmentTests {
         #expect(state.rows.count == 1)
         #expect(state.rows[0].text == "see this")
         #expect(state.rows[0].attachments.map(\.displayName) == ["pasted-image.png"])
+    }
+}
+
+private final class HeightBox: @unchecked Sendable {
+    var height: CGFloat = 0
+}
+
+private struct ReplyBarHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

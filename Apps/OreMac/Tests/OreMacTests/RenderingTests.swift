@@ -677,6 +677,26 @@ struct UserMessageAttachmentTests {
         #expect(attachmentCount >= 2)
     }
 
+    @Test func sentUserBubblesQuoteTheTaggedMessage() {
+        let row = TranscriptRow(
+            id: "u2",
+            turnID: TurnID(rawValue: "t2"),
+            kind: .userMessage,
+            text: "what did you mean by that?",
+            replyTo: MessageReply(
+                rowID: "a1",
+                turnID: TurnID(rawValue: "t1"),
+                role: .assistant,
+                author: "Claude",
+                text: "The login check should be silent."
+            )
+        )
+        let rendered = TranscriptCell.attributedText(for: row)
+        #expect(rendered.string.contains("↩ Claude"))
+        #expect(rendered.string.contains("The login check should be silent."))
+        #expect(rendered.string.contains("what did you mean by that?"))
+    }
+
     @Test func imageAttachmentsUseHoverPreviewInsteadOfInlineThumbnails() {
         let row = TranscriptRow(
             id: "u-preview",

@@ -35,10 +35,12 @@ final class TranscriptScrollAnchor {
 
     @ObservationIgnored fileprivate var jump: (() -> Void)?
     @ObservationIgnored fileprivate var searchStep: ((Int) -> Void)?
+    @ObservationIgnored fileprivate var reveal: ((String) -> Void)?
 
     func jumpToBottom() { jump?() }
     func findNext() { searchStep?(1) }
     func findPrevious() { searchStep?(-1) }
+    func reveal(_ rowID: String) { reveal?(rowID) }
 
     /// Edge-triggered: the scroll observer fires on every tick, and all but a
     /// couple of them leave this flag exactly where it was. Writing it
@@ -57,10 +59,11 @@ final class TranscriptScrollAnchor {
 struct TranscriptView: NSViewRepresentable {
     /// What the footer's ⋯ menu can do to a finished turn. Copying is handled
     /// inside the cell, which already holds the turn's rows.
-    enum TurnAction {
+    enum TurnAction: Equatable {
         case fork
         case handoffPlan
         case revert
+        case reply
     }
 
     var rows: [TranscriptRow]
@@ -79,6 +82,7 @@ struct TranscriptView: NSViewRepresentable {
     var onToggleActivity: (String) -> Void
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+    var onReply: (TranscriptRow) -> Void = { _ in }
     var canFork = false
     var scrollAnchor: TranscriptScrollAnchor?
     /// Extra clearance at the foot of the scroll: the composer dock floats
@@ -192,6 +196,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.onToggleActivity = onToggleActivity
         context.coordinator.onOpenFile = onOpenFile
         context.coordinator.onTurnAction = onTurnAction
+        context.coordinator.onReply = onReply
         context.coordinator.canFork = canFork
         context.coordinator.worktreePath = worktreePath
         context.coordinator.isBusy = isBusy
@@ -221,6 +226,7 @@ struct TranscriptView: NSViewRepresentable {
         var onToggleActivity: (String) -> Void
         var onOpenFile: (String) -> Void
         var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+        var onReply: (TranscriptRow) -> Void = { _ in }
         var canFork = false
         var worktreePath: String
         var isBusy = false {
@@ -1164,6 +1170,7 @@ struct TranscriptView: NSViewRepresentable {
                 onToggleActivity: toggleActivityForward,
                 onOpenFile: onOpenFile,
                 onTurnAction: onTurnAction,
+                onReply: { [weak self] in self?.onReply(item) },
                 onToggleResponse: { [weak self] in self?.toggleResponse(item.id) }
             )
             return cell
@@ -1404,9 +1411,14 @@ struct TranscriptView: NSViewRepresentable {
             guard scrollAnchor !== self.scrollAnchor else { return }
             self.scrollAnchor?.jump = nil
             self.scrollAnchor?.searchStep = nil
+            self.scrollAnchor?.reveal = nil
             self.scrollAnchor = scrollAnchor
             scrollAnchor?.jump = { [weak self] in self?.jumpToBottom() }
             scrollAnchor?.searchStep = { [weak self] delta in self?.stepSearch(delta) }
+            scrollAnchor?.reveal = { [weak self] id in
+                guard let self, let index = self.rows.firstIndex(where: { $0.id == id }) else { return }
+                self.scroll(to: index)
+            }
             lastReportedAway = nil
             reportFollowState()
         }
@@ -2133,7 +2145,10 @@ final class TranscriptCell: NSTableCellView {
     private var responseToggleAction: (() -> Void)?
     private var revertAction: (() -> Void)?
     private var toggleActivityAction: (() -> Void)?
+    private var replyAction: (() -> Void)?
+    private var isReplyable = false
     private let copyButton = NSButton()
+    private let replyButton = NSButton()
     private let menuButton = NSButton()
     private var copyableText = ""
     private var isUserMessage = false
@@ -2146,6 +2161,8 @@ final class TranscriptCell: NSTableCellView {
     private var configuredRowID: String?
     private var menuButtonCenterConstraint: NSLayoutConstraint!
     private var copyTrackingArea: NSTrackingArea?
+    private var userReplyConstraint: NSLayoutConstraint!
+    private var assistantReplyConstraint: NSLayoutConstraint!
     /// The streaming render currently in the label's storage, or zero for
     /// anything else. Cleared on every whole-string application, so a reused
     /// cell can never mistake another row's text for a render it may splice on.
@@ -2187,6 +2204,21 @@ final class TranscriptCell: NSTableCellView {
         copyIcon.translatesAutoresizingMaskIntoConstraints = false
         copyButton.addSubview(copyIcon)
         addSubview(copyButton)
+
+        replyButton.isBordered = false
+        replyButton.bezelStyle = .regularSquare
+        replyButton.imagePosition = .imageOnly
+        replyButton.image = NSImage(
+            systemSymbolName: "arrowshape.turn.up.left",
+            accessibilityDescription: "Reply to this message"
+        )
+        replyButton.contentTintColor = .secondaryLabelColor
+        replyButton.target = self
+        replyButton.action = #selector(replyToMessage)
+        replyButton.translatesAutoresizingMaskIntoConstraints = false
+        replyButton.isHidden = true
+        replyButton.toolTip = "Reply"
+        addSubview(replyButton)
 
         // The turn footer's overflow menu. A real button rather than a glyph in
         // the attributed string, because the row's text view swallows clicks to
@@ -2334,12 +2366,22 @@ final class TranscriptCell: NSTableCellView {
             copyButton.heightAnchor.constraint(equalToConstant: 22),
             copyIcon.centerXAnchor.constraint(equalTo: copyButton.centerXAnchor),
             copyIcon.centerYAnchor.constraint(equalTo: copyButton.centerYAnchor),
+            replyButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
+            replyButton.widthAnchor.constraint(equalToConstant: 22),
+            replyButton.heightAnchor.constraint(equalToConstant: 22),
 
             menuButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -4),
             menuButtonCenterConstraint,
             menuButton.widthAnchor.constraint(equalToConstant: 24),
             menuButton.heightAnchor.constraint(equalToConstant: 22),
         ])
+        userReplyConstraint = replyButton.trailingAnchor.constraint(
+            equalTo: copyButton.leadingAnchor, constant: -2
+        )
+        assistantReplyConstraint = replyButton.leadingAnchor.constraint(
+            equalTo: bubble.trailingAnchor, constant: 8
+        )
+        userReplyConstraint.isActive = true
     }
 
     @available(*, unavailable)
@@ -2359,6 +2401,7 @@ final class TranscriptCell: NSTableCellView {
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
         onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in },
+        onReply: @escaping () -> Void = {},
         onToggleResponse: (() -> Void)? = nil
     ) {
         let isFooter = row.kind == .turnFooter
@@ -2374,6 +2417,7 @@ final class TranscriptCell: NSTableCellView {
         }
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
+        replyAction = onReply
 
         // The turn header borrows the badge line: "Claude · 2:41 PM" on the
         // first agent row of the turn. A real badge (QUEUED, PLAN) still wins —
@@ -2399,6 +2443,17 @@ final class TranscriptCell: NSTableCellView {
         let isUser = row.kind == .userMessage
         copyableText = Self.copyableText(for: row)
         isUserMessage = isUser
+        isReplyable = (row.kind == .userMessage || row.kind == .assistantText || row.kind == .plan)
+            && (!row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !row.attachments.isEmpty)
+        if isUser {
+            assistantReplyConstraint.isActive = false
+            userReplyConstraint.isActive = true
+        } else {
+            userReplyConstraint.isActive = false
+            assistantReplyConstraint.isActive = true
+        }
+        replyButton.isHidden = !(isHovering && isReplyable)
         // A reused cell starts with a fresh copy glyph, not the last row's tick.
         if row.id != configuredRowID, isCopyConfirmed {
             copyGeneration += 1
@@ -2680,12 +2735,18 @@ final class TranscriptCell: NSTableCellView {
     override func mouseEntered(with event: NSEvent) {
         isHovering = true
         if isUserMessage { copyButton.isHidden = false }
+        if isReplyable { replyButton.isHidden = false }
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovering = false
         // A tick mid-confirmation stays until its beat ends.
         if !isCopyConfirmed { copyButton.isHidden = true }
+        replyButton.isHidden = true
+    }
+
+    @objc private func replyToMessage() {
+        replyAction?()
     }
 
     @objc private func copyMessage() {
@@ -2738,6 +2799,14 @@ final class TranscriptCell: NSTableCellView {
         // Offered only where the harness can actually branch a session. A menu
         // entry that silently starts an unrelated chat would be worse than not
         // offering the action at all.
+        let reply = NSMenuItem(
+            title: "Reply to This Turn", action: #selector(replyToTurn), keyEquivalent: ""
+        )
+        reply.target = self
+        reply.toolTip = "Tag this turn so the next message aims at it"
+        menu.addItem(reply)
+        menu.addItem(.separator())
+
         if footerCanFork {
             let fork = NSMenuItem(
                 title: "Fork to New Tab", action: #selector(forkTurn), keyEquivalent: ""
@@ -2790,6 +2859,11 @@ final class TranscriptCell: NSTableCellView {
         onTurnAction?(footerTurnID, .revert)
     }
 
+    @objc private func replyToTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .reply)
+    }
+
     /// The block the turn ended on — the answer, as opposed to the preamble
     /// that led up to it.
     private static func finalResponse(in rows: [TranscriptRow]) -> String {
@@ -2799,14 +2873,22 @@ final class TranscriptCell: NSTableCellView {
         }?.text ?? ""
     }
 
-    /// Right-click a user message to copy it, in addition to the hover button.
+    /// Right-click a user or assistant message to copy or reply, in addition
+    /// to the hover buttons.
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard isUserMessage else { return super.menu(for: event) }
+        guard isUserMessage || isReplyable else { return super.menu(for: event) }
         let menu = NSMenu()
-        let item = NSMenuItem(title: "Copy Message", action: #selector(copyMessage), keyEquivalent: "")
-        item.target = self
-        menu.addItem(item)
-        return menu
+        if isUserMessage {
+            let copy = NSMenuItem(title: "Copy Message", action: #selector(copyMessage), keyEquivalent: "")
+            copy.target = self
+            menu.addItem(copy)
+        }
+        if isReplyable {
+            let reply = NSMenuItem(title: "Reply", action: #selector(replyToMessage), keyEquivalent: "")
+            reply.target = self
+            menu.addItem(reply)
+        }
+        return menu.items.isEmpty ? super.menu(for: event) : menu
     }
 
     // MARK: - Presentation
@@ -3106,6 +3188,7 @@ final class TranscriptCell: NSTableCellView {
         hasher.combine(row.isError)
         hasher.combine(row.resolvedSubject)
         hasher.combine(row.attachments)
+        hasher.combine(row.replyTo)
         hasher.combine(row.subagentChildCount)
         if row.kind == .assistantText {
             hasher.combine(SnippetRunCache.revision)
@@ -3315,6 +3398,18 @@ final class TranscriptCell: NSTableCellView {
             .font: font(for: row),
             .foregroundColor: textColor(for: row),
         ]
+        if let reply = row.replyTo {
+            let quoteTitle: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+            let quoteBody: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]
+            result.append(NSAttributedString(string: "↩ \(reply.author)\n", attributes: quoteTitle))
+            result.append(NSAttributedString(string: "\(reply.preview)\n", attributes: quoteBody))
+        }
         if !row.text.isEmpty {
             result.append(styledMentions(
                 row.text,

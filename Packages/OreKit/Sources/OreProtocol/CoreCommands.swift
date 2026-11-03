@@ -295,6 +295,10 @@ public struct SendMessageRequest: Sendable, Codable {
     /// assistant receives a live app-state snapshot without cluttering the
     /// Assistant window with it.
     public var hiddenContext: String?
+    /// The earlier message or turn this prompt is tagged to, the way a chat
+    /// app's reply-to points at one bubble. Folded into the model prompt so
+    /// the agent targets that context; the transcript draws it as a quote.
+    public var replyTo: MessageReply?
 
     public init(
         workspaceID: WorkspaceID,
@@ -307,7 +311,8 @@ public struct SendMessageRequest: Sendable, Codable {
         serviceTier: String? = nil,
         origin: MessageOrigin = .user,
         submissionID: String = UUID().uuidString,
-        hiddenContext: String? = nil
+        hiddenContext: String? = nil,
+        replyTo: MessageReply? = nil
     ) {
         self.workspaceID = workspaceID
         self.chatID = chatID
@@ -320,6 +325,52 @@ public struct SendMessageRequest: Sendable, Codable {
         self.origin = origin
         self.submissionID = submissionID
         self.hiddenContext = hiddenContext
+        self.replyTo = replyTo
+    }
+}
+
+/// A reply-to tag: one earlier message the user is aiming this prompt at.
+public struct MessageReply: Sendable, Codable, Hashable {
+    public enum Role: String, Sendable, Codable, Hashable {
+        case user
+        case assistant
+    }
+
+    public var rowID: String
+    public var turnID: TurnID
+    public var role: Role
+    public var author: String
+    public var text: String
+
+    public init(
+        rowID: String,
+        turnID: TurnID,
+        role: Role,
+        author: String,
+        text: String
+    ) {
+        self.rowID = rowID
+        self.turnID = turnID
+        self.role = role
+        self.author = author
+        self.text = Self.clip(text, limit: Self.agentLimit)
+    }
+
+    /// One-line chip text for the composer and the quote on the sent bubble.
+    public var preview: String {
+        let line = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .first.map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return Self.clip(line.isEmpty ? text : line, limit: Self.previewLimit)
+    }
+
+    public static let previewLimit = 120
+    public static let agentLimit = 4_000
+
+    public static func clip(_ text: String, limit: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return String(trimmed.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
 }
 

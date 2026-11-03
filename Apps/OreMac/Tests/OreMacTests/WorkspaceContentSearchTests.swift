@@ -164,3 +164,34 @@ struct RemoteHTTPLimitsTests {
         #expect(RemoteHTTPLimits.headersTooLarge(Data(repeating: 0x41, count: RemoteHTTPLimits.maxHeaderBytes + 1)))
     }
 }
+
+struct WorkspaceFileCreationTests {
+    @Test func validatedRelativePathRejectsTraversal() {
+        #expect(AppModel.validatedRelativePath("foo.swift") == "foo.swift")
+        #expect(AppModel.validatedRelativePath("src/foo.swift") == "src/foo.swift")
+        #expect(AppModel.validatedRelativePath("  notes.md  ") == "notes.md")
+        #expect(AppModel.validatedRelativePath("../secret") == nil)
+        #expect(AppModel.validatedRelativePath("/etc/passwd") == nil)
+        #expect(AppModel.validatedRelativePath("foo/../bar") == nil)
+        #expect(AppModel.validatedRelativePath("") == nil)
+        #expect(AppModel.validatedRelativePath(".") == nil)
+        #expect(AppModel.validatedRelativePath("foo\\bar") == nil)
+    }
+
+    @Test func writeEmptyFileCreatesNestedPathAndRefusesOverwrite() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-new-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try AppModel.writeEmptyFile("src/hello.swift", root: root.path)
+        let created = root.appendingPathComponent("src/hello.swift")
+        #expect(FileManager.default.fileExists(atPath: created.path))
+        #expect(throws: AppModel.FileCreationError.alreadyExists) {
+            try AppModel.writeEmptyFile("src/hello.swift", root: root.path)
+        }
+        #expect(throws: AppModel.FileCreationError.invalidName) {
+            try AppModel.writeEmptyFile("../outside.swift", root: root.path)
+        }
+    }
+}

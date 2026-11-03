@@ -4432,6 +4432,59 @@ final class AppModel {
         }.value
     }
 
+    enum FileCreationError: Error, Equatable, LocalizedError {
+        case invalidName
+        case alreadyExists
+        case writeFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidName: "Enter a file name without .. or an absolute path."
+            case .alreadyExists: "A file with that name already exists."
+            case .writeFailed: "The file could not be created."
+            }
+        }
+    }
+
+    /// A worktree-relative path with no traversal. `nil` if the name is not
+    /// something we will write.
+    nonisolated static func validatedRelativePath(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("\\") else {
+            return nil
+        }
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return nil
+        }
+        return parts.joined(separator: "/")
+    }
+
+    func createEmptyFile(path: String, in workspace: WorkspaceSummary) throws {
+        guard let relative = Self.validatedRelativePath(path) else {
+            throw FileCreationError.invalidName
+        }
+        try Self.writeEmptyFile(relative, root: workspace.worktreePath)
+    }
+
+    nonisolated static func writeEmptyFile(_ relativePath: String, root: String) throws {
+        guard let relative = validatedRelativePath(relativePath) else {
+            throw FileCreationError.invalidName
+        }
+        let url = try safeFileURL(root: root, relativePath: relative)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            throw FileCreationError.alreadyExists
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
+            throw FileCreationError.writeFailed
+        }
+    }
+
     /// Internal rather than private: the binary-file preview needs the same
     /// path-escape check before it reads an image off disk, and duplicating
     /// a traversal guard is how one of the copies ends up wrong.

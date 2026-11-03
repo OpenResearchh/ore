@@ -316,7 +316,23 @@ struct AssistantActivityView: View {
                         }
                     },
                     onOpenFile: { openTranscriptFile($0, in: assistant) },
-                    onTurnAction: { _, _ in },
+                    onTurnAction: { turn, action in
+                        if action == .reply {
+                            let turnRows = state.rows.filter { $0.turnID == turn }
+                            let target = turnRows.last {
+                                ($0.kind == .assistantText || $0.kind == .plan)
+                                    && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            } ?? turnRows.first { $0.kind == .userMessage }
+                            if let target, let reply = MessageReply.targeting(target, agentName: summary?.harness.displayName ?? "ORE") {
+                                state.setDraftReply(reply)
+                            }
+                        }
+                    },
+                    onReply: { row in
+                        if let reply = MessageReply.targeting(row, agentName: summary?.harness.displayName ?? "ORE") {
+                            state.setDraftReply(reply)
+                        }
+                    },
                     scrollAnchor: scrollAnchor,
                     bottomInset: bottomInset ?? Self.restingBottomInset
                 )
@@ -374,7 +390,7 @@ struct AssistantActivityView: View {
             }
             needsYouStrip
 
-            AssistantComposer(draft: draft, chatID: chatID, state: state)
+            AssistantComposer(draft: draft, chatID: chatID, state: state, scrollAnchor: scrollAnchor)
         }
     }
 
@@ -692,11 +708,19 @@ private struct AssistantComposer: View {
     @Bindable var draft: AssistantDraft
     let chatID: ChatID
     let state: ChatState
+    var scrollAnchor: TranscriptScrollAnchor?
     @FocusState private var composerFocused: Bool
 
     var body: some View {
         let isEmpty = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return VStack(alignment: .leading, spacing: 6) {
+            if let reply = state.draftReply {
+                ReplyTargetBar(
+                    reply: reply,
+                    onReveal: { scrollAnchor?.reveal(reply.rowID) },
+                    onClear: { state.setDraftReply(nil) }
+                )
+            }
             if let error = state.prominentError {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
@@ -762,6 +786,9 @@ private struct AssistantComposer: View {
             // is the progress indicator here too.
             .oreComposerSurface(padding: 10, isBusy: state.isBusy)
         }
+        .onChange(of: state.draftReply?.rowID) { _, id in
+            if id != nil { composerFocused = true }
+        }
         .padding(.horizontal, OreTheme.Space.md)
         .padding(.vertical, 10)
     }
@@ -771,7 +798,7 @@ private struct AssistantComposer: View {
         let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft.text = ""
-        model.send(text, to: assistant.id)
+        model.send(text, to: assistant.id, chatID: chatID)
     }
 }
 

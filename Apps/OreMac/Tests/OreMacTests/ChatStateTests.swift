@@ -311,6 +311,54 @@ struct ChatStateTests {
         #expect(state.revertableTurns.count == 1)
         #expect(state.hasRows)
     }
+
+    @Test func draftReplyIsTakenOnceOnSend() {
+        let state = ChatState()
+        let reply = MessageReply(
+            rowID: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            role: .assistant,
+            author: "Claude",
+            text: "The login check should be silent."
+        )
+        state.setDraftReply(reply)
+        #expect(state.draftReply == reply)
+        #expect(state.takeDraftReply() == reply)
+        #expect(state.draftReply == nil)
+        #expect(state.takeDraftReply() == nil)
+    }
+
+    @Test func messageReplyTargetsUserAndAssistantRows() {
+        let user = TranscriptRow(
+            id: "u1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "fix the flaky login"
+        )
+        let tagged = MessageReply.targeting(user, agentName: "Claude")
+        #expect(tagged?.role == .user)
+        #expect(tagged?.author == "You")
+        #expect(tagged?.text == "fix the flaky login")
+
+        let agent = TranscriptRow(
+            id: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .assistantText,
+            text: "The login check should be silent.\nMore detail."
+        )
+        let quoted = MessageReply.targeting(agent, agentName: "Claude")
+        #expect(quoted?.role == .assistant)
+        #expect(quoted?.author == "Claude")
+        #expect(quoted?.preview == "The login check should be silent.")
+
+        let tool = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Read"
+        )
+        #expect(MessageReply.targeting(tool, agentName: "Claude") == nil)
+    }
 }
 
 @MainActor

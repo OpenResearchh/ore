@@ -1591,6 +1591,7 @@ final class AppModel {
         // A button's prompt isn't the composer's text: whatever the user has
         // half-typed, attached or commented stays put for their own send.
         let comments = fromComposer ? state.takeDraftComments() : []
+        let reply = fromComposer ? state.takeDraftReply() : nil
         if fromComposer {
             persistDraftComments([], for: chatID)
             persistDraftAttachments([], for: chatID)
@@ -1611,6 +1612,7 @@ final class AppModel {
             text,
             attachments: attachments,
             comments: comments,
+            replyTo: reply,
             // Forwarded, not defaulted. The engine's echo carries the true
             // origin but is dropped as a duplicate of this row, so whatever is
             // set here is what the transcript believes forever — and a `.watch`
@@ -1631,7 +1633,8 @@ final class AppModel {
                 serviceTier: serviceTier,
                 origin: origin,
                 submissionID: submissionID,
-                hiddenContext: hidden
+                hiddenContext: hidden,
+                replyTo: reply
             )))
         }
     }

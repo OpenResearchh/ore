@@ -577,6 +577,32 @@ public actor OreStore {
         }
     }
 
+    /// The last thing said in a conversation, for the sidebar snippet: the
+    /// turn's stored summary when one exists, else the prompt that opened it.
+    /// Sequential guards, not a multi-clause condition — see the OreKit
+    /// async-frame miscompile.
+    public nonisolated func lastTurnDigest(chatID: ChatID) async throws -> String? {
+        let turn = try await latestTurn(chatID: chatID)
+        guard let turn else { return nil }
+        if let summary = turn.summary, !summary.isEmpty { return summary }
+        return turn.prompt
+    }
+
+    /// Sidebar snippet for a workspace without starting its engine: the most
+    /// recently active chat's digest. Painting the list must not `makeEngine`.
+    public nonisolated func lastTurnDigest(workspaceID: WorkspaceID) async throws -> String? {
+        let chats = try await chats(workspaceID: workspaceID)
+        let ordered = chats.sorted { lhs, rhs in
+            (lhs.lastActivityAt ?? .distantPast) > (rhs.lastActivityAt ?? .distantPast)
+        }
+        for chat in ordered {
+            if let digest = try await lastTurnDigest(chatID: chat.chatID) {
+                return digest
+            }
+        }
+        return nil
+    }
+
     /// The visible transcript belongs to the chat, not to any one provider
     /// incarnation. Sessions are ordered first so ordinals can restart at zero
     /// after a cross-harness handoff without scrambling history.

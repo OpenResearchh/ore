@@ -1805,8 +1805,11 @@ public actor InProcessCoreClient: CoreClient {
         try await engine(for: workspaceID).turnCheckpoints(chatID: chatID)
     }
 
-    public func lastTurnDigest(workspaceID: WorkspaceID, chatID: ChatID) async throws -> String? {
-        try await engine(for: workspaceID).lastTurnDigest(chatID: chatID)
+    public func lastTurnDigest(workspaceID: WorkspaceID) async throws -> String? {
+        // Store-only: `engine(for:)` starts the workspace, and every sidebar
+        // row asking for a snippet at launch flooded the List with chat/git
+        // updates mid-layout. AttributeGraph aborted.
+        try await store.lastTurnDigest(workspaceID: workspaceID)
     }
 
     public func diffFromCheckpoint(

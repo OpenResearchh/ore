@@ -98,64 +98,45 @@ struct Sidebar: View {
                 }
             }
 
-            ForEach(layout.groups) { repository in
-                DisclosureGroup(isExpanded: repositoryBinding(repository.path)) {
-                    ForEach(repository.workspaces) { workspace in
-                        WorkspaceRow(
-                            workspace: workspace,
-                            identity: model.researchIdentity(for: workspace),
-                            isSelected: selectedID == workspace.id,
-                            shortcutIndex: shortcuts[workspace.id],
-                            onRename: {
-                                renameText = workspace.name
-                                renameWorkspace = workspace
-                            }
-                        )
-                            .padding(.leading, OreTheme.Space.sm)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                            .onTapGesture { model.selectedWorkspaceID = workspace.id }
-                            // One concrete background faded in and out: swapping
-                            // between two type-erased views rebuilt the row
-                            // background on every selection change.
-                            .listRowBackground(
-                                SidebarSelectionBackground()
-                                    .opacity(selectedID == workspace.id ? 1 : 0)
-                            )
-                            .contextMenu { menu(for: workspace) }
-                    }
-                } label: {
-                    RepositoryRow(repository: repository.name, workspaces: repository.workspaces)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        // The chevron alone was a small target; the whole header
-                        // row toggles expansion now, which is what a click here
-                        // reads as.
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            let binding = repositoryBinding(repository.path)
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                binding.wrappedValue.toggle()
-                            }
-                        }
-                        .contextMenu {
-                            Button("Reveal in Finder") {
-                                NSWorkspace.shared.activateFileViewerSelecting(
-                                    [URL(fileURLWithPath: repository.path)]
-                                )
-                            }
-                            Divider()
-                            Button("Delete Project\u{2026}", role: .destructive) {
-                                model.requestProjectDelete(repository.path)
-                            }
-                        }
+            // One ForEach of leaf rows, not DisclosureGroup / nested ForEach /
+            // Section(isExpanded:). Those become NSOutlineView disclosure
+            // buttons, and laying them out re-enters SwiftUI's AttributeGraph
+            // (SIGABRT at launch).
+            ForEach(sidebarListItems(
+                groups: layout.groups,
+                collapsed: collapsedRepositories,
+                shortcuts: shortcuts
+            )) { item in
+                switch item {
+                case .repository(let repository, let expanded):
+                    repositoryHeader(repository, isExpanded: expanded)
+                case .workspace(let workspace, let shortcut):
+                    workspaceRow(
+                        workspace,
+                        selectedID: selectedID,
+                        shortcutIndex: shortcut
+                    )
                 }
-                .listRowSeparator(.hidden)
             }
 
             if !model.archivedWorkspaces.isEmpty {
-                Section(isExpanded: $showArchived) {
+                HStack {
+                    Text(archivedHeader)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    SidebarDisclosureChevron(isExpanded: showArchived)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeOut(duration: 0.2)) { showArchived.toggle() }
+                }
+                .listRowSeparator(.hidden)
+
+                if showArchived {
                     ForEach(model.archivedWorkspaces) { workspace in
                         ArchivedWorkspaceRow(workspace: workspace)
+                            .listRowSeparator(.hidden)
                             .contextMenu {
                                 Button("Restore") { model.unarchive(workspace.id) }
                                 Button("Copy Branch Name") {
@@ -170,8 +151,6 @@ struct Sidebar: View {
                                 }
                             }
                     }
-                } header: {
-                    Text(archivedHeader)
                 }
             }
         }
@@ -179,7 +158,12 @@ struct Sidebar: View {
             guard let selected,
                   let workspace = model.sortedWorkspaces.first(where: { $0.id == selected })
             else { return }
-            setRepository(workspace.repositoryPath, expanded: true)
+            // Expanding in the same update that selected a row re-enters list
+            // layout. Push it off this pass; no-op writes are skipped below.
+            let path = workspace.repositoryPath
+            Task { @MainActor in
+                setRepository(path, expanded: true)
+            }
         }
         // Warm every row's portrait up front instead of on first render, so
         // faces appear with the list rather than popping in as you scroll.
@@ -266,7 +250,10 @@ struct Sidebar: View {
         // While the order is held the model is told what is on screen; nil
         // hands the shortcuts back to the live order.
         .onChange(of: heldOrder == nil ? nil : layout.shortcutOrder, initial: true) { _, order in
-            model.sidebarShortcutOrder = order
+            Task { @MainActor in
+                guard model.sidebarShortcutOrder != order else { return }
+                model.sidebarShortcutOrder = order
+            }
         }
         .onDisappear {
             holdClock.reset()
@@ -350,17 +337,72 @@ struct Sidebar: View {
         return "Archived (\(workspaces.count)) · \(freed) freed"
     }
 
-    private func repositoryBinding(_ path: String) -> Binding<Bool> {
-        Binding(
-            get: { !collapsedRepositories.contains(path) },
-            set: { expanded in setRepository(path, expanded: expanded) }
-        )
-    }
-
     private func setRepository(_ path: String, expanded: Bool) {
         var values = collapsedRepositories
         if expanded { values.remove(path) } else { values.insert(path) }
-        collapsedRepositoriesRaw = values.sorted().joined(separator: "\n")
+        let next = values.sorted().joined(separator: "\n")
+        guard next != collapsedRepositoriesRaw else { return }
+        collapsedRepositoriesRaw = next
+    }
+
+    @ViewBuilder
+    private func repositoryHeader(
+        _ repository: SidebarLayout.RepositoryGroup,
+        isExpanded: Bool
+    ) -> some View {
+        RepositoryRow(
+            repository: repository.name,
+            workspaces: repository.workspaces,
+            isExpanded: isExpanded
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeOut(duration: 0.2)) {
+                setRepository(repository.path, expanded: !isExpanded)
+            }
+        }
+        .listRowSeparator(.hidden)
+        .contextMenu {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting(
+                    [URL(fileURLWithPath: repository.path)]
+                )
+            }
+            Divider()
+            Button("Delete Project\u{2026}", role: .destructive) {
+                model.requestProjectDelete(repository.path)
+            }
+        }
+    }
+
+    private func workspaceRow(
+        _ workspace: WorkspaceSummary,
+        selectedID: WorkspaceID?,
+        shortcutIndex: Int?
+    ) -> some View {
+        WorkspaceRow(
+            workspace: workspace,
+            identity: model.researchIdentity(for: workspace),
+            isSelected: selectedID == workspace.id,
+            shortcutIndex: shortcutIndex,
+            onRename: {
+                renameText = workspace.name
+                renameWorkspace = workspace
+            }
+        )
+        .padding(.leading, OreTheme.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedWorkspaceID = workspace.id }
+        .listRowSeparator(.hidden)
+        // One concrete background faded in and out: swapping between two
+        // type-erased views rebuilt the row background on every selection change.
+        .listRowBackground(
+            SidebarSelectionBackground()
+                .opacity(selectedID == workspace.id ? 1 : 0)
+        )
+        .contextMenu { menu(for: workspace) }
     }
 
     private var emptyState: some View {
@@ -391,7 +433,7 @@ struct Sidebar: View {
 /// repository groups. Pure so the order hold is testable without a window.
 /// Internal for tests.
 struct SidebarLayout {
-    struct RepositoryGroup: Identifiable {
+    struct RepositoryGroup: Identifiable, Equatable {
         var id: String { path }
         var path: String
         var name: String
@@ -470,6 +512,38 @@ struct SidebarLayout {
                 // project sections even though neither project had changed.
                 return first.path < second.path
             }
+    }
+}
+
+/// One leaf row in the sidebar list. Flattened so SwiftUI never builds an
+/// NSOutlineView disclosure tree — `DisclosureGroup` inside `List` aborted
+/// AttributeGraph at launch.
+enum SidebarListItem: Identifiable, Equatable {
+    case repository(SidebarLayout.RepositoryGroup, expanded: Bool)
+    case workspace(WorkspaceSummary, shortcut: Int?)
+
+    var id: String {
+        switch self {
+        case .repository(let group, _):
+            return "repo:\(group.path)"
+        case .workspace(let workspace, _):
+            return "ws:\(workspace.id.rawValue)"
+        }
+    }
+}
+
+func sidebarListItems(
+    groups: [SidebarLayout.RepositoryGroup],
+    collapsed: Set<String>,
+    shortcuts: [WorkspaceID: Int]
+) -> [SidebarListItem] {
+    groups.flatMap { group in
+        let expanded = !collapsed.contains(group.path)
+        let header = SidebarListItem.repository(group, expanded: expanded)
+        guard expanded else { return [header] }
+        return [header] + group.workspaces.map {
+            SidebarListItem.workspace($0, shortcut: shortcuts[$0.id])
+        }
     }
 }
 
@@ -1269,13 +1343,27 @@ private struct ArchivedWorkspaceRow: View {
     }
 }
 
+private struct SidebarDisclosureChevron: View {
+    var isExpanded: Bool
+
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .frame(width: 10)
+            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+    }
+}
+
 private struct RepositoryRow: View {
     @Environment(AppModel.self) private var model
     let repository: String
     let workspaces: [WorkspaceSummary]
+    var isExpanded: Bool
 
     var body: some View {
         HStack(spacing: OreTheme.Space.sm) {
+            SidebarDisclosureChevron(isExpanded: isExpanded)
             Image(systemName: "shippingbox.fill")
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)

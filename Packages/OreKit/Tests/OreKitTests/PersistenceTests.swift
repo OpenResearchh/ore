@@ -674,6 +674,58 @@ struct PersistenceTests {
         }
         #expect(try await store.blocks(chatID: ChatID(rawValue: "missing")).isEmpty)
     }
+
+    @Test func lastTurnDigestPrefersTheLatestChatSummaryAndStaysOnThisWorkspace() async throws {
+        let store = try makeStore()
+        let workspace = try await seedWorkspace(store)
+        let other = try await seedWorkspace(store, id: "ws2", name: "other")
+        let now = Date()
+
+        let quiet = ChatRecord(
+            id: ChatID(rawValue: "quiet"), workspaceID: workspace.workspaceID,
+            title: "Quiet", harness: .claudeCode, lastActivityAt: now.addingTimeInterval(-60)
+        )
+        let recent = ChatRecord(
+            id: ChatID(rawValue: "recent"), workspaceID: workspace.workspaceID,
+            title: "Recent", harness: .claudeCode, lastActivityAt: now
+        )
+        let elsewhere = ChatRecord(
+            id: ChatID(rawValue: "elsewhere"), workspaceID: other.workspaceID,
+            title: "Elsewhere", harness: .claudeCode, lastActivityAt: now.addingTimeInterval(60)
+        )
+        for chat in [quiet, recent, elsewhere] {
+            try await store.saveChat(chat)
+        }
+
+        try await store.saveSession(SessionRecord(
+            id: SessionID(rawValue: "s-quiet"), workspaceID: workspace.workspaceID,
+            chatID: quiet.chatID, harness: .claudeCode
+        ))
+        try await store.saveTurn(TurnRecord(
+            id: "t-quiet", sessionID: SessionID(rawValue: "s-quiet"), ordinal: 0,
+            prompt: "old prompt"
+        ))
+        try await store.saveSession(SessionRecord(
+            id: SessionID(rawValue: "s-recent"), workspaceID: workspace.workspaceID,
+            chatID: recent.chatID, harness: .claudeCode
+        ))
+        try await store.saveTurn(TurnRecord(
+            id: "t-recent", sessionID: SessionID(rawValue: "s-recent"), ordinal: 0,
+            prompt: "new prompt", summary: "the summary"
+        ))
+        try await store.saveSession(SessionRecord(
+            id: SessionID(rawValue: "s-else"), workspaceID: other.workspaceID,
+            chatID: elsewhere.chatID, harness: .claudeCode
+        ))
+        try await store.saveTurn(TurnRecord(
+            id: "t-else", sessionID: SessionID(rawValue: "s-else"), ordinal: 0,
+            prompt: "other workspace"
+        ))
+
+        #expect(try await store.lastTurnDigest(workspaceID: workspace.workspaceID) == "the summary")
+        #expect(try await store.lastTurnDigest(chatID: quiet.chatID) == "old prompt")
+        #expect(try await store.lastTurnDigest(workspaceID: WorkspaceID(rawValue: "missing")) == nil)
+    }
 }
 
 struct TranscriptWriterTests {

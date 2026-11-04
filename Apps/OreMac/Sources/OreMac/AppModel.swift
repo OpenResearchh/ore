@@ -3448,15 +3448,17 @@ final class AppModel {
     /// has been said yet, so a fresh workspace's row stays one line tall.
     ///
     /// Only goes to the core when `lastActivity` moved since the last read —
-    /// i.e. once per completed turn, not once per appearance.
+    /// i.e. once per completed turn, not once per appearance. The core reads
+    /// the store directly, so a quiet sidebar never starts an engine.
     func lastTurnDigest(for id: WorkspaceID, lastActivity: Date?) async -> String? {
         if let cached = cachedTurnDigest(for: id, lastActivity: lastActivity) { return cached }
-        let recent = chats(for: id).max {
-            ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast)
-        }
-        guard let chatID = recent?.id else { return nil }
-        guard let digest = try? await client.lastTurnDigest(workspaceID: id, chatID: chatID) else {
-            // A failed read is not cached: the next appearance tries again.
+        let digest: String
+        do {
+            // Nil is "nothing said yet", not a failure; still not cached so a
+            // later appearance can pick up the first turn.
+            guard let value = try await client.lastTurnDigest(workspaceID: id) else { return nil }
+            digest = value
+        } catch {
             return nil
         }
         let flattened = digest

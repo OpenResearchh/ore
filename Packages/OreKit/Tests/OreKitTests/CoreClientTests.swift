@@ -1141,6 +1141,39 @@ struct CoreClientTests {
 
         await client.shutdown()
     }
+
+    @Test func lastTurnDigestDoesNotStartAnEngine() async throws {
+        let store = try OreStore()
+        try await store.addRepository(RepositoryRecord(
+            path: "/repo", name: "repo", defaultBranch: "main"
+        ))
+        let workspaceID = WorkspaceID(rawValue: "ws1")
+        try await store.saveWorkspace(WorkspaceRecord(
+            id: workspaceID, name: "ws", repositoryPath: "/repo",
+            worktreePath: "/wt", branch: "ore/ws", baseBranch: "main", harness: .claudeCode
+        ))
+        let chatID = ChatID(rawValue: "chat1")
+        try await store.saveChat(ChatRecord(
+            id: chatID, workspaceID: workspaceID, title: "Chat", harness: .claudeCode,
+            lastActivityAt: Date()
+        ))
+        try await store.saveSession(SessionRecord(
+            id: SessionID(rawValue: "s1"), workspaceID: workspaceID, chatID: chatID,
+            harness: .claudeCode
+        ))
+        try await store.saveTurn(TurnRecord(
+            id: TurnID(rawValue: "t1"), sessionID: SessionID(rawValue: "s1"), ordinal: 0,
+            prompt: "the prompt", summary: "the summary"
+        ))
+
+        let client = InProcessCoreClient(
+            store: store,
+            harnessRegistry: HarnessRegistry(harnesses: [])
+        )
+        #expect(try await client.lastTurnDigest(workspaceID: workspaceID) == "the summary")
+        #expect(await client.isEngineRunning(workspaceID) == false)
+        await client.shutdown()
+    }
 }
 
 struct AssistantModelPolicyTests {

@@ -48,7 +48,29 @@ struct SplitChatColumn: View {
                     // Files open in the main column's document tabs — the
                     // split stays a conversation.
                     onOpenFile: { model.openSourceFile($0, in: workspace.id) },
-                    onTurnAction: { _, _ in },
+                    onTurnAction: { turn, action in
+                        if action == .reply {
+                            let turnRows = state.rows.filter { $0.turnID == turn }
+                            let target = turnRows.last {
+                                ($0.kind == .assistantText || $0.kind == .plan)
+                                    && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            } ?? turnRows.first { $0.kind == .userMessage }
+                            if let target, let reply = MessageReply.targeting(
+                                target,
+                                agentName: summary?.harness.displayName ?? "Agent"
+                            ) {
+                                state.setDraftReply(reply)
+                            }
+                        }
+                    },
+                    onReply: { row in
+                        if let reply = MessageReply.targeting(
+                            row,
+                            agentName: summary?.harness.displayName ?? "Agent"
+                        ) {
+                            state.setDraftReply(reply)
+                        }
+                    },
                     scrollAnchor: scrollAnchor
                 )
                 .equatable()
@@ -128,6 +150,13 @@ struct SplitChatColumn: View {
     private func composer(summary: ChatSummary?, state: ChatState) -> some View {
         let isEmpty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return VStack(alignment: .leading, spacing: 6) {
+            if let reply = state.draftReply {
+                ReplyTargetBar(
+                    reply: reply,
+                    onReveal: { scrollAnchor.reveal(reply.rowID) },
+                    onClear: { state.setDraftReply(nil) }
+                )
+            }
             if state.isBusy {
                 Button {
                     model.interrupt(workspace.id, chatID: chatID)
@@ -165,6 +194,9 @@ struct SplitChatColumn: View {
             // The same glass surface as every composer, so this one is its own
             // busy indicator too.
             .oreComposerSurface(padding: 10, isBusy: state.isBusy)
+        }
+        .onChange(of: state.draftReply?.rowID) { _, id in
+            if id != nil { focused = true }
         }
         .padding(.horizontal, OreTheme.Space.md)
         .padding(.vertical, 10)

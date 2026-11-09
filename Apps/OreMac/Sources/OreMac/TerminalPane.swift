@@ -4,6 +4,16 @@ import OreProtocol
 import SwiftTerm
 import SwiftUI
 
+extension Notification.Name {
+    /// Requests that the workspace window reveal ORE's own terminal pane.
+    /// Command-producing views post this instead of reaching for Terminal.app.
+    static let oreShowWorkspaceTerminal = Notification.Name("ore.showWorkspaceTerminal")
+    /// Lets setup surfaces refresh themselves as soon as a tracked command
+    /// finishes; unlike an external Terminal handoff, focus never leaves ORE.
+    static let oreSetupTerminalCommandCompleted = Notification.Name("ore.setupTerminalCommandCompleted")
+    static let oreShowKeyboardShortcuts = Notification.Name("ore.showKeyboardShortcuts")
+}
+
 /// A real shell in the workspace's worktree.
 ///
 /// Agents write code; people still need to run it. Without a terminal the loop
@@ -38,6 +48,13 @@ final class TerminalRegistry {
     private(set) var activeTabIDs: [WorkspaceID: UUID] = [:]
     /// Localhost URLs seen in output, per workspace.
     private(set) var detectedURLs: [WorkspaceID: [URL]] = [:]
+    /// One-shot callbacks for commands launched by another piece of ORE UI.
+    /// The shell stays alive after a command, so command completion is carried
+    /// by an invisible marker in its output rather than process termination.
+    @ObservationIgnored
+    private var commandCompletions: [UUID: (Int32) -> Void] = [:]
+    @ObservationIgnored
+    private var commandTabs: [UUID: (workspaceID: WorkspaceID, tabID: UUID)] = [:]
 
     func activeTab(for workspaceID: WorkspaceID) -> UUID? {
         let open = tabs[workspaceID] ?? []
@@ -77,9 +94,13 @@ final class TerminalRegistry {
     }
 
     @discardableResult
-    func addTab(for workspaceID: WorkspaceID, workingDirectory: String) -> TerminalTab {
+    func addTab(
+        for workspaceID: WorkspaceID,
+        workingDirectory: String,
+        title: String? = nil
+    ) -> TerminalTab {
         let index = (tabs[workspaceID]?.count ?? 0) + 1
-        let tab = TerminalTab(id: UUID(), title: "Terminal \(index)")
+        let tab = TerminalTab(id: UUID(), title: title ?? "Terminal \(index)")
         tabs[workspaceID, default: []].append(tab)
         let created = view(for: tab.id, workspaceID: workspaceID, workingDirectory: workingDirectory)
         activeTabIDs[workspaceID] = tab.id
@@ -101,6 +122,9 @@ final class TerminalRegistry {
         terminal.configureAppearance()
         terminal.onDetectedURL = { [weak self] url in
             self?.recordURL(url, for: workspaceID)
+        }
+        terminal.onCommandCompleted = { [weak self] completion in
+            self?.finishCommand(completion)
         }
 
         // A login shell, so the user's aliases, prompt and version managers are
@@ -139,6 +163,13 @@ final class TerminalRegistry {
         )
         views[workspaceID]?.removeValue(forKey: tabID)?.terminate()
         tabs[workspaceID]?.removeAll { $0.id == tabID }
+        let cancelled = commandTabs.compactMap { operationID, owner in
+            owner.workspaceID == workspaceID && owner.tabID == tabID ? operationID : nil
+        }
+        for operationID in cancelled {
+            commandTabs.removeValue(forKey: operationID)
+            commandCompletions.removeValue(forKey: operationID)?(-1)
+        }
         if activeTabIDs[workspaceID] == tabID {
             activeTabIDs[workspaceID] = next
         }
@@ -150,6 +181,62 @@ final class TerminalRegistry {
         let tab = ensureTabs(for: workspaceID, workingDirectory: workingDirectory).first!
         view(for: tab.id, workspaceID: workspaceID, workingDirectory: workingDirectory)
             .send(txt: command + "\n")
+    }
+
+    /// Opens a clean terminal tab for a command initiated elsewhere in ORE.
+    ///
+    /// Privileged repairs are inserted using the terminal bracketed-paste
+    /// protocol, which keeps embedded newlines editable and waits for Return.
+    /// Safe, explicitly-labelled "Run in Terminal" actions include Return and
+    /// begin immediately. A fresh tab also avoids appending to half-entered
+    /// input in an existing shell (including zsh's `bquote>` continuation).
+    @discardableResult
+    func prepare(
+        _ command: String,
+        in workspaceID: WorkspaceID,
+        workingDirectory: String,
+        title: String,
+        runsImmediately: Bool,
+        operationID: UUID? = nil,
+        onCompletion: ((Int32) -> Void)? = nil
+    ) -> TerminalTab {
+        let tab = addTab(
+            for: workspaceID,
+            workingDirectory: workingDirectory,
+            title: title
+        )
+        let terminal = view(
+            for: tab.id,
+            workspaceID: workspaceID,
+            workingDirectory: workingDirectory
+        )
+        let prepared: String
+        if let operationID, let onCompletion {
+            commandCompletions[operationID] = onCompletion
+            commandTabs[operationID] = (workspaceID, tab.id)
+            prepared = Self.trackedCommand(command, operationID: operationID)
+        } else {
+            prepared = command
+        }
+        terminal.send(txt: runsImmediately ? prepared + "\n" : Self.bracketedPaste(prepared))
+        return tab
+    }
+
+    /// Appends an OSC marker that SwiftTerm consumes without drawing. It is
+    /// emitted after the command returns and carries that command's status;
+    /// unlike the shell process, which intentionally lives for the whole tab.
+    nonisolated static func trackedCommand(_ command: String, operationID: UUID) -> String {
+        command + "\n"
+            + "__ore_command_status=$?\n"
+            + "printf '\\033]1337;OreCommand=\(operationID.uuidString);Exit=%d\\007' "
+            + "\"$__ore_command_status\"\n"
+            + "unset __ore_command_status"
+    }
+
+    /// zsh/readline treat this as one paste rather than a series of Returns.
+    /// Kept pure so the safety-critical distinction is regression-testable.
+    nonisolated static func bracketedPaste(_ text: String) -> String {
+        "\u{1B}[200~" + text + "\u{1B}[201~"
     }
 
     func closeTerminal(for workspaceID: WorkspaceID) {
@@ -182,6 +269,12 @@ final class TerminalRegistry {
         if existing.count > 4 { existing.removeFirst(existing.count - 4) }
         detectedURLs[workspaceID] = existing
     }
+
+    private func finishCommand(_ completion: TerminalCommandCompletion) {
+        commandTabs.removeValue(forKey: completion.id)
+        guard let callback = commandCompletions.removeValue(forKey: completion.id) else { return }
+        callback(completion.exitCode)
+    }
 }
 
 /// A terminal that also watches its own output for a local server address.
@@ -190,8 +283,10 @@ final class TerminalRegistry {
 /// then hunts for it. Catching it as it goes past turns that into a button.
 final class OreTerminalView: LocalProcessTerminalView {
     var onDetectedURL: ((URL) -> Void)?
+    var onCommandCompleted: ((TerminalCommandCompletion) -> Void)?
 
     private var urlScanner = TerminalURLScanner()
+    private var commandCompletionScanner = TerminalCommandCompletionScanner()
 
     /// GPU rendering through SwiftTerm's Metal path. SwiftTerm's CoreGraphics
     /// renderer redraws the whole grid for every line scrolled, which competes
@@ -297,11 +392,16 @@ final class OreTerminalView: LocalProcessTerminalView {
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
         let urls = urlScanner.scan(slice)
-        guard !urls.isEmpty else { return }
+        let completions = commandCompletionScanner.scan(slice)
+        guard !urls.isEmpty || !completions.isEmpty else { return }
         // A turn later: recording a URL mutates observed registry state, which
         // shouldn't happen from inside SwiftTerm's feed.
-        let deliver = onDetectedURL
-        DispatchQueue.main.async { urls.forEach { deliver?($0) } }
+        let deliverURL = onDetectedURL
+        let deliverCompletion = onCommandCompleted
+        DispatchQueue.main.async {
+            urls.forEach { deliverURL?($0) }
+            completions.forEach { deliverCompletion?($0) }
+        }
     }
 
     private func revealScroller() {
@@ -342,6 +442,54 @@ final class OreTerminalView: LocalProcessTerminalView {
                 scroller.animator().alphaValue = 0
             }
         }
+    }
+}
+
+struct TerminalCommandCompletion: Equatable {
+    var id: UUID
+    var exitCode: Int32
+}
+
+/// Reads ORE's invisible command-finished OSC sequence across arbitrary PTY
+/// chunk boundaries. Only a short tail is retained; ordinary terminal output
+/// never accumulates here.
+struct TerminalCommandCompletionScanner {
+    private static let prefix = "\u{1B}]1337;OreCommand="
+    private static let expression = try? NSRegularExpression(
+        pattern: #"\u001B\]1337;OreCommand=([0-9A-Fa-f-]{36});Exit=(-?[0-9]+)\u0007"#
+    )
+    private(set) var carry = ""
+
+    mutating func scan(_ chunk: ArraySlice<UInt8>) -> [TerminalCommandCompletion] {
+        guard !chunk.isEmpty else { return [] }
+        carry += String(decoding: chunk, as: UTF8.self)
+        if carry.utf8.count > 1024 {
+            carry = String(carry.suffix(1024))
+        }
+        guard carry.contains(Self.prefix), let expression = Self.expression else {
+            // Keep enough bytes for a prefix split across chunks.
+            if carry.count > Self.prefix.count {
+                carry = String(carry.suffix(Self.prefix.count))
+            }
+            return []
+        }
+
+        let range = NSRange(carry.startIndex..., in: carry)
+        var completions: [TerminalCommandCompletion] = []
+        var consumed = carry.startIndex
+        for match in expression.matches(in: carry, range: range) {
+            guard match.numberOfRanges == 3,
+                  let whole = Range(match.range(at: 0), in: carry),
+                  let idRange = Range(match.range(at: 1), in: carry),
+                  let codeRange = Range(match.range(at: 2), in: carry),
+                  let id = UUID(uuidString: String(carry[idRange])),
+                  let code = Int32(carry[codeRange])
+            else { continue }
+            completions.append(TerminalCommandCompletion(id: id, exitCode: code))
+            consumed = whole.upperBound
+        }
+        carry = String(carry[consumed...].suffix(1024))
+        return completions
     }
 }
 
@@ -543,7 +691,7 @@ struct TerminalPane: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("New terminal (⌘T while the shell is focused)")
+                    .help("New terminal tab (⌥⌘N, or ⌘T while the shell is focused)")
                 }
                 .padding(.horizontal, OreTheme.Space.xs)
             }
@@ -584,6 +732,7 @@ struct TerminalPane: View {
         }
         .buttonStyle(OrePressableButtonStyle())
         .foregroundStyle(isSelected ? .primary : .secondary)
+        .help(isSelected ? "Close this terminal with ⌃⌘W" : tab.title)
         .onHover { hovering in
             if hovering { hoveredTabID = tab.id }
             else if hoveredTabID == tab.id { hoveredTabID = nil }

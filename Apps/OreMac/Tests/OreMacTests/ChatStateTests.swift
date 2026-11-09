@@ -311,6 +311,54 @@ struct ChatStateTests {
         #expect(state.revertableTurns.count == 1)
         #expect(state.hasRows)
     }
+
+    @Test func draftReplyIsTakenOnceOnSend() {
+        let state = ChatState()
+        let reply = MessageReply(
+            rowID: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            role: .assistant,
+            author: "Claude",
+            text: "The login check should be silent."
+        )
+        state.setDraftReply(reply)
+        #expect(state.draftReply == reply)
+        #expect(state.takeDraftReply() == reply)
+        #expect(state.draftReply == nil)
+        #expect(state.takeDraftReply() == nil)
+    }
+
+    @Test func messageReplyTargetsUserAndAssistantRows() {
+        let user = TranscriptRow(
+            id: "u1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .userMessage,
+            text: "fix the flaky login"
+        )
+        let tagged = MessageReply.targeting(user, agentName: "Claude")
+        #expect(tagged?.role == .user)
+        #expect(tagged?.author == "You")
+        #expect(tagged?.text == "fix the flaky login")
+
+        let agent = TranscriptRow(
+            id: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .assistantText,
+            text: "The login check should be silent.\nMore detail."
+        )
+        let quoted = MessageReply.targeting(agent, agentName: "Claude")
+        #expect(quoted?.role == .assistant)
+        #expect(quoted?.author == "Claude")
+        #expect(quoted?.preview == "The login check should be silent.")
+
+        let tool = TranscriptRow(
+            id: "tool",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Read"
+        )
+        #expect(MessageReply.targeting(tool, agentName: "Claude") == nil)
+    }
 }
 
 @MainActor
@@ -938,5 +986,26 @@ struct RateLimitExpiryTests {
         state.recordAnswer("develop", for: QuestionID(rawValue: "q1"))
         state.apply(.question(question("q1")))
         #expect(state.pendingQuestions.isEmpty)
+    }
+
+    @Test func olderHistoryLandsBeforeTheRecentWindow() {
+        let state = ChatState()
+        let recent = TranscriptRow(
+            id: "recent",
+            turnID: TurnID(rawValue: "t-new"),
+            kind: .userMessage,
+            text: "latest"
+        )
+        let older = TranscriptRow(
+            id: "older",
+            turnID: TurnID(rawValue: "t-old"),
+            kind: .userMessage,
+            text: "earlier"
+        )
+        state.loadHistory([recent])
+        state.prependOlderHistory([older])
+        #expect(state.rows.map(\.id) == ["older", "recent"])
+        state.prependOlderHistory([older])
+        #expect(state.rows.map(\.id) == ["older", "recent"])
     }
 }

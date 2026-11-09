@@ -11,6 +11,8 @@ import SwiftUI
 /// other banners, so an update never covers an error.
 struct HarnessUpdateBanner: View {
     @Environment(AppModel.self) private var model
+    var onOpenInTerminal: (HarnessKind, HarnessRepair) -> Void
+    var onShowTerminal: (HarnessKind) -> Void
 
     var body: some View {
         ForEach(model.pendingHarnessUpdates) { status in
@@ -18,18 +20,23 @@ struct HarnessUpdateBanner: View {
                 status: status,
                 update: model.harnessCLIUpdate,
                 onUpdate: { model.updateHarnessCLI(status.kind) },
-                onDismiss: { model.dismissHarnessUpdate(status) }
+                onDismiss: { model.dismissHarnessUpdate(status) },
+                onOpenInTerminal: { repair in onOpenInTerminal(status.kind, repair) },
+                onShowTerminal: { onShowTerminal(status.kind) }
             )
         }
     }
 }
 
 private struct HarnessUpdateRow: View {
+    @Environment(AppModel.self) private var model
     let status: HarnessUpdateStatus
     /// The single in-flight CLI upgrade, whichever harness owns it.
     let update: AppModel.HarnessCLIUpdate?
     let onUpdate: () -> Void
     let onDismiss: () -> Void
+    let onOpenInTerminal: (HarnessRepair) -> Void
+    let onShowTerminal: () -> Void
 
     private var isUpdating: Bool {
         update?.kind == status.kind && update?.isRunning == true
@@ -39,6 +46,11 @@ private struct HarnessUpdateRow: View {
     private var failure: String? {
         guard update?.kind == status.kind, update?.isRunning == false else { return nil }
         return update?.error
+    }
+
+    private var terminalRepairState: AppModel.HarnessCLIUpdate.TerminalRepairState? {
+        guard update?.kind == status.kind else { return nil }
+        return update?.terminalRepairState
     }
 
     var body: some View {
@@ -54,7 +66,10 @@ private struct HarnessUpdateRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let failure {
+                if let terminalRepairState {
+                    terminalRepairProgress(terminalRepairState)
+                        .transition(.blurReplace.combined(with: .opacity))
+                } else if let failure {
                     Text(failure)
                         .font(.caption)
                         .foregroundStyle(.red)
@@ -66,11 +81,10 @@ private struct HarnessUpdateRow: View {
                     // directory and which command. Hand over the exact lines
                     // for the install that actually failed instead.
                     //
-                    // Copy-and-open rather than run-it-for-me on purpose:
-                    // these can need root, and it is better for the user to
-                    // read what runs as root and type their own password than
-                    // for ORE to become something that executes privileged
-                    // commands on request. See `HarnessRepair`.
+                    // Root repairs are staged, not executed: the integrated
+                    // terminal shows the exact commands and waits for Return.
+                    // Repairs that need no elevation get an explicit Run label
+                    // and can start immediately. See `HarnessRepair`.
                     if let repair = update?.repair {
                         Text(repair.reason)
                             .font(.caption)
@@ -86,7 +100,7 @@ private struct HarnessUpdateRow: View {
                             .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 6))
 
                         if repair.needsRoot {
-                            Text("Runs as root — read it before you paste it.")
+                            Text("Runs as root — review the commands before pressing Return.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -96,11 +110,9 @@ private struct HarnessUpdateRow: View {
                                 value: repair.script, label: "Copy fix", help: "Copy the commands"
                             )
                             .buttonStyle(OreSecondaryButtonStyle())
-                            Button("Open Terminal") {
-                                ExternalTools.openInTerminal(NSHomeDirectory())
+                            if model.selectedWorkspace != nil {
+                                terminalButton(for: repair)
                             }
-                            .buttonStyle(OreSecondaryButtonStyle())
-                            .help("Paste the commands here and press return")
                         }
                         .font(.system(size: OreTheme.Font.caption))
                     }
@@ -109,25 +121,27 @@ private struct HarnessUpdateRow: View {
 
             Spacer(minLength: 8)
 
-            Button(action: onUpdate) {
-                HStack(spacing: 6) {
-                    if isUpdating {
-                        ProgressView().controlSize(.small)
-                        Text("Updating…")
-                    } else {
-                        Image(systemName: "arrow.down.app")
-                        Text(failure == nil ? "Update" : "Try Again")
+            if terminalRepairState == nil {
+                Button(action: onUpdate) {
+                    HStack(spacing: 6) {
+                        if isUpdating {
+                            ProgressView().controlSize(.small)
+                            Text("Updating…")
+                        } else {
+                            Image(systemName: "arrow.down.app")
+                            Text(failure == nil ? "Update" : "Try Again")
+                        }
                     }
+                    .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.18), in: Capsule())
+                    .contentShape(Capsule())
                 }
-                .font(.system(size: OreTheme.Font.caption, weight: .semibold))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.accentColor.opacity(0.18), in: Capsule())
-                .contentShape(Capsule())
+                .buttonStyle(.plain)
+                .disabled(isUpdating)
+                .help(helpText)
             }
-            .buttonStyle(.plain)
-            .disabled(isUpdating)
-            .help(helpText)
 
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
@@ -137,11 +151,58 @@ private struct HarnessUpdateRow: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(isUpdating)
+            .disabled(isUpdating || terminalRepairState != nil)
             .help("Hide until the next release")
         }
         .frame(maxWidth: 560)
         .oreCard(padding: 12, radius: 14)
+        .animation(.smooth(duration: 0.3), value: terminalRepairState)
+    }
+
+    private func terminalRepairProgress(
+        _ state: AppModel.HarnessCLIUpdate.TerminalRepairState
+    ) -> some View {
+        Button(action: onShowTerminal) {
+            HStack(spacing: 7) {
+                switch state {
+                case .waiting:
+                    ProgressView().controlSize(.small)
+                    Text(update?.repair?.needsRoot == true
+                        ? "Ready in Terminal — press Return to run"
+                        : "Running in Terminal…")
+                case .verifying:
+                    ProgressView().controlSize(.small)
+                    Text("Checking the installed version…")
+                case .succeeded:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .symbolEffect(.bounce, value: true)
+                    Text("Updated successfully")
+                }
+            }
+            .font(.system(size: OreTheme.Font.caption, weight: .semibold))
+            .foregroundStyle(state == .succeeded ? Color.green : Color.secondary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background(OreTheme.subduedFill, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(state == .succeeded ? "Update complete" : "Show the repair terminal")
+        .disabled(state == .succeeded)
+    }
+
+    @ViewBuilder
+    private func terminalButton(for repair: HarnessRepair) -> some View {
+        if repair.needsRoot {
+            Button("Review in Terminal") { onOpenInTerminal(repair) }
+                .buttonStyle(OreSecondaryButtonStyle())
+                .help("Open ORE's workspace terminal with the commands ready; press Return to run")
+        } else {
+            Button("Run in Terminal") { onOpenInTerminal(repair) }
+                .buttonStyle(OrePrimaryButtonStyle())
+                .help("Run these commands in ORE's workspace terminal")
+        }
     }
 
     private var detail: String {

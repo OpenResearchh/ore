@@ -1,5 +1,6 @@
 import AppKit
 import OreProtocol
+import SwiftUI
 import Testing
 
 @testable import OreMac
@@ -114,6 +115,25 @@ struct MarkdownRendererTests {
         let color = result.attribute(.foregroundColor, at: location, effectiveRange: nil) as? NSColor
         #expect(color != nil)
         #expect(color != NSColor.labelColor)
+    }
+
+    @Test func bashFencesCarryARunControl() {
+        let result = render("""
+        Try:
+
+        ```bash
+        echo hello
+        ```
+        """)
+        #expect(result.string.contains("Run"))
+        var runLink: URL?
+        result.enumerateAttribute(.link, in: NSRange(location: 0, length: result.length)) { value, _, _ in
+            if let url = value as? URL, url.scheme == "ore-run" { runLink = url }
+        }
+        #expect(runLink != nil)
+        if let runLink {
+            #expect(MarkdownRenderer.TranscriptLink.parse(runLink) == .runSnippet(ShellSnippet.id(for: "echo hello")))
+        }
     }
 
     @Test func multilineCodeUsesOneTextBlockInsteadOfLineBackgrounds() {
@@ -332,6 +352,79 @@ struct MarkdownRendererTests {
             files: files
         )
         #expect(escaped == nil)
+    }
+
+    @Test func leadingDotPathsSurviveUnwrap() {
+        #expect(AgentFileReferenceResolver.unwrapPunctuation(
+            ".context/attachments/03BE1FE5-pasted-image.png"
+        ) == ".context/attachments/03BE1FE5-pasted-image.png")
+        #expect(AgentFileReferenceResolver.unwrapPunctuation("`.env`") == ".env")
+        #expect(AgentFileReferenceResolver.unwrapPunctuation("Sources/App.swift.") == "Sources/App.swift")
+    }
+
+    @Test func hiddenAttachmentPathsResolveFromDisk() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ore-attach-\(UUID().uuidString)", isDirectory: true)
+        let relative = ".context/attachments/03BE1FE5-pasted-image.png"
+        let file = root.appendingPathComponent(relative)
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("png".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let resolved = AgentFileReferenceResolver.resolve(
+            relative,
+            worktreePath: root.path,
+            files: []
+        )
+        #expect(resolved == .init(path: relative, line: nil))
+
+        let noteRelative = ".context/realtime-live-improved.md"
+        let note = root.appendingPathComponent(noteRelative)
+        try Data("# notes".utf8).write(to: note)
+        let noteResolved = AgentFileReferenceResolver.resolve(
+            noteRelative,
+            worktreePath: root.path,
+            files: []
+        )
+        #expect(noteResolved == .init(path: noteRelative, line: nil))
+    }
+
+    @Test func pastedImagePathsBecomeInternalLinks() {
+        let result = render("Read .context/attachments/03BE1FE5-pasted-image.png next.")
+        guard let range = result.string.range(of: ".context/attachments/03BE1FE5-pasted-image.png") else {
+            Issue.record("attachment path was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        let path = url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "path" })?.value
+        }
+        #expect(url?.scheme == "ore-file")
+        #expect(path == ".context/attachments/03BE1FE5-pasted-image.png")
+    }
+
+    @Test func markdownLinksToContextNotesStayWorkspaceFiles() {
+        let result = render(
+            "[Read all ten live exchanges.](.context/realtime-live-improved.md)"
+        )
+        guard let range = result.string.range(of: "Read all ten live exchanges.") else {
+            Issue.record("link text was lost")
+            return
+        }
+        let location = result.string.distance(from: result.string.startIndex, to: range.lowerBound)
+        let url = result.attribute(.link, at: location, effectiveRange: nil) as? URL
+        #expect(url?.scheme == "ore-file")
+        if let url {
+            #expect(
+                MarkdownRenderer.TranscriptLink.parse(url)
+                    == .openFile(".context/realtime-live-improved.md")
+            )
+        }
     }
 
     @Test func emphasisAndStrongChangeTheFontRatherThanTheText() {
@@ -583,6 +676,62 @@ struct UserMessageAttachmentTests {
             if value != nil { attachmentCount += 1 }
         }
         #expect(attachmentCount >= 2)
+    }
+
+    @Test func sentUserBubblesQuoteTheTaggedMessage() {
+        let row = TranscriptRow(
+            id: "u2",
+            turnID: TurnID(rawValue: "t2"),
+            kind: .userMessage,
+            text: "what did you mean by that?",
+            replyTo: MessageReply(
+                rowID: "a1",
+                turnID: TurnID(rawValue: "t1"),
+                role: .assistant,
+                author: "Claude",
+                text: "The login check should be silent."
+            )
+        )
+        let rendered = TranscriptCell.attributedText(for: row)
+        #expect(rendered.string.contains("↩ Claude"))
+        #expect(rendered.string.contains("The login check should be silent."))
+        #expect(rendered.string.contains("what did you mean by that?"))
+    }
+
+    @Test func replyTargetBarStaysAChipWhenThePaneIsTall() {
+        let reply = MessageReply(
+            rowID: "a1",
+            turnID: TurnID(rawValue: "t1"),
+            role: .assistant,
+            author: "Cursor Agent",
+            text: "Direct hangup no longer waits on a stalled synthesizer. finish_goodbye now uses TaskScope.wait_for so cancel does not hang."
+        )
+        let box = HeightBox()
+        let root = ZStack(alignment: .bottom) {
+            Color.clear.frame(width: 520, height: 720)
+            ReplyTargetBar(reply: reply, onReveal: {}, onClear: {})
+                .background {
+                    GeometryReader { geo in
+                        Color.clear.preference(key: ReplyBarHeightKey.self, value: geo.size.height)
+                    }
+                }
+                .onPreferenceChange(ReplyBarHeightKey.self) { box.height = $0 }
+        }
+        .frame(width: 520, height: 720)
+        let host = NSHostingView(rootView: root)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 720),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        window.setContentSize(NSSize(width: 520, height: 720))
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+        #expect(box.height > 28)
+        #expect(box.height < 96)
+        window.contentView = nil
     }
 
     @Test func imageAttachmentsUseHoverPreviewInsteadOfInlineThumbnails() {
@@ -1272,6 +1421,17 @@ struct UserMessageAttachmentTests {
         #expect(state.rows.count == 1)
         #expect(state.rows[0].text == "see this")
         #expect(state.rows[0].attachments.map(\.displayName) == ["pasted-image.png"])
+    }
+}
+
+private final class HeightBox: @unchecked Sendable {
+    var height: CGFloat = 0
+}
+
+private struct ReplyBarHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

@@ -1312,28 +1312,40 @@ public actor WorkspaceEngine {
         return summarized
     }
 
-    /// Folds diff comments into the prompt with enough anchoring that the agent
-    /// can act on them without being told which file to open.
+    /// Folds a reply-to tag and diff comments into the prompt. The transcript
+    /// keeps the user's own words; this is what the model reads so it can aim
+    /// at the tagged message without guessing which "that" they meant.
     private func composeMessage(_ request: SendMessageRequest) -> String {
-        guard !request.diffComments.isEmpty else { return request.text }
-
         var sections: [String] = []
+        if let reply = request.replyTo {
+            let who = reply.role == .user
+                ? "the user's earlier message"
+                : "an earlier assistant reply"
+            let quoted = reply.text
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { "> \($0)" }
+                .joined(separator: "\n")
+            sections.append(
+                "The user is replying to \(who) from this conversation (\(reply.author)). Treat it as the target of their follow-up, not as a new instruction.\n\n\(quoted)"
+            )
+        }
         if !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sections.append(request.text)
         }
-        sections.append("Review comments on the current diff:")
-
-        for comment in request.diffComments {
-            let location = comment.startLine == comment.endLine
-                ? "\(comment.filePath):\(comment.startLine)"
-                : "\(comment.filePath):\(comment.startLine)-\(comment.endLine)"
-            var section = "\n**\(location)**\n\(comment.body)"
-            if let context = comment.context, !context.isEmpty {
-                section += "\n\n```\n\(context)\n```"
+        if !request.diffComments.isEmpty {
+            sections.append("Review comments on the current diff:")
+            for comment in request.diffComments {
+                let location = comment.startLine == comment.endLine
+                    ? "\(comment.filePath):\(comment.startLine)"
+                    : "\(comment.filePath):\(comment.startLine)-\(comment.endLine)"
+                var section = "\n**\(location)**\n\(comment.body)"
+                if let context = comment.context, !context.isEmpty {
+                    section += "\n\n```\n\(context)\n```"
+                }
+                sections.append(section)
             }
-            sections.append(section)
         }
-        return sections.joined(separator: "\n")
+        return sections.isEmpty ? request.text : sections.joined(separator: "\n\n")
     }
 
     /// Drains the queue after a turn ended somewhere other than `.turnCompleted`

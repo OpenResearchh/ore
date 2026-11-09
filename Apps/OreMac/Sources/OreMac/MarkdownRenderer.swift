@@ -60,15 +60,18 @@ struct MarkdownRenderer {
     var baseFont: NSFont
     var textColor: NSColor
     var highlighter: SyntaxHighlighter?
+    var worktreePath: String
 
     init(
         baseFont: NSFont = .systemFont(ofSize: 13),
         textColor: NSColor = .labelColor,
-        highlighter: SyntaxHighlighter? = nil
+        highlighter: SyntaxHighlighter? = nil,
+        worktreePath: String = ""
     ) {
         self.baseFont = baseFont
         self.textColor = textColor
         self.highlighter = highlighter
+        self.worktreePath = worktreePath
     }
 
     func render(
@@ -94,7 +97,8 @@ struct MarkdownRenderer {
             textColor: textColor,
             highlighter: highlighter,
             fenceCount: fenceCount,
-            skipCachingLastFence: highlighting == .stablePrefix
+            skipCachingLastFence: highlighting == .stablePrefix,
+            worktreePath: worktreePath
         )
         let result = NSMutableAttributedString(attributedString: visitor.visit(document))
         // Claim bare URLs first so the file-reference pass can't chew into a
@@ -377,6 +381,7 @@ struct MarkdownRenderer {
     enum TranscriptLink: Equatable {
         case openFile(String)
         case openURL(URL)
+        case runSnippet(String)
 
         static func parse(_ link: Any) -> TranscriptLink? {
             if let url = link as? URL { return parse(url) }
@@ -398,6 +403,11 @@ struct MarkdownRenderer {
                 return .openURL(url)
             case "file":
                 return .openFile(url.path)
+            case "ore-run":
+                let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "id" })?.value
+                guard let id, !id.isEmpty else { return nil }
+                return .runSnippet(id)
             default:
                 return nil
             }
@@ -424,6 +434,7 @@ struct MarkdownRenderer {
             "js", "jsx", "ts", "tsx", "py", "rb", "php", "sh", "zsh", "fish", "sql",
             "html", "css", "scss", "vue", "svelte", "json", "jsonl", "yaml", "yml", "toml",
             "xml", "md", "mdx", "txt", "plist", "gradle", "properties", "env",
+            "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp", "pdf",
         ].joined(separator: "|")
         // A trailing `:line`, `:line:col`, or `:line,col` locator is captured so a
         // click can jump straight to it. The trailing `(?![A-Za-z0-9])` boundary
@@ -703,6 +714,7 @@ struct MarkdownRenderer {
         let highlighter: SyntaxHighlighter?
         let fenceCount: Int
         let skipCachingLastFence: Bool
+        let worktreePath: String
         /// Nesting depth for list items, so a nested bullet indents.
         var listDepth = 0
         var visitedFences = 0
@@ -917,7 +929,11 @@ struct MarkdownRenderer {
                 attributes: [.font: font, .foregroundColor: textColor]
             )
 
-            let result = NSMutableAttributedString(attributedString: highlighted)
+            let result = NSMutableAttributedString()
+            if ShellSnippet.isRunnable(language) {
+                result.append(runControl(for: code, font: font))
+            }
+            result.append(highlighted)
             let table = NSTextTable()
             table.numberOfColumns = 1
             table.collapsesBorders = true
@@ -944,8 +960,54 @@ struct MarkdownRenderer {
                 ],
                 range: NSRange(location: 0, length: result.length)
             )
+            if ShellSnippet.isRunnable(language) {
+                result.append(snippetOutput(for: code, font: font))
+            }
             result.append(NSAttributedString(string: "\n\n", attributes: [.font: font]))
             return result
+        }
+
+        private func runControl(for command: String, font: NSFont) -> NSAttributedString {
+            let id = ShellSnippet.id(for: command, worktree: worktreePath)
+            let label: String
+            switch SnippetRunCache.result(id: id)?.status {
+            case .running: label = "Running…"
+            case .succeeded: label = "Run again"
+            case .failed: label = "Run failed — try again"
+            case nil: label = "Run"
+            }
+            let chip = NSMutableAttributedString(
+                string: " ▶ \(label) ",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: font.pointSize, weight: .semibold),
+                    .foregroundColor: NSColor.oreInlineChipText,
+                    .backgroundColor: NSColor.oreInlineChipFill,
+                    .link: ShellSnippet.runURL(command: command, worktree: worktreePath),
+                    .underlineStyle: 0,
+                ]
+            )
+            chip.append(NSAttributedString(string: "\n", attributes: [.font: font]))
+            return chip
+        }
+
+        private func snippetOutput(for command: String, font: NSFont) -> NSAttributedString {
+            let id = ShellSnippet.id(for: command, worktree: worktreePath)
+            guard let result = SnippetRunCache.result(id: id), result.status != .running else {
+                return NSAttributedString()
+            }
+            let body = result.output.isEmpty
+                ? (result.status == .succeeded ? "(no output)" : "exit \(result.exitCode)")
+                : result.output
+            let color: NSColor = result.status == .failed
+                ? .systemRed
+                : .secondaryLabelColor
+            return NSAttributedString(
+                string: "\n" + body,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: color,
+                ]
+            )
         }
 
         mutating func visitBlockQuote(_ blockQuote: BlockQuote) -> NSAttributedString {

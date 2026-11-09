@@ -79,7 +79,7 @@ echo "==> OreKit tests"
 (cd "$REPO/Packages/OreKit" && swift test)
 
 echo "==> OreMac tests"
-(cd "$MAC" && xcrun --sdk macosx swift test)
+(cd "$MAC" && xcrun --sdk macosx swift test --no-parallel)
 
 echo "==> Bumping $PART version"
 VERSION="$("$MAC/Scripts/bump-version.sh" "$PART")"

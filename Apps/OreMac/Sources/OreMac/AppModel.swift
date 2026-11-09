@@ -224,7 +224,7 @@ final class AppModel {
     @ObservationIgnored
     private var didWarmWorkspaces = false
     @ObservationIgnored
-    private var historyLoadsInFlight: Set<ChatID> = []
+    private var historyLoadsInFlight: Set<ObjectIdentifier> = []
 
     /// Speaks agent activity aloud for tabs whose speaker toggle is on.
     let narration = NarrationEngine()
@@ -348,6 +348,7 @@ final class AppModel {
             self?.rescanStorageRoots()
         }
         StorageVolumeMonitor.shared.start()
+        RemoteControlServer.shared.bind(model: self)
         eventTask = Task { [weak self] in
             guard let self else { return }
             for await event in await self.client.events {
@@ -1071,30 +1072,52 @@ final class AppModel {
     /// rows. Doing the conversion here — rather than storing rows — keeps the
     /// database shaped like the domain rather than like this particular view.
     private func loadHistory(for id: ChatID) async {
-        guard historyLoadsInFlight.insert(id).inserted else { return }
-        defer { historyLoadsInFlight.remove(id) }
-        let state = chatStates[id] ?? makeChatState(for: id)
-        guard !state.hasLoadedHistory else { return }
+        let expected = chatStates[id] ?? makeChatState(for: id)
+        guard !expected.hasLoadedHistory else { return }
+        let loadID = ObjectIdentifier(expected)
+        guard historyLoadsInFlight.insert(loadID).inserted else { return }
+        defer { historyLoadsInFlight.remove(loadID) }
         guard let turns = try? await client.transcript(chatID: id) else { return }
-        // One query for the whole chat; a long chat used to cost one round
-        // trip per turn, each resuming on the main actor.
-        let grouped = (try? await client.blocks(chatID: id)) ?? []
+        let (recentTurns, olderTurns) = ChatHistoryWindow.split(turns)
         let transitions = (try? await client.chatTransitions(chatID: id)) ?? []
-        // Folding results into calls and sorting is linear in the transcript's
-        // length; a long chat is not a reason to hold the main thread.
-        let rows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
+        let splitMarkers = olderTurns.isEmpty
+            ? (recent: transitions, older: [ChatTransition]())
+            : ChatHistoryWindow.splitTransitions(
+                transitions,
+                recentStart: recentTurns.first?.startedAt
+            )
+        // Newest turns first so opening a long chat isn't gated on every
+        // historical tool result. Remaining turns are prepended below.
+        var recentGrouped: [(turnID: TurnID, blocks: [BlockRecord])] = []
+        for turn in recentTurns {
+            let blocks = (try? await client.blocks(turnID: turn.turnID)) ?? []
+            if !blocks.isEmpty { recentGrouped.append((turn.turnID, blocks)) }
+        }
+        let recentRows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
             let blocks = Dictionary(
-                grouped.map { ($0.turnID, $0.blocks) },
+                recentGrouped.map { ($0.turnID, $0.blocks) },
                 uniquingKeysWith: { first, _ in first }
             )
-            return Self.historyRows(turns: turns, blocks: blocks, transitions: transitions)
+            return Self.historyRows(turns: recentTurns, blocks: blocks, transitions: splitMarkers.recent)
         }.value
-        // The chat may have closed (state released) or closed and reopened
-        // (a new state) while this read ran. Load into whatever is current, and
-        // never resurrect state for a chat nobody holds any more.
-        // `ChatState.loadHistory` ignores a second load.
-        guard let current = chatStates[id] else { return }
-        current.loadHistory(rows)
+        // Close+reopen mid-load replaces ChatState. Never paint this fetch
+        // onto the replacement — that dropped the newest turns and left only
+        // whatever the old task prepended next.
+        guard chatStates[id] === expected else { return }
+        expected.loadHistory(recentRows)
+
+        guard !olderTurns.isEmpty else { return }
+        let grouped = (try? await client.blocks(chatID: id)) ?? []
+        let olderIDs = Set(olderTurns.map(\.turnID))
+        let olderRows = await Task.detached(priority: .userInitiated) { () -> [TranscriptRow] in
+            let blocks = Dictionary(
+                grouped.filter { olderIDs.contains($0.turnID) }.map { ($0.turnID, $0.blocks) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            return Self.historyRows(turns: olderTurns, blocks: blocks, transitions: splitMarkers.older)
+        }.value
+        guard chatStates[id] === expected else { return }
+        expected.prependOlderHistory(olderRows)
     }
 
     /// A chat's state only if something already loaded it. For polls and
@@ -1553,7 +1576,8 @@ final class AppModel {
         origin: MessageOrigin = .user,
         to id: WorkspaceID,
         chatID: ChatID,
-        fromComposer: Bool = true
+        fromComposer: Bool = true,
+        replyTo: MessageReply? = nil
     ) {
         if let workspace = workspaces.first(where: { $0.id == id }),
            workspace.isStorageOffline {
@@ -1568,6 +1592,7 @@ final class AppModel {
         // A button's prompt isn't the composer's text: whatever the user has
         // half-typed, attached or commented stays put for their own send.
         let comments = fromComposer ? state.takeDraftComments() : []
+        let reply = replyTo ?? (fromComposer ? state.takeDraftReply() : nil)
         if fromComposer {
             persistDraftComments([], for: chatID)
             persistDraftAttachments([], for: chatID)
@@ -1588,6 +1613,7 @@ final class AppModel {
             text,
             attachments: attachments,
             comments: comments,
+            replyTo: reply,
             // Forwarded, not defaulted. The engine's echo carries the true
             // origin but is dropped as a duplicate of this row, so whatever is
             // set here is what the transcript believes forever — and a `.watch`
@@ -1608,7 +1634,8 @@ final class AppModel {
                 serviceTier: serviceTier,
                 origin: origin,
                 submissionID: submissionID,
-                hiddenContext: hidden
+                hiddenContext: hidden,
+                replyTo: reply
             )))
         }
     }
@@ -2222,6 +2249,17 @@ final class AppModel {
             )
         } else {
             closeChat(chatID, in: workspaceID)
+        }
+    }
+
+    /// Closes whichever coding tab owns the centre column: a source/diff tab
+    /// first, otherwise the active agent conversation. All keyboard and menu
+    /// surfaces use this so ⌘W never develops subtly different meanings.
+    func requestCloseActiveCodingTab(in workspaceID: WorkspaceID) {
+        if let path = activeFilePath[workspaceID] {
+            closeDiffFile(path, in: workspaceID)
+        } else if let chat = activeChat(for: workspaceID) {
+            requestCloseChat(chat.id, in: workspaceID, title: chat.title)
         }
     }
 
@@ -3744,17 +3782,62 @@ final class AppModel {
         try await GitHubClient(repositoryURL: OreHome.directory).authenticate()
     }
 
-    /// Opens Terminal with the vendor installer. ORE does not pipe `curl | bash`
-    /// itself — that is the user's decision, in a shell they can read first.
+    /// Runs setup in ORE's workspace terminal when a workspace exists. The
+    /// no-workspace onboarding screen is the only fallback to Terminal.app:
+    /// there is no worktree (and therefore no in-app PTY) to attach it to yet.
+    func runCommandInTerminal(
+        _ command: String,
+        title: String,
+        runsImmediately: Bool = true,
+        onCompletion: ((Int32) -> Void)? = nil
+    ) {
+        guard let workspace = selectedWorkspace else {
+            ExternalTools.copyAndRunInTerminal(command)
+            return
+        }
+
+        NotificationCenter.default.post(name: .oreShowWorkspaceTerminal, object: nil)
+        let operationID = onCompletion == nil ? nil : UUID()
+        TerminalRegistry.shared.prepare(
+            command,
+            in: workspace.id,
+            workingDirectory: workspace.worktreePath,
+            title: title,
+            runsImmediately: runsImmediately,
+            operationID: operationID,
+            onCompletion: onCompletion
+        )
+    }
+
+    /// Opens the vendor installer in a terminal the user can see. A successful
+    /// tracked run re-probes immediately, so install cards resolve without a
+    /// manual refresh or an app-focus round trip.
     func installHarness(_ kind: HarnessKind) {
-        ExternalTools.copyAndRunInTerminal(HarnessSetup.installCommand(for: kind))
+        runCommandInTerminal(
+            HarnessSetup.installCommand(for: kind),
+            title: "Install \(kind.displayName)"
+        ) { [weak self] exitCode in
+            guard exitCode == 0, let self else { return }
+            ShellEnvironment.invalidateCache()
+            Task { await self.client.send(.probeHarnesses) }
+        }
     }
 
     /// Install `gh` when Homebrew is on PATH; otherwise open the download page
     /// and still copy the brew command for later.
     func installGitHubCLI() {
         if ShellEnvironment.locate("brew") != nil {
-            ExternalTools.copyAndRunInTerminal(GitHubCLISetup.installCommand)
+            runCommandInTerminal(
+                GitHubCLISetup.installCommand,
+                title: "Install GitHub CLI"
+            ) { exitCode in
+                guard exitCode == 0 else { return }
+                ShellEnvironment.invalidateCache()
+                NotificationCenter.default.post(
+                    name: .oreSetupTerminalCommandCompleted,
+                    object: nil
+                )
+            }
             return
         }
         ExternalTools.copyPath(GitHubCLISetup.installCommand)
@@ -3807,7 +3890,10 @@ final class AppModel {
         } else {
             command = HarnessSetup.signInCommand(for: kind)
         }
-        ExternalTools.copyAndRunInTerminal(command)
+        runCommandInTerminal(command, title: "Sign in to \(kind.displayName)") { [weak self] exitCode in
+            guard exitCode == 0, let self else { return }
+            Task { await self.client.send(.probeHarnesses) }
+        }
     }
 
     /// Clones into ORE's repository library using owner/name folders, which
@@ -3926,12 +4012,29 @@ final class AppModel {
     }
 
     struct HarnessCLIUpdate: Equatable {
+        enum TerminalRepairState: Equatable {
+            case waiting(UUID)
+            case verifying(UUID)
+            case succeeded
+
+            var operationID: UUID? {
+                switch self {
+                case .waiting(let id), .verifying(let id): id
+                case .succeeded: nil
+                }
+            }
+        }
+
         var kind: HarnessKind
         var isRunning: Bool
         var error: String?
         /// Filled in for a failure the user can actually fix — a root-owned
         /// install — with commands matching how that CLI was installed.
         var repair: HarnessRepair?
+        /// Set the instant the repair is handed to ORE's terminal. The repair
+        /// controls disappear while this is non-nil, preventing duplicate
+        /// tabs and repeated privileged commands from one impatient click.
+        var terminalRepairState: TerminalRepairState? = nil
     }
     private(set) var harnessCLIUpdate: HarnessCLIUpdate?
 
@@ -3950,6 +4053,72 @@ final class AppModel {
     /// launched with; the next one they start picks up the new version.
     func updateHarnessCLI(_ kind: HarnessKind) {
         Task { _ = await runHarnessCLIUpdate(kind) }
+    }
+
+    func beginHarnessTerminalRepair(_ kind: HarnessKind, operationID: UUID) {
+        guard harnessCLIUpdate?.kind == kind, harnessCLIUpdate?.repair != nil else { return }
+        harnessCLIUpdate?.terminalRepairState = .waiting(operationID)
+    }
+
+    /// Resolves a repair launched in the persistent in-app shell. A zero shell
+    /// status is necessary but not sufficient: self-updaters can exit zero
+    /// while leaving the old binary in place, so ORE re-probes PATH and checks
+    /// the installed version against the version the card promised.
+    func completeHarnessTerminalRepair(
+        _ kind: HarnessKind,
+        operationID: UUID,
+        exitCode: Int32
+    ) {
+        Task { await resolveHarnessTerminalRepair(kind, operationID: operationID, exitCode: exitCode) }
+    }
+
+    private func resolveHarnessTerminalRepair(
+        _ kind: HarnessKind,
+        operationID: UUID,
+        exitCode: Int32
+    ) async {
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState?.operationID == operationID
+        else { return }
+
+        guard exitCode == 0 else {
+            harnessCLIUpdate?.terminalRepairState = nil
+            harnessCLIUpdate?.error = exitCode == -1
+                ? "The terminal was closed before the repair finished."
+                : "The terminal repair exited with status \(exitCode)."
+            return
+        }
+
+        harnessCLIUpdate?.terminalRepairState = .verifying(operationID)
+        let target = harnessUpdate(for: kind)?.latestVersion
+        await client.send(.probeHarnesses)
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState?.operationID == operationID
+        else { return }
+
+        let installed = await client.harnessProbeResult(kind)?.version
+        let reachedTarget: Bool
+        if let installed, let target {
+            reachedTarget = installed == target || HarnessVersion.isNewer(installed, than: target)
+        } else {
+            reachedTarget = false
+        }
+
+        guard reachedTarget else {
+            harnessCLIUpdate?.terminalRepairState = nil
+            let version = installed.map { " It is still reporting \($0)." } ?? ""
+            harnessCLIUpdate?.error = "The terminal command finished, but the update was not detected."
+                + version
+            return
+        }
+
+        harnessCLIUpdate?.terminalRepairState = .succeeded
+        try? await Task.sleep(for: .milliseconds(900))
+        guard harnessCLIUpdate?.kind == kind,
+              harnessCLIUpdate?.terminalRepairState == .succeeded
+        else { return }
+        await client.send(.checkHarnessUpdates(force: true))
+        harnessCLIUpdate = nil
     }
 
     /// Why an upgrade that exited zero did not actually change anything.
@@ -4265,6 +4434,59 @@ final class AppModel {
             let url = try Self.safeFileURL(root: root, relativePath: path)
             try contents.write(to: url, atomically: true, encoding: .utf8)
         }.value
+    }
+
+    enum FileCreationError: Error, Equatable, LocalizedError {
+        case invalidName
+        case alreadyExists
+        case writeFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidName: "Enter a file name without .. or an absolute path."
+            case .alreadyExists: "A file with that name already exists."
+            case .writeFailed: "The file could not be created."
+            }
+        }
+    }
+
+    /// A worktree-relative path with no traversal. `nil` if the name is not
+    /// something we will write.
+    nonisolated static func validatedRelativePath(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("\\") else {
+            return nil
+        }
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return nil
+        }
+        return parts.joined(separator: "/")
+    }
+
+    func createEmptyFile(path: String, in workspace: WorkspaceSummary) throws {
+        guard let relative = Self.validatedRelativePath(path) else {
+            throw FileCreationError.invalidName
+        }
+        try Self.writeEmptyFile(relative, root: workspace.worktreePath)
+    }
+
+    nonisolated static func writeEmptyFile(_ relativePath: String, root: String) throws {
+        guard let relative = validatedRelativePath(relativePath) else {
+            throw FileCreationError.invalidName
+        }
+        let url = try safeFileURL(root: root, relativePath: relative)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            throw FileCreationError.alreadyExists
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
+            throw FileCreationError.writeFailed
+        }
     }
 
     /// Internal rather than private: the binary-file preview needs the same

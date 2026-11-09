@@ -2165,6 +2165,13 @@ public actor InProcessCoreClient: CoreClient {
         harnessUpdates.first { $0.kind == kind }
     }
 
+    /// The probe currently backing the app's harness status. Terminal-driven
+    /// repairs use this after an explicit re-probe so success is based on the
+    /// binary that now answers on PATH, not merely the shell command's exit.
+    public func harnessProbeResult(_ kind: HarnessKind) -> HarnessProbeResult? {
+        harnessProbes.first { $0.kind == kind }
+    }
+
     /// What to run when an upgrade failed because something isn't writable.
     ///
     /// Asked for only after a failure, because answering it costs two short

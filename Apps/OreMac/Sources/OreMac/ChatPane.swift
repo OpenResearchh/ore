@@ -364,7 +364,24 @@ struct ChatPane: View {
             }
         case .revert:
             revertTarget = turn
+        case .reply:
+            tagReply(in: chat, agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "", turnID: turn)
         }
+    }
+
+    private func tagReply(_ row: TranscriptRow, agentName: String) {
+        guard let reply = MessageReply.targeting(row, agentName: agentName) else { return }
+        chat.setDraftReply(reply)
+        composerFocused = true
+    }
+
+    private func tagReply(in chat: ChatState, agentName: String, turnID: TurnID) {
+        let turnRows = chat.rows.filter { $0.turnID == turnID }
+        let target = turnRows.last {
+            ($0.kind == .assistantText || $0.kind == .plan)
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } ?? turnRows.first { $0.kind == .userMessage }
+        if let target { tagReply(target, agentName: agentName) }
     }
 
     /// The transcript itself, or the empty state before a chat has any rows.
@@ -407,6 +424,12 @@ struct ChatPane: View {
                         onToggleActivity: { toggleActivity($0) },
                         onOpenFile: { openAgentFile($0) },
                         onTurnAction: { turn, action in handleTurnAction(turn, action) },
+                        onReply: { row in
+                            tagReply(
+                                row,
+                                agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? ""
+                            )
+                        },
                         scrollAnchor: scrollAnchor,
                         // A hair of air between the newest row and the dock's glass.
                         bottomInset: dockHeight + OreTheme.Space.sm,
@@ -571,6 +594,19 @@ struct ChatPane: View {
                     .padding(.horizontal, OreTheme.Space.md)
             }
 
+            if let reply = chat.draftReply, !reviewingPlan {
+                ReplyTargetBar(
+                    reply: reply,
+                    onReveal: { scrollAnchor.reveal(reply.rowID) },
+                    onClear: { chat.setDraftReply(nil) }
+                )
+                .frame(maxWidth: OreTheme.contentMaxWidth)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, OreTheme.Space.md)
+                .padding(.top, OreTheme.Space.sm)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             if !chat.draftComments.isEmpty && !reviewingPlan {
                 DraftCommentsBar(
                     comments: chat.draftComments,
@@ -665,6 +701,7 @@ struct ChatPane: View {
             .animation(.easeOut(duration: 0.18), value: nudge?.id)
             .animation(.easeOut(duration: 0.18), value: chat.pendingQuestion?.id)
             .animation(.easeOut(duration: 0.18), value: chat.draftComments.isEmpty)
+            .animation(.easeOut(duration: 0.18), value: chat.draftReply?.rowID)
         }
         .onPreferenceChange(ComposerDockHeightKey.self) { height in
             // Whole points, and only on a real change: sub-point layout noise
@@ -1109,7 +1146,7 @@ struct ChatPane: View {
         }
         .padding(.horizontal, compact ? 8 : 10)
         .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
-        .help(compact ? path : "")
+        .help(isSelected ? "\(path) — close with ⌘W" : path)
         .foregroundStyle(isSelected ? .primary : .secondary)
         .oreNavigationSelection(
             isSelected: isSelected,
@@ -1168,7 +1205,7 @@ struct ChatPane: View {
         }
         .padding(.horizontal, compact ? 8 : 10)
         .frame(maxWidth: compact ? 130 : 190, minHeight: 28)
-        .help(compact ? tab.title : "")
+        .help(isSelected ? "\(tab.title) — close with ⌘W" : tab.title)
         .foregroundStyle(isSelected ? .primary : .secondary)
         // The active tab is at full strength; every other tab recedes — even a
         // working one — so which tab you're actually in is never in doubt. A
@@ -3066,9 +3103,8 @@ struct ChatPane: View {
     }
 
     /// Agent output may use a repository-relative path, an absolute worktree
-    /// path, or a short basename. Resolve all three into the workspace index so
-    /// clicking a reference opens ORE's source tab rather than asking Finder to
-    /// interpret a relative URL.
+    /// path, or a short basename. Resolve into the workspace, including hidden
+    /// `.context` notes the All Files list does not show.
     private func openAgentFile(_ reference: String) {
         guard let resolved = AgentFileReferenceResolver.resolve(
             reference,
@@ -5591,6 +5627,7 @@ struct TranscriptHost: View, Equatable {
     var onToggleActivity: (String) -> Void
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TranscriptView.TurnAction) -> Void
+    var onReply: (TranscriptRow) -> Void = { _ in }
     var scrollAnchor: TranscriptScrollAnchor
     /// Foot clearance for the floating composer dock — see `TranscriptView`.
     /// Defaults to the resting inset for hosts whose composer does not float
@@ -5655,6 +5692,7 @@ struct TranscriptHost: View, Equatable {
             onToggleActivity: onToggleActivity,
             onOpenFile: onOpenFile,
             onTurnAction: onTurnAction,
+            onReply: onReply,
             canFork: canFork,
             // Passing the reference registers no observation — only the button
             // below reads `isAwayFromBottom`, so the transcript is not rebuilt
@@ -6107,6 +6145,57 @@ private struct BusyTabDot: View {
         // longer wakes the main thread twelve times a second per tab.
         PulsingDot(isAnimated: !reduceMotion, isPaused: controlActiveState != .key)
             .frame(width: 6, height: 6)
+    }
+}
+
+/// The iMessage-style quote sitting on the composer: who the next send is
+/// tagged to, a preview of that message, and a way to drop the tag.
+struct ReplyTargetBar: View {
+    let reply: MessageReply
+    var onReveal: () -> Void
+    var onClear: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Button(action: onReveal) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Replying to \(reply.author)", systemImage: "arrowshape.turn.up.left")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .labelStyle(.titleAndIcon)
+                    Text(reply.preview)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .help("Jump to this message")
+            Button(action: onClear) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.plain)
+            .help("Remove reply")
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
+        .padding(.vertical, 7)
+        // Overlay, not a sibling: a `RoundedRectangle` in the HStack only had
+        // a width and ate the pane height the dock was offered, stretching the
+        // quote over the transcript.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(Color.accentColor)
+                .frame(width: 3)
+                .padding(.vertical, 8)
+                .padding(.leading, 8)
+        }
+        .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

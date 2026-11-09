@@ -112,6 +112,9 @@ struct ReviewPane: View {
     /// a slow walk for a workspace the user already left must not land.
     @State private var fileTreeWorkspaceID: WorkspaceID?
     @State private var fileTreeRequestedFor: WorkspaceID?
+    @State private var newFileFolder: String?
+    @State private var newFileName = ""
+    @State private var newFileError: String?
     private let chrome = ChromeLayoutStore.shared
 
     private enum DiffScope: Hashable {
@@ -264,10 +267,10 @@ struct ReviewPane: View {
     // Workspace destinations; actions live in the window toolbar.
     private var tabRow: some View {
         HStack(spacing: OreTheme.Space.xs) {
-            segment("All files", count: nil, target: .allFiles)
-            segment("Changes", count: diffs.count, target: .changes)
+            segment("All files", systemImage: "folder", count: nil, target: .allFiles)
+            segment("Changes", systemImage: "plusminus", count: diffs.count, target: .changes)
 
-            segment("Requests", count: pendingRequestCount > 0 ? pendingRequestCount : nil, target: .requests)
+            segment("Requests", systemImage: "bell", count: pendingRequestCount > 0 ? pendingRequestCount : nil, target: .requests)
             Spacer(minLength: 0)
 
         }
@@ -278,10 +281,12 @@ struct ReviewPane: View {
         // stack a second pane over it.
     }
 
-    private func segment(_ title: String, count: Int?, target: ReviewTab) -> some View {
+    private func segment(_ title: String, systemImage: String, count: Int?, target: ReviewTab) -> some View {
         let isSelected = tab == target
         return Button { tab = target } label: {
             HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .semibold))
                 Text(title)
                     .font(.system(size: OreTheme.Font.body, weight: isSelected ? .semibold : .regular))
                 if let count {
@@ -339,6 +344,14 @@ struct ReviewPane: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(.tertiary)
                 }
+                Button {
+                    beginNewFile(in: "")
+                } label: {
+                    Image(systemName: "doc.badge.plus")
+                }
+                .buttonStyle(.plain)
+                .help("New File")
+                .disabled(workspace.isStorageOffline)
             }
             .padding(.horizontal, OreTheme.Space.sm)
             .frame(height: 34)
@@ -348,7 +361,14 @@ struct ReviewPane: View {
             if isLoadingFiles && fileTree.isEmpty {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if fileTree.isEmpty {
-                ContentUnavailableView("No files", systemImage: "folder")
+                ContentUnavailableView {
+                    Label("No files", systemImage: "folder")
+                } description: {
+                    Text("Create a file in this workspace.")
+                } actions: {
+                    Button("New File", systemImage: "doc.badge.plus") { beginNewFile(in: "") }
+                        .disabled(workspace.isStorageOffline)
+                }
             } else {
                 List {
                     if fileSearch.isEmpty {
@@ -364,7 +384,23 @@ struct ReviewPane: View {
                 // Overlay scrollers, not none: a file tree with no knob gives
                 // the reader no idea how far down a thousand paths they are.
                 .oreOverlayScrollers()
+                .contextMenu {
+                    Button("New File…", systemImage: "doc.badge.plus") { beginNewFile(in: "") }
+                        .disabled(workspace.isStorageOffline)
+                }
             }
+        }
+        .alert("New File", isPresented: newFilePresented) {
+            TextField("filename.swift", text: $newFileName)
+            Button("Create") { submitNewFile() }
+            Button("Cancel", role: .cancel) { newFileFolder = nil }
+        } message: {
+            Text(newFilePrompt)
+        }
+        .alert("Couldn’t Create File", isPresented: newFileErrorPresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(newFileError ?? "")
         }
         // The list rides the inspector's glass; an opaque well here would punch
         // a matte hole in the pane.
@@ -410,14 +446,19 @@ struct ReviewPane: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
-            if !node.isDirectory {
-                Button("Open") { model.openSourceFile(node.path, in: workspace.id) }
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.selectFile(
-                        workspace.worktreePath + "/" + node.path,
-                        inFileViewerRootedAtPath: workspace.worktreePath
-                    )
-                }
+            if node.isDirectory {
+                Button("New File…", systemImage: "doc.badge.plus") { beginNewFile(in: node.path) }
+                    .disabled(workspace.isStorageOffline)
+            } else {
+                Button("Open", systemImage: "doc") { model.openSourceFile(node.path, in: workspace.id) }
+                Button("New File…", systemImage: "doc.badge.plus") { beginNewFile(in: parentFolder(of: node.path)) }
+                    .disabled(workspace.isStorageOffline)
+            }
+            Button("Reveal in Finder", systemImage: "folder") {
+                NSWorkspace.shared.selectFile(
+                    workspace.worktreePath + "/" + node.path,
+                    inFileViewerRootedAtPath: workspace.worktreePath
+                )
             }
         }
     }
@@ -439,6 +480,59 @@ struct ReviewPane: View {
     private func toggleFileFolder(_ path: String) {
         if expandedFileFolders.contains(path) { expandedFileFolders.remove(path) }
         else { expandedFileFolders.insert(path) }
+    }
+
+    private var newFilePresented: Binding<Bool> {
+        Binding(
+            get: { newFileFolder != nil },
+            set: { if !$0 { newFileFolder = nil } }
+        )
+    }
+
+    private var newFileErrorPresented: Binding<Bool> {
+        Binding(
+            get: { newFileError != nil },
+            set: { if !$0 { newFileError = nil } }
+        )
+    }
+
+    private var newFilePrompt: String {
+        guard let folder = newFileFolder else { return "Choose a name." }
+        if folder.isEmpty { return "Created in the workspace root." }
+        return "Created in \(folder)."
+    }
+
+    private func parentFolder(of path: String) -> String {
+        let parent = (path as NSString).deletingLastPathComponent
+        return parent == "." ? "" : parent
+    }
+
+    private func beginNewFile(in folder: String) {
+        newFileFolder = folder
+        newFileName = ""
+        newFileError = nil
+    }
+
+    private func submitNewFile() {
+        guard let folder = newFileFolder else { return }
+        let name = newFileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let combined = folder.isEmpty ? name : "\(folder)/\(name)"
+        newFileFolder = nil
+        guard let path = AppModel.validatedRelativePath(combined) else {
+            newFileError = AppModel.FileCreationError.invalidName.localizedDescription
+            return
+        }
+        do {
+            try model.createEmptyFile(path: path, in: workspace)
+            let parent = parentFolder(of: path)
+            if !parent.isEmpty { expandedFileFolders.insert(parent) }
+            Task {
+                await refreshFileTree()
+                model.openSourceFile(path, in: workspace.id)
+            }
+        } catch {
+            newFileError = error.localizedDescription
+        }
     }
 
     private var filteredFiles: [WorkspaceFileNode] {

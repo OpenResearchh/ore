@@ -180,6 +180,10 @@ final class ChatState {
     /// pass over the diff, not one message per note.
     private(set) var draftComments: [DiffCommentReference] = []
 
+    /// The transcript message this draft is tagged to, like a chat app's
+    /// reply-to. Lives on the chat so switching tabs keeps the quote.
+    private(set) var draftReply: MessageReply?
+
     /// The agent is actively producing — the spinner, the elapsed timer.
     /// Deliberately *not* the same question as whether a turn is still open:
     /// an agent blocked on a permission prompt has stopped working (`isBusy`
@@ -600,6 +604,19 @@ final class ChatState {
         refreshRevertableTurns()
     }
 
+    /// Older turns, painted after the newest window so opening a long chat
+    /// shows the latest reply first.
+    func prependOlderHistory(_ older: [TranscriptRow]) {
+        let existing = Set(rows.map(\.id))
+        let new = older.filter { !existing.contains($0.id) }
+        guard !new.isEmpty else { return }
+        rows = new + rows
+        for (blockID, index) in streamingRowIndex {
+            streamingRowIndex[blockID] = index + new.count
+        }
+        refreshRevertableTurns()
+    }
+
     private(set) var hasLoadedHistory = false
 
     // MARK: - Rate limits
@@ -639,6 +656,7 @@ final class ChatState {
         _ text: String,
         attachments: [Attachment] = [],
         comments: [DiffCommentReference],
+        replyTo: MessageReply? = nil,
         origin: MessageOrigin = .user,
         submissionID: String = UUID().uuidString,
         isQueued: Bool? = nil
@@ -655,7 +673,8 @@ final class ChatState {
             isQueued: willQueue,
             origin: origin,
             attachedComments: comments,
-            attachments: attachments
+            attachments: attachments,
+            replyTo: replyTo
         ))
         refreshRevertableTurns()
         guard !willQueue else {
@@ -810,6 +829,15 @@ final class ChatState {
     func takeDraftComments() -> [DiffCommentReference] {
         defer { draftComments.removeAll() }
         return draftComments
+    }
+
+    func setDraftReply(_ reply: MessageReply?) {
+        draftReply = reply
+    }
+
+    func takeDraftReply() -> MessageReply? {
+        defer { draftReply = nil }
+        return draftReply
     }
 
     func resolvePermission(_ id: PermissionRequestID) {
@@ -1140,6 +1168,9 @@ struct TranscriptRow: Identifiable, Sendable {
     var permissionRequestID: PermissionRequestID?
     var attachedComments: [DiffCommentReference] = []
     var attachments: [Attachment] = []
+    /// The earlier message this user bubble is tagged to. Drawn as a quote;
+    /// the engine also folds it into the model prompt.
+    var replyTo: MessageReply?
     var groupedRows: [TranscriptRow] = []
     var isExpanded = false
     /// When this row launched a subagent (a Task tool call), how many tool uses
@@ -1173,5 +1204,38 @@ struct TranscriptRow: Identifiable, Sendable {
         }
         activitySignature = hasher.finalize()
         contentRevision = UInt64(truncatingIfNeeded: activitySignature)
+    }
+}
+
+extension MessageReply {
+    /// A reply-to tag for a transcript row the user pointed at. Nil when the
+    /// row has nothing to quote (empty tools, dividers, footers).
+    static func targeting(_ row: TranscriptRow, agentName: String) -> MessageReply? {
+        let role: Role
+        let author: String
+        switch row.kind {
+        case .userMessage:
+            role = .user
+            author = row.origin == .user ? "You" : "Assistant"
+        case .assistantText, .plan:
+            role = .assistant
+            author = agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Agent"
+                : agentName
+        default:
+            return nil
+        }
+        var body = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty, !row.attachments.isEmpty {
+            body = row.attachments.map { "@\($0.displayName)" }.joined(separator: " ")
+        }
+        guard !body.isEmpty else { return nil }
+        return MessageReply(
+            rowID: row.id,
+            turnID: row.turnID,
+            role: role,
+            author: author,
+            text: body
+        )
     }
 }

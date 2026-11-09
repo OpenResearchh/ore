@@ -218,6 +218,7 @@ private struct LayoutRender {
             isShowingNewWorkspace: .constant(false),
             isShowingPalette: .constant(false),
             isShowingFilePalette: .constant(false),
+            isShowingContentSearch: .constant(false),
             launchFailure: nil,
             isShowingShortcuts: .constant(false)
         )

@@ -155,7 +155,9 @@ jobs:
 
       - name: OreMac tests
         working-directory: Apps/OreMac
-        run: xcrun --sdk macosx swift test
+        # Match the OreMac CI job. Parallel Swift Testing on hosted macOS
+        # runners crashes the helper with signal 11 and no per-test failure.
+        run: xcrun --sdk macosx swift test --no-parallel
 
       - name: Bump version
         id: bump

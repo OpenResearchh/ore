@@ -159,7 +159,7 @@ struct NextStepCard: View {
                 .background(OreTheme.subduedFill, in: RoundedRectangle(cornerRadius: 8))
             HStack(spacing: 8) {
                 Button(primaryTitle) {
-                    ExternalTools.copyAndRunInTerminal(command)
+                    model.runCommandInTerminal(command, title: primaryTitle)
                 }
                 .buttonStyle(OrePrimaryButtonStyle())
                 Button(copied ? "Copied" : "Copy") {

@@ -11,6 +11,72 @@ import Testing
     }
 }
 
+@Suite struct CursorPrivacyBoundaryTests {
+    @Test func sessionOverridesPersistedSandboxSetting() async {
+        let configuration = SessionConfiguration(
+            workingDirectory: URL(fileURLWithPath: "/tmp/ore-cursor-workspace")
+        )
+        let session = CursorAgentSession(
+            id: SessionID.generate(),
+            executablePath: "/usr/local/bin/cursor-agent",
+            configuration: configuration,
+            capabilities: CursorAgentHarness().capabilities,
+            allowUnprompted: false
+        )
+
+        let arguments = await session.arguments(for: "hello")
+        #expect(zip(arguments, arguments.dropFirst()).contains {
+            $0 == "--sandbox" && $1 == "enabled"
+        })
+        #expect(arguments.contains("--auto-review"))
+    }
+
+    @Test func profileDeniesMacOSProtectedFoldersButAllowsWorkspaceExceptions() throws {
+        let workspace = URL(fileURLWithPath: #"/Users/example/Desktop/Repo "One""#)
+        let profile = CursorAgentPrivacyBoundary.profile(
+            homeDirectory: URL(fileURLWithPath: "/Users/example"),
+            allowedRoots: [workspace, URL(fileURLWithPath: "/Volumes/Code/repo.git")]
+        )
+
+        #expect(profile.contains(
+            #"(deny file-read* file-write* (subpath "/Users/example/Desktop"))"#
+        ))
+        #expect(profile.contains(
+            #"(deny file-read* file-write* (subpath "/Users/example/Library/CloudStorage"))"#
+        ))
+        #expect(profile.contains(
+            #"(deny file-read* file-write* (subpath "/Volumes"))"#
+        ))
+        #expect(profile.contains(
+            #"(allow file-read* file-write* (subpath "/Users/example/Desktop/Repo \"One\""))"#
+        ))
+
+        let desktopDeny = try #require(profile.range(of: #"subpath "/Users/example/Desktop""#))
+        let workspaceAllow = try #require(profile.range(of: #"subpath "/Users/example/Desktop/Repo \"One\""#))
+        #expect(desktopDeny.lowerBound < workspaceAllow.lowerBound)
+    }
+
+    @Test func launchWrapsCursorInSeatbeltOnMacOS() {
+        let command = CursorAgentPrivacyBoundary.launchCommand(
+            executablePath: "/usr/local/bin/cursor-agent",
+            arguments: ["--print", "hello"],
+            workingDirectory: URL(fileURLWithPath: "/tmp/project"),
+            additionalAllowedRoots: [],
+            homeDirectory: URL(fileURLWithPath: "/Users/example")
+        )
+
+        #if os(macOS)
+        #expect(command.executablePath == "/usr/bin/sandbox-exec")
+        #expect(command.arguments.first == "-p")
+        #expect(command.arguments.dropFirst(2).first == "/usr/local/bin/cursor-agent")
+        #expect(command.arguments.suffix(2) == ["--print", "hello"])
+        #else
+        #expect(command.executablePath == "/usr/local/bin/cursor-agent")
+        #expect(command.arguments == ["--print", "hello"])
+        #endif
+    }
+}
+
 /// cursor-agent's `stream-json` streams a *full* assistant message per chunk,
 /// puts reasoning and tools in top-level `thinking`/`tool_call` records, and
 /// ends with one non-timestamped assistant message plus a `result`. These tests

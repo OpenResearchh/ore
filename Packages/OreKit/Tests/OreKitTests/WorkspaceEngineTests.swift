@@ -517,6 +517,29 @@ struct WorkspaceEngineTests {
         #expect(sent.contains("let value = optional!"))
     }
 
+    @Test func aReplyTagReachesTheAgentAsQuotedContext() async throws {
+        let harness = try await makeEngine()
+
+        _ = try await harness.engine.send(SendMessageRequest(
+            workspaceID: harness.workspaceID,
+            text: "what did you mean by that?",
+            replyTo: MessageReply(
+                rowID: "a1",
+                turnID: TurnID(rawValue: "t1"),
+                role: .assistant,
+                author: "Claude",
+                text: "The login check should be silent."
+            )
+        ))
+
+        let session = try #require(harness.harness.latestSession)
+        let sent = try #require(await session.messageTexts().first)
+        #expect(sent.contains("what did you mean by that?"))
+        #expect(sent.contains("The login check should be silent."))
+        #expect(sent.contains("earlier assistant reply"))
+        #expect(sent.contains("Claude"))
+    }
+
     @Test func postedJSONCommentsLandInPendingDiffComments() async throws {
         // PostDiffComment writes the JSON file from a side process. The review
         // pane and the next send read the database — ingest is what joins them.

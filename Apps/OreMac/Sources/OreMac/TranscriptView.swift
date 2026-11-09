@@ -35,10 +35,12 @@ final class TranscriptScrollAnchor {
 
     @ObservationIgnored fileprivate var jump: (() -> Void)?
     @ObservationIgnored fileprivate var searchStep: ((Int) -> Void)?
+    @ObservationIgnored fileprivate var reveal: ((String) -> Void)?
 
     func jumpToBottom() { jump?() }
     func findNext() { searchStep?(1) }
     func findPrevious() { searchStep?(-1) }
+    func reveal(_ rowID: String) { reveal?(rowID) }
 
     /// Edge-triggered: the scroll observer fires on every tick, and all but a
     /// couple of them leave this flag exactly where it was. Writing it
@@ -57,10 +59,11 @@ final class TranscriptScrollAnchor {
 struct TranscriptView: NSViewRepresentable {
     /// What the footer's ⋯ menu can do to a finished turn. Copying is handled
     /// inside the cell, which already holds the turn's rows.
-    enum TurnAction {
+    enum TurnAction: Equatable {
         case fork
         case handoffPlan
         case revert
+        case reply
     }
 
     var rows: [TranscriptRow]
@@ -79,6 +82,7 @@ struct TranscriptView: NSViewRepresentable {
     var onToggleActivity: (String) -> Void
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+    var onReply: (TranscriptRow) -> Void = { _ in }
     var canFork = false
     var scrollAnchor: TranscriptScrollAnchor?
     /// Extra clearance at the foot of the scroll: the composer dock floats
@@ -197,6 +201,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.onToggleActivity = onToggleActivity
         context.coordinator.onOpenFile = onOpenFile
         context.coordinator.onTurnAction = onTurnAction
+        context.coordinator.onReply = onReply
         context.coordinator.canFork = canFork
         context.coordinator.worktreePath = worktreePath
         context.coordinator.isBusy = isBusy
@@ -228,6 +233,7 @@ struct TranscriptView: NSViewRepresentable {
         var onToggleActivity: (String) -> Void
         var onOpenFile: (String) -> Void
         var onTurnAction: (TurnID, TurnAction) -> Void = { _, _ in }
+        var onReply: (TranscriptRow) -> Void = { _ in }
         var canFork = false
         var worktreePath: String
         var isBusy = false {
@@ -360,6 +366,29 @@ struct TranscriptView: NSViewRepresentable {
             self.onRevert = onRevert
             self.onToggleActivity = onToggleActivity
             self.onOpenFile = onOpenFile
+            super.init()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(snippetRunDidChange),
+                name: SnippetRunCache.didChange,
+                object: nil
+            )
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func snippetRunDidChange() {
+            guard let tableView else { return }
+            var reload = IndexSet()
+            for (index, row) in rows.enumerated() where row.kind == .assistantText {
+                invalidateHeight(at: index)
+                reload.insert(index)
+            }
+            guard !reload.isEmpty else { return }
+            tableView.noteHeightOfRows(withIndexesChanged: reload)
+            tableView.reloadData(forRowIndexes: reload, columnIndexes: IndexSet(integer: 0))
         }
 
         func update(rows newRows: [TranscriptRow], structureToken: Int? = nil) {
@@ -461,11 +490,12 @@ struct TranscriptView: NSViewRepresentable {
             // row count — neither changes while text streams into the last row.
             // Skipping the redraw + tracking-area rebuild on every delta is what
             // keeps streaming cheap.
-            let turnRows = newRows.indices.filter { newRows[$0].kind == .userMessage }
+            let outline = ChatOutlineItem.items(from: newRows)
+            let turnRows = outline.map(\.row)
             if turnRows != railTurnRows || newRows.count != railTotalRows {
                 railTurnRows = turnRows
                 railTotalRows = newRows.count
-                container?.turnRail.update(turnRows: turnRows, totalRows: newRows.count)
+                container?.turnRail.update(turns: outline, totalRows: newRows.count)
             }
 
             // A chat you switch to opens at the newest exchange, deliberately:
@@ -1234,6 +1264,7 @@ struct TranscriptView: NSViewRepresentable {
                 onToggleActivity: toggleActivityForward,
                 onOpenFile: onOpenFile,
                 onTurnAction: onTurnAction,
+                onReply: { [weak self] in self?.onReply(item) },
                 onToggleResponse: { [weak self] in self?.toggleResponse(item.id) },
                 responsePlayback: playback(for: item),
                 onResponseSpeaker: { [weak self] action in
@@ -1478,9 +1509,14 @@ struct TranscriptView: NSViewRepresentable {
             guard scrollAnchor !== self.scrollAnchor else { return }
             self.scrollAnchor?.jump = nil
             self.scrollAnchor?.searchStep = nil
+            self.scrollAnchor?.reveal = nil
             self.scrollAnchor = scrollAnchor
             scrollAnchor?.jump = { [weak self] in self?.jumpToBottom() }
             scrollAnchor?.searchStep = { [weak self] delta in self?.stepSearch(delta) }
+            scrollAnchor?.reveal = { [weak self] id in
+                guard let self, let index = self.rows.firstIndex(where: { $0.id == id }) else { return }
+                self.scroll(to: index)
+            }
             lastReportedAway = nil
             reportFollowState()
         }
@@ -1918,7 +1954,7 @@ final class TranscriptContainerView: NSView {
             ),
             turnRail.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             turnRail.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -50),
-            turnRail.widthAnchor.constraint(equalToConstant: 18),
+            turnRail.widthConstraint,
         ])
     }
 
@@ -1927,30 +1963,36 @@ final class TranscriptContainerView: NSView {
 }
 
 final class TurnRailView: NSView {
-    var turnRows: [Int] = []
+    var turns: [ChatOutlineItem] = []
+    var turnRows: [Int] { turns.map(\.row) }
     var totalRows = 0
     // Only a genuine change is worth a redraw; the scroll observer sets this on
     // every tick, and most ticks leave the active turn exactly where it was.
     var activeRow: Int? { didSet { if oldValue != activeRow { needsDisplay = true } } }
     var onSelectRow: ((Int) -> Void)?
     private var isHovering = false
+    private(set) var widthConstraint: NSLayoutConstraint!
     /// How far from a marker's centre a click still counts as that marker.
-    private static let markerHitSlop: CGFloat = 5
+    private static let markerHitSlop: CGFloat = 8
     /// Below this, a minimap is noise: two dots that say what the scrollbar
     /// already says, in the strip beside it.
     private static let minimumTurns = 3
+    private static let compactWidth: CGFloat = 18
+    private static let expandedWidth: CGFloat = 168
 
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        // Installed once, with `.inVisibleRect` so AppKit keeps it in step with
-        // the bounds. Rebuilding it on every `update` — which a streaming turn
-        // reaches whenever the row count moves — was tracking-area churn on the
-        // path that has to stay cheap.
+        let constraint = widthAnchor.constraint(equalToConstant: Self.compactWidth)
+        constraint.identifier = "turn-rail-width"
+        widthConstraint = constraint
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            options: [
+                .mouseEnteredAndExited, .mouseMoved,
+                .activeInKeyWindow, .inVisibleRect,
+            ],
             owner: self
         ))
     }
@@ -1958,11 +2000,11 @@ final class TurnRailView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not supported") }
 
-    func update(turnRows: [Int], totalRows: Int) {
-        self.turnRows = turnRows
+    func update(turns: [ChatOutlineItem], totalRows: Int) {
+        self.turns = turns
         self.totalRows = totalRows
-        if activeRow == nil { activeRow = turnRows.last }
-        isHidden = turnRows.count < Self.minimumTurns
+        if activeRow == nil { activeRow = turns.last?.row }
+        isHidden = turns.count < Self.minimumTurns
         needsDisplay = true
     }
 
@@ -1972,36 +2014,64 @@ final class TurnRailView: NSView {
     /// hover. Returning the rail for that empty space is what turned a scrollbar
     /// drag into a jump to the nearest turn.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, !turnRows.isEmpty else { return nil }
+        guard !isHidden, !turns.isEmpty else { return nil }
         let local = convert(point, from: superview)
         guard bounds.contains(local) else { return nil }
-        let near = turnRows.contains { abs(y(for: $0) - local.y) <= Self.markerHitSlop }
+        if isHovering { return self }
+        let near = turns.contains { abs(y(for: $0.row) - local.y) <= Self.markerHitSlop }
         return near ? self : nil
     }
 
-    override func mouseEntered(with event: NSEvent) { isHovering = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { isHovering = false; needsDisplay = true }
+    override func mouseEntered(with event: NSEvent) {
+        setExpanded(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setExpanded(false)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        needsDisplay = true
+    }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard let nearest = turnRows.min(by: {
-            abs(y(for: $0) - point.y) < abs(y(for: $1) - point.y)
+        guard let nearest = turns.min(by: {
+            abs(y(for: $0.row) - point.y) < abs(y(for: $1.row) - point.y)
         }) else { return }
-        activeRow = nearest
-        onSelectRow?(nearest)
+        activeRow = nearest.row
+        onSelectRow?(nearest.row)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard !turnRows.isEmpty else { return }
+        guard !turns.isEmpty else { return }
         NSColor.separatorColor.withAlphaComponent(0.25).setFill()
         NSBezierPath(roundedRect: NSRect(x: bounds.maxX - 2, y: 4, width: 1, height: max(0, bounds.height - 8)), xRadius: 0.5, yRadius: 0.5).fill()
-        for row in turnRows {
-            let active = row == activeRow
+        for item in turns {
+            let active = item.row == activeRow
             let width: CGFloat = active ? 13 : (isHovering ? 8 : 5)
-            let rect = NSRect(x: bounds.maxX - width, y: y(for: row) - 2, width: width, height: 4)
+            let rect = NSRect(x: bounds.maxX - width, y: y(for: item.row) - 2, width: width, height: 4)
             (active ? NSColor.controlAccentColor : NSColor.secondaryLabelColor.withAlphaComponent(0.5)).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+            if isHovering {
+                let title = item.title as NSString
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: active ? .semibold : .regular),
+                    .foregroundColor: active ? NSColor.labelColor : NSColor.secondaryLabelColor,
+                ]
+                let size = title.size(withAttributes: attributes)
+                title.draw(
+                    at: NSPoint(x: max(4, bounds.maxX - width - 8 - size.width), y: y(for: item.row) - size.height / 2),
+                    withAttributes: attributes
+                )
+            }
         }
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        isHovering = expanded
+        widthConstraint.constant = expanded ? Self.expandedWidth : Self.compactWidth
+        needsDisplay = true
     }
 
     private func y(for row: Int) -> CGFloat {
@@ -2179,7 +2249,10 @@ final class TranscriptCell: NSTableCellView {
     private var responseToggleAction: (() -> Void)?
     private var revertAction: (() -> Void)?
     private var toggleActivityAction: (() -> Void)?
+    private var replyAction: (() -> Void)?
+    private var isReplyable = false
     private let copyButton = NSButton()
+    private let replyButton = NSButton()
     private let menuButton = NSButton()
     private var copyableText = ""
     private var isUserMessage = false
@@ -2192,6 +2265,8 @@ final class TranscriptCell: NSTableCellView {
     private var configuredRowID: String?
     private var menuButtonCenterConstraint: NSLayoutConstraint!
     private var copyTrackingArea: NSTrackingArea?
+    private var userReplyConstraint: NSLayoutConstraint!
+    private var assistantReplyConstraint: NSLayoutConstraint!
     /// The streaming render currently in the label's storage, or zero for
     /// anything else. Cleared on every whole-string application, so a reused
     /// cell can never mistake another row's text for a render it may splice on.
@@ -2239,6 +2314,21 @@ final class TranscriptCell: NSTableCellView {
         copyIcon.translatesAutoresizingMaskIntoConstraints = false
         copyButton.addSubview(copyIcon)
         addSubview(copyButton)
+
+        replyButton.isBordered = false
+        replyButton.bezelStyle = .regularSquare
+        replyButton.imagePosition = .imageOnly
+        replyButton.image = NSImage(
+            systemSymbolName: "arrowshape.turn.up.left",
+            accessibilityDescription: "Reply to this message"
+        )
+        replyButton.contentTintColor = .secondaryLabelColor
+        replyButton.target = self
+        replyButton.action = #selector(replyToMessage)
+        replyButton.translatesAutoresizingMaskIntoConstraints = false
+        replyButton.isHidden = true
+        replyButton.toolTip = "Reply"
+        addSubview(replyButton)
 
         // The turn footer's overflow menu. A real button rather than a glyph in
         // the attributed string, because the row's text view swallows clicks to
@@ -2404,6 +2494,9 @@ final class TranscriptCell: NSTableCellView {
             copyButton.heightAnchor.constraint(equalToConstant: 22),
             copyIcon.centerXAnchor.constraint(equalTo: copyButton.centerXAnchor),
             copyIcon.centerYAnchor.constraint(equalTo: copyButton.centerYAnchor),
+            replyButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
+            replyButton.widthAnchor.constraint(equalToConstant: 22),
+            replyButton.heightAnchor.constraint(equalToConstant: 22),
 
             menuButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -4),
             menuButtonCenterConstraint,
@@ -2417,6 +2510,13 @@ final class TranscriptCell: NSTableCellView {
             speakerIcon.centerXAnchor.constraint(equalTo: speakerButton.centerXAnchor),
             speakerIcon.centerYAnchor.constraint(equalTo: speakerButton.centerYAnchor),
         ])
+        userReplyConstraint = replyButton.trailingAnchor.constraint(
+            equalTo: copyButton.leadingAnchor, constant: -2
+        )
+        assistantReplyConstraint = replyButton.leadingAnchor.constraint(
+            equalTo: bubble.trailingAnchor, constant: 8
+        )
+        userReplyConstraint.isActive = true
     }
 
     @available(*, unavailable)
@@ -2436,6 +2536,7 @@ final class TranscriptCell: NSTableCellView {
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
         onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in },
+        onReply: @escaping () -> Void = {},
         onToggleResponse: (() -> Void)? = nil,
         responsePlayback: ResponsePlaybackUpdate = .idle,
         onResponseSpeaker: ((ResponseSpeakerAction) -> Void)? = nil
@@ -2454,6 +2555,7 @@ final class TranscriptCell: NSTableCellView {
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
         self.onResponseSpeaker = onResponseSpeaker
+        replyAction = onReply
         let showsSpeaker = ResponseReading.isSpeakableResponse(row)
         speakerButton.isHidden = !showsSpeaker
         if showsSpeaker {
@@ -2486,6 +2588,17 @@ final class TranscriptCell: NSTableCellView {
         let isUser = row.kind == .userMessage
         copyableText = Self.copyableText(for: row)
         isUserMessage = isUser
+        isReplyable = (row.kind == .userMessage || row.kind == .assistantText || row.kind == .plan)
+            && (!row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !row.attachments.isEmpty)
+        if isUser {
+            assistantReplyConstraint.isActive = false
+            userReplyConstraint.isActive = true
+        } else {
+            userReplyConstraint.isActive = false
+            assistantReplyConstraint.isActive = true
+        }
+        replyButton.isHidden = !(isHovering && isReplyable)
         // A reused cell starts with a fresh copy glyph, not the last row's tick.
         if row.id != configuredRowID, isCopyConfirmed {
             copyGeneration += 1
@@ -2552,6 +2665,7 @@ final class TranscriptCell: NSTableCellView {
             menuButtonCenterConstraint.constant = Self.firstLineHeight(of: attributedText) / 2
         }
         label.onOpenFile = onOpenFile
+        label.worktreePath = worktreePath
         label.skipHoverTracking = skipHoverTracking
         // Activity groups toggle on a click, so their text isn't selectable;
         // every other row is, now that selecting no longer restyles it. The
@@ -2697,10 +2811,14 @@ final class TranscriptCell: NSTableCellView {
     /// renders streaming text the same way), so cutting mid-document is safe.
     /// Cached per (row id, text length, appearance) — collapsed rows are
     /// complete, so the text cannot change under the cache.
-    static func collapsedAttributedText(for row: TranscriptRow) -> NSAttributedString {
+    static func collapsedAttributedText(
+        for row: TranscriptRow,
+        worktreePath: String = ""
+    ) -> NSAttributedString {
         var hasher = Hasher()
         hasher.combine(currentAppearance.name.rawValue)
         hasher.combine(row.text.utf8.count)
+        hasher.combine(worktreePath)
         let signature = hasher.finalize()
         if let cached = collapsedRenderCache.value(forID: row.id, signature: signature) {
             return cached
@@ -2708,7 +2826,8 @@ final class TranscriptCell: NSTableCellView {
         let rendered = MarkdownRenderer(
             baseFont: .systemFont(ofSize: OreTheme.Font.prose),
             textColor: .labelColor,
-            highlighter: SyntaxHighlighter.shared
+            highlighter: SyntaxHighlighter.shared,
+            worktreePath: worktreePath
         ).render(truncatedMarkdown(row.text), highlighting: .all)
         collapsedRenderCache.store(rendered, id: row.id, turnID: row.turnID, signature: signature)
         return rendered
@@ -2766,12 +2885,18 @@ final class TranscriptCell: NSTableCellView {
     override func mouseEntered(with event: NSEvent) {
         isHovering = true
         if isUserMessage { copyButton.isHidden = false }
+        if isReplyable { replyButton.isHidden = false }
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovering = false
         // A tick mid-confirmation stays until its beat ends.
         if !isCopyConfirmed { copyButton.isHidden = true }
+        replyButton.isHidden = true
+    }
+
+    @objc private func replyToMessage() {
+        replyAction?()
     }
 
     @objc private func copyMessage() {
@@ -2926,6 +3051,14 @@ final class TranscriptCell: NSTableCellView {
         // Offered only where the harness can actually branch a session. A menu
         // entry that silently starts an unrelated chat would be worse than not
         // offering the action at all.
+        let reply = NSMenuItem(
+            title: "Reply to This Turn", action: #selector(replyToTurn), keyEquivalent: ""
+        )
+        reply.target = self
+        reply.toolTip = "Tag this turn so the next message aims at it"
+        menu.addItem(reply)
+        menu.addItem(.separator())
+
         if footerCanFork {
             let fork = NSMenuItem(
                 title: "Fork to New Tab", action: #selector(forkTurn), keyEquivalent: ""
@@ -2978,6 +3111,11 @@ final class TranscriptCell: NSTableCellView {
         onTurnAction?(footerTurnID, .revert)
     }
 
+    @objc private func replyToTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .reply)
+    }
+
     /// The block the turn ended on — the answer, as opposed to the preamble
     /// that led up to it.
     private static func finalResponse(in rows: [TranscriptRow]) -> String {
@@ -2987,14 +3125,22 @@ final class TranscriptCell: NSTableCellView {
         }?.text ?? ""
     }
 
-    /// Right-click a user message to copy it, in addition to the hover button.
+    /// Right-click a user or assistant message to copy or reply, in addition
+    /// to the hover buttons.
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard isUserMessage else { return super.menu(for: event) }
+        guard isUserMessage || isReplyable else { return super.menu(for: event) }
         let menu = NSMenu()
-        let item = NSMenuItem(title: "Copy Message", action: #selector(copyMessage), keyEquivalent: "")
-        item.target = self
-        menu.addItem(item)
-        return menu
+        if isUserMessage {
+            let copy = NSMenuItem(title: "Copy Message", action: #selector(copyMessage), keyEquivalent: "")
+            copy.target = self
+            menu.addItem(copy)
+        }
+        if isReplyable {
+            let reply = NSMenuItem(title: "Reply", action: #selector(replyToMessage), keyEquivalent: "")
+            reply.target = self
+            menu.addItem(reply)
+        }
+        return menu.items.isEmpty ? super.menu(for: event) : menu
     }
 
     // MARK: - Presentation
@@ -3021,7 +3167,7 @@ final class TranscriptCell: NSTableCellView {
         turnHarness: HarnessKind? = nil
     ) -> NSAttributedString {
         let base = responseCollapse == .collapsed
-            ? collapsedAttributedText(for: row)
+            ? collapsedAttributedText(for: row, worktreePath: worktreePath)
             : attributedText(for: row, worktreePath: worktreePath)
         guard row.kind == .activityGroup, badgeText(for: row).isEmpty,
               let turnHeader, !turnHeader.isEmpty
@@ -3169,7 +3315,7 @@ final class TranscriptCell: NSTableCellView {
 
     static func attributedText(for row: TranscriptRow, worktreePath: String = "") -> NSAttributedString {
         let appearance = currentAppearance.name.rawValue
-        let signature = renderSignature(for: row, appearance: appearance)
+        let signature = renderSignature(for: row, appearance: appearance, worktreePath: worktreePath)
         if let cached = renderCache.value(forID: row.id, signature: signature) { return cached }
 
         let rendered: NSAttributedString
@@ -3183,7 +3329,8 @@ final class TranscriptCell: NSTableCellView {
             let renderer = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             )
             if row.isComplete {
                 rendered = renderer.render(row.text, highlighting: .all)
@@ -3219,7 +3366,8 @@ final class TranscriptCell: NSTableCellView {
             rendered = MarkdownRenderer(
                 baseFont: font(for: row),
                 textColor: textColor(for: row),
-                highlighter: SyntaxHighlighter.shared
+                highlighter: SyntaxHighlighter.shared,
+                worktreePath: worktreePath
             ).render(source, highlighting: row.isComplete ? .all : .stablePrefix)
 
         case .toolCall, .thinking, .error:
@@ -3275,9 +3423,14 @@ final class TranscriptCell: NSTableCellView {
     /// rows built elsewhere (history, tests) that reuse an id at revision zero.
     /// Rendered rows bake in resolved colours and rasterised chips, so the
     /// appearance is part of the identity too.
-    static func renderSignature(for row: TranscriptRow, appearance: String) -> Int {
+    static func renderSignature(
+        for row: TranscriptRow,
+        appearance: String,
+        worktreePath: String = ""
+    ) -> Int {
         var hasher = Hasher()
         hasher.combine(appearance)
+        hasher.combine(worktreePath)
         hasher.combine(row.kind)
         hasher.combine(row.contentRevision)
         hasher.combine(row.activitySignature)
@@ -3289,7 +3442,11 @@ final class TranscriptCell: NSTableCellView {
         hasher.combine(row.isError)
         hasher.combine(row.resolvedSubject)
         hasher.combine(row.attachments)
+        hasher.combine(row.replyTo)
         hasher.combine(row.subagentChildCount)
+        if row.kind == .assistantText {
+            hasher.combine(SnippetRunCache.revision)
+        }
         combineFingerprint(of: row.toolInput, into: &hasher)
         combineFingerprint(of: row.resultMetadata, into: &hasher)
         return hasher.finalize()
@@ -3495,6 +3652,18 @@ final class TranscriptCell: NSTableCellView {
             .font: font(for: row),
             .foregroundColor: textColor(for: row),
         ]
+        if let reply = row.replyTo {
+            let quoteTitle: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+            let quoteBody: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]
+            result.append(NSAttributedString(string: "↩ \(reply.author)\n", attributes: quoteTitle))
+            result.append(NSAttributedString(string: "\(reply.preview)\n", attributes: quoteBody))
+        }
         if !row.text.isEmpty {
             result.append(styledMentions(
                 row.text,
@@ -5053,6 +5222,7 @@ private final class TranscriptTextView: FlowchartTextView, NSTextViewDelegate {
     var onSingleClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onOpenFile: ((String) -> Void)?
+    var worktreePath = ""
     /// Agent-busy: don't TextKit-hit-test on every mouseMoved. Those events
     /// queued ahead of clicks and are a large part of "the close button does
     /// nothing until I click twice."
@@ -5115,6 +5285,9 @@ private final class TranscriptTextView: FlowchartTextView, NSTextViewDelegate {
             return true
         case .openURL(let url):
             return NSWorkspace.shared.open(url)
+        case .runSnippet(let id):
+            SnippetRunCache.run(id: id, in: worktreePath)
+            return true
         case nil:
             return false
         }

@@ -95,6 +95,11 @@ struct TranscriptView: NSViewRepresentable {
     /// `rows`. While it holds still only the last row can have changed, so the
     /// table diffs that one row. Nil always takes the full diff.
     var structureToken: Int? = nil
+    /// The app-wide narration engine. A stable reference — progress ticks
+    /// reach the speaking cell through a callback, not through SwiftUI, so a
+    /// word boundary cannot rebuild the transcript.
+    var narration: NarrationEngine? = nil
+    var chatID: ChatID? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -198,6 +203,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.agentName = agentName
         context.coordinator.agentHarness = agentHarness
         context.coordinator.bind(scrollAnchor: scrollAnchor)
+        context.coordinator.bindPlayback(narration, chatID: chatID)
         context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.setSearchQuery(searchQuery)
         context.coordinator.update(rows: rows, structureToken: structureToken)
@@ -211,6 +217,7 @@ struct TranscriptView: NSViewRepresentable {
         // The anchor outlives this view (it is the pane's `@State`), so leaving
         // the closure attached would keep a dead coordinator reachable.
         coordinator.bind(scrollAnchor: nil)
+        coordinator.bindPlayback(nil, chatID: nil)
     }
 
     @MainActor
@@ -228,6 +235,7 @@ struct TranscriptView: NSViewRepresentable {
         }
         var agentName = ""
         var agentHarness: HarnessKind?
+        var chatID: ChatID?
         /// Names this chat's entry in `TranscriptHeightStore`, so a tab or
         /// workspace switch — which builds a fresh coordinator — starts from
         /// the heights the last one measured.
@@ -319,6 +327,8 @@ struct TranscriptView: NSViewRepresentable {
         /// click. The change it causes is anchored on that row, so the thing
         /// they clicked stays under the pointer rather than the top of the view.
         private var toggleAnchor: (id: String, time: CFTimeInterval)?
+        private weak var playbackEngine: NarrationEngine?
+        private var playbackUpdate = ResponsePlaybackUpdate.idle
         /// Set while an animated follow pin is in flight (see
         /// `animatesFollowPins`). Its bounds changes arrive over later frames,
         /// after `withProgrammaticScroll` has already returned.
@@ -1083,6 +1093,90 @@ struct TranscriptView: NSViewRepresentable {
             }
         }
 
+        func bindPlayback(_ engine: NarrationEngine?, chatID: ChatID?) {
+            self.chatID = chatID
+            if playbackEngine !== engine {
+                playbackEngine?.removePlaybackObserver(self)
+                playbackEngine = engine
+                engine?.addPlaybackObserver(self) { [weak self] update in
+                    self?.applyPlayback(update)
+                }
+            }
+        }
+
+        private func applyPlayback(_ update: ResponsePlaybackUpdate) {
+            let previousID = playbackUpdate.rowID
+            let previousPhase = playbackUpdate.phase
+            playbackUpdate = update
+            let speakerChanged = previousID != update.rowID || previousPhase != update.phase
+            if speakerChanged {
+                refreshSpeaker(for: previousID)
+                refreshSpeaker(for: update.rowID)
+            }
+            applySpokenHighlight(update)
+        }
+
+        private func refreshSpeaker(for rowID: String?) {
+            guard let rowID, let tableView,
+                  let index = rows.firstIndex(where: { $0.id == rowID }),
+                  let cell = tableView.view(atColumn: 0, row: index, makeIfNecessary: false)
+                    as? TranscriptCell
+            else { return }
+            cell.updateResponseSpeaker(playback(for: rows[index]))
+        }
+
+        private func applySpokenHighlight(_ update: ResponsePlaybackUpdate) {
+            guard let tableView else { return }
+            let visible = tableView.rows(in: tableView.visibleRect)
+            guard visible.location != NSNotFound else { return }
+            let end = min(rows.count, visible.location + visible.length)
+            for index in visible.location..<end {
+                guard let cell = tableView.view(atColumn: 0, row: index, makeIfNecessary: false)
+                    as? TranscriptCell
+                else { continue }
+                let row = rows[index]
+                cell.applySpokenHighlight(row.id == update.rowID ? update.highlight : nil)
+            }
+        }
+
+        private func playback(for row: TranscriptRow) -> ResponsePlaybackUpdate {
+            guard playbackUpdate.rowID == row.id else {
+                return ResponsePlaybackUpdate(
+                    rowID: nil, phase: .idle, highlight: nil, mode: playbackUpdate.mode
+                )
+            }
+            return playbackUpdate
+        }
+
+        private func handleResponseSpeaker(_ action: TranscriptCell.ResponseSpeakerAction, row: TranscriptRow) {
+            guard let narration = playbackEngine else { return }
+            switch action {
+            case .toggle:
+                guard let chatID else { return }
+                if collapsedResponses.contains(row.id) { toggleResponse(row.id) }
+                let appearance = tableView?.effectiveAppearance ?? NSAppearance.currentDrawing()
+                let displayed = TranscriptCell.usingAppearance(appearance) {
+                    TranscriptCell.displayedText(
+                        for: row,
+                        worktreePath: worktreePath,
+                        responseCollapse: .none,
+                        turnHeader: turnHeader(for: row),
+                        turnHarness: agentHarness
+                    ).string
+                }
+                narration.toggleResponseReading(
+                    rowID: row.id,
+                    chatID: chatID,
+                    markdown: row.text,
+                    displayed: displayed
+                )
+            case .setMode(let mode):
+                narration.responseReadingMode = mode
+            case .stop:
+                narration.stopResponseReading()
+            }
+        }
+
         // MARK: - Data source
 
         func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -1140,7 +1234,11 @@ struct TranscriptView: NSViewRepresentable {
                 onToggleActivity: toggleActivityForward,
                 onOpenFile: onOpenFile,
                 onTurnAction: onTurnAction,
-                onToggleResponse: { [weak self] in self?.toggleResponse(item.id) }
+                onToggleResponse: { [weak self] in self?.toggleResponse(item.id) },
+                responsePlayback: playback(for: item),
+                onResponseSpeaker: { [weak self] action in
+                    self?.handleResponseSpeaker(action, row: item)
+                }
             )
             return cell
         }
@@ -2044,6 +2142,12 @@ final class TranscriptCell: NSTableCellView {
     /// the same string, so their heights cannot disagree — the class of bug
     /// that left blank bands in the transcript.
     enum ResponseCollapse { case none, collapsed, expanded }
+
+    enum ResponseSpeakerAction {
+        case toggle
+        case setMode(ResponseReadingMode)
+        case stop
+    }
     /// Toggle control plus its spacing, shared by measure and layout.
     private static let responseToggleBand: CGFloat = 22
 
@@ -2098,6 +2202,12 @@ final class TranscriptCell: NSTableCellView {
     private var footerCanFork = false
     private var footerHasPlan = false
     private var onTurnAction: ((TurnID, TranscriptView.TurnAction) -> Void)?
+    private let speakerButton = NSButton()
+    private let speakerIcon = ClickThroughImageView()
+    private var onResponseSpeaker: ((ResponseSpeakerAction) -> Void)?
+    private var speakerPhase: ResponsePlaybackPhase = .idle
+    private var speakerMode: ResponseReadingMode = .full
+    private var spokenHighlightRange: NSRange?
 
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -2146,6 +2256,24 @@ final class TranscriptCell: NSTableCellView {
         menuButton.isHidden = true
         menuButton.toolTip = "Actions for this turn"
         addSubview(menuButton)
+
+        speakerButton.isBordered = false
+        speakerButton.bezelStyle = .regularSquare
+        speakerButton.imagePosition = .noImage
+        speakerButton.title = ""
+        speakerButton.target = self
+        speakerButton.action = #selector(toggleResponseSpeaker)
+        speakerButton.translatesAutoresizingMaskIntoConstraints = false
+        speakerButton.isHidden = true
+        speakerButton.setAccessibilityLabel("Read response aloud")
+        speakerIcon.image = NSImage(
+            systemSymbolName: "speaker.wave.2", accessibilityDescription: "Read response aloud"
+        )
+        speakerIcon.contentTintColor = .secondaryLabelColor
+        speakerIcon.translatesAutoresizingMaskIntoConstraints = false
+        speakerButton.addSubview(speakerIcon)
+        addSubview(speakerButton)
+
         addLayoutGuide(contentGuide)
 
         indentGuide.wantsLayer = true
@@ -2281,6 +2409,13 @@ final class TranscriptCell: NSTableCellView {
             menuButtonCenterConstraint,
             menuButton.widthAnchor.constraint(equalToConstant: 24),
             menuButton.heightAnchor.constraint(equalToConstant: 22),
+
+            speakerButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -4),
+            speakerButton.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 2),
+            speakerButton.widthAnchor.constraint(equalToConstant: 22),
+            speakerButton.heightAnchor.constraint(equalToConstant: 22),
+            speakerIcon.centerXAnchor.constraint(equalTo: speakerButton.centerXAnchor),
+            speakerIcon.centerYAnchor.constraint(equalTo: speakerButton.centerYAnchor),
         ])
     }
 
@@ -2301,7 +2436,9 @@ final class TranscriptCell: NSTableCellView {
         onToggleActivity: @escaping (String) -> Void,
         onOpenFile: @escaping (String) -> Void,
         onTurnAction: @escaping (TurnID, TranscriptView.TurnAction) -> Void = { _, _ in },
-        onToggleResponse: (() -> Void)? = nil
+        onToggleResponse: (() -> Void)? = nil,
+        responsePlayback: ResponsePlaybackUpdate = .idle,
+        onResponseSpeaker: ((ResponseSpeakerAction) -> Void)? = nil
     ) {
         let isFooter = row.kind == .turnFooter
         menuButton.isHidden = !isFooter
@@ -2316,6 +2453,14 @@ final class TranscriptCell: NSTableCellView {
         }
         footerResponse = isFooter ? Self.finalResponse(in: row.groupedRows) : ""
         self.onTurnAction = onTurnAction
+        self.onResponseSpeaker = onResponseSpeaker
+        let showsSpeaker = ResponseReading.isSpeakableResponse(row)
+        speakerButton.isHidden = !showsSpeaker
+        if showsSpeaker {
+            updateResponseSpeaker(responsePlayback)
+        } else {
+            applySpokenHighlight(nil)
+        }
 
         // The turn header borrows the badge line: "Claude · 2:41 PM" on the
         // first agent row of the turn. A real badge (QUEUED, PLAN) still wins —
@@ -2398,6 +2543,11 @@ final class TranscriptCell: NSTableCellView {
         }
         label.dismissAttachmentPreview()
         applyText(attributedText, row: row, responseCollapse: responseCollapse)
+        if showsSpeaker {
+            applySpokenHighlight(
+                responsePlayback.rowID == row.id ? responsePlayback.highlight : nil
+            )
+        }
         if isFooter {
             menuButtonCenterConstraint.constant = Self.firstLineHeight(of: attributedText) / 2
         }
@@ -2660,6 +2810,108 @@ final class TranscriptCell: NSTableCellView {
         copyButton.toolTip = label
     }
 
+    func updateResponseSpeaker(_ playback: ResponsePlaybackUpdate) {
+        speakerPhase = playback.phase
+        speakerMode = playback.mode
+        let symbol: String
+        let tint: NSColor
+        let help: String
+        let accessibility: String
+        switch playback.phase {
+        case .idle:
+            symbol = "speaker.wave.2"
+            tint = .secondaryLabelColor
+            help = "Listen to this response. Right-click to choose all words or headings only."
+            accessibility = "Read response aloud"
+        case .speaking:
+            symbol = "speaker.wave.2.fill"
+            tint = .controlAccentColor
+            help = "Pause reading"
+            accessibility = "Pause reading"
+        case .paused:
+            symbol = "pause.circle.fill"
+            tint = .controlAccentColor
+            help = "Resume reading. Right-click to stop or change mode."
+            accessibility = "Resume reading"
+        }
+        speakerIcon.contentTintColor = tint
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: accessibility) {
+            // Same one-shot swap the copy glyph uses; Reduce Motion still
+            // gets a new icon, just without the morph.
+            speakerIcon.setSymbolImage(image, contentTransition: .replace)
+        }
+        speakerButton.toolTip = help
+        speakerButton.setAccessibilityLabel(accessibility)
+        speakerIcon.removeAllSymbolEffects()
+        // Looping motion is the "this is the live voice" cue, and only that.
+        // The composer speaker uses the same effect, and both go still when
+        // the system asks for Reduce Motion.
+        if playback.phase == .speaking,
+           !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            speakerIcon.addSymbolEffect(.variableColor.iterative, options: .repeating)
+        }
+        rebuildSpeakerMenu()
+    }
+
+    func applySpokenHighlight(_ range: NSRange?) {
+        guard let layoutManager = label.layoutManager, let storage = label.textStorage else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        if whole.length > 0 {
+            layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: whole)
+            layoutManager.removeTemporaryAttribute(.underlineColor, forCharacterRange: whole)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: whole)
+        }
+        spokenHighlightRange = range
+        guard let range, range.length > 0, NSMaxRange(range) <= storage.length else { return }
+        layoutManager.addTemporaryAttributes(
+            [
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: NSColor.controlAccentColor,
+                .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.14),
+            ],
+            forCharacterRange: range
+        )
+    }
+
+    @objc private func toggleResponseSpeaker() {
+        onResponseSpeaker?(.toggle)
+    }
+
+    @objc private func chooseReadingMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = ResponseReadingMode(rawValue: raw)
+        else { return }
+        onResponseSpeaker?(.setMode(mode))
+        speakerMode = mode
+        rebuildSpeakerMenu()
+    }
+
+    @objc private func stopResponseSpeaker() {
+        onResponseSpeaker?(.stop)
+    }
+
+    private func rebuildSpeakerMenu() {
+        let menu = NSMenu()
+        for mode in ResponseReadingMode.allCases {
+            let item = NSMenuItem(
+                title: mode.menuTitle, action: #selector(chooseReadingMode(_:)), keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = mode.rawValue
+            item.state = mode == speakerMode ? .on : .off
+            menu.addItem(item)
+        }
+        if speakerPhase != .idle {
+            menu.addItem(.separator())
+            let stop = NSMenuItem(
+                title: "Stop Reading", action: #selector(stopResponseSpeaker), keyEquivalent: ""
+            )
+            stop.target = self
+            menu.addItem(stop)
+        }
+        speakerButton.menu = menu
+    }
+
     @objc private func showTurnMenu() {
         guard footerTurnID != nil else { return }
         let menu = NSMenu()
@@ -2747,10 +2999,12 @@ final class TranscriptCell: NSTableCellView {
 
     // MARK: - Presentation
 
-    /// Space kept free at the bubble's trailing edge. Only the turn footer
-    /// needs it, for its ⋯ button.
+    /// Space kept free at the bubble's trailing edge. The turn footer needs
+    /// it for its ⋯ button; a finished agent reply needs it for the speaker.
     static func trailingInset(for row: TranscriptRow) -> CGFloat {
-        row.kind == .turnFooter ? 34 : 10
+        if row.kind == .turnFooter { return 34 }
+        if ResponseReading.isSpeakableResponse(row) { return 32 }
+        return 10
     }
 
     /// What a row's text view shows — the one string `height(for:)` measures

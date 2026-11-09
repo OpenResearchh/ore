@@ -31,6 +31,7 @@ final class NarrationEngine {
     static let voiceKindKey = "ore.narration.voiceKind"
     static let fleetSwitchKey = "ore.narration.fleet"
     static let mutedKey = "ore.narration.muted"
+    static let responseReadingModeKey = "ore.narration.responseReadingMode"
 
     private(set) var enabledChats: Set<ChatID>
     /// The assistant's one global mute — the sidebar's speaker. Unlike "Allow
@@ -46,6 +47,10 @@ final class NarrationEngine {
     /// voice — exactly by the system one's word boundaries, closely by the
     /// neural one's playback clock.
     private(set) var spokenCharacterCount = 0
+    /// Which transcript row the response speaker is currently voicing, if any.
+    /// Observed only by things that redraw on play/pause — not on every word.
+    private(set) var responsePlaybackRowID: String?
+    private(set) var responsePlaybackPhase: ResponsePlaybackPhase = .idle
 
     /// The part of the current utterance already spoken, cut back to a whole
     /// word. The HUD streams this: the pill shows what the assistant is saying
@@ -108,6 +113,13 @@ final class NarrationEngine {
     /// touching the synthesizer. Each line gets a reading-time hold, then the
     /// queue advances like audible narration.
     private var silentDisplayTask: Task<Void, Never>?
+    /// A response the user asked the speaker control to read. Not a queued
+    /// utterance: it has to pause, map onto the rendered text, and survive a
+    /// mic duck without being dropped as stale progress.
+    private var responseSession: ResponseReadingSession?
+    private var responsePausedForMic = false
+    @ObservationIgnored
+    private var playbackObservers: [ObjectIdentifier: @MainActor (ResponsePlaybackUpdate) -> Void] = [:]
 
     var isMasterEnabled: Bool {
         UserDefaults.standard.object(forKey: Self.masterSwitchKey) as? Bool ?? true
@@ -162,7 +174,7 @@ final class NarrationEngine {
     /// keeping and can survive a synthesizer that failed before delivering its
     /// end callback; actual playback or a queued line cannot.
     var hasAudibleOrQueuedSpeech: Bool {
-        isVoiceSpeaking || queue.peek != nil
+        isVoiceSpeaking || queue.peek != nil || responseSession != nil
     }
 
     /// Stops whichever voice is mid-utterance, for the same reason.
@@ -293,7 +305,9 @@ final class NarrationEngine {
         } ?? false
         return Self.tickerIsNeeded(
             hasQueuedSpeech: queue.peek != nil,
-            isMidUtterance: currentUtterance != nil,
+            isMidUtterance: currentUtterance != nil
+                || responseSession?.phase == .handingOff
+                || responseSession?.phase == .speaking,
             isAudible: isVoiceSpeaking,
             hasQuietWaiters: !quietWaiters.isEmpty,
             hasPendingToolBatch: hasPendingBatch
@@ -378,7 +392,9 @@ final class NarrationEngine {
     /// Dictation owns the audio: stop speaking for the mic's whole lifetime —
     /// both so the user isn't talked over and so TTS can't leak into the
     /// transcription. Ambient narration is dropped (stale by the time the mic
-    /// closes); needs-you utterances are re-spoken from the start.
+    /// closes); needs-you utterances are re-spoken from the start. A response
+    /// the user asked to hear is paused instead — it is still the thing they
+    /// tapped, and dropping it would make the speaker control lie.
     func setMicActive(_ active: Bool) {
         guard micActive != active else { return }
         micActive = active
@@ -389,15 +405,35 @@ final class NarrationEngine {
             if let current = currentUtterance, current.priority > .progress {
                 _ = queue.enqueue(current)
             }
-            stopSpeaking(immediate: false)
+            switch responseSession?.phase {
+            case .speaking:
+                pauseResponseReading()
+                responsePausedForMic = true
+            case .handingOff:
+                // Don't let the ambient ending start the reply over the mic.
+                pauseResponseReading()
+                responsePausedForMic = true
+                stopSpeaking(immediate: false)
+            case .paused:
+                // Already held. Stopping would drop the paused buffers, and
+                // the player is silent so it cannot leak into dictation.
+                break
+            case nil:
+                stopSpeaking(immediate: false)
+            }
             ensureTicker()
         } else {
             // A beat after the mic closes, so speech doesn't collide with the
             // settle-hold send.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(300))
-                self?.pump()
-                self?.ensureTicker()
+                guard let self else { return }
+                if self.responsePausedForMic {
+                    self.responsePausedForMic = false
+                    self.resumeResponseReading()
+                }
+                self.pump()
+                self.ensureTicker()
             }
         }
     }
@@ -406,6 +442,7 @@ final class NarrationEngine {
         silentDisplayTask?.cancel()
         silentDisplayTask = nil
         queue.removeAll()
+        finishResponseReading()
         stopSpeaking(immediate: true)
         clearDisplayedUtterance()
         flushQuietWaitersIfIdle()
@@ -448,6 +485,212 @@ final class NarrationEngine {
             kind: kind ?? (priority == .progress ? .toolActivity : .turnCompleted),
             text: spoken
         ))
+    }
+
+    // MARK: - Response reading
+
+    /// The mode the speaker control will use on the next tap. Stored, so the
+    /// Settings picker and the control's own menu stay in agreement.
+    var responseReadingMode: ResponseReadingMode {
+        get {
+            UserDefaults.standard.string(forKey: Self.responseReadingModeKey)
+                .flatMap(ResponseReadingMode.init(rawValue:)) ?? .full
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: Self.responseReadingModeKey)
+            publishResponsePlayback()
+        }
+    }
+
+    /// Play / pause / resume the tapped agent response. A tap on a different
+    /// row stops the current one and starts the new; a tap on the same row
+    /// pauses or resumes it.
+    func toggleResponseReading(
+        rowID: String,
+        chatID: ChatID,
+        markdown: String,
+        displayed: String
+    ) {
+        if responsePlaybackRowID == rowID {
+            switch responsePlaybackPhase {
+            case .speaking:
+                pauseResponseReading()
+                responsePausedForMic = false
+            case .paused:
+                resumeResponseReading()
+            case .idle:
+                startResponseReading(
+                    rowID: rowID, chatID: chatID, markdown: markdown, displayed: displayed
+                )
+            }
+            return
+        }
+        startResponseReading(
+            rowID: rowID, chatID: chatID, markdown: markdown, displayed: displayed
+        )
+    }
+
+    func stopResponseReading() {
+        finishResponseReading()
+        if isVoiceSpeaking { stopSpeaking(immediate: false) }
+        publishResponsePlayback()
+        pump()
+    }
+
+    func addPlaybackObserver(
+        _ owner: AnyObject,
+        _ handler: @escaping @MainActor (ResponsePlaybackUpdate) -> Void
+    ) {
+        playbackObservers[ObjectIdentifier(owner)] = handler
+        handler(currentPlaybackUpdate)
+    }
+
+    func removePlaybackObserver(_ owner: AnyObject) {
+        playbackObservers.removeValue(forKey: ObjectIdentifier(owner))
+    }
+
+    private func startResponseReading(
+        rowID: String,
+        chatID: ChatID,
+        markdown: String,
+        displayed: String
+    ) {
+        // An explicit tap is a request to hear this reply, so a mute that
+        // would make the speaker appear broken is lifted — the same move the
+        // composer speaker makes.
+        if isMuted { setMuted(false) }
+        silentDisplayTask?.cancel()
+        silentDisplayTask = nil
+        loadNeuralVoiceIfNeeded()
+        let script = ResponseReading.script(
+            markdown: markdown,
+            displayed: displayed,
+            mode: responseReadingMode
+        )
+        guard !script.isEmpty else { return }
+        responsePausedForMic = false
+        currentUtterance = nil
+        let session = ResponseReadingSession(
+            rowID: rowID,
+            chatID: chatID,
+            script: script,
+            mode: responseReadingMode,
+            phase: isVoiceSpeaking ? .handingOff : .speaking
+        )
+        responseSession = session
+        responsePlaybackRowID = rowID
+        responsePlaybackPhase = .speaking
+        if isVoiceSpeaking {
+            stopSpeaking(immediate: false)
+            publishResponsePlayback()
+            ensureTicker()
+            return
+        }
+        beginSpeakingResponse()
+    }
+
+    private func beginSpeakingResponse() {
+        guard var session = responseSession else { return }
+        guard !micActive else {
+            // Dictation owns the audio. Park until the mic closes so the
+            // speaker doesn't talk over the user or leak into the transcript.
+            session.phase = .paused
+            responseSession = session
+            responsePlaybackRowID = session.rowID
+            responsePlaybackPhase = .paused
+            responsePausedForMic = true
+            publishResponsePlayback()
+            return
+        }
+        session.phase = .speaking
+        responseSession = session
+        speakingChatID = session.chatID
+        currentSpokenText = session.script.spokenText
+        spokenCharacterCount = 0
+        responsePlaybackRowID = session.rowID
+        responsePlaybackPhase = .speaking
+        // Interrupt so the neural voice streams instead of rendering the
+        // whole reply first; zero lead because a tap is not an interjection
+        // that needs a beat to land.
+        if let neural = voice as? NeuralNarrationVoice {
+            neural.speak(session.script.spokenText, priority: .interrupt, lead: .zero)
+        } else {
+            voice.speak(session.script.spokenText, priority: .interrupt)
+        }
+        publishResponsePlayback()
+        ensureTicker()
+    }
+
+    private func pauseResponseReading() {
+        guard var session = responseSession else { return }
+        switch session.phase {
+        case .paused:
+            return
+        case .speaking:
+            playbackVoice.pause()
+        case .handingOff:
+            break
+        }
+        session.phase = .paused
+        responseSession = session
+        responsePlaybackPhase = .paused
+        publishResponsePlayback()
+    }
+
+    private func resumeResponseReading() {
+        guard var session = responseSession, session.phase == .paused else { return }
+        guard !micActive else { return }
+        if playbackVoice.isPaused {
+            playbackVoice.resume()
+            session.phase = .speaking
+            responseSession = session
+            responsePlaybackPhase = .speaking
+            publishResponsePlayback()
+            return
+        }
+        // Parked before the first buffer — mic was already open, or the
+        // user paused during the handoff — so there is nothing to continue.
+        beginSpeakingResponse()
+    }
+
+    /// The voice that is actually holding the line, which may not be the one
+    /// `voice` would pick now (neural finishing a download mid-utterance).
+    private var playbackVoice: NarrationVoice {
+        if neuralVoice.isSpeaking || neuralVoice.isPaused { return neuralVoice }
+        if systemVoice.isSpeaking || systemVoice.isPaused { return systemVoice }
+        return voice
+    }
+
+    private func finishResponseReading() {
+        guard responseSession != nil || responsePlaybackRowID != nil else { return }
+        responseSession = nil
+        responsePausedForMic = false
+        responsePlaybackRowID = nil
+        responsePlaybackPhase = .idle
+        publishResponsePlayback()
+    }
+
+    private var currentPlaybackUpdate: ResponsePlaybackUpdate {
+        guard let session = responseSession else {
+            return ResponsePlaybackUpdate(
+                rowID: nil, phase: .idle, highlight: nil, mode: responseReadingMode
+            )
+        }
+        let phase: ResponsePlaybackPhase = switch session.phase {
+        case .handingOff, .speaking: .speaking
+        case .paused: .paused
+        }
+        return ResponsePlaybackUpdate(
+            rowID: session.rowID,
+            phase: phase,
+            highlight: session.script.highlightRange(atSpokenUTF16: spokenCharacterCount),
+            mode: session.mode
+        )
+    }
+
+    private func publishResponsePlayback() {
+        let update = currentPlaybackUpdate
+        for handler in playbackObservers.values { handler(update) }
     }
 
     /// A permission was answered while its prompt was queued or speaking.
@@ -885,6 +1128,9 @@ final class NarrationEngine {
         defer { ensureTicker() }
         switch queue.enqueue(utterance) {
         case .interruptCurrent:
+            // A permission or a spoken question outranks a response the user
+            // is listening to — those are the things that need an answer now.
+            if responseSession != nil { finishResponseReading() }
             if isMuted {
                 silentDisplayTask?.cancel()
                 silentDisplayTask = nil
@@ -921,8 +1167,10 @@ final class NarrationEngine {
         // stays mid-utterance, `notifyWhenQuiet` is never released, and the
         // voice pill sits on "Speaking…" with the agent long since silent.
         if Self.endingWasLost(
-            isAudibleOrQueued: hasAudibleOrQueuedSpeech,
+            isAudibleOrQueued: isVoiceSpeaking || queue.peek != nil,
             isMidUtterance: currentUtterance != nil
+                || responseSession?.phase == .handingOff
+                || responseSession?.phase == .speaking
         ) {
             utteranceEnded()
         } else {
@@ -943,6 +1191,7 @@ final class NarrationEngine {
     }
 
     private func pump() {
+        if responseSession != nil { return }
         if isMuted {
             pumpSilent()
             return
@@ -986,9 +1235,24 @@ final class NarrationEngine {
             of: currentSpokenText, from: spokenCharacterCount, to: next
         ) else { return }
         spokenCharacterCount = next
+        if responseSession != nil { publishResponsePlayback() }
     }
 
     private func utteranceEnded() {
+        if let session = responseSession {
+            switch session.phase {
+            case .handingOff:
+                beginSpeakingResponse()
+                return
+            case .paused:
+                // A late ending from the line we stopped or paused must not
+                // clear the speaker. Resume starts it again if the voice
+                // never held a buffer.
+                return
+            case .speaking:
+                finishResponseReading()
+            }
+        }
         clearDisplayedUtterance()
         lastUtteranceEndedAt = Date()
         if isMuted { pumpSilent() } else { pump() }
@@ -1037,8 +1301,29 @@ final class NarrationEngine {
         lastInProgressTodo.removeValue(forKey: chatID)
         lastToolFailureAt.removeValue(forKey: chatID)
         phraseVariant.removeValue(forKey: chatID)
+        if responseSession?.chatID == chatID {
+            finishResponseReading()
+        }
         if speakingChatID == chatID {
             stopSpeaking(immediate: true)
         }
     }
+}
+
+/// In-flight read of one agent response. Lives beside the ambient queue
+/// rather than in it, because pause/resume and transcript highlighting have
+/// nothing to say to "what the agent is doing now".
+private struct ResponseReadingSession {
+    enum Phase: Equatable {
+        /// Ambient speech is stopping; `utteranceEnded` will start this line.
+        case handingOff
+        case speaking
+        case paused
+    }
+
+    var rowID: String
+    var chatID: ChatID
+    var script: ResponseReadingScript
+    var mode: ResponseReadingMode
+    var phase: Phase
 }

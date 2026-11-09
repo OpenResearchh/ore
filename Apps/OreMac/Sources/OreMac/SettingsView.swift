@@ -62,6 +62,7 @@ private struct SettingsPanes: View {
     @AppStorage(AppModel.greetingEnabledKey) private var greetingEnabled = true
     @AppStorage(AppModel.greetingVoiceKey) private var greetingVoice = true
     @AppStorage(NarrationEngine.fleetSwitchKey) private var fleetNarration = true
+    @AppStorage(NarrationEngine.responseReadingModeKey) private var responseReadingMode = ResponseReadingMode.full.rawValue
     @AppStorage(VoiceAssistantController.voiceAskKey) private var voiceAsks = true
     @AppStorage(VoiceAssistantController.quietModeKey) private var quietMode = false
     @AppStorage(VoiceAssistantController.silenceAutoSendKey) private var silenceAutoSend = false
@@ -448,6 +449,16 @@ private struct SettingsPanes: View {
                 Divider()
                 NarrationVoicePicker(voice: appModel.narration.neuralVoice)
                     .disabled(!narrationEnabled)
+                SettingsRow(
+                    "Reading a response",
+                    detail: "Each agent reply has a speaker. Tap to hear it; tap again to pause. Right-click the speaker to switch modes."
+                ) {
+                    SettingsPicker(
+                        selection: $responseReadingMode,
+                        options: ResponseReadingMode.allCases.map { ($0.rawValue, $0.title) },
+                        width: 240
+                    )
+                }
                 // Whether the smarter narration path exists on this machine.
                 // "Ready" versus "turn on Apple Intelligence" is the answer to
                 // why narration is or isn't summarizing the agent's own words.

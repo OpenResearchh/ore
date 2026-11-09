@@ -670,6 +670,18 @@ struct NarrationVoiceSelectionTests {
         #expect(NeuralNarrationSynthesis.segments("  All done.  ") == ["All done."])
         #expect(NeuralNarrationSynthesis.segments("   ").isEmpty)
     }
+
+    @Test func aLongReplyIsOneStreamingBodyNotPerSentenceSessions() {
+        // One enqueue of the whole reply lets Pocket TTS start the first
+        // ≤50-token chunk without waiting for later sentences to exist as
+        // audio. A session per sentence used to re-pay voice prefill at
+        // every period.
+        let answer = "It finished the parser. The tests pass! Do you want the report?"
+        #expect(NeuralNarrationSynthesis.streamingBody(answer) == answer)
+        #expect(NeuralNarrationSynthesis.streamingBody("  All done.  ") == "All done.")
+        #expect(NeuralNarrationSynthesis.streamingBody("   ").isEmpty)
+        #expect(NeuralNarrationSynthesis.segments(answer).count == 3)
+    }
 }
 
 struct NarrationPreRollTests {
@@ -727,6 +739,13 @@ struct NarrationPreRollTests {
         // A "needs you" line that takes a second to start is a worse bug than
         // one that stutters.
         #expect(cushion(.interrupt) <= 0.4)
+    }
+
+    @Test func aTappedReplySkipsTheInterjectionLead() {
+        #expect(NeuralNarrationVoice.defaultLead(for: .interrupt) == .milliseconds(200))
+        #expect(NeuralNarrationVoice.defaultLead(for: .progress) == .zero)
+        // Response reading passes `lead: .zero` so synthesis starts immediately;
+        // the interrupt cushion (pre-roll) is still what covers underruns.
     }
 }
 

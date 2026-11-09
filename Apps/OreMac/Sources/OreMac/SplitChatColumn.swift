@@ -34,6 +34,7 @@ struct SplitChatColumn: View {
                     chat: state,
                     worktreePath: workspace.worktreePath,
                     agentName: summary?.harness.displayName ?? "Agent",
+                    chatID: chatID,
                     searchQuery: "",
                     persistenceKey: "split-\(chatID.rawValue)",
                     expandedActivityGroups: expandedActivityGroups,

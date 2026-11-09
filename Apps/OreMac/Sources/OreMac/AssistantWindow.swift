@@ -305,6 +305,7 @@ struct AssistantActivityView: View {
                     worktreePath: assistant.worktreePath,
                     agentName: summary?.harness.displayName ?? "ORE",
                     agentHarness: summary?.harness,
+                    chatID: chatID,
                     searchQuery: "",
                     persistenceKey: "assistant-\(chatID.rawValue)",
                     expandedActivityGroups: expandedActivityGroups,

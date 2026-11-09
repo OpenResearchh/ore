@@ -62,6 +62,15 @@ protocol NarrationVoice: AnyObject {
     /// natural boundary it can honour, so preemption doesn't clip a word in
     /// half.
     func stop(immediate: Bool)
+    /// Whether `pause()` is holding a line that `resume()` can continue. Idle
+    /// and finished utterances are not paused — they have nothing to continue.
+    var isPaused: Bool { get }
+    /// Holds the current line at a natural boundary. A second `speak` or a
+    /// `stop` cancels the hold; `resume` continues it. Ambient narration never
+    /// pauses — it is always fresher to skip ahead — but a response the user
+    /// asked to hear has to survive a tap.
+    func pause()
+    func resume()
     /// A hint that `text` will likely be the next utterance. The engine calls
     /// this while an utterance waits out its quiet gap, so a voice that
     /// renders ahead of playback can spend that idle time synthesizing and
@@ -71,6 +80,9 @@ protocol NarrationVoice: AnyObject {
 }
 
 extension NarrationVoice {
+    var isPaused: Bool { false }
+    func pause() {}
+    func resume() {}
     func prepare(_ text: String, priority: NarrationPriority) {}
 }
 
@@ -98,11 +110,23 @@ final class SystemNarrationVoice: NarrationVoice {
         synthesizer.delegate = delegate
     }
 
+    var isPaused: Bool { synthesizer.isPaused }
+
     func speak(_ text: String, priority: NarrationPriority) {
         let speech = AVSpeechUtterance(string: text)
         if let voice = bestVoice() { speech.voice = voice }
         applyDelivery(to: speech, priority: priority)
         synthesizer.speak(speech)
+    }
+
+    func pause() {
+        guard synthesizer.isSpeaking, !synthesizer.isPaused else { return }
+        synthesizer.pauseSpeaking(at: .word)
+    }
+
+    func resume() {
+        guard synthesizer.isPaused else { return }
+        synthesizer.continueSpeaking()
     }
 
     /// Half of sounding robotic is delivery, not wording: without this every
@@ -216,11 +240,18 @@ enum NeuralNarrationSynthesis {
     static let seed: UInt64 = 0x4F_52_45_5F_56_4F_49_43
     static let cacheVersion = "pocket-tts-2-english-alba-t055-stable"
 
-    /// Pocket TTS is autoregressive, so voice characteristics can wander over
-    /// a long generation even with stable conditioning. Starting a fresh,
-    /// identically seeded session at natural sentence boundaries reasserts
-    /// both the speaker prompt and the sampling profile. Punctuation remains
-    /// attached so each segment keeps its intended cadence.
+    /// How a line is handed to one Pocket TTS session. The session, not the
+    /// caller, chunks at ≤50 tokens and yields 80ms frames from the first
+    /// chunk — so a tapped reply starts as soon as that chunk has audio, not
+    /// after later sentences have been rendered. Splitting into a new session
+    /// per sentence used to re-pay the ~125-token voice prefill at every
+    /// period, which is what made long answers sit silent.
+    static func streamingBody(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Sentence boundaries, for tests and for anything that still wants the
+    /// spoken cadence split without implying a new synthesis session.
     static func segments(_ text: String) -> [String] {
         var result: [String] = []
         text.enumerateSubstrings(
@@ -579,6 +610,10 @@ final class NeuralNarrationVoice: NarrationVoice {
     @ObservationIgnored var onEnd: (@MainActor () -> Void)?
     @ObservationIgnored var onProgress: (@MainActor (String, Int) -> Void)?
     private(set) var isSpeaking = false
+    /// Distinct from the underrun pause: that one re-banks and continues on
+    /// its own. This one is the user's tap, and only `resume` lifts it.
+    @ObservationIgnored private var userPaused = false
+    var isPaused: Bool { userPaused }
 
     var isReady: Bool { readiness == .ready }
 
@@ -601,6 +636,14 @@ final class NeuralNarrationVoice: NarrationVoice {
         case .progress: 10  // 800ms
         case .milestone: 8  // 640ms
         case .interrupt: 4  // 320ms
+        }
+    }
+
+    nonisolated static func defaultLead(for priority: NarrationPriority) -> Duration {
+        switch priority {
+        case .progress: .zero
+        case .milestone: .milliseconds(100)
+        case .interrupt: .milliseconds(200)
         }
     }
 
@@ -952,6 +995,14 @@ final class NeuralNarrationVoice: NarrationVoice {
     }
 
     func speak(_ text: String, priority: NarrationPriority) {
+        speak(text, priority: priority, lead: nil)
+    }
+
+    /// `lead: .zero` is for a tap-to-hear control: the user already waited
+    /// for the reply, and a 200ms interjection beat on top of first-chunk
+    /// synthesis is the delay they can hear. Ambient narration keeps the
+    /// priority's usual lead.
+    func speak(_ text: String, priority: NarrationPriority, lead: Duration?) {
         guard readiness == .ready else {
             // Nothing to say and nothing will say it — report the ending so
             // the engine's queue doesn't stall waiting on a voice that can't
@@ -965,6 +1016,7 @@ final class NeuralNarrationVoice: NarrationVoice {
         generation += 1
         let generation = generation
         isSpeaking = true
+        userPaused = false
         streamEnded = false
         scheduledBuffers = 0
         pendingFrames = []
@@ -982,11 +1034,7 @@ final class NeuralNarrationVoice: NarrationVoice {
         // survive. The model's own prosody covers more of the difference than
         // the tuning did.
         player.volume = priority == .progress ? 0.85 : 1
-        let lead: Duration = switch priority {
-        case .progress: .zero
-        case .milestone: .milliseconds(100)
-        case .interrupt: .milliseconds(200)
-        }
+        let lead = lead ?? Self.defaultLead(for: priority)
 
         speakTask = Task { [weak self] in
             guard let self else { return }
@@ -1066,15 +1114,8 @@ final class NeuralNarrationVoice: NarrationVoice {
     /// The whole line as one waveform, no playback until it's finished.
     private func synthesizeAll(_ text: String) async throws -> [Float] {
         var recorded: [Float] = []
-        for segment in NeuralNarrationSynthesis.segments(text) {
-            let session = try await stableSession(for: segment)
-            for try await frame in session.frames {
-                if Task.isCancelled {
-                    await session.cancel()
-                    throw CancellationError()
-                }
-                recorded.append(contentsOf: frame.samples)
-            }
+        try await withStreamingSession(text) { samples in
+            recorded.append(contentsOf: samples)
         }
         return recorded
     }
@@ -1095,16 +1136,9 @@ final class NeuralNarrationVoice: NarrationVoice {
     private func synthesize(_ text: String, generation: Int) async throws {
         let worthKeeping = NarrationPhraseCache.isCacheable(text)
         var recorded: [Float] = []
-        for segment in NeuralNarrationSynthesis.segments(text) {
-            let session = try await stableSession(for: segment)
-            for try await frame in session.frames {
-                if Task.isCancelled {
-                    await session.cancel()
-                    throw CancellationError()
-                }
-                if worthKeeping { recorded.append(contentsOf: frame.samples) }
-                accept(frame.samples, generation: generation)
-            }
+        try await withStreamingSession(text) { samples in
+            if worthKeeping { recorded.append(contentsOf: samples) }
+            accept(samples, generation: generation)
         }
         // Only a line that ran to completion is worth remembering. A preempted
         // one is half a sentence, and replaying half a sentence later would be
@@ -1113,19 +1147,33 @@ final class NeuralNarrationVoice: NarrationVoice {
         phraseCache.store(recorded, for: text)
     }
 
-    /// FluidAudio's streaming convenience API does not expose its seed and
-    /// therefore chooses a random one internally. The session API does, so a
-    /// short-lived session is the narrowest way to make every line use the
-    /// exact same voice conditioning and sampling profile.
-    private func stableSession(for text: String) async throws -> PocketTtsSession {
+    /// One Pocket TTS session for the whole utterance. Frames start after the
+    /// first ≤50-token chunk is prefilled — not after later sentences, and
+    /// not after a fresh voice prefill at every period.
+    ///
+    /// FluidAudio's session API does not expose its seed on the convenience
+    /// streaming call, so a short-lived session is still the narrowest way to
+    /// pin Alba's conditioning; it just is not recreated per sentence.
+    private func withStreamingSession(
+        _ text: String,
+        handleFrame: ([Float]) -> Void
+    ) async throws {
+        let body = NeuralNarrationSynthesis.streamingBody(text)
+        guard !body.isEmpty else { return }
         let session = try await manager.makeSession(
             voice: NeuralNarrationSynthesis.voice,
             temperature: NeuralNarrationSynthesis.temperature,
             seed: NeuralNarrationSynthesis.seed
         )
-        session.enqueue(text)
+        session.enqueue(body)
         session.finish()
-        return session
+        for try await frame in session.frames {
+            if Task.isCancelled {
+                await session.cancel()
+                throw CancellationError()
+            }
+            handleFrame(frame.samples)
+        }
     }
 
     // MARK: Common phrase warmup
@@ -1187,11 +1235,24 @@ final class NeuralNarrationVoice: NarrationVoice {
         schedule(samples, generation: generation)
     }
 
+    func pause() {
+        guard isSpeaking, !userPaused else { return }
+        userPaused = true
+        if player.isPlaying { player.pause() }
+    }
+
+    func resume() {
+        guard userPaused else { return }
+        userPaused = false
+        if isSpeaking, !player.isPlaying { player.play() }
+    }
+
     func stop(immediate: Bool) {
         guard isSpeaking else { return }
         cancelCurrent()
         generation += 1
         isSpeaking = false
+        userPaused = false
         if immediate {
             player.stop()
             player.volume = 1
@@ -1284,7 +1345,7 @@ final class NeuralNarrationVoice: NarrationVoice {
                 self?.noteBufferPlayed(samples: played, generation: generation)
             }
         }
-        if !player.isPlaying { player.play() }
+        if !player.isPlaying, !userPaused { player.play() }
     }
 
     private func noteBufferPlayed(samples: Int, generation: Int) {

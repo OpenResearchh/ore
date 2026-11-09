@@ -410,6 +410,7 @@ private struct DreamTranscriptSheet: View {
                     ?? finding.repositoryPath,
                 agentName: model.chatIndex.summary(for: chatID)?.harness.displayName ?? "Agent",
                 agentHarness: model.chatIndex.summary(for: chatID)?.harness,
+                chatID: chatID,
                 searchQuery: "",
                 persistenceKey: "dream-\(chatID.rawValue)",
                 expandedActivityGroups: expandedActivityGroups,

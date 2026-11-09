@@ -415,6 +415,7 @@ struct ChatPane: View {
                         worktreePath: workspace.worktreePath,
                         agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "",
                         agentHarness: chatSummary?.harness,
+                        chatID: chatSummary?.id,
                         searchQuery: isSearching ? effectiveSearchQuery : "",
                         persistenceKey: transcriptScrollKey(chatSummary),
                         expandedActivityGroups: expandedActivityGroups,
@@ -5610,11 +5611,13 @@ private struct ComposerDockInset<Content: View>: View {
 }
 
 struct TranscriptHost: View, Equatable {
+    @Environment(AppModel.self) private var model
     var chat: ChatState
     var worktreePath: String
     /// Short agent name ("Claude") for the transcript's turn headers.
     var agentName: String
     var agentHarness: HarnessKind? = nil
+    var chatID: ChatID? = nil
     /// The find bar's live query; empty when the bar is closed.
     var searchQuery: String
     var persistenceKey: String
@@ -5671,6 +5674,7 @@ struct TranscriptHost: View, Equatable {
             && lhs.bottomInset == rhs.bottomInset
             && lhs.topInset == rhs.topInset
             && lhs.expandedActivityGroups == rhs.expandedActivityGroups
+            && lhs.chatID == rhs.chatID
     }
 
     @State private var memo = TranscriptDisplay.Memo()
@@ -5697,7 +5701,9 @@ struct TranscriptHost: View, Equatable {
             bottomInset: bottomInset,
             topInset: topInset,
             // Read after `displayRows` above, which is what bumps it.
-            structureToken: memo.structureToken
+            structureToken: memo.structureToken,
+            narration: model.narration,
+            chatID: chatID
         )
         // An NSViewRepresentable keeps its coordinator when only its inputs
         // change. Without an explicit conversation identity, switching tabs

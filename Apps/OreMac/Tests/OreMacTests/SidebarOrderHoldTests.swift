@@ -180,6 +180,29 @@ struct SidebarLayoutTests {
         #expect(layout.shortcutOrder.last == WorkspaceID(rawValue: "w8"))
     }
 
+    @Test func collapsedRepositoriesOmitWorkspaceRows() {
+        let layout = SidebarLayout(
+            workspaces: [
+                workspace("a", repository: "one"),
+                workspace("b", repository: "one"),
+                workspace("c", repository: "two"),
+            ],
+            activeIDs: nil,
+            held: nil
+        )
+        let shortcuts = [WorkspaceID(rawValue: "a"): 1]
+        let items = sidebarListItems(
+            groups: layout.groups,
+            collapsed: ["/repos/one"],
+            shortcuts: shortcuts
+        )
+        #expect(items.map(\.id) == [
+            "repo:/repos/one",
+            "repo:/repos/two",
+            "ws:c",
+        ])
+    }
+
     private func workspace(
         _ name: String,
         pinned: Bool = false,

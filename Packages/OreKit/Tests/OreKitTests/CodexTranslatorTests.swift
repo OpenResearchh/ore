@@ -25,6 +25,32 @@ struct CodexTranslatorTests {
         #expect(started.first?.harnessVersion != nil)
     }
 
+    @Test func fileChangeKeepsTheUnifiedDiffForTheTranscriptCard() {
+        var translator = CodexTranslator(sessionID: SessionID(rawValue: "test"))
+        _ = translator.translate(
+            method: "turn/started",
+            params: .object(["turn": .object(["id": .string("t1")])])
+        )
+        let output = translator.translate(method: "item/completed", params: .object([
+            "item": .object([
+                "id": .string("edit-1"),
+                "type": .string("fileChange"),
+                "changes": .array([
+                    .object([
+                        "path": .string("Sources/App.swift"),
+                        "diff": .string("@@ -1,2 +1,2 @@\n-let a = 1\n+let a = 2\n"),
+                    ]),
+                ]),
+            ]),
+        ]))
+        let result = output.events.compactMap { event -> String? in
+            if case .toolResult(let result) = event { return result.text }
+            return nil
+        }
+        #expect(result.contains { $0.contains("+let a = 2") })
+        #expect(result.contains { $0.contains("Sources/App.swift") })
+    }
+
     @Test func aWhitespaceOnlyPlanItemIsDropped() {
         // A completed plan item with no readable body must not advertise
         // "plan ready" — whitespace and JSON debris are not a plan.

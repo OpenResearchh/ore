@@ -389,6 +389,7 @@ struct CursorAgentTranslator {
         case "todowrite", "todoread", "todo": return "TodoWrite"
         case "createplan", "create_plan": return "CreatePlan"
         case "exitplanmode", "exit_plan_mode": return "ExitPlanMode"
+        case "generateimage", "generate_image", "image": return "GenerateImage"
         default:
             return base.isEmpty ? "Tool" : base.prefix(1).uppercased() + base.dropFirst()
         }
@@ -467,6 +468,9 @@ struct CursorAgentTranslator {
         }
 
         if let path = dict["path"]?.stringValue { dict["file_path"] = .string(path) }
+        if dict["file_path"] == nil, let path = dict["filePath"]?.stringValue {
+            dict["file_path"] = .string(path)
+        }
         if let target = dict["targetDirectory"]?.stringValue ?? dict["target_directory"]?.stringValue {
             dict["path"] = .string(target)
             dict["file_path"] = .string(target)

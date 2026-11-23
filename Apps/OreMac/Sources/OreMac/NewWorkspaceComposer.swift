@@ -225,20 +225,26 @@ struct NewWorkspaceComposer: View {
     /// because a button floating in the text is a button in the way.
     private var micButton: some View {
         Button { voice.toggle() } label: {
-            Image(systemName: voice.isListening ? "mic.fill" : "mic")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(voice.isListening ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-                .frame(width: 30, height: 30)
-                .background(
-                    voice.isListening
-                        ? AnyShapeStyle(Color.accentColor)
-                        : AnyShapeStyle(OreTheme.glassControlFill),
-                    in: Circle()
-                )
-                .contentShape(Circle())
+            Group {
+                if voice.isActive && !voice.isListening {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: voice.isListening ? "mic.fill" : "mic")
+                }
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(voice.isListening ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+            .frame(width: 30, height: 30)
+            .background(
+                voice.isListening
+                    ? AnyShapeStyle(Color.accentColor)
+                    : AnyShapeStyle(OreTheme.glassControlFill),
+                in: Circle()
+            )
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .help(voice.isListening ? "Stop listening" : "Speak your instruction")
+        .help(voice.isListening ? "Stop listening" : voice.isActive ? "Starting dictation…" : "Speak your instruction")
     }
 
     // MARK: - What ORE worked out

@@ -360,6 +360,28 @@ enum VoiceAvailability {
     }
 }
 
+/// What a mic click should do given the controller's current status.
+///
+/// A second press while the analyzer is still coming up used to cancel the
+/// start. The first click looked like a no-op, the second killed it, and
+/// dictation never reached listening.
+@MainActor
+enum VoiceMicPress {
+    enum Action: Equatable {
+        case start
+        case stop
+        case ignore
+    }
+
+    static func action(status: VoiceInputController.Status) -> Action {
+        switch status {
+        case .listening: return .stop
+        case .requestingPermission, .preparing, .downloadingModel: return .ignore
+        case .idle, .error: return .start
+        }
+    }
+}
+
 /// Live microphone dictation for the composer. Stays in OreMac: the core still
 /// only ever receives the resulting string.
 @MainActor
@@ -439,7 +461,11 @@ final class VoiceInputController {
     }
 
     func toggle() {
-        if isActive { stop() } else { start() }
+        switch VoiceMicPress.action(status: status) {
+        case .start: start()
+        case .stop: stop()
+        case .ignore: break
+        }
     }
 
     func start() {
@@ -459,7 +485,11 @@ final class VoiceInputController {
         audioLevel = 0
         errorSettingsLink = nil
         if #available(macOS 26.0, *) { DictationPrewarm.warm() }
-        status = .requestingPermission
+        // Already-authorized presses skip the permission spinner so the
+        // composer shows "Starting dictation…" for the analyzer wait, not
+        // "Waiting for microphone permission…" for a prompt that will not appear.
+        let microphone = AVCaptureDevice.authorizationStatus(for: .audio)
+        status = microphone == .authorized ? .preparing : .requestingPermission
         runTask = Task { await run() }
     }
 
@@ -523,12 +553,16 @@ final class VoiceInputController {
                 fail(denied)
                 return
             }
-            let allowed = await AVAudioApplication.requestRecordPermission()
-            guard allowed else {
-                fail(VoiceAvailability.microphoneDenied)
-                return
+            if microphone != .authorized {
+                status = .requestingPermission
+                let allowed = await AVAudioApplication.requestRecordPermission()
+                guard allowed else {
+                    fail(VoiceAvailability.microphoneDenied)
+                    return
+                }
             }
             guard !Task.isCancelled else { return }
+            if status == .requestingPermission { status = .preparing }
 
             if #available(macOS 26.0, *) {
                 do {
@@ -588,9 +622,9 @@ final class VoiceInputController {
         } catch {
             // A prewarmed analyzer is one-shot and often spent by the time
             // the assistant actually opens the mic. Build a fresh pipeline
-            // once before giving up on the on-device model.
+            // once before giving up on the on-device model — without throwing
+            // away a pipeline that finished warming during the failed start.
             SpeechAssetKeeper.reset()
-            _ = DictationPrewarm.take()
             try await runSpeechAnalyzerSession()
         }
     }
@@ -602,9 +636,10 @@ final class VoiceInputController {
         let analyzer: SpeechAnalyzer
         let bestFormat: AVAudioFormat?
 
-        if let warmed = DictationPrewarm.take() {
+        if let warmed = await DictationPrewarm.take() {
             // The model is already sitting in a prepared analyzer — listening
-            // starts as fast as the microphone does.
+            // starts as fast as the microphone does. Waiting for an in-flight
+            // warm beats starting a second `prepareToAnalyze` beside it.
             transcriber = warmed.transcriber
             analyzer = warmed.analyzer
             bestFormat = warmed.format
@@ -902,7 +937,10 @@ enum DictationPrewarm {
         }
     }
 
-    static func take() -> Prepared? {
+    static func take() async -> Prepared? {
+        if prepared == nil, let warmTask {
+            await warmTask.value
+        }
         defer { prepared = nil }
         return prepared
     }

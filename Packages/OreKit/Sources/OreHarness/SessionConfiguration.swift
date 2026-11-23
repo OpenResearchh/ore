@@ -16,6 +16,8 @@ public struct SessionConfiguration: Sendable {
     /// rooted here, which is what makes N parallel agents safe.
     public var workingDirectory: URL
     public var model: String?
+    /// Passed as `--effort` on Claude CLIs that advertise the flag.
+    public var reasoningEffort: ReasoningEffort?
     public var permissionMode: PermissionMode
     public var resume: SessionRequest.ResumeMode
     /// Extra text appended to the CLI's own system prompt — how ORE tells the
@@ -54,6 +56,7 @@ public struct SessionConfiguration: Sendable {
     public init(
         workingDirectory: URL,
         model: String? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
         permissionMode: PermissionMode = .default,
         resume: SessionRequest.ResumeMode = .fresh,
         appendSystemPrompt: String? = nil,
@@ -68,6 +71,7 @@ public struct SessionConfiguration: Sendable {
     ) {
         self.workingDirectory = workingDirectory
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.permissionMode = permissionMode
         self.resume = resume
         self.appendSystemPrompt = appendSystemPrompt

@@ -233,8 +233,16 @@ struct CodexTranslator {
             )
 
         case "fileChange":
-            let paths = item["changes"]?.arrayValue?
-                .compactMap { $0["path"]?.stringValue ?? $0["file"]?.stringValue } ?? []
+            let changes = item["changes"]?.arrayValue ?? []
+            let paths = changes.compactMap { $0["path"]?.stringValue ?? $0["file"]?.stringValue }
+            let diffs = changes.compactMap { change -> String? in
+                guard let diff = change["diff"]?.stringValue, !diff.isEmpty else { return nil }
+                let path = change["path"]?.stringValue ?? change["file"]?.stringValue
+                if let path, !diff.contains(path) {
+                    return "--- a/\(path)\n+++ b/\(path)\n\(diff)"
+                }
+                return diff
+            }
             applyToolItem(
                 item,
                 itemID: itemID,
@@ -243,7 +251,26 @@ struct CodexTranslator {
                 name: "Edit",
                 displayName: paths.first.map { FilePath.lastComponent($0) },
                 input: item["changes"] ?? .object([:]),
-                resultText: paths.isEmpty ? "" : paths.joined(separator: "\n"),
+                resultText: diffs.isEmpty
+                    ? (paths.isEmpty ? "" : paths.joined(separator: "\n"))
+                    : diffs.joined(separator: "\n"),
+                isError: item["status"]?.stringValue == "failed",
+                to: &output
+            )
+
+        case "imageView":
+            let path = item["path"]?.stringValue
+                ?? item["file"]?.stringValue
+                ?? item["filename"]?.stringValue
+            applyToolItem(
+                item,
+                itemID: itemID,
+                turnID: turnID,
+                completed: completed,
+                name: "Read",
+                displayName: path.map { FilePath.lastComponent($0) } ?? "image",
+                input: .object(["file_path": path.map(JSONValue.string) ?? .null]),
+                resultText: path ?? "",
                 isError: item["status"]?.stringValue == "failed",
                 to: &output
             )

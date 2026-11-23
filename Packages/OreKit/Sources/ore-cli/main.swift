@@ -137,6 +137,7 @@ func runChat(options: CommandLineOptions) async {
         session = try await harness.makeSession(SessionConfiguration(
             workingDirectory: directory,
             model: options.value(for: "--model"),
+            reasoningEffort: nil,
             permissionMode: options.permissionMode,
             resume: options.resumeMode
         ))

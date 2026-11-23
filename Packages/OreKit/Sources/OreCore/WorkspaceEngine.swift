@@ -556,6 +556,7 @@ public actor WorkspaceEngine {
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
             model: request?.model ?? runtime.record.model,
+            reasoningEffort: reasoningEffort,
             permissionMode: request?.permissionMode
                 ?? PermissionMode(rawValue: runtime.record.permissionMode) ?? .default,
             resume: resume,
@@ -1057,6 +1058,7 @@ public actor WorkspaceEngine {
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
             model: auxiliaryModel,
+            reasoningEffort: .low,
             permissionMode: .plan,
             appendSystemPrompt: instruction,
             environmentOverrides: harnessKind == .claudeCode
@@ -1739,13 +1741,9 @@ public actor WorkspaceEngine {
 
     /// The last thing said in a conversation, for the sidebar's snippet line:
     /// the turn's stored summary when one exists, else the prompt that opened
-    /// it. Sequential guards, not a multi-clause condition — see the OreKit
-    /// async-frame miscompile.
+    /// it.
     public func lastTurnDigest(chatID: ChatID) async throws -> String? {
-        let turn = try await store.latestTurn(chatID: chatID)
-        guard let turn else { return nil }
-        if let summary = turn.summary, !summary.isEmpty { return summary }
-        return turn.prompt
+        try await store.lastTurnDigest(chatID: chatID)
     }
 
     public func diffFromCheckpoint(_ commit: String) async throws -> [FileDiff] {

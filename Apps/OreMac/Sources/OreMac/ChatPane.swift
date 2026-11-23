@@ -34,6 +34,7 @@ struct ChatPane: View {
     @State private var showChatHistory = false
     @State private var revertTarget: TurnID?
     @State private var expandedActivityGroups: Set<String> = []
+    @AppStorage("ore.transcriptDensity") private var transcriptDensityRaw = TranscriptDensity.normal.rawValue
     /// Attachment relative paths that live as inline chips in the draft (pasted
     /// images and long text) rather than in the attachment shelf above the composer.
     ///
@@ -182,7 +183,8 @@ struct ChatPane: View {
                     renameChatText: $renameChatText,
                     isSearching: $isSearching,
                     searchFocusRequest: $searchFocusRequest,
-                    showChatHistory: $showChatHistory
+                    showChatHistory: $showChatHistory,
+                    scrollAnchor: scrollAnchor
                 )
                 ChromePaneListener(workspaceID: workspace.id) { applyChromePaneRequest($0) }
                 // No scrim. A full-width gradient here ended in hard
@@ -366,6 +368,9 @@ struct ChatPane: View {
             revertTarget = turn
         case .reply:
             tagReply(in: chat, agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? "", turnID: turn)
+        case .review:
+            ChromeLayout.showsReview = true
+            ChromeLayout.request(.reviewTabChanges)
         }
     }
 
@@ -430,6 +435,7 @@ struct ChatPane: View {
                                 agentName: chatSummary.map { AgentPresenceStrip.shortName($0.harness) } ?? ""
                             )
                         },
+                        density: TranscriptDensity(rawValue: transcriptDensityRaw) ?? .normal,
                         scrollAnchor: scrollAnchor,
                         // A hair of air between the newest row and the dock's glass.
                         bottomInset: dockHeight + OreTheme.Space.sm,
@@ -784,6 +790,16 @@ struct ChatPane: View {
             model.narration.setMicActive(active)
         }
         .onChange(of: voice.status) { _, status in
+            if case .listening = status {
+                // After the analyzer is up: MPS and SpeechAnalyzer share the
+                // GPU, and warming the refiner on the same click as the mic
+                // made the first press stall or never reach listening.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(400))
+                    guard voice.isListening else { return }
+                    VoiceIntentRefiner.shared.prewarm()
+                }
+            }
             handleVoiceStatusChange(status)
         }
         .onChange(of: chatSummary?.id) { _, _ in
@@ -979,6 +995,9 @@ struct ChatPane: View {
         @Binding var isSearching: Bool
         @Binding var searchFocusRequest: Int
         @Binding var showChatHistory: Bool
+        var scrollAnchor: TranscriptScrollAnchor
+        @AppStorage("ore.transcriptDensity") private var transcriptDensityRaw = TranscriptDensity.normal.rawValue
+        @State private var showTranscriptOutline = false
         @State private var hoveredTabKey: String?
 
         var body: some View {
@@ -1103,9 +1122,9 @@ struct ChatPane: View {
     /// centred rather than shifted by the controls' width. Must track the
     /// controls' real width — reserved short, the last tab's tail (and its
     /// close button) hides underneath them and no amount of scrolling brings
-    /// it back.
+    /// it back. Density and outline sit with search / new-tab / history.
     private var tabControlAllowance: CGFloat {
-        136
+        196
     }
 
     /// "Femtosecond Chemistry" → "Femtosecond": the first word carries the
@@ -1259,6 +1278,38 @@ struct ChatPane: View {
     private func trailingControls(chat: ChatState?) -> some View {
         let revertableTurns = chat?.revertableTurns ?? []
         HStack(spacing: OreTheme.Space.xs) {
+            Menu {
+                ForEach(TranscriptDensity.allCases, id: \.self) { density in
+                    Button {
+                        transcriptDensityRaw = density.rawValue
+                    } label: {
+                        if transcriptDensityRaw == density.rawValue {
+                            Label(density.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(density.displayName)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "line.3.horizontal.decrease")
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .help("Transcript density: \(TranscriptDensity(rawValue: transcriptDensityRaw)?.displayName ?? "Normal")")
+
+            Button {
+                showTranscriptOutline.toggle()
+            } label: {
+                Image(systemName: "list.bullet")
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(OrePressableButtonStyle())
+            .popover(isPresented: $showTranscriptOutline, arrowEdge: .bottom) {
+                transcriptOutline(chat: chat)
+            }
+            .disabled(chat == nil)
+            .help("Jump to a turn")
+
             Button {
                 // ⌘F never closes: pressed with the bar already open it
                 // returns focus to the field. Esc is what closes.
@@ -1347,6 +1398,41 @@ struct ChatPane: View {
             }
             .padding(.bottom, 6)
             .frame(minWidth: 220)
+        }
+
+        @ViewBuilder
+        private func transcriptOutline(chat: ChatState?) -> some View {
+            let entries = (chat?.rows ?? []).compactMap { row -> (id: String, title: String)? in
+                guard row.kind == .userMessage,
+                      row.origin != .watch
+                else { return nil }
+                let title = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !title.isEmpty else { return nil }
+                let clipped = title.split(separator: "\n", omittingEmptySubsequences: false)
+                    .first.map(String.init) ?? title
+                let preview = clipped.count > 72 ? String(clipped.prefix(72)) + "…" : clipped
+                return (row.id, preview)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                if entries.isEmpty {
+                    Text("No turns yet")
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                } else {
+                    ForEach(entries, id: \.id) { entry in
+                        Button(entry.title) {
+                            scrollAnchor.reveal(entry.id)
+                            showTranscriptOutline = false
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .frame(minHeight: 28, alignment: .leading)
+                        .lineLimit(1)
+                    }
+                }
+            }
+            .padding(.vertical, 6)
+            .frame(minWidth: 260, maxWidth: 360)
         }
     }
 
@@ -2309,10 +2395,17 @@ struct ChatPane: View {
     private func toggleVoice() {
         // Pressing again during the hold means "go now": send the pending turn
         // rather than opening a second dictation on top of it.
-        if voice.isActive || voiceSettle != nil {
+        if voiceSettle != nil {
             finishVoice(.send)
-        } else {
+            return
+        }
+        switch VoiceMicPress.action(status: voice.status) {
+        case .start:
             startVoice()
+        case .stop:
+            finishVoice(.send)
+        case .ignore:
+            break
         }
     }
 
@@ -2330,9 +2423,6 @@ struct ChatPane: View {
             voiceQuote = ""
         }
         composerFocused = true
-        // Load the on-device model while the user talks, so the commit-time
-        // refinement doesn't pay the cold start.
-        VoiceIntentRefiner.shared.prewarm()
         voice.start()
     }
 
@@ -5628,6 +5718,7 @@ struct TranscriptHost: View, Equatable {
     var onOpenFile: (String) -> Void
     var onTurnAction: (TurnID, TranscriptView.TurnAction) -> Void
     var onReply: (TranscriptRow) -> Void = { _ in }
+    var density: TranscriptDensity = .normal
     var scrollAnchor: TranscriptScrollAnchor
     /// Foot clearance for the floating composer dock — see `TranscriptView`.
     /// Defaults to the resting inset for hosts whose composer does not float
@@ -5675,6 +5766,7 @@ struct TranscriptHost: View, Equatable {
             && lhs.topInset == rhs.topInset
             && lhs.expandedActivityGroups == rhs.expandedActivityGroups
             && lhs.chatID == rhs.chatID
+            && lhs.density == rhs.density
     }
 
     @State private var memo = TranscriptDisplay.Memo()
@@ -5722,17 +5814,22 @@ struct TranscriptHost: View, Equatable {
         // transcript cannot have changed either. Completed turns are reused
         // inside the memo so a live stream does not regroup history.
         _ = chat.plan
+        var expanded = expandedActivityGroups
+        if !searchQuery.isEmpty {
+            expanded.formUnion(TranscriptDisplay.matchingActivityIDs(query: searchQuery, in: chat.rows))
+        }
         return TranscriptDisplay.rows(
             from: chat.rows,
             keepLiveTurnExpanded: chat.isTurnActive,
-            expanded: expandedActivityGroups,
+            expanded: expanded,
             memo: memo,
             hidingPlanTurnID: {
                 if case .proposal = chat.plan { return chat.planTurnID }
                 return nil
             }(),
             revision: chat.rowsRevision,
-            structuralRevision: chat.structuralRevision
+            structuralRevision: chat.structuralRevision,
+            density: density
         )
     }
 }

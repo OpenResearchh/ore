@@ -74,7 +74,7 @@ public struct ClaudeCodeHarness: AgentHarness {
         let version = versionProbe.firstLine
         // Answered now, while the doctor is already asking the CLI things, so
         // the first session doesn't pay for it.
-        _ = await ClaudeFlagSupport.shared.allowsBypassSwitch(executablePath: path)
+        _ = await ClaudeFlagSupport.shared.flags(executablePath: path)
 
         return HarnessProbeResult(
             kind: kind,
@@ -148,7 +148,7 @@ public struct ClaudeCodeHarness: AgentHarness {
             executablePath: path,
             configuration: configuration,
             capabilities: capabilities,
-            allowsBypassSwitch: await ClaudeFlagSupport.shared.allowsBypassSwitch(executablePath: path)
+            flags: await ClaudeFlagSupport.shared.flags(executablePath: path)
         )
     }
 
@@ -221,12 +221,18 @@ enum ClaudeAuthStatus {
 actor ClaudeFlagSupport {
     static let shared = ClaudeFlagSupport()
 
-    private var answers: [String: Task<Bool, Never>] = [:]
+    struct Flags: Sendable, Equatable {
+        var bypassSwitch = false
+        var forwardSubagentText = false
+        var effort = false
+    }
 
-    func allowsBypassSwitch(executablePath: String) async -> Bool {
+    private var answers: [String: Task<Flags, Never>] = [:]
+
+    func flags(executablePath: String) async -> Flags {
         if let answer = answers[executablePath] { return await answer.value }
         let probe = Task {
-            Self.helpOffersBypassSwitch(await CommandProbe.output(
+            Self.flags(fromHelp: await CommandProbe.output(
                 executablePath: executablePath,
                 arguments: ["--help"],
                 timeout: .seconds(10)
@@ -234,6 +240,18 @@ actor ClaudeFlagSupport {
         }
         answers[executablePath] = probe
         return await probe.value
+    }
+
+    func allowsBypassSwitch(executablePath: String) async -> Bool {
+        await flags(executablePath: executablePath).bypassSwitch
+    }
+
+    nonisolated static func flags(fromHelp help: String?) -> Flags {
+        Flags(
+            bypassSwitch: helpOffersBypassSwitch(help),
+            forwardSubagentText: help?.contains("--forward-subagent-text") ?? false,
+            effort: help?.contains("--effort") ?? false
+        )
     }
 
     nonisolated static func helpOffersBypassSwitch(_ help: String?) -> Bool {

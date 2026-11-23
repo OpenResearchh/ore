@@ -17,10 +17,9 @@ public actor ClaudeCodeSession: AgentSession {
     private nonisolated let continuation: AsyncStream<AgentEvent>.Continuation
     private let configuration: SessionConfiguration
     private let executablePath: String
-    /// Whether this CLI knows `--allow-dangerously-skip-permissions`. With it a
-    /// running session can be switched into Bypass; without it the CLI refuses
-    /// and the engine relaunches the session in the new mode instead.
-    private let allowsBypassSwitch: Bool
+    /// Launch flags this CLI advertised on `--help`. An unknown flag refuses
+    /// to start, so older builds skip `--forward-subagent-text` and `--effort`.
+    private let flags: ClaudeFlagSupport.Flags
 
     private var translator: ClaudeCodeTranslator
     /// The current mode, which the control channel keeps in step with the
@@ -53,11 +52,11 @@ public actor ClaudeCodeSession: AgentSession {
         executablePath: String,
         configuration: SessionConfiguration,
         capabilities: HarnessCapabilities,
-        allowsBypassSwitch: Bool = false
+        flags: ClaudeFlagSupport.Flags = ClaudeFlagSupport.Flags()
     ) {
         self.id = id
         self.executablePath = executablePath
-        self.allowsBypassSwitch = allowsBypassSwitch
+        self.flags = flags
         self.configuration = configuration
         self.permissionMode = configuration.permissionMode
         self.capabilities = capabilities
@@ -204,6 +203,31 @@ public actor ClaudeCodeSession: AgentSession {
         var arguments = ["--permission-mode", mode.rawValue]
         if allowsBypassSwitch { arguments.append("--allow-dangerously-skip-permissions") }
         return arguments
+    }
+
+    /// Nested subagent transcripts and `--effort` only when this CLI listed them.
+    nonisolated static func capabilityArguments(
+        flags: ClaudeFlagSupport.Flags,
+        effort: ReasoningEffort?
+    ) -> [String] {
+        var arguments: [String] = []
+        if flags.forwardSubagentText {
+            arguments.append("--forward-subagent-text")
+        }
+        if flags.effort, let effort, let value = cliEffortValue(effort) {
+            arguments += ["--effort", value]
+        }
+        return arguments
+    }
+
+    /// Claude's `--effort` vocabulary. Adaptive and none have no CLI equivalent.
+    nonisolated static func cliEffortValue(_ effort: ReasoningEffort) -> String? {
+        switch effort {
+        case .low, .medium, .high, .xhigh, .max:
+            return effort.rawValue
+        case .none, .adaptive:
+            return nil
+        }
     }
 
     /// "Cannot set permission mode to bypassPermissions because the session was
@@ -452,7 +476,11 @@ public actor ClaudeCodeSession: AgentSession {
         }
         arguments += Self.permissionArguments(
             mode: permissionMode,
-            allowsBypassSwitch: allowsBypassSwitch
+            allowsBypassSwitch: flags.bypassSwitch
+        )
+        arguments += Self.capabilityArguments(
+            flags: flags,
+            effort: configuration.reasoningEffort
         )
 
         switch configuration.resume {

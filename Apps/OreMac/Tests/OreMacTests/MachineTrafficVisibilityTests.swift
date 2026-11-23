@@ -26,6 +26,8 @@ struct MachineTrafficVisibilityTests {
     }
 
     private func display(_ rows: [TranscriptRow]) -> [TranscriptRow] {
+        // Finished turns append a footer for copy/reply chrome. These tests
+        // are about which conversation rows survive, not that chrome.
         TranscriptDisplay.rows(
             from: rows,
             keepLiveTurnExpanded: false,
@@ -33,7 +35,7 @@ struct MachineTrafficVisibilityTests {
             memo: TranscriptDisplay.Memo(),
             hidingPlanTurnID: nil,
             revision: 1
-        )
+        ).filter { $0.kind != .turnFooter }
     }
 
     @Test func aWatchDigestIsNotDrawnInTheTranscript() {

@@ -5,45 +5,44 @@ import OreSupport
 /// Cursor's agent CLI, exposing Grok and Cursor's other models on the user's
 /// own Cursor plan.
 ///
-/// **Experimental, and behind a flag.** The plan for this driver assumed an ACP
-/// mode with a real `session/request_permission` channel; the shipping CLI has
-/// no such subcommand, so the only machine-readable interface is
-/// `--print --output-format stream-json`, which streams output but offers no
-/// way to answer a permission prompt.
-///
-/// That is a genuine capability gap, not a detail to paper over. It is also not
-/// a reason to ship an agent that silently cannot work: with no approval
-/// channel *and* no approval policy, the CLI rejects every shell and write call
-/// — the turn returns `result: {rejected: …}` and the agent reports it was
-/// "blocked by the environment". So this driver passes `--auto-review`, whose
-/// server-side classifier runs the safe calls and refuses the rest. That is a
-/// real policy the user can reason about, unlike `--force`, which runs anything
-/// at all and therefore still requires an explicit opt-in.
-///
-/// `permissionModel` stays `.none`: the UI must not offer an approve button
-/// there is no channel to answer on.
+/// Current CLIs speak ACP (`agent acp`): live permissions, plan approval,
+/// questions, thinking, and generated images. Older builds that have no ACP
+/// subcommand still run `--print --output-format stream-json` with
+/// `--auto-review`, because without a policy every write comes back rejected.
+/// `--force` stays behind the explicit Bypass opt-in.
 public struct CursorAgentHarness: AgentHarness {
     public let kind: HarnessKind = .cursorAgent
     static let executableNames = ["cursor-agent", "agent"]
 
-    public var capabilities: HarnessCapabilities {
-        HarnessCapabilities(
-            // `--mode plan` is read-only, but there's no plan-approval
-            // round trip to hang an approve button on.
-            supportsPlanMode: false,
-            supportsSteering: false,
-            supportsInterrupt: true,
-            supportsResume: true,
-            supportsSessionFork: false,
-            supportsThinkingStream: true,
-            supportsPartialMessages: true,
-            supportsRuntimePermissionModeChange: false,
-            supportsCustomTools: false,
-            // No interactive approval channel exists in this CLI version.
-            permissionModel: .none,
-            usageGranularity: .perTurn
-        )
-    }
+    public var capabilities: HarnessCapabilities { Self.acpCapabilities }
+
+    static let acpCapabilities = HarnessCapabilities(
+        supportsPlanMode: true,
+        supportsSteering: false,
+        supportsInterrupt: true,
+        supportsResume: true,
+        supportsSessionFork: false,
+        supportsThinkingStream: true,
+        supportsPartialMessages: true,
+        supportsRuntimePermissionModeChange: true,
+        supportsCustomTools: false,
+        permissionModel: .interactiveCallback,
+        usageGranularity: .live
+    )
+
+    static let printCapabilities = HarnessCapabilities(
+        supportsPlanMode: false,
+        supportsSteering: false,
+        supportsInterrupt: true,
+        supportsResume: true,
+        supportsSessionFork: false,
+        supportsThinkingStream: false,
+        supportsPartialMessages: true,
+        supportsRuntimePermissionModeChange: false,
+        supportsCustomTools: false,
+        permissionModel: .none,
+        usageGranularity: .perTurn
+    )
 
     public var executablePathOverride: String?
     /// Opt-in, never inferred. Escalates the tool policy from `--auto-review`
@@ -116,6 +115,8 @@ public struct CursorAgentHarness: AgentHarness {
             )
         }
 
+        let acp = await CursorFlagSupport.shared.supportsACP(executablePath: path)
+
         let status = await CommandProbe.run(
             executablePath: path,
             arguments: ["status"],
@@ -135,9 +136,12 @@ public struct CursorAgentHarness: AgentHarness {
             executablePath: path,
             version: version,
             authState: authState,
-            diagnostic: "Experimental: this CLI has no approval channel. Tool "
-                + "calls are decided by Cursor's auto-review classifier"
-                + (allowUnprompted ? ", or run unprompted in Bypass mode." : "."),
+            diagnostic: acp
+                ? "Uses Cursor ACP for live permissions, plans, and thinking"
+                    + (allowUnprompted ? ". Bypass still requires an explicit opt-in." : ".")
+                : "This CLI has no ACP subcommand. Tool calls are decided by "
+                    + "Cursor's auto-review classifier"
+                    + (allowUnprompted ? ", or run unprompted in Bypass mode." : "."),
             shadowedPaths: shadowed
         )
     }
@@ -184,11 +188,20 @@ public struct CursorAgentHarness: AgentHarness {
                 kind, searchedPath: ShellEnvironment.searchPathDescription
             )
         }
+        if await CursorFlagSupport.shared.supportsACP(executablePath: path) {
+            return CursorACPSession(
+                id: SessionID.generate(),
+                executablePath: path,
+                configuration: configuration,
+                capabilities: Self.acpCapabilities,
+                allowUnprompted: allowUnprompted
+            )
+        }
         return CursorAgentSession(
             id: SessionID.generate(),
             executablePath: path,
             configuration: configuration,
-            capabilities: capabilities,
+            capabilities: Self.printCapabilities,
             allowUnprompted: allowUnprompted
         )
     }
@@ -223,6 +236,34 @@ public struct CursorAgentHarness: AgentHarness {
             }
         }
         return nil
+    }
+}
+
+/// Whether this binary speaks `agent acp`. An unknown subcommand refuses to
+/// start, so older print-only builds skip ACP rather than fail the first turn.
+actor CursorFlagSupport {
+    static let shared = CursorFlagSupport()
+
+    private var answers: [String: Task<Bool, Never>] = [:]
+
+    func supportsACP(executablePath: String) async -> Bool {
+        if let answer = answers[executablePath] { return await answer.value }
+        let probe = Task {
+            let help = await CommandProbe.output(
+                executablePath: executablePath,
+                arguments: ["acp", "--help"],
+                timeout: .seconds(10)
+            )
+            return Self.helpOffersACP(help)
+        }
+        answers[executablePath] = probe
+        return await probe.value
+    }
+
+    nonisolated static func helpOffersACP(_ help: String?) -> Bool {
+        guard let help else { return false }
+        return help.localizedCaseInsensitiveContains("Agent Client Protocol")
+            || help.localizedCaseInsensitiveContains(" as an ACP")
     }
 }
 
@@ -383,6 +424,9 @@ public actor CursorAgentSession: AgentSession {
         }
         if permissionMode == .plan {
             arguments += ["--mode", "plan"]
+        }
+        for root in configuration.additionalWritableRoots {
+            arguments += ["--add-dir", root.path]
         }
         if let providerSessionID {
             arguments += ["--resume", providerSessionID]

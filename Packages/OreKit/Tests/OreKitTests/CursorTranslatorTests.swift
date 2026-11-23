@@ -31,6 +31,38 @@ import Testing
         #expect(arguments.contains("--auto-review"))
     }
 
+    @Test func additionalWritableRootsArePassedAsAddDir() async {
+        let gitDir = URL(fileURLWithPath: "/tmp/ore-cursor-workspace.git")
+        let session = CursorAgentSession(
+            id: SessionID.generate(),
+            executablePath: "/usr/local/bin/cursor-agent",
+            configuration: SessionConfiguration(
+                workingDirectory: URL(fileURLWithPath: "/tmp/ore-cursor-workspace"),
+                additionalWritableRoots: [gitDir]
+            ),
+            capabilities: CursorAgentHarness.printCapabilities,
+            allowUnprompted: false
+        )
+        let arguments = await session.arguments(for: "hello")
+        #expect(zip(arguments, arguments.dropFirst()).contains {
+            $0 == "--add-dir" && $1 == gitDir.path
+        })
+    }
+
+    @Test func acpHelpIsRecognised() {
+        #expect(CursorFlagSupport.helpOffersACP(
+            "Start the Cursor Agent as an ACP (Agent Client Protocol) server"
+        ))
+        #expect(!CursorFlagSupport.helpOffersACP("Print responses to console"))
+        #expect(!CursorFlagSupport.helpOffersACP(nil))
+    }
+
+    @Test func acpCapabilitiesAdvertiseAPermissionChannel() {
+        #expect(CursorAgentHarness.acpCapabilities.permissionModel == .interactiveCallback)
+        #expect(CursorAgentHarness.acpCapabilities.supportsThinkingStream)
+        #expect(CursorAgentHarness.printCapabilities.permissionModel == .none)
+    }
+
     @Test func profileDeniesMacOSProtectedFoldersButAllowsWorkspaceExceptions() throws {
         let workspace = URL(fileURLWithPath: #"/Users/example/Desktop/Repo "One""#)
         let profile = CursorAgentPrivacyBoundary.profile(
@@ -147,6 +179,7 @@ struct CursorTranslatorTests {
             #"{"type":"tool_call","subtype":"started","call_id":"ls","tool_call":{"lsToolCall":{"args":{"targetDirectory":"/tmp/Sources"}}}}"#,
             #"{"type":"tool_call","subtype":"started","call_id":"del","tool_call":{"deleteToolCall":{"args":{"path":"/tmp/gone.swift"}}}}"#,
             #"{"type":"tool_call","subtype":"started","call_id":"sem","tool_call":{"semSearchToolCall":{"args":{"query":"hover preview"}}}}"#,
+            #"{"type":"tool_call","subtype":"started","call_id":"img","tool_call":{"generateImageToolCall":{"args":{"filePath":"/tmp/icon.png"}}}}"#,
         ])
         let calls = all.compactMap { if case .toolCall(let c) = $0 { return c } else { return nil } }
         let byID = Dictionary(uniqueKeysWithValues: calls.map { ($0.id.rawValue, $0) })
@@ -157,6 +190,8 @@ struct CursorTranslatorTests {
         #expect(byID["del"]?.name == "Delete")
         #expect(byID["sem"]?.name == "Grep")
         #expect(byID["sem"]?.input["pattern"]?.stringValue == "hover preview")
+        #expect(byID["img"]?.name == "GenerateImage")
+        #expect(byID["img"]?.input["file_path"]?.stringValue == "/tmp/icon.png")
     }
 
     @Test func webFetchCarriesTheUrlEvenWhenCursorSpellsItTargetUrl() {
@@ -726,5 +761,212 @@ struct CursorAgentFailureTests {
         )
         let events = translator.closeTurn(exitCode: 0).events
         #expect(exitSummary(of: events) == "Halfway done")
+    }
+}
+
+@Suite struct CursorACPTranslatorTests {
+    private func events(
+        _ method: String,
+        _ params: JSONValue,
+        translator: inout CursorACPTranslator
+    ) -> [AgentEvent] {
+        translator.translate(method: method, params: params).events
+    }
+
+    @Test func textAndThoughtChunksBecomeDeltas() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let thought = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("agent_thought_chunk"),
+                "content": .object(["type": .string("text"), "text": .string("hmm")]),
+            ]),
+        ]), translator: &translator)
+        #expect(thought.contains { if case .thinkingDelta(let d) = $0 { return d.text == "hmm" }; return false })
+
+        let text = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object(["type": .string("text"), "text": .string("Hello")]),
+            ]),
+        ]), translator: &translator)
+        #expect(text.contains { if case .textDelta(let d) = $0 { return d.text == "Hello" }; return false })
+    }
+
+    @Test func toolCallDiffLandsOnTheResultText() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        _ = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("tool_call"),
+                "toolCallId": .string("call_1"),
+                "title": .string("Edit App.swift"),
+                "kind": .string("edit"),
+                "rawInput": .object(["path": .string("App.swift")]),
+            ]),
+        ]), translator: &translator)
+        let completed = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("tool_call_update"),
+                "toolCallId": .string("call_1"),
+                "status": .string("completed"),
+                "content": .array([
+                    .object([
+                        "type": .string("diff"),
+                        "path": .string("App.swift"),
+                        "oldText": .string("let a = 1"),
+                        "newText": .string("let a = 2"),
+                    ]),
+                ]),
+            ]),
+        ]), translator: &translator)
+        let result = completed.compactMap { event -> String? in
+            if case .toolResult(let result) = event { return result.text }
+            return nil
+        }.first
+        #expect(result?.contains("App.swift") == true)
+        #expect(result?.contains("+let a = 2") == true)
+    }
+
+    @Test func permissionRequestKeepsAllowAlwaysAsASuggestion() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let request = translator.permissionRequest(
+            params: .object([
+                "toolCall": .object([
+                    "toolCallId": .string("c1"),
+                    "title": .string("Run tests"),
+                    "kind": .string("execute"),
+                    "rawInput": .object(["command": .string("swift test")]),
+                ]),
+                "options": .array([
+                    .object([
+                        "optionId": .string("allow-once"),
+                        "name": .string("Allow once"),
+                        "kind": .string("allow_once"),
+                    ]),
+                    .object([
+                        "optionId": .string("allow-always"),
+                        "name": .string("Allow always"),
+                        "kind": .string("allow_always"),
+                    ]),
+                    .object([
+                        "optionId": .string("reject-once"),
+                        "name": .string("Reject"),
+                        "kind": .string("reject_once"),
+                    ]),
+                ]),
+            ]),
+            requestID: "perm-1"
+        )
+        #expect(request?.toolName == "Bash")
+        #expect(request?.input["command"]?.stringValue == "swift test")
+        #expect(request?.suggestions.contains { $0.title == "Allow always" } == true)
+        let allowed = CursorACPTranslator.permissionOutcome(for: .allow, params: request.map { _ in
+            .object(["options": .array([
+                .object(["optionId": .string("allow-once"), "kind": .string("allow_once")]),
+            ])])
+        })
+        #expect(allowed["outcome"]?["optionId"]?.stringValue == "allow-once")
+    }
+
+    @Test func createPlanBecomesAReadyProposal() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let pair = translator.planProposal(
+            params: .object([
+                "toolCallId": .string("p1"),
+                "name": .string("Refactor tabs"),
+                "overview": .string("Tighten layout."),
+                "plan": .string("1. Inspect current sizing.\n2. Update layout."),
+            ]),
+            requestID: "plan-1"
+        )
+        guard case .proposal(let markdown, let permissionID)? = pair?.0.content else {
+            Issue.record("expected a plan proposal")
+            return
+        }
+        #expect(markdown.contains("Inspect current sizing"))
+        #expect(permissionID?.rawValue == "plan-1")
+        #expect(pair?.0.isReady == true)
+        #expect(pair?.1.toolName == "CreatePlan")
+    }
+
+    @Test func askQuestionFlattensOptions() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let question = translator.question(
+            params: .object([
+                "title": .string("Need input"),
+                "questions": .array([
+                    .object([
+                        "id": .string("q1"),
+                        "prompt": .string("Which mode?"),
+                        "options": .array([
+                            .object(["id": .string("agent"), "label": .string("Agent")]),
+                            .object(["id": .string("plan"), "label": .string("Plan")]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            requestID: "q-1"
+        )
+        #expect(question?.prompt == "Which mode?")
+        #expect(question?.options.map(\.label) == ["Agent", "Plan"])
+        let answered = CursorACPTranslator.questionOutcome(
+            params: .object([
+                "questions": .array([
+                    .object([
+                        "id": .string("q1"),
+                        "options": .array([
+                            .object(["id": .string("plan"), "label": .string("Plan")]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            answer: "Plan"
+        )
+        #expect(answered["outcome"]?["outcome"]?.stringValue == "answered")
+    }
+
+    @Test func generateImageAndTaskBecomeToolRows() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let image = events("cursor/generate_image", .object([
+            "toolCallId": .string("img"),
+            "description": .string("app icon"),
+            "filePath": .string("/tmp/icon.png"),
+        ]), translator: &translator)
+        #expect(image.contains { if case .toolCall(let c) = $0 { return c.name == "GenerateImage" }; return false })
+
+        let task = events("cursor/task", .object([
+            "toolCallId": .string("t1"),
+            "description": .string("Explore codebase"),
+            "prompt": .string("Find auth."),
+            "subagentType": .string("explore"),
+        ]), translator: &translator)
+        #expect(task.contains { if case .toolCall(let c) = $0 { return c.name == "Task" }; return false })
+    }
+
+    @Test func usageAndCompactionAreSurfaced() {
+        var translator = CursorACPTranslator(sessionID: SessionID.generate())
+        _ = translator.beginTurn()
+        let usage = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("usage_update"),
+                "used": .integer(1200),
+                "size": .integer(200_000),
+            ]),
+        ]), translator: &translator)
+        #expect(usage.contains { if case .usage(let report) = $0 { return report.inputTokens == 1200 && report.contextWindow == 200_000 }; return false })
+
+        let compact = events("session/update", .object([
+            "update": .object([
+                "sessionUpdate": .string("compaction_update"),
+                "status": .string("completed"),
+                "used": .integer(180_000),
+            ]),
+        ]), translator: &translator)
+        #expect(compact.contains { if case .contextCompacted = $0 { return true }; return false })
     }
 }

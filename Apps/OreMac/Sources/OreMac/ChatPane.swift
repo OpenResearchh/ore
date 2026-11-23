@@ -790,6 +790,16 @@ struct ChatPane: View {
             model.narration.setMicActive(active)
         }
         .onChange(of: voice.status) { _, status in
+            if case .listening = status {
+                // After the analyzer is up: MPS and SpeechAnalyzer share the
+                // GPU, and warming the refiner on the same click as the mic
+                // made the first press stall or never reach listening.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(400))
+                    guard voice.isListening else { return }
+                    VoiceIntentRefiner.shared.prewarm()
+                }
+            }
             handleVoiceStatusChange(status)
         }
         .onChange(of: chatSummary?.id) { _, _ in
@@ -2385,10 +2395,17 @@ struct ChatPane: View {
     private func toggleVoice() {
         // Pressing again during the hold means "go now": send the pending turn
         // rather than opening a second dictation on top of it.
-        if voice.isActive || voiceSettle != nil {
+        if voiceSettle != nil {
             finishVoice(.send)
-        } else {
+            return
+        }
+        switch VoiceMicPress.action(status: voice.status) {
+        case .start:
             startVoice()
+        case .stop:
+            finishVoice(.send)
+        case .ignore:
+            break
         }
     }
 
@@ -2406,9 +2423,6 @@ struct ChatPane: View {
             voiceQuote = ""
         }
         composerFocused = true
-        // Load the on-device model while the user talks, so the commit-time
-        // refinement doesn't pay the cold start.
-        VoiceIntentRefiner.shared.prewarm()
         voice.start()
     }
 

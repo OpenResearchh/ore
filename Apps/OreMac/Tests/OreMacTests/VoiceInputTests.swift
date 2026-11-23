@@ -763,6 +763,15 @@ struct VoiceAvailabilityTests {
         #expect(VoiceAvailability.recognizerFailure(exists: true, isAvailable: true) == nil)
     }
 
+    @Test func aSecondMicPressWhileStartingDoesNotCancelDictation() {
+        #expect(VoiceMicPress.action(status: .idle) == .start)
+        #expect(VoiceMicPress.action(status: .error("busy")) == .start)
+        #expect(VoiceMicPress.action(status: .listening) == .stop)
+        #expect(VoiceMicPress.action(status: .requestingPermission) == .ignore)
+        #expect(VoiceMicPress.action(status: .preparing) == .ignore)
+        #expect(VoiceMicPress.action(status: .downloadingModel) == .ignore)
+    }
+
     @Test func aFailedLocaleReservationIsRetriedOnTheNextAttempt() async {
         struct Refused: Error {}
         final class Attempts { var count = 0 }

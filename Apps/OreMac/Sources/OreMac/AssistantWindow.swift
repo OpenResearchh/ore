@@ -28,6 +28,7 @@ struct AssistantActivityView: View {
     /// chat pane's, so its identity survives every body pass — `TranscriptHost`
     /// compares it by reference.
     @State private var scrollAnchor = TranscriptScrollAnchor()
+    @AppStorage("ore.transcriptDensity") private var transcriptDensityRaw = TranscriptDensity.normal.rawValue
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -334,6 +335,7 @@ struct AssistantActivityView: View {
                             state.setDraftReply(reply)
                         }
                     },
+                    density: TranscriptDensity(rawValue: transcriptDensityRaw) ?? .normal,
                     scrollAnchor: scrollAnchor,
                     bottomInset: bottomInset ?? Self.restingBottomInset
                 )

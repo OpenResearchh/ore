@@ -2164,6 +2164,25 @@ struct ToolChangeStatsTests {
         #expect(counts.deletions == 0)
     }
 
+    @MainActor
+    @Test func expandedDiffCardsTruncateLongPatches() {
+        let lines = (1...40).map { i in "+line \(i)" }.joined(separator: "\n")
+        let row = TranscriptRow(
+            id: "edit",
+            turnID: TurnID(rawValue: "t1"),
+            kind: .toolCall,
+            text: "Edit",
+            toolName: "Edit",
+            toolInput: .object(["file_path": .string("App.swift")]),
+            resultText: "--- a/App.swift\n+++ b/App.swift\n" + lines,
+            isExpanded: true
+        )
+        let rendered = TranscriptCell.attributedText(for: row)
+        #expect(rendered.string.contains("+line 1"))
+        #expect(!rendered.string.contains("+line 40"))
+        #expect(rendered.string.contains("more. Review to see the full diff."))
+    }
+
     @Test func unifiedDiffInResultTextIsRecognised() {
         let diff = """
         --- a/App.swift

@@ -64,6 +64,7 @@ struct TranscriptView: NSViewRepresentable {
         case handoffPlan
         case revert
         case reply
+        case review
     }
 
     var rows: [TranscriptRow]
@@ -3041,6 +3042,20 @@ final class TranscriptCell: NSTableCellView {
         guard footerTurnID != nil else { return }
         let menu = NSMenu()
 
+        let review = NSMenuItem(
+            title: "Review Changes", action: #selector(reviewTurn), keyEquivalent: ""
+        )
+        review.target = self
+        review.toolTip = "Open this turn's files in the Changes inspector"
+        menu.addItem(review)
+        let undo = NSMenuItem(
+            title: "Undo All", action: #selector(revertTurn), keyEquivalent: ""
+        )
+        undo.target = self
+        undo.toolTip = "Restore the worktree and conversation to before this turn"
+        menu.addItem(undo)
+        menu.addItem(.separator())
+
         if !footerResponse.isEmpty {
             let copy = NSMenuItem(
                 title: "Copy Response", action: #selector(copyFooterResponse), keyEquivalent: ""
@@ -3057,8 +3072,10 @@ final class TranscriptCell: NSTableCellView {
         reply.target = self
         reply.toolTip = "Tag this turn so the next message aims at it"
         menu.addItem(reply)
-        menu.addItem(.separator())
 
+        if footerCanFork || footerHasPlan {
+            menu.addItem(.separator())
+        }
         if footerCanFork {
             let fork = NSMenuItem(
                 title: "Fork to New Tab", action: #selector(forkTurn), keyEquivalent: ""
@@ -3077,13 +3094,6 @@ final class TranscriptCell: NSTableCellView {
             handoff.toolTip = "Copy this plan into a new tab so you can run it with another agent"
             menu.addItem(handoff)
         }
-        menu.addItem(.separator())
-        let revert = NSMenuItem(
-            title: "Revert to Before This Turn", action: #selector(revertTurn), keyEquivalent: ""
-        )
-        revert.target = self
-        menu.addItem(revert)
-
         menu.popUp(
             positioning: nil,
             at: NSPoint(x: 0, y: menuButton.bounds.height),
@@ -3109,6 +3119,11 @@ final class TranscriptCell: NSTableCellView {
     @objc private func revertTurn() {
         guard let footerTurnID else { return }
         onTurnAction?(footerTurnID, .revert)
+    }
+
+    @objc private func reviewTurn() {
+        guard let footerTurnID else { return }
+        onTurnAction?(footerTurnID, .review)
     }
 
     @objc private func replyToTurn() {
@@ -4194,7 +4209,9 @@ final class TranscriptCell: NSTableCellView {
         }
         guard row.isExpanded, !item.detail.isEmpty else { return result }
         result.append(NSAttributedString(string: "\n\n"))
-        let lines = item.detail.split(separator: "\n", omittingEmptySubsequences: false)
+        let allLines = item.detail.split(separator: "\n", omittingEmptySubsequences: false)
+        let limit = item.isDiff ? 14 : allLines.count
+        let lines = allLines.prefix(limit)
         for (index, line) in lines.enumerated() {
             let value = String(line)
             let color: NSColor
@@ -4204,6 +4221,15 @@ final class TranscriptCell: NSTableCellView {
             result.append(NSAttributedString(
                 string: value + (index == lines.count - 1 ? "" : "\n"),
                 attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular), .foregroundColor: color]
+            ))
+        }
+        if allLines.count > limit {
+            result.append(NSAttributedString(
+                string: "\n… +\(allLines.count - limit) more. Review to see the full diff.",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ]
             ))
         }
         return result

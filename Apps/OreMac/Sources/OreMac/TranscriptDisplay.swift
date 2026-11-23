@@ -1,6 +1,22 @@
 import Foundation
 import OreProtocol
 
+/// How much process the transcript shows. Focus hides tools and thinking;
+/// verbose never folds a finished turn into an activity group.
+enum TranscriptDensity: String, CaseIterable, Sendable {
+    case focus
+    case normal
+    case verbose
+
+    var displayName: String {
+        switch self {
+        case .focus: "Focus"
+        case .normal: "Normal"
+        case .verbose: "Verbose"
+        }
+    }
+}
+
 /// Derives the transcript the table shows from the event-stream rows.
 ///
 /// Completed turns are grouped once and reused. Streaming a later turn used to
@@ -35,6 +51,7 @@ enum TranscriptDisplay {
             var keepLiveTurnExpanded: Bool
             var expanded: Set<String>
             var hidingPlanTurnID: TurnID?
+            var density: TranscriptDensity
         }
 
         fileprivate var lastKey: CacheKey?
@@ -68,7 +85,8 @@ enum TranscriptDisplay {
         memo: Memo,
         hidingPlanTurnID: TurnID? = nil,
         revision: Int? = nil,
-        structuralRevision: Int? = nil
+        structuralRevision: Int? = nil,
+        density: TranscriptDensity = .normal
     ) -> [TranscriptRow] {
         // The per-turn memo below still walks and hashes every row, which is
         // O(transcript) — fine per stream flush, but this function also runs on
@@ -81,7 +99,8 @@ enum TranscriptDisplay {
                 sourceCount: source.count,
                 keepLiveTurnExpanded: keepLiveTurnExpanded,
                 expanded: expanded,
-                hidingPlanTurnID: hidingPlanTurnID
+                hidingPlanTurnID: hidingPlanTurnID,
+                density: density
             )
         }
         if let key, key == memo.lastKey { return memo.lastOutput }
@@ -116,7 +135,7 @@ enum TranscriptDisplay {
             if isActive {
                 let withSubjects = annotated(slice, subjects: subjects)
                 result.append(contentsOf: nestSubagents(
-                    present(turn: withSubjects, isActive: true, expanded: expanded),
+                    present(turn: withSubjects, isActive: true, expanded: expanded, density: density),
                     expanded: expanded
                 ))
                 continue
@@ -147,7 +166,7 @@ enum TranscriptDisplay {
 
             let withSubjects = annotated(slice, subjects: subjects)
             let output = nestSubagents(
-                present(turn: withSubjects, isActive: false, expanded: expanded),
+                present(turn: withSubjects, isActive: false, expanded: expanded, density: density),
                 expanded: expanded
             )
             let entry = Memo.TurnEntry(
@@ -192,6 +211,7 @@ enum TranscriptDisplay {
               previousKey.sourceCount == key.sourceCount,
               previousKey.expanded == key.expanded,
               previousKey.hidingPlanTurnID == key.hidingPlanTurnID,
+              previousKey.density == key.density,
               memo.lastStructuralRevision == structuralRevision,
               let last = source.last,
               last.id == memo.lastSourceRowID,
@@ -224,7 +244,8 @@ enum TranscriptDisplay {
     static func present(
         turn rows: [TranscriptRow],
         isActive: Bool,
-        expanded: Set<String>
+        expanded: Set<String>,
+        density: TranscriptDensity = .normal
     ) -> [TranscriptRow] {
         guard let turnID = rows.first?.turnID else { return rows }
 
@@ -233,13 +254,24 @@ enum TranscriptDisplay {
                 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         let collapsible = rows.indices.filter { isCollapsible(rows[$0], isAnswer: $0 == answer) }
-        guard !collapsible.isEmpty else { return rows }
         let collapsibleSet = Set(collapsible)
+
+        if density == .focus {
+            var result = rows.enumerated().compactMap { offset, row -> TranscriptRow? in
+                collapsibleSet.contains(offset) ? nil : row
+            }
+            if !isActive { result.append(footer(for: rows, turnID: turnID)) }
+            return result
+        }
+
+        guard !collapsible.isEmpty else {
+            return isActive ? rows : rows + [footer(for: rows, turnID: turnID)]
+        }
 
         // A live turn keeps every step visible, under the message card the
         // reader is already looking at. Folding them into "14 steps" above
         // that card hid the work until the turn ended. The fold comes back
-        // on its own once the turn is no longer active.
+        // on its own once the turn is no longer active. Verbose keeps them.
         if isActive {
             guard answer != nil else { return rows }
             var leading: [TranscriptRow] = []
@@ -257,6 +289,21 @@ enum TranscriptDisplay {
                 }
             }
             return leading + steps
+        }
+
+        if density == .verbose {
+            var result: [TranscriptRow] = []
+            result.reserveCapacity(rows.count + 1)
+            for (offset, row) in rows.enumerated() {
+                var item = row
+                if collapsibleSet.contains(offset),
+                   item.kind == .toolCall || item.kind == .thinking || item.kind == .error {
+                    item.isExpanded = expanded.contains(item.id)
+                }
+                result.append(item)
+            }
+            result.append(footer(for: rows, turnID: turnID))
+            return result
         }
 
         let foldCount = collapsible.count
@@ -296,6 +343,11 @@ enum TranscriptDisplay {
             result.append(row)
         }
 
+        result.append(footer(for: rows, turnID: turnID))
+        return result
+    }
+
+    private static func footer(for rows: [TranscriptRow], turnID: TurnID) -> TranscriptRow {
         var footer = TranscriptRow(
             id: "footer-\(turnID.rawValue)",
             turnID: turnID,
@@ -305,8 +357,7 @@ enum TranscriptDisplay {
         )
         footer.createdAt = rows.last?.createdAt ?? Date()
         footer.sealDerivedContent()
-        result.append(footer)
-        return result
+        return footer
     }
 
     static func nestSubagents(
@@ -356,10 +407,41 @@ enum TranscriptDisplay {
     static func activitySummary(for rows: [TranscriptRow]) -> String {
         // One count for the fold — not tool calls vs thoughts vs notes, which
         // is harness jargon. Issues are drawn separately on the row so they
-        // don't hide in a comma list.
+        // don't hide in a comma list. Duration sits beside the count so the
+        // header stays one line tall while streaming.
         let steps = rows.count
         guard steps > 0 else { return "Activity" }
-        return "\(steps) step\(steps == 1 ? "" : "s")"
+        var text = "\(steps) step\(steps == 1 ? "" : "s")"
+        if let first = rows.first?.createdAt, let last = rows.last?.createdAt {
+            let elapsed = last.timeIntervalSince(first)
+            if elapsed >= 1 {
+                text += " · \(elapsedLabel(elapsed))"
+            }
+        }
+        return text
+    }
+
+    static func elapsedLabel(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds))
+        let hours = total / 3600, minutes = (total % 3600) / 60, secs = total % 60
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        if minutes > 0 { return "\(minutes)m \(secs)s" }
+        return "\(secs)s"
+    }
+
+    /// Turns whose collapsed activity group should open because find hit a
+    /// hidden step. Without this, a match inside "14 steps" looks deleted.
+    static func matchingActivityIDs(query: String, in source: [TranscriptRow]) -> Set<String> {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return [] }
+        var ids: Set<String> = []
+        for row in source {
+            let haystacks = [row.text, row.resultText ?? ""]
+            if haystacks.contains(where: { $0.range(of: trimmed, options: .caseInsensitive) != nil }) {
+                ids.insert("activity-\(row.turnID.rawValue)")
+            }
+        }
+        return ids
     }
 
     // MARK: - Source prep

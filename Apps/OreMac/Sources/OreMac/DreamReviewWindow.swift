@@ -375,6 +375,7 @@ private struct DreamTranscriptSheet: View {
     /// Held here so its identity survives every body pass — `TranscriptHost`
     /// compares it by reference.
     @State private var scrollAnchor = TranscriptScrollAnchor()
+    @AppStorage("ore.transcriptDensity") private var transcriptDensityRaw = TranscriptDensity.normal.rawValue
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -423,6 +424,7 @@ private struct DreamTranscriptSheet: View {
                 },
                 onOpenFile: { openTranscriptFile($0) },
                 onTurnAction: { _, _ in },
+                density: TranscriptDensity(rawValue: transcriptDensityRaw) ?? .normal,
                 scrollAnchor: scrollAnchor
             )
             .equatable()

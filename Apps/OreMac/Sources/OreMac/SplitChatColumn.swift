@@ -21,6 +21,7 @@ struct SplitChatColumn: View {
     /// Its own anchor, deliberately — sharing the main pane's would make one
     /// column's "jump to latest" scroll the other.
     @State private var scrollAnchor = TranscriptScrollAnchor()
+    @AppStorage("ore.transcriptDensity") private var transcriptDensityRaw = TranscriptDensity.normal.rawValue
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -49,7 +50,11 @@ struct SplitChatColumn: View {
                     // split stays a conversation.
                     onOpenFile: { model.openSourceFile($0, in: workspace.id) },
                     onTurnAction: { turn, action in
-                        if action == .reply {
+                        switch action {
+                        case .review:
+                            ChromeLayout.showsReview = true
+                            ChromeLayout.request(.reviewTabChanges)
+                        case .reply:
                             let turnRows = state.rows.filter { $0.turnID == turn }
                             let target = turnRows.last {
                                 ($0.kind == .assistantText || $0.kind == .plan)
@@ -61,6 +66,8 @@ struct SplitChatColumn: View {
                             ) {
                                 state.setDraftReply(reply)
                             }
+                        case .fork, .handoffPlan, .revert:
+                            break
                         }
                     },
                     onReply: { row in
@@ -71,6 +78,7 @@ struct SplitChatColumn: View {
                             state.setDraftReply(reply)
                         }
                     },
+                    density: TranscriptDensity(rawValue: transcriptDensityRaw) ?? .normal,
                     scrollAnchor: scrollAnchor
                 )
                 .equatable()

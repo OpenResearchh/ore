@@ -405,6 +405,58 @@ struct TranscriptDisplayTests {
         #expect(!summary.contains("issue"))
     }
 
+    @Test func focusDensityHidesToolsAndThinking() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "go"),
+            TranscriptRow(id: "th", turnID: turn, kind: .thinking, text: "hmm", isComplete: true),
+            TranscriptRow(id: "tool", turnID: turn, kind: .toolCall, text: "Read", isComplete: true),
+            TranscriptRow(id: "a1", turnID: turn, kind: .assistantText, text: "done", isComplete: true),
+        ]
+        let displayed = TranscriptDisplay.rows(
+            from: rows,
+            keepLiveTurnExpanded: false,
+            expanded: [],
+            memo: TranscriptDisplay.Memo(),
+            density: .focus
+        )
+        #expect(!displayed.contains { $0.kind == .thinking || $0.kind == .toolCall || $0.kind == .activityGroup })
+        #expect(displayed.contains { $0.kind == .userMessage })
+        #expect(displayed.contains { $0.kind == .assistantText })
+        #expect(displayed.contains { $0.kind == .turnFooter })
+    }
+
+    @Test func verboseDensityKeepsStepsUnfolded() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "u1", turnID: turn, kind: .userMessage, text: "go"),
+            TranscriptRow(id: "tool", turnID: turn, kind: .toolCall, text: "Read", isComplete: true),
+            TranscriptRow(id: "a1", turnID: turn, kind: .assistantText, text: "done", isComplete: true),
+        ]
+        let displayed = TranscriptDisplay.rows(
+            from: rows,
+            keepLiveTurnExpanded: false,
+            expanded: [],
+            memo: TranscriptDisplay.Memo(),
+            density: .verbose
+        )
+        #expect(!displayed.contains { $0.kind == .activityGroup })
+        #expect(displayed.contains { $0.kind == .toolCall })
+        #expect(displayed.contains { $0.kind == .turnFooter })
+    }
+
+    @Test func findExpandsTheActivityGroupThatHidesAMatch() {
+        let turn = TurnID(rawValue: "t1")
+        let rows = [
+            TranscriptRow(id: "tool", turnID: turn, kind: .toolCall, text: "Read", resultText: "secret-token"),
+        ]
+        #expect(
+            TranscriptDisplay.matchingActivityIDs(query: "secret-token", in: rows)
+                == ["activity-t1"]
+        )
+        #expect(TranscriptDisplay.matchingActivityIDs(query: "missing", in: rows).isEmpty)
+    }
+
     @Test func aSingleItemIsOneStep() {
         let row = TranscriptRow(
             id: "th", turnID: TurnID(rawValue: "t1"), kind: .thinking, text: "hmm"
@@ -478,11 +530,12 @@ struct TranscriptDisplayTests {
         )
         #expect(cached.map(\.text) == first.map(\.text))
 
-        // Bumping it re-derives.
+        // Bumping it re-derives. The last row is the turn footer, so the
+        // mutated answer is the last assistant line, not `last` itself.
         let fresh = TranscriptDisplay.rows(
             from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 2
         )
-        #expect(fresh.last?.text == "mutated behind the revision's back")
+        #expect(fresh.contains { $0.kind == .assistantText && $0.text == "mutated behind the revision's back" })
     }
 
     /// `keepLiveTurnExpanded` and `expanded` change the output without touching
@@ -514,6 +567,13 @@ struct TranscriptDisplayTests {
             from: rows, keepLiveTurnExpanded: false, expanded: ["activity-t1"], memo: memo, revision: 1
         )
         #expect(expanded.count > collapsed.count)
+
+        let focused = TranscriptDisplay.rows(
+            from: rows, keepLiveTurnExpanded: false, expanded: [], memo: memo, revision: 1,
+            density: .focus
+        )
+        #expect(!focused.contains { $0.kind == .toolCall || $0.kind == .activityGroup })
+        #expect(focused.contains { $0.kind == .assistantText })
     }
 
     /// A permission prompt used to flip `isBusy` off, which folded the live

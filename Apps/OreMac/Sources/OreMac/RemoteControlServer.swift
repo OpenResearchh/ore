@@ -316,6 +316,16 @@ final class RemoteControlServer {
                 else { return }
                 model.closeChat(ChatID(rawValue: raw), in: workspace)
             }
+        case "/api/revert":
+            return mutate(body) { payload in
+                guard let workspace = workspaceID(payload["workspaceID"]),
+                      let turn = payload["turnID"], !turn.isEmpty
+                else { return }
+                if let raw = payload["chatID"], !raw.isEmpty {
+                    model.selectChat(ChatID(rawValue: raw), in: workspace)
+                }
+                model.revert(to: TurnID(rawValue: turn), in: workspace)
+            }
         case "/api/files":
             return json(files(model: model, query: query))
         case "/api/file":
@@ -483,7 +493,7 @@ final class RemoteControlServer {
             let stamp = ISO8601DateFormatter()
             var headerTurns = Set<TurnID>()
             messages = displayed.suffix(80).compactMap { row in
-                guard row.kind != .divider, row.kind != .turnFooter else { return nil }
+                guard row.kind != .divider else { return nil }
                 var payload = Self.message(from: row)
                 if (row.kind == .activityGroup || row.kind == .assistantText || row.kind == .plan),
                    headerTurns.insert(row.turnID).inserted {
@@ -1034,7 +1044,8 @@ final class RemoteControlServer {
         case .thinking: kind = "thinking"
         case .error: kind = "error"
         case .plan: kind = "plan"
-        case .divider, .turnFooter: kind = "agent"
+        case .divider: kind = "agent"
+        case .turnFooter: kind = "footer"
         }
         let title: String
         switch row.kind {

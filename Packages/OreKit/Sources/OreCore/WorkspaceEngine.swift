@@ -556,6 +556,7 @@ public actor WorkspaceEngine {
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
             model: request?.model ?? runtime.record.model,
+            reasoningEffort: reasoningEffort,
             permissionMode: request?.permissionMode
                 ?? PermissionMode(rawValue: runtime.record.permissionMode) ?? .default,
             resume: resume,
@@ -1057,6 +1058,7 @@ public actor WorkspaceEngine {
         let configuration = SessionConfiguration(
             workingDirectory: worktreeURL,
             model: auxiliaryModel,
+            reasoningEffort: .low,
             permissionMode: .plan,
             appendSystemPrompt: instruction,
             environmentOverrides: harnessKind == .claudeCode

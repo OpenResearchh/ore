@@ -28,11 +28,32 @@ struct ClaudeBypassSwitchTests {
         let current = """
           --allow-dangerously-skip-permissions  Enable bypassing all permission checks
           --dangerously-skip-permissions        Bypass all permission checks.
+          --forward-subagent-text               Forward nested subagent text
+          --effort <level>                      Reasoning effort
         """
         let older = "  --dangerously-skip-permissions        Bypass all permission checks."
         #expect(ClaudeFlagSupport.helpOffersBypassSwitch(current))
         #expect(!ClaudeFlagSupport.helpOffersBypassSwitch(older))
         #expect(!ClaudeFlagSupport.helpOffersBypassSwitch(nil), "a CLI that hangs reads as no")
+        let flags = ClaudeFlagSupport.flags(fromHelp: current)
+        #expect(flags.forwardSubagentText)
+        #expect(flags.effort)
+        #expect(!ClaudeFlagSupport.flags(fromHelp: older).forwardSubagentText)
+        #expect(!ClaudeFlagSupport.flags(fromHelp: nil).effort)
+    }
+
+    @Test func nestedSubagentTextAndEffortAreOnlyPassedWhenTheCLIListsThem() {
+        let flags = ClaudeFlagSupport.Flags(forwardSubagentText: true, effort: true)
+        #expect(
+            ClaudeCodeSession.capabilityArguments(flags: flags, effort: .high)
+                == ["--forward-subagent-text", "--effort", "high"]
+        )
+        #expect(
+            ClaudeCodeSession.capabilityArguments(flags: ClaudeFlagSupport.Flags(), effort: .high)
+                .isEmpty
+        )
+        #expect(ClaudeCodeSession.cliEffortValue(.adaptive) == nil)
+        #expect(ClaudeCodeSession.cliEffortValue(.xhigh) == "xhigh")
     }
 
     @Test func theCLIsRefusalIsRecognisedAndNothingElseIs() {
